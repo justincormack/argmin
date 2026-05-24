@@ -1,8 +1,17 @@
-use crate::{metadata_command::decode_metadata_command_envelope, types::ChecksumBytes};
+use crate::{
+    cluster::ShardLocation,
+    metadata_command::{decode_metadata_command_envelope, BucketWriteReservationProof},
+    types::{
+        ChecksumBytes, ClusterEpoch, DataPgId, GenerationId, ObjectKey, ObjectPayloadReclaimKind,
+        PgId, ShardIndex, ShardKey, WriteAck,
+    },
+    BucketName, NodeId,
+};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+const STORAGE_RPC_SHARD_LOCATION_LEN: usize = 8 + 4 + 1 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -84,6 +93,16 @@ pub(crate) enum StorageRpcPayloadError {
     ShardWriteSizeMismatch { expected: u64, actual: u64 },
     #[error("shard write checksum mismatch")]
     ShardWriteChecksumMismatch,
+    #[error("shard location shard index does not match shard key")]
+    ShardLocationMismatch,
+    #[error("invalid read handle acquire request: {0}")]
+    InvalidReadHandleAcquireRequest(&'static str),
+    #[error("invalid durable claim token: {0}")]
+    InvalidDurableClaimToken(&'static str),
+    #[error("invalid bucket write reservation proof: {0}")]
+    InvalidBucketWriteReservationProof(&'static str),
+    #[error("invalid UTF-8 string")]
+    InvalidUtf8,
     #[error("invalid checksum metadata: {0}")]
     InvalidChecksumMetadata(&'static str),
 }
@@ -99,6 +118,74 @@ pub(crate) struct StorageRpcShardWriteItem {
     pub(crate) expected_size: u64,
     pub(crate) expected_crc64: u64,
     pub(crate) payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardWriteRequest {
+    pub(crate) location: ShardLocation,
+    pub(crate) shard_key: ShardKey,
+    pub(crate) expected_size: u64,
+    pub(crate) expected_crc64: u64,
+    pub(crate) payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardDeleteRequest {
+    pub(crate) location: ShardLocation,
+    pub(crate) shard_key: ShardKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcReadHandleAcquireRequest {
+    pub(crate) read_operation_id: String,
+    pub(crate) locations: Vec<ShardLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketClaimToken {
+    pub(crate) bucket: BucketName,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimClaimToken {
+    pub(crate) bucket: BucketName,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) key: ObjectKey,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) reclaim_kind: ObjectPayloadReclaimKind,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcDurableClaimToken {
+    ObjectPayloadReclaim(StorageRpcObjectPayloadReclaimClaimToken),
+    BucketDeleteFinalize(StorageRpcBucketClaimToken),
+    LifecycleSweep(StorageRpcBucketClaimToken),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcClaimHeartbeatRequest {
+    pub(crate) token: StorageRpcDurableClaimToken,
+    pub(crate) heartbeat_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcClaimReleaseRequest {
+    pub(crate) token: StorageRpcDurableClaimToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcProofReleaseRequest {
+    pub(crate) proof: BucketWriteReservationProof,
 }
 
 pub(crate) fn encode_storage_rpc_frame(
@@ -278,6 +365,225 @@ pub(crate) fn decode_shard_write_item(
     })
 }
 
+pub(crate) fn encode_shard_write_request(
+    request: &StorageRpcShardWriteRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_shard_location_matches_key(&request.location, &request.shard_key)?;
+    validate_shard_write_payload(
+        request.expected_size,
+        request.expected_crc64,
+        &request.payload,
+    )?;
+    let mut out = Vec::new();
+    put_shard_location(&mut out, request.location);
+    put_bytes(&mut out, request.shard_key.as_bytes());
+    put_u64(&mut out, request.expected_size);
+    put_u64(&mut out, request.expected_crc64);
+    put_bytes(&mut out, &request.payload);
+    Ok(out)
+}
+
+pub(crate) fn decode_shard_write_request(
+    bytes: &[u8],
+) -> Result<StorageRpcShardWriteRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let location = decoder.read_shard_location()?;
+    let shard_key = decoder.read_shard_key()?;
+    let expected_size = decoder.read_u64()?;
+    let expected_crc64 = decoder.read_u64()?;
+    let payload = decoder.read_bytes()?.to_vec();
+    decoder.finish()?;
+    validate_shard_location_matches_key(&location, &shard_key)?;
+    validate_shard_write_payload(expected_size, expected_crc64, &payload)?;
+    Ok(StorageRpcShardWriteRequest {
+        location,
+        shard_key,
+        expected_size,
+        expected_crc64,
+        payload,
+    })
+}
+
+pub(crate) fn encode_shard_write_ack(ack: WriteAck) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, ack.stored_size);
+    put_u64(&mut out, ack.crc64);
+    out
+}
+
+pub(crate) fn decode_shard_write_ack(
+    bytes: &[u8],
+    expected_size: u64,
+    expected_crc64: u64,
+) -> Result<WriteAck, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let stored_size = decoder.read_u64()?;
+    let crc64 = decoder.read_u64()?;
+    decoder.finish()?;
+    if stored_size != expected_size {
+        return Err(StorageRpcPayloadError::ShardWriteSizeMismatch {
+            expected: expected_size,
+            actual: stored_size,
+        });
+    }
+    if crc64 != expected_crc64 {
+        return Err(StorageRpcPayloadError::ShardWriteChecksumMismatch);
+    }
+    Ok(WriteAck { stored_size, crc64 })
+}
+
+pub(crate) fn encode_shard_delete_request(
+    request: &StorageRpcShardDeleteRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_shard_location_matches_key(&request.location, &request.shard_key)?;
+    let mut out = Vec::new();
+    put_shard_location(&mut out, request.location);
+    put_bytes(&mut out, request.shard_key.as_bytes());
+    Ok(out)
+}
+
+pub(crate) fn decode_shard_delete_request(
+    bytes: &[u8],
+) -> Result<StorageRpcShardDeleteRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let location = decoder.read_shard_location()?;
+    let shard_key = decoder.read_shard_key()?;
+    decoder.finish()?;
+    validate_shard_location_matches_key(&location, &shard_key)?;
+    Ok(StorageRpcShardDeleteRequest {
+        location,
+        shard_key,
+    })
+}
+
+pub(crate) fn encode_read_handle_acquire_request(
+    request: &StorageRpcReadHandleAcquireRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_read_operation_id(&request.read_operation_id)?;
+    if request.locations.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire must include at least one shard location",
+        ));
+    }
+    validate_read_handle_locations(&request.locations)?;
+    let mut out = Vec::new();
+    put_string(&mut out, &request.read_operation_id);
+    put_u32(
+        &mut out,
+        u32::try_from(request.locations.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: request.locations.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for location in &request.locations {
+        put_shard_location(&mut out, *location);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_read_handle_acquire_request(
+    bytes: &[u8],
+) -> Result<StorageRpcReadHandleAcquireRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let read_operation_id = decoder.read_string()?;
+    let location_count = decoder.read_u32()? as usize;
+    if location_count == 0 {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire must include at least one shard location",
+        ));
+    }
+    if location_count > decoder.remaining_len() / STORAGE_RPC_SHARD_LOCATION_LEN {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut locations = Vec::with_capacity(location_count);
+    for _ in 0..location_count {
+        locations.push(decoder.read_shard_location()?);
+    }
+    decoder.finish()?;
+    validate_read_operation_id(&read_operation_id)?;
+    validate_read_handle_locations(&locations)?;
+    Ok(StorageRpcReadHandleAcquireRequest {
+        read_operation_id,
+        locations,
+    })
+}
+
+pub(crate) fn encode_claim_heartbeat_request(
+    request: &StorageRpcClaimHeartbeatRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_claim_token(&request.token)?;
+    if request
+        .lease_deadline
+        .is_some_and(|lease_deadline| lease_deadline <= request.heartbeat_at)
+    {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim heartbeat lease deadline must be after heartbeat time",
+        ));
+    }
+    let mut out = Vec::new();
+    put_claim_token(&mut out, &request.token);
+    put_u64(&mut out, request.heartbeat_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    Ok(out)
+}
+
+pub(crate) fn decode_claim_heartbeat_request(
+    bytes: &[u8],
+) -> Result<StorageRpcClaimHeartbeatRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let token = decoder.read_claim_token()?;
+    let heartbeat_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    decoder.finish()?;
+    let request = StorageRpcClaimHeartbeatRequest {
+        token,
+        heartbeat_at,
+        lease_deadline,
+    };
+    encode_claim_heartbeat_request(&request)?;
+    Ok(request)
+}
+
+pub(crate) fn encode_claim_release_request(
+    request: &StorageRpcClaimReleaseRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_claim_token(&request.token)?;
+    let mut out = Vec::new();
+    put_claim_token(&mut out, &request.token);
+    Ok(out)
+}
+
+pub(crate) fn decode_claim_release_request(
+    bytes: &[u8],
+) -> Result<StorageRpcClaimReleaseRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let token = decoder.read_claim_token()?;
+    decoder.finish()?;
+    validate_claim_token(&token)?;
+    Ok(StorageRpcClaimReleaseRequest { token })
+}
+
+pub(crate) fn encode_proof_release_request(
+    request: &StorageRpcProofReleaseRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_reservation_proof(&request.proof)?;
+    let mut out = Vec::new();
+    put_bucket_write_reservation_proof(&mut out, &request.proof);
+    Ok(out)
+}
+
+pub(crate) fn decode_proof_release_request(
+    bytes: &[u8],
+) -> Result<StorageRpcProofReleaseRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let proof = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    validate_bucket_write_reservation_proof(&proof)?;
+    Ok(StorageRpcProofReleaseRequest { proof })
+}
+
 pub(crate) fn encode_optional_checksum_metadata(checksum: Option<&ChecksumBytes>) -> Vec<u8> {
     let mut out = Vec::new();
     match checksum {
@@ -325,6 +631,91 @@ fn validate_shard_write_payload(
     }
     if checksum::crc64::checksum(payload) != expected_crc64 {
         return Err(StorageRpcPayloadError::ShardWriteChecksumMismatch);
+    }
+    Ok(())
+}
+
+fn validate_shard_location_matches_key(
+    location: &ShardLocation,
+    shard_key: &ShardKey,
+) -> Result<(), StorageRpcPayloadError> {
+    if location.shard_index() != shard_key.shard_index() {
+        return Err(StorageRpcPayloadError::ShardLocationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_read_operation_id(id: &str) -> Result<(), StorageRpcPayloadError> {
+    if id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read operation id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_handle_locations(
+    locations: &[ShardLocation],
+) -> Result<(), StorageRpcPayloadError> {
+    for pair in locations.windows(2) {
+        if shard_location_sort_key(pair[0]) >= shard_location_sort_key(pair[1]) {
+            return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire locations must be sorted and unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn shard_location_sort_key(location: ShardLocation) -> (u64, u32, u8, u32) {
+    (
+        location.cluster_epoch().get(),
+        location.data_pg_id().get(),
+        location.shard_index().get(),
+        location.node_id().as_u32(),
+    )
+}
+
+fn validate_claim_token(token: &StorageRpcDurableClaimToken) -> Result<(), StorageRpcPayloadError> {
+    let (claim_id, owner_token) = match token {
+        StorageRpcDurableClaimToken::ObjectPayloadReclaim(token) => {
+            (token.claim_id.as_str(), token.owner_token.as_str())
+        }
+        StorageRpcDurableClaimToken::BucketDeleteFinalize(token)
+        | StorageRpcDurableClaimToken::LifecycleSweep(token) => {
+            (token.claim_id.as_str(), token.owner_token.as_str())
+        }
+    };
+    if claim_id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim id must not be empty",
+        ));
+    }
+    if owner_token.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "owner token must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bucket_write_reservation_proof(
+    proof: &BucketWriteReservationProof,
+) -> Result<(), StorageRpcPayloadError> {
+    if proof.reservation_id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "reservation id must not be empty",
+        ));
+    }
+    if proof.owner_token.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token must not be empty",
+        ));
+    }
+    if proof.operation_kind.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "operation kind must not be empty",
+        ));
     }
     Ok(())
 }
@@ -382,6 +773,178 @@ impl<'a> StorageRpcDecoder<'a> {
         self.read_exact(len)
     }
 
+    fn read_string(&mut self) -> Result<String, StorageRpcPayloadError> {
+        std::str::from_utf8(self.read_bytes()?)
+            .map(str::to_owned)
+            .map_err(|_| StorageRpcPayloadError::InvalidUtf8)
+    }
+
+    fn read_bucket_name(&mut self) -> Result<BucketName, StorageRpcPayloadError> {
+        BucketName::try_from(self.read_string()?)
+            .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid bucket name"))
+    }
+
+    fn read_object_key(&mut self) -> Result<ObjectKey, StorageRpcPayloadError> {
+        ObjectKey::try_from(self.read_string()?)
+            .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid object key"))
+    }
+
+    fn read_generation_id(&mut self) -> Result<GenerationId, StorageRpcPayloadError> {
+        GenerationId::new(self.read_u64()?).ok_or(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "generation id must not be zero",
+        ))
+    }
+
+    fn read_object_payload_reclaim_kind(
+        &mut self,
+    ) -> Result<ObjectPayloadReclaimKind, StorageRpcPayloadError> {
+        ObjectPayloadReclaimKind::from_u8(self.read_u8()?).ok_or(
+            StorageRpcPayloadError::InvalidDurableClaimToken("invalid object reclaim kind"),
+        )
+    }
+
+    fn read_shard_key(&mut self) -> Result<ShardKey, StorageRpcPayloadError> {
+        let bytes = self.read_bytes()?;
+        ShardKey::from_bytes(bytes).map_err(|_| StorageRpcPayloadError::Truncated)
+    }
+
+    fn read_shard_location(&mut self) -> Result<ShardLocation, StorageRpcPayloadError> {
+        let cluster_epoch = ClusterEpoch::new(self.read_u64()?).ok_or(
+            StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "cluster epoch must not be zero",
+            ),
+        )?;
+        let data_pg_id = DataPgId::new(PgId::new(self.read_u32()?));
+        let shard_index = ShardIndex::new(self.read_u8()?);
+        let node_id = NodeId::new(self.read_u32()?);
+        Ok(ShardLocation::new(
+            cluster_epoch,
+            data_pg_id,
+            shard_index,
+            node_id,
+        ))
+    }
+
+    fn read_bucket_claim_token(
+        &mut self,
+    ) -> Result<StorageRpcBucketClaimToken, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let claim_id = self.read_string()?;
+        let owner_token = self.read_string()?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let pg_id = self.read_u32()?;
+        Ok(StorageRpcBucketClaimToken {
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            pg_id,
+        })
+    }
+
+    fn read_object_payload_reclaim_claim_token(
+        &mut self,
+    ) -> Result<StorageRpcObjectPayloadReclaimClaimToken, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let key = self.read_object_key()?;
+        let generation_id = self.read_generation_id()?;
+        let reclaim_kind = self.read_object_payload_reclaim_kind()?;
+        let claim_id = self.read_string()?;
+        let owner_token = self.read_string()?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let pg_id = self.read_u32()?;
+        Ok(StorageRpcObjectPayloadReclaimClaimToken {
+            bucket,
+            bucket_incarnation_generation,
+            key,
+            generation_id,
+            reclaim_kind,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            pg_id,
+        })
+    }
+
+    fn read_claim_token(&mut self) -> Result<StorageRpcDurableClaimToken, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(StorageRpcDurableClaimToken::ObjectPayloadReclaim(
+                self.read_object_payload_reclaim_claim_token()?,
+            )),
+            1 => Ok(StorageRpcDurableClaimToken::BucketDeleteFinalize(
+                self.read_bucket_claim_token()?,
+            )),
+            2 => Ok(StorageRpcDurableClaimToken::LifecycleSweep(
+                self.read_bucket_claim_token()?,
+            )),
+            _ => Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+                "invalid claim token kind",
+            )),
+        }
+    }
+
+    fn read_bucket_write_reservation_proof(
+        &mut self,
+    ) -> Result<BucketWriteReservationProof, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name().map_err(|_| {
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof("invalid bucket name")
+        })?;
+        let reservation_id = self.read_string()?;
+        let owner_token = self.read_string()?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let bucket_execution_generation = self.read_u64()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let operation_kind = self.read_string()?;
+        let created_at = self.read_u64()?;
+        let lease_deadline = self.read_optional_u64()?;
+        let target_context = self.read_optional_string()?;
+        Ok(BucketWriteReservationProof {
+            bucket,
+            reservation_id,
+            owner_token,
+            cluster_epoch,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+            operation_kind,
+            created_at,
+            lease_deadline,
+            target_context,
+        })
+    }
+
+    fn read_cluster_epoch(&mut self) -> Result<ClusterEpoch, StorageRpcPayloadError> {
+        ClusterEpoch::new(self.read_u64()?).ok_or(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "cluster epoch must not be zero",
+        ))
+    }
+
+    fn read_optional_u64(&mut self) -> Result<Option<u64>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u64()?)),
+            _ => Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional u64 tag",
+            )),
+        }
+    }
+
+    fn read_optional_string(&mut self) -> Result<Option<String>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_string()?)),
+            _ => Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional string tag",
+            )),
+        }
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.bytes.len() - self.cursor
+    }
+
     fn read_u8(&mut self) -> Result<u8, StorageRpcPayloadError> {
         Ok(self.read_exact(1)?[0])
     }
@@ -409,6 +972,84 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("storage RPC byte slice length must fit in u32");
     put_u32(out, len);
     out.extend_from_slice(bytes);
+}
+
+fn put_string(out: &mut Vec<u8>, value: &str) {
+    put_bytes(out, value.as_bytes());
+}
+
+fn put_shard_location(out: &mut Vec<u8>, location: ShardLocation) {
+    put_u64(out, location.cluster_epoch().get());
+    put_u32(out, location.data_pg_id().get());
+    put_u8(out, location.shard_index().get());
+    put_u32(out, location.node_id().as_u32());
+}
+
+fn put_claim_token(out: &mut Vec<u8>, token: &StorageRpcDurableClaimToken) {
+    match token {
+        StorageRpcDurableClaimToken::ObjectPayloadReclaim(token) => {
+            put_u8(out, 0);
+            put_string(out, token.bucket.as_str());
+            put_u64(out, token.bucket_incarnation_generation);
+            put_string(out, token.key.as_str());
+            put_u64(out, token.generation_id.get());
+            put_u8(out, token.reclaim_kind as u8);
+            put_string(out, &token.claim_id);
+            put_string(out, &token.owner_token);
+            put_u64(out, token.cluster_epoch.get());
+            put_u32(out, token.pg_id);
+        }
+        StorageRpcDurableClaimToken::BucketDeleteFinalize(token) => {
+            put_u8(out, 1);
+            put_bucket_claim_token(out, token);
+        }
+        StorageRpcDurableClaimToken::LifecycleSweep(token) => {
+            put_u8(out, 2);
+            put_bucket_claim_token(out, token);
+        }
+    }
+}
+
+fn put_bucket_claim_token(out: &mut Vec<u8>, token: &StorageRpcBucketClaimToken) {
+    put_string(out, token.bucket.as_str());
+    put_u64(out, token.bucket_incarnation_generation);
+    put_string(out, &token.claim_id);
+    put_string(out, &token.owner_token);
+    put_u64(out, token.cluster_epoch.get());
+    put_u32(out, token.pg_id);
+}
+
+fn put_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteReservationProof) {
+    put_string(out, proof.bucket.as_str());
+    put_string(out, &proof.reservation_id);
+    put_string(out, &proof.owner_token);
+    put_u64(out, proof.cluster_epoch.get());
+    put_u64(out, proof.bucket_execution_generation);
+    put_u64(out, proof.bucket_incarnation_generation);
+    put_string(out, &proof.operation_kind);
+    put_u64(out, proof.created_at);
+    put_optional_u64(out, proof.lease_deadline);
+    put_optional_string(out, proof.target_context.as_deref());
+}
+
+fn put_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => put_u8(out, 0),
+        Some(value) => {
+            put_u8(out, 1);
+            put_u64(out, value);
+        }
+    }
+}
+
+fn put_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => put_u8(out, 0),
+        Some(value) => {
+            put_u8(out, 1);
+            put_string(out, value);
+        }
+    }
 }
 
 fn put_u8(out: &mut Vec<u8>, value: u8) {
@@ -617,6 +1258,192 @@ mod tests {
     }
 
     #[test]
+    fn shard_write_request_carries_idempotency_identity() {
+        let payload = b"payload bytes".to_vec();
+        let request = StorageRpcShardWriteRequest {
+            location: test_shard_location(2),
+            shard_key: test_shard_key(2),
+            expected_size: payload.len() as u64,
+            expected_crc64: checksum::crc64::checksum(&payload),
+            payload,
+        };
+
+        let bytes = encode_shard_write_request(&request).unwrap();
+        let decoded = decode_shard_write_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn shard_write_request_rejects_location_key_mismatch() {
+        let payload = b"payload bytes".to_vec();
+        let request = StorageRpcShardWriteRequest {
+            location: test_shard_location(3),
+            shard_key: test_shard_key(2),
+            expected_size: payload.len() as u64,
+            expected_crc64: checksum::crc64::checksum(&payload),
+            payload,
+        };
+
+        assert_eq!(
+            encode_shard_write_request(&request),
+            Err(StorageRpcPayloadError::ShardLocationMismatch)
+        );
+    }
+
+    #[test]
+    fn shard_write_ack_must_match_request_expectation() {
+        let payload = b"payload bytes";
+        let expected_size = payload.len() as u64;
+        let expected_crc64 = checksum::crc64::checksum(payload);
+        let ack = WriteAck {
+            stored_size: expected_size,
+            crc64: expected_crc64,
+        };
+        let bytes = encode_shard_write_ack(ack);
+        let decoded = decode_shard_write_ack(&bytes, expected_size, expected_crc64).unwrap();
+
+        assert_eq!(decoded.stored_size, ack.stored_size);
+        assert_eq!(decoded.crc64, ack.crc64);
+        assert!(matches!(
+            decode_shard_write_ack(&bytes, expected_size, expected_crc64 ^ 1),
+            Err(StorageRpcPayloadError::ShardWriteChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn shard_delete_request_carries_operation_key() {
+        let request = StorageRpcShardDeleteRequest {
+            location: test_shard_location(4),
+            shard_key: test_shard_key(4),
+        };
+
+        let bytes = encode_shard_delete_request(&request).unwrap();
+        let decoded = decode_shard_delete_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn read_handle_acquire_request_requires_idempotency_key_and_locations() {
+        let request = StorageRpcReadHandleAcquireRequest {
+            read_operation_id: "read-op-1".to_string(),
+            locations: vec![test_shard_location(0), test_shard_location(1)],
+        };
+
+        let bytes = encode_read_handle_acquire_request(&request).unwrap();
+        let decoded = decode_read_handle_acquire_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(
+            encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+                read_operation_id: String::new(),
+                locations: vec![test_shard_location(0)],
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read operation id must not be empty",
+            ))
+        );
+        assert_eq!(
+            encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+                read_operation_id: "read-op-2".to_string(),
+                locations: Vec::new(),
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire must include at least one shard location",
+            ))
+        );
+    }
+
+    #[test]
+    fn read_handle_acquire_request_rejects_corrupt_location_count_before_allocating() {
+        let mut bytes = Vec::new();
+        put_string(&mut bytes, "read-op-oom");
+        put_u32(&mut bytes, u32::MAX);
+
+        assert_eq!(
+            decode_read_handle_acquire_request(&bytes),
+            Err(StorageRpcPayloadError::Truncated)
+        );
+    }
+
+    #[test]
+    fn read_handle_acquire_request_rejects_noncanonical_location_sets() {
+        assert_eq!(
+            encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+                read_operation_id: "read-op-duplicate".to_string(),
+                locations: vec![test_shard_location(1), test_shard_location(1)],
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire locations must be sorted and unique",
+            ))
+        );
+        assert_eq!(
+            encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+                read_operation_id: "read-op-unsorted".to_string(),
+                locations: vec![test_shard_location(1), test_shard_location(0)],
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire locations must be sorted and unique",
+            ))
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_and_release_requests_are_token_fenced() {
+        let token = test_claim_token();
+        let heartbeat = StorageRpcClaimHeartbeatRequest {
+            token: token.clone(),
+            heartbeat_at: 100,
+            lease_deadline: Some(160),
+        };
+        let heartbeat_bytes = encode_claim_heartbeat_request(&heartbeat).unwrap();
+        let decoded_heartbeat = decode_claim_heartbeat_request(&heartbeat_bytes).unwrap();
+
+        assert_eq!(decoded_heartbeat, heartbeat);
+        assert_eq!(
+            encode_claim_heartbeat_request(&StorageRpcClaimHeartbeatRequest {
+                token: token.clone(),
+                heartbeat_at: 100,
+                lease_deadline: Some(100),
+            }),
+            Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+                "claim heartbeat lease deadline must be after heartbeat time",
+            ))
+        );
+
+        let release = StorageRpcClaimReleaseRequest { token };
+        let release_bytes = encode_claim_release_request(&release).unwrap();
+        let decoded_release = decode_claim_release_request(&release_bytes).unwrap();
+
+        assert_eq!(decoded_release, release);
+    }
+
+    #[test]
+    fn object_reclaim_claim_release_request_carries_full_work_identity() {
+        let release = StorageRpcClaimReleaseRequest {
+            token: test_object_reclaim_claim_token(),
+        };
+
+        let bytes = encode_claim_release_request(&release).unwrap();
+        let decoded = decode_claim_release_request(&bytes).unwrap();
+
+        assert_eq!(decoded, release);
+    }
+
+    #[test]
+    fn proof_release_request_carries_full_reservation_identity() {
+        let request = StorageRpcProofReleaseRequest {
+            proof: test_bucket_write_reservation_proof(),
+        };
+
+        let bytes = encode_proof_release_request(&request).unwrap();
+        let decoded = decode_proof_release_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn user_checksum_metadata_survives_rpc_payload_round_trip() {
         let checksum = ChecksumBytes::new([1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let payload = encode_optional_checksum_metadata(Some(&checksum));
@@ -652,5 +1479,60 @@ mod tests {
             MetadataCommandLogIndex::new(9).unwrap(),
         );
         MetadataCommandEnvelope::new(id, MetadataCommandPayload::CreateBucket(command))
+    }
+
+    fn test_shard_location(shard_index: u8) -> ShardLocation {
+        ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(11)),
+            ShardIndex::new(shard_index),
+            NodeId::new(u32::from(shard_index) + 100),
+        )
+    }
+
+    fn test_shard_key(shard_index: u8) -> ShardKey {
+        ShardKey::new(&[0x42; 16], 77, shard_index)
+    }
+
+    fn test_claim_token() -> StorageRpcDurableClaimToken {
+        StorageRpcDurableClaimToken::LifecycleSweep(StorageRpcBucketClaimToken {
+            bucket: BucketName::try_from("bucket-claim").unwrap(),
+            bucket_incarnation_generation: 17,
+            claim_id: "claim-id".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: 23,
+        })
+    }
+
+    fn test_object_reclaim_claim_token() -> StorageRpcDurableClaimToken {
+        StorageRpcDurableClaimToken::ObjectPayloadReclaim(
+            StorageRpcObjectPayloadReclaimClaimToken {
+                bucket: BucketName::try_from("bucket-reclaim").unwrap(),
+                bucket_incarnation_generation: 17,
+                key: ObjectKey::try_from("key").unwrap(),
+                generation_id: GenerationId::new(19).unwrap(),
+                reclaim_kind: ObjectPayloadReclaimKind::Multipart,
+                claim_id: "claim-id".to_string(),
+                owner_token: "owner-token".to_string(),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: 23,
+            },
+        )
+    }
+
+    fn test_bucket_write_reservation_proof() -> BucketWriteReservationProof {
+        BucketWriteReservationProof {
+            bucket: BucketName::try_from("bucket-proof").unwrap(),
+            reservation_id: "reservation-id".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 31,
+            bucket_incarnation_generation: 37,
+            operation_kind: "put-object".to_string(),
+            created_at: 41,
+            lease_deadline: Some(43),
+            target_context: Some("key/context".to_string()),
+        }
     }
 }

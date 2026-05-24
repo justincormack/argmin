@@ -4874,12 +4874,15 @@ Required idempotence rules:
    volatile read handles acquired on that connection. If the acquire response
    is lost or the client crashes before release, disconnect releases the
    session's handles. Within a live session, acquire should also be idempotent
-   by a client-supplied read operation id and shard-location set, so retrying a
-   lost acquire response returns the same handle set instead of acquiring a
-   second set.
-5. durable claim heartbeat/release RPCs are fenced by the durable claim token
-   and incarnation/proof fields, so stale retries cannot refresh or release a
-   newer claim
+   by a client-supplied read operation id and a canonical sorted/unique
+   shard-location set, so retrying a lost acquire response returns the same
+   handle set instead of acquiring a second set.
+5. durable claim heartbeat/release RPCs are fenced by claim-class-specific
+   durable tokens, so stale retries cannot refresh or release a newer claim.
+   Bucket finalizer and lifecycle claims carry bucket/incarnation/claim/owner/
+   epoch/PG identity; object payload reclaim claims additionally carry key,
+   generation id, and reclaim kind. Heartbeats preserve nullable lease-deadline
+   semantics rather than forcing every claim to carry a non-null deadline.
 6. bucket write reservation/drain proof release RPCs are fenced by reservation
    id/proof identity and are idempotent after the proof has already reached
    terminal state
@@ -4905,20 +4908,37 @@ command kind ids must remain separate.
 
 Required tests:
 
-1. frame round-trip and stable encoding tests
-2. rejects trailing bytes and invalid tags
-3. rejects bad frame checksum before payload decode
-4. rejects oversized frames
-5. metadata-command RPC rejects command bytes whose embedded checksum no longer
-   matches
-6. shard-write RPC rejects corrupted payload bytes even if the transport frame
-   decodes cleanly but the semantic `WriteAck` expectation is wrong
-7. user checksum metadata survives RPC encode/decode and later persistence
-8. response loss after a successful side-effecting RPC is retried safely for
-   metadata commands, shard writes, shard deletes, read-handle acquire/release,
-   claim heartbeat/release, and proof release
-9. lost read-handle acquire response returns the same handle set when retried
-   on the same session, and client disconnect before release frees the handles
+1. [done] frame round-trip and stable encoding tests
+2. [done] rejects trailing bytes and invalid tags
+3. [done] rejects bad frame checksum before payload decode, including valid
+   message-kind flips
+4. [done] rejects oversized frames
+5. [done] metadata-command RPC rejects command bytes whose embedded checksum no
+   longer matches and rejects non-canonical command bytes even when their raw
+   CRC matches
+6. [done] shard-write RPC rejects corrupted payload bytes even if the transport
+   frame decodes cleanly but the semantic `WriteAck` expectation is wrong
+7. [done] user checksum metadata survives RPC encode/decode and later
+   persistence
+8. [done] codec-level operation identities are explicit for shard writes,
+   shard deletes, read-handle acquire, durable claim heartbeat/release, and
+   bucket-write proof release. Shard write requests carry `ShardLocation`,
+   `ShardKey`, expected size, expected CRC, and payload bytes; read-handle
+   acquire requests carry a client read operation id and a canonical
+   sorted/unique shard-location set; claim requests carry claim-class-specific
+   durable tokens including object reclaim key/generation/kind where required;
+   proof requests carry full durable reservation proofs.
+9. [pending Phase 10.2-10.5 call-site work] response loss after a successful
+   side-effecting RPC is retried safely for metadata commands, shard writes,
+   shard deletes, read-handle acquire/release, claim heartbeat/release, and
+   proof release. The Phase 10.1 codec now makes the required operation keys
+   representable, but the behavioral lost-reply tests belong with the first
+   local client/server implementations.
+10. [pending Phase 10.3 session work] lost read-handle acquire response returns
+    the same handle set when retried on the same session, and client disconnect
+    before release frees the handles. Phase 10.1 carries the client operation
+    id and shard-location set; Phase 10.3 must bind that key to a long-lived
+    storage-node session.
 
 ### Phase 10.2: Node Client Boundary
 
