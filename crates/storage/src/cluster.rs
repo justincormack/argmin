@@ -22,7 +22,7 @@ use crate::node::SharedStorageNode;
 use crate::node_client::StorageNodeClient;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
-    BucketName, BucketState, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
@@ -542,7 +542,6 @@ pub(super) struct DurableBucketWriteReservation {
 }
 
 pub(super) struct DurableBucketWriteDrain {
-    node: Arc<SharedStorageNode>,
     pg_id: u32,
     record: BucketWriteDrainRecord,
 }
@@ -1699,38 +1698,11 @@ impl StorageCluster {
             .into());
         }
         let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
-        let node = self.bucket_metadata_primary_node_arc(&proof.bucket)?;
-        let bucket_pg = node.get_pg(pg_id)?;
-        let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
-            &*bucket_pg,
-            &proof.bucket,
-            &proof.reservation_id,
-        )?
-        else {
-            return Err(MetadataError::BucketWriteReservationNotFound {
-                reservation_id: proof.reservation_id.clone(),
-            }
-            .into());
-        };
-        if proof.matches_record(&record) {
-            let current_bucket = PgMetadataStore::head_bucket_raw(&*bucket_pg, &proof.bucket)?;
-            if current_bucket.state == BucketState::Active
-                && current_bucket.bucket_incarnation_generation
-                    == proof.bucket_incarnation_generation
-            {
-                Ok(())
-            } else {
-                Err(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: proof.reservation_id.clone(),
-                }
-                .into())
-            }
-        } else {
-            Err(MetadataError::BucketWriteReservationConflict {
-                reservation_id: proof.reservation_id.clone(),
-            }
-            .into())
-        }
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_client()
+            .validate_bucket_write_reservation_proof(PgId::new(pg_id), proof)
     }
 
     fn release_metadata_command_bucket_write_reservation(
@@ -1747,31 +1719,14 @@ impl StorageCluster {
         &self,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let node = self.bucket_metadata_primary_node_arc(&proof.bucket)?;
         let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
-        let bucket_pg = node.get_pg(pg_id)?;
-        if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
-            &*bucket_pg,
-            &proof.bucket,
-            &proof.reservation_id,
-        )? {
-            if !proof.matches_record(&record) {
-                return Err(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: proof.reservation_id.clone(),
-                }
-                .into());
-            }
-        }
-        PgMetadataStore::release_metadata_command_bucket_write_reservation(
-            &*bucket_pg,
-            &proof.bucket,
-            &proof.reservation_id,
-            &proof.owner_token,
-            proof.cluster_epoch,
-            proof.bucket_execution_generation,
-            proof.bucket_incarnation_generation,
-        )?;
-        node.notify_bucket_coordination_change(&proof.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_client()
+            .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
+        node.storage_node()
+            .notify_bucket_coordination_change(&proof.bucket);
         Ok(())
     }
 

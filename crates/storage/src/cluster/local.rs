@@ -13,7 +13,6 @@ use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
 use crate::node_client::{LocalStorageNodeClient, StorageNodeClient};
-use crate::traits::PgMetadataStore;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
     PgState, ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
@@ -1392,54 +1391,15 @@ fn release_open_metadata_command_bucket_write_reservation(
     let node = nodes
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
-    let pg = node
-        .storage_node()
-        .get_pg(bucket_pg_id.get())
+    node.storage_client()
+        .release_metadata_command_bucket_write_reservation(bucket_pg_id, proof)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
-            source,
+            source: StoreError::Io {
+                context: "release metadata command bucket write reservation on local cluster open",
+                source: std::io::Error::other(source),
+            },
         })?;
-    if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
-        &*pg,
-        &proof.bucket,
-        &proof.reservation_id,
-    )
-    .map_err(|source| ClusterBuildError::OpenLocalNode {
-        node_id: primary_node_id.as_u32(),
-        source: StoreError::Io {
-            context: "load metadata command bucket write reservation on local cluster open",
-            source: std::io::Error::other(source),
-        },
-    })? {
-        if !proof.matches_record(&record) {
-            return Err(ClusterBuildError::OpenLocalNode {
-                node_id: primary_node_id.as_u32(),
-                source: StoreError::Io {
-                    context:
-                        "release metadata command bucket write reservation on local cluster open",
-                    source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
-                        reservation_id: proof.reservation_id.clone(),
-                    }),
-                },
-            });
-        }
-    }
-    PgMetadataStore::release_metadata_command_bucket_write_reservation(
-        &*pg,
-        &proof.bucket,
-        &proof.reservation_id,
-        &proof.owner_token,
-        proof.cluster_epoch,
-        proof.bucket_execution_generation,
-        proof.bucket_incarnation_generation,
-    )
-    .map_err(|source| ClusterBuildError::OpenLocalNode {
-        node_id: primary_node_id.as_u32(),
-        source: StoreError::Io {
-            context: "release metadata command bucket write reservation on local cluster open",
-            source: std::io::Error::other(source),
-        },
-    })?;
     node.storage_node()
         .notify_bucket_coordination_change(&proof.bucket);
     Ok(())
@@ -1535,72 +1495,15 @@ fn validate_open_metadata_command_bucket_write_reservation(
     let node = nodes
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
-    let pg = node
-        .storage_node()
-        .get_pg(bucket_pg_id.get())
+    node.storage_client()
+        .validate_bucket_write_reservation_proof(bucket_pg_id, proof)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
-            source,
-        })?;
-    let record = PgMetadataStore::durable_bucket_write_reservation(
-        &*pg,
-        &proof.bucket,
-        &proof.reservation_id,
-    )
-    .map_err(|source| ClusterBuildError::OpenLocalNode {
-        node_id: primary_node_id.as_u32(),
-        source: StoreError::Io {
-            context: "validate metadata command bucket write reservation on local cluster open",
-            source: std::io::Error::other(source),
-        },
-    })?
-    .ok_or_else(|| ClusterBuildError::OpenLocalNode {
-        node_id: primary_node_id.as_u32(),
-        source: StoreError::Io {
-            context: "validate metadata command bucket write reservation on local cluster open",
-            source: std::io::Error::other(MetadataError::BucketWriteReservationNotFound {
-                reservation_id: proof.reservation_id.clone(),
-            }),
-        },
-    })?;
-    if !proof.matches_record(&record) {
-        return Err(ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
             source: StoreError::Io {
                 context: "validate metadata command bucket write reservation on local cluster open",
-                source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: proof.reservation_id.clone(),
-                }),
-            },
-        });
-    }
-
-    let current_bucket =
-        PgMetadataStore::head_bucket_raw(&*pg, &proof.bucket).map_err(|source| {
-            ClusterBuildError::OpenLocalNode {
-                node_id: primary_node_id.as_u32(),
-                source: StoreError::Io {
-                    context:
-                        "validate metadata command bucket write reservation bucket on local cluster open",
-                    source: std::io::Error::other(source),
-                },
-            }
-        })?;
-    if current_bucket.state == crate::BucketState::Active
-        && current_bucket.bucket_incarnation_generation == proof.bucket_incarnation_generation
-    {
-        Ok(())
-    } else {
-        Err(ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source: StoreError::Io {
-                context: "validate metadata command bucket write reservation on local cluster open",
-                source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: proof.reservation_id.clone(),
-                }),
+                source: std::io::Error::other(source),
             },
         })
-    }
 }
 
 fn command_bucket_write_reservation_proof(
@@ -32720,11 +32623,7 @@ mod tests {
             let record = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
                 .unwrap()
                 .expect("DeleteBucket begin should leave a terminal durable drain");
-            super::super::DurableBucketWriteDrain {
-                node: Arc::clone(node),
-                pg_id,
-                record,
-            }
+            super::super::DurableBucketWriteDrain { pg_id, record }
         };
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),

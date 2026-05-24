@@ -5008,6 +5008,10 @@ Progress:
 - Included `cluster/local.rs` command acceptance and open-time command-log
   convergence in that migration, so the guardrail now scans local cluster
   production code for the migrated command-log operations too.
+- Migrated durable bucket write reservation/drain acquire, validation, release,
+  drain begin/clear, and reservation-list operations through the local node
+  client, including open-time reservation validation/release. Added a guardrail
+  for production raw `PgMetadataStore` bucket write coordination calls.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::MutexGuard;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1566,24 +1565,26 @@ impl super::StorageCluster {
         target_context: Option<&str>,
     ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
         let pg_id = self.bucket_metadata_pg_id(bucket);
-        let node = self.bucket_metadata_primary_node_arc(bucket)?;
-        let bucket_pg = node.get_pg(pg_id)?;
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         let reservation_id = self.next_bucket_write_reservation_id()?;
         let owner_token = self.bucket_write_owner_token();
-        let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
-            &*bucket_pg,
-            bucket,
-            &reservation_id,
-            &owner_token,
-            self.operation_epoch(),
-            operation_kind,
-            crate::clock::current_time_millis(),
-            None,
-            target_context,
-        )?;
-        drop(bucket_pg);
+        let record = node
+            .storage_client()
+            .acquire_durable_bucket_write_reservation(
+                PgId::new(pg_id),
+                bucket,
+                &reservation_id,
+                &owner_token,
+                self.operation_epoch(),
+                operation_kind,
+                crate::clock::current_time_millis(),
+                None,
+                target_context,
+            )?;
         Ok(super::DurableBucketWriteReservation {
-            node,
+            node: Arc::clone(node.storage_node()),
             pg_id,
             record,
         })
@@ -1593,17 +1594,14 @@ impl super::StorageCluster {
         &self,
         reservation: super::DurableBucketWriteReservation,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
-        let durable_result = PgMetadataStore::release_durable_bucket_write_reservation(
-            &*bucket_pg,
-            &reservation.record.bucket,
-            &reservation.record.reservation_id,
-            &reservation.record.owner_token,
-            reservation.record.cluster_epoch,
-            reservation.record.bucket_execution_generation,
-            reservation.record.bucket_incarnation_generation,
-        );
-        durable_result?;
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(reservation.pg_id))?;
+        node.storage_client()
+            .release_durable_bucket_write_reservation(
+                PgId::new(reservation.pg_id),
+                &reservation.record,
+            )?;
         Ok(())
     }
 
@@ -1634,12 +1632,13 @@ impl super::StorageCluster {
     ) -> Result<super::DurableBucketDeleteDrainBegin, BucketWriteDrainError> {
         loop {
             let pg_id = self.bucket_metadata_pg_id(bucket);
-            let node = self.bucket_metadata_primary_node_arc(bucket)?;
-            let bucket_pg = node.get_pg(pg_id)?;
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             let drain_id = self.next_bucket_write_drain_id()?;
             let owner_token = self.bucket_write_owner_token();
-            match PgMetadataStore::begin_durable_bucket_write_drain(
-                &*bucket_pg,
+            match node.storage_client().begin_durable_bucket_write_drain(
+                PgId::new(pg_id),
                 bucket,
                 &drain_id,
                 &owner_token,
@@ -1648,22 +1647,21 @@ impl super::StorageCluster {
                 None,
             ) {
                 Ok(record) => {
-                    drop(bucket_pg);
                     return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
-                        super::DurableBucketWriteDrain {
-                            node,
-                            pg_id,
-                            record,
-                        },
-                    ));
+                        super::DurableBucketWriteDrain { pg_id, record },
+                    ))
                 }
-                Err(MetadataError::BucketWriteDrainConflict { .. }) => {
-                    if let Some(expired) =
-                        PgMetadataStore::clear_expired_durable_bucket_write_drain(
-                            &*bucket_pg,
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketWriteDrainConflict { .. },
+                )) => {
+                    if let Some(expired) = node
+                        .storage_client()
+                        .clear_expired_durable_bucket_write_drain(
+                            PgId::new(pg_id),
                             bucket,
                             crate::clock::current_time_millis(),
-                        )?
+                        )
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                     {
                         let _ = observability::event(
                             super::TRACE_TARGET,
@@ -1673,10 +1671,11 @@ impl super::StorageCluster {
                                 bucket, pg_id, expired.drain_id
                             )),
                         );
-                        drop(bucket_pg);
-                        node.notify_bucket_coordination_change(bucket);
+                        node.storage_node()
+                            .notify_bucket_coordination_change(bucket);
                         continue;
                     }
+                    let bucket_pg = node.storage_node().get_pg(pg_id)?;
                     match PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket) {
                         Ok(current) if current.state == BucketState::Deleting => {
                             drop(bucket_pg);
@@ -1695,7 +1694,7 @@ impl super::StorageCluster {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(bucket_snapshot_error_to_bucket_write_drain_error(error)),
             }
         }
     }
@@ -1704,18 +1703,13 @@ impl super::StorageCluster {
         &self,
         drain: &super::DurableBucketWriteDrain,
     ) -> Result<(), BucketWriteDrainError> {
-        let bucket_pg = drain.node.get_pg(drain.pg_id)?;
-        PgMetadataStore::clear_durable_bucket_write_drain(
-            &*bucket_pg,
-            &drain.record.bucket,
-            &drain.record.drain_id,
-            &drain.record.owner_token,
-            drain.record.cluster_epoch,
-            drain.record.bucket_execution_generation,
-        )?;
-        drop(bucket_pg);
-        drain
-            .node
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(drain.pg_id))?;
+        node.storage_client()
+            .clear_durable_bucket_write_drain(PgId::new(drain.pg_id), &drain.record)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        node.storage_node()
             .notify_bucket_coordination_change(&drain.record.bucket);
         Ok(())
     }
@@ -1740,14 +1734,16 @@ impl super::StorageCluster {
     ) -> Result<(), BucketWriteDrainError> {
         loop {
             let pg_id = self.bucket_metadata_pg_id(bucket);
-            let node = self.bucket_metadata_primary_node_arc(bucket)?;
-            let bucket_pg = node.get_pg(pg_id)?;
-            let reservations =
-                PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, bucket)?;
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+            let reservations = node
+                .storage_client()
+                .durable_bucket_write_reservations(PgId::new(pg_id), bucket)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if reservations.is_empty() {
                 return Ok(());
             }
-            drop(bucket_pg);
             self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
             crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);
             std::thread::sleep(std::time::Duration::from_millis(1));
