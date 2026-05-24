@@ -5017,6 +5017,16 @@ Progress:
   lifecycle sweep root/claim acquire/heartbeat/error/release through the local
   node client. Added a guardrail for production raw finalizer/reclaim/lifecycle
   worker root and claim calls in cluster code.
+- Migrated single-bucket snapshot loads, reserved bucket-write snapshot loads,
+  bucket execution-generation batch reads, and bucket fast-path identity reads
+  through the local node client. Added a guardrail so those production
+  single-bucket snapshot and fast-path reads cannot return to direct
+  `SharedStorageNode` helpers from cluster code.
+- Left `StorageCluster::load_bucket_snapshot_pair` as the only explicit raw
+  `load_bucket_snapshot_from_pg` inventory exception because it currently
+  preserves ordered multi-PG locking for pair snapshots. The boundary guardrail
+  now allows only that function; migrating pair snapshots needs a pair-shaped
+  client/RPC model rather than accidentally weakening the lock ordering.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

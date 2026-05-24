@@ -1423,8 +1423,11 @@ impl super::StorageCluster {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .load_bucket_snapshot(bucket, request)
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_bucket_snapshot(pg_id, bucket, request)
     }
 
     pub fn load_available_bucket_execution_generation_batches(
@@ -1441,10 +1444,16 @@ impl super::StorageCluster {
 
         let mut batches = Vec::new();
         for (pg_id, buckets) in buckets_by_pg {
-            let Ok(node) = self.metadata_pg_primary_node(pg_id) else {
+            let pg_id = PgId::new(pg_id);
+            let Ok(node) = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            else {
                 continue;
             };
-            let Ok(generations) = node.load_bucket_execution_generations_for_pg(pg_id, &buckets)
+            let Ok(generations) = node
+                .storage_client()
+                .load_bucket_execution_generations(pg_id, &buckets)
             else {
                 continue;
             };
@@ -1457,10 +1466,13 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<Option<BucketFastPathIdentity>, BucketSnapshotLoadError> {
-        let pg_id = self.bucket_metadata_pg_id(bucket);
-        let node = self.metadata_pg_primary_node(pg_id)?;
-        let mut identities =
-            node.load_bucket_fast_path_identities_for_pg(pg_id, std::slice::from_ref(bucket))?;
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let mut identities = node
+            .storage_client()
+            .load_bucket_fast_path_identities(pg_id, std::slice::from_ref(bucket))?;
         Ok(identities.remove(bucket))
     }
 
@@ -1501,11 +1513,11 @@ impl super::StorageCluster {
             let proof = BucketWriteReservationProof::from(&reservation.record);
 
             let result = (|| {
-                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
-                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket_pg, bucket, request,
+                let snapshot = reservation.node.load_bucket_snapshot(
+                    PgId::new(reservation.pg_id),
+                    bucket,
+                    request,
                 )?;
-                drop(bucket_pg);
                 action(snapshot, proof)
             })();
             let (result, release_result) = match result {
@@ -1546,11 +1558,11 @@ impl super::StorageCluster {
             };
 
             let result = (|| {
-                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
-                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket_pg, bucket, request,
+                let snapshot = reservation.node.load_bucket_snapshot(
+                    PgId::new(reservation.pg_id),
+                    bucket,
+                    request,
                 )?;
-                drop(bucket_pg);
                 action(snapshot)
             })();
             let release_result = self.release_durable_bucket_write_reservation(reservation);
@@ -1584,7 +1596,7 @@ impl super::StorageCluster {
                 target_context,
             )?;
         Ok(super::DurableBucketWriteReservation {
-            node: Arc::clone(node.storage_node()),
+            node: Arc::clone(node.storage_client()),
             pg_id,
             record,
         })
@@ -6304,11 +6316,11 @@ impl super::StorageCluster {
             let proof = BucketWriteReservationProof::from(&reservation.record);
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {
-                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
-                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket_pg, bucket, request,
+                let snapshot = reservation.node.load_bucket_snapshot(
+                    PgId::new(reservation.pg_id),
+                    bucket,
+                    request,
                 )?;
-                drop(bucket_pg);
 
                 let primary_node = self.object_metadata_primary_node(bucket, key)?;
                 let object_pg = primary_node.get_pg(pg_id.get())?;
@@ -6876,11 +6888,11 @@ impl super::StorageCluster {
             let proof = BucketWriteReservationProof::from(&reservation.record);
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {
-                let bucket_pg = reservation.node.get_pg(reservation.pg_id)?;
-                let snapshot = crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket_pg, bucket, request,
+                let snapshot = reservation.node.load_bucket_snapshot(
+                    PgId::new(reservation.pg_id),
+                    bucket,
+                    request,
                 )?;
-                drop(bucket_pg);
 
                 let primary_node = self.object_metadata_primary_node(bucket, key)?;
                 let object_pg = primary_node.get_pg(pg_id.get())?;

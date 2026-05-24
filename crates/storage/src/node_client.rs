@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use placement::NodeId;
@@ -11,10 +12,11 @@ use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketName, BucketState,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId,
-    LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord,
-    ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey, WriteAck,
+    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketName,
+    BucketSnapshot, BucketSnapshotRequest, BucketState, BucketWriteDrainRecord,
+    BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId, LifecycleSweepClaimRecord,
+    LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
+    PayloadReclaimRoot, PgId, ShardKey, WriteAck,
 };
 
 pub(crate) trait StorageNodeClient: Send + Sync {
@@ -201,6 +203,25 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
+
+    fn load_bucket_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
+
+    fn load_bucket_execution_generations(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError>;
+
+    fn load_bucket_fast_path_identities(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError>;
 
     fn get_bucket_payload_reclaim_root(
         &self,
@@ -732,6 +753,34 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::durable_bucket_write_reservations(
             &*pg, bucket,
         )?)
+    }
+
+    fn load_bucket_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)
+    }
+
+    fn load_bucket_execution_generations(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.load_bucket_execution_generations(buckets)?)
+    }
+
+    fn load_bucket_fast_path_identities(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.load_bucket_fast_path_identities(buckets)?)
     }
 
     fn get_bucket_payload_reclaim_root(
