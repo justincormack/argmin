@@ -4940,6 +4940,12 @@ Required tests:
     id and shard-location set; Phase 10.3 must bind that key to a long-lived
     storage-node session.
 
+Phase 10.1 is complete. The frame codec, semantic checksum layering, and
+operation-key payload shapes are in place. The remaining lost-reply guarantees
+must be tested with the first storage-node client/server call sites, because
+the codec alone cannot observe a server-side mutation followed by response
+loss.
+
 ### Phase 10.2: Node Client Boundary
 
 Introduce a storage-node client abstraction before adding sockets.
