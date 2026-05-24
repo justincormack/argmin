@@ -12,6 +12,7 @@ use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
+use crate::node_client::{LocalStorageNodeClient, StorageNodeClient};
 use crate::traits::PgMetadataStore;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
@@ -48,14 +49,20 @@ pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
     storage_node: Arc<SharedStorageNode>,
+    storage_client: Arc<dyn StorageNodeClient>,
 }
 
 impl LocalNodeStore {
     fn new(node_id: NodeId, data_dir: PathBuf, storage_node: Arc<SharedStorageNode>) -> Self {
+        let storage_client: Arc<dyn StorageNodeClient> = Arc::new(LocalStorageNodeClient::new(
+            node_id,
+            Arc::clone(&storage_node),
+        ));
         Self {
             node_id,
             data_dir,
             storage_node,
+            storage_client,
         }
     }
 
@@ -70,6 +77,10 @@ impl LocalNodeStore {
     pub fn storage_node(&self) -> &Arc<SharedStorageNode> {
         &self.storage_node
     }
+
+    pub(crate) fn storage_client(&self) -> &Arc<dyn StorageNodeClient> {
+        &self.storage_client
+    }
 }
 
 impl std::fmt::Debug for LocalNodeStore {
@@ -82,24 +93,23 @@ impl std::fmt::Debug for LocalNodeStore {
 }
 
 struct LocalShardNodeClient<'a> {
-    node: &'a LocalNodeStore,
+    node_id: NodeId,
+    client: &'a dyn StorageNodeClient,
     cluster_epoch: ClusterEpoch,
     data_pg_id: DataPgId,
 }
 
 impl LocalShardNodeClient<'_> {
     fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, ShardIoError> {
-        self.node
-            .storage_node()
-            .write_shard_file(self.data_pg_id.get(), key, data)
+        self.client
+            .write_placed_shard(self.data_pg_id, key, data)
             .map_err(|source| self.store_error(source))
     }
 
     fn read_shard(&self, key: &ShardKey, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
         let data = self
-            .node
-            .storage_node()
-            .read_shard_file(self.data_pg_id.get(), key)
+            .client
+            .read_placed_shard(self.data_pg_id, key)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, &data)?;
         Ok(data)
@@ -117,23 +127,21 @@ impl LocalShardNodeClient<'_> {
                 source: std::io::Error::from(std::io::ErrorKind::InvalidData),
             }));
         }
-        self.node
-            .storage_node()
-            .read_shard_file_into(self.data_pg_id.get(), key, dst)
+        self.client
+            .read_placed_shard_into(self.data_pg_id, key, dst)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, dst)
     }
 
     fn delete_shard(&self, key: &ShardKey) -> Result<(), ShardIoError> {
-        self.node
-            .storage_node()
-            .delete_shard_file(self.data_pg_id.get(), key)
+        self.client
+            .delete_placed_shard(self.data_pg_id, key)
             .map_err(|source| self.store_error(source))
     }
 
     fn store_error(&self, source: StoreError) -> ShardIoError {
         ShardIoError::Store {
-            node_id: self.node.node_id().as_u32(),
+            node_id: self.node_id.as_u32(),
             pg_id: self.data_pg_id.get(),
             cluster_epoch: self.cluster_epoch,
             source,
@@ -494,10 +502,10 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn object_payload_lease_storage_nodes(&self) -> Vec<Arc<SharedStorageNode>> {
+    pub(crate) fn object_payload_lease_storage_clients(&self) -> Vec<Arc<dyn StorageNodeClient>> {
         self.nodes
             .values()
-            .map(|node| Arc::clone(node.storage_node()))
+            .map(|node| Arc::clone(node.storage_client()))
             .collect()
     }
 
@@ -511,14 +519,14 @@ impl LocalClusterMap {
         let mut acquired = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
             if node
-                .storage_node()
+                .storage_client()
                 .try_acquire_object_payload_lease(bucket, key, generation_id)
             {
-                acquired.push(Arc::clone(node.storage_node()));
+                acquired.push(Arc::clone(node.storage_client()));
                 continue;
             }
-            for storage_node in acquired {
-                storage_node.release_object_payload_lease(bucket, key, generation_id);
+            for storage_client in acquired {
+                storage_client.release_object_payload_lease(bucket, key, generation_id);
             }
             return false;
         }
@@ -531,7 +539,7 @@ impl LocalClusterMap {
         key: &ObjectKey,
         generation_id: GenerationId,
         locations: &[ShardLocation],
-    ) -> Result<Vec<Arc<SharedStorageNode>>, StoreError> {
+    ) -> Result<Vec<Arc<dyn StorageNodeClient>>, StoreError> {
         let mut node_ids = BTreeMap::new();
         for location in locations {
             if location.cluster_epoch() != self.epoch {
@@ -573,24 +581,24 @@ impl LocalClusterMap {
                 .or_insert_with(|| location.data_pg_id().get());
         }
 
-        let mut storage_nodes = Vec::with_capacity(node_ids.len());
+        let mut storage_clients = Vec::with_capacity(node_ids.len());
         for (node_id, pg_id) in node_ids {
             let node = self.nodes.get(&node_id).ok_or(StoreError::NodeNotFound {
                 node_id: node_id.as_u32(),
                 pg_id,
                 cluster_epoch: self.epoch,
             })?;
-            storage_nodes.push(Arc::clone(node.storage_node()));
+            storage_clients.push(Arc::clone(node.storage_client()));
         }
 
-        let mut acquired = Vec::with_capacity(storage_nodes.len());
-        for storage_node in storage_nodes {
-            if storage_node.try_acquire_object_payload_lease(bucket, key, generation_id) {
-                acquired.push(storage_node);
+        let mut acquired = Vec::with_capacity(storage_clients.len());
+        for storage_client in storage_clients {
+            if storage_client.try_acquire_object_payload_lease(bucket, key, generation_id) {
+                acquired.push(storage_client);
                 continue;
             }
-            for storage_node in acquired {
-                storage_node.release_object_payload_lease(bucket, key, generation_id);
+            for storage_client in acquired {
+                storage_client.release_object_payload_lease(bucket, key, generation_id);
             }
             return Ok(Vec::new());
         }
@@ -606,14 +614,14 @@ impl LocalClusterMap {
         let mut acquired = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
             if node
-                .storage_node()
+                .storage_client()
                 .try_begin_object_payload_reclaim(bucket, key, generation_id)
             {
-                acquired.push(Arc::clone(node.storage_node()));
+                acquired.push(Arc::clone(node.storage_client()));
                 continue;
             }
-            for storage_node in acquired {
-                storage_node.finish_object_payload_reclaim(bucket, key, generation_id, false);
+            for storage_client in acquired {
+                storage_client.finish_object_payload_reclaim(bucket, key, generation_id, false);
             }
             return false;
         }
@@ -628,7 +636,7 @@ impl LocalClusterMap {
         keep_fence: bool,
     ) {
         for node in self.nodes.values() {
-            node.storage_node().finish_object_payload_reclaim(
+            node.storage_client().finish_object_payload_reclaim(
                 bucket,
                 key,
                 generation_id,
@@ -644,7 +652,7 @@ impl LocalClusterMap {
         generation_id: GenerationId,
     ) {
         for node in self.nodes.values() {
-            node.storage_node()
+            node.storage_client()
                 .clear_object_payload_reclaim_fence(bucket, key, generation_id);
         }
     }
@@ -658,7 +666,7 @@ impl LocalClusterMap {
         self.nodes
             .values()
             .map(|node| {
-                node.storage_node()
+                node.storage_client()
                     .object_payload_lease_count(bucket, key, generation_id)
             })
             .max()
@@ -675,7 +683,7 @@ impl LocalClusterMap {
         self.nodes
             .values()
             .filter(|node| {
-                node.storage_node()
+                node.storage_client()
                     .object_payload_lease_count(bucket, key, generation_id)
                     != 0
             })
@@ -687,7 +695,7 @@ impl LocalClusterMap {
         self.nodes
             .values()
             .map(|node| {
-                node.storage_node()
+                node.storage_client()
                     .bucket_object_payload_lease_count(bucket)
             })
             .max()
@@ -1138,7 +1146,8 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             })?;
         Ok(LocalShardNodeClient {
-            node,
+            node_id: node.storage_client().node_id(),
+            client: node.storage_client().as_ref(),
             cluster_epoch: self.epoch,
             data_pg_id: location.data_pg_id(),
         })

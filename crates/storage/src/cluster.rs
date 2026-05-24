@@ -19,6 +19,7 @@ use crate::metadata_command::{
     ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::node::SharedStorageNode;
+use crate::node_client::StorageNodeClient;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     BucketName, BucketState, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
@@ -417,7 +418,7 @@ impl ShardLocation {
 
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
-    storage_nodes: Vec<Arc<SharedStorageNode>>,
+    storage_clients: Vec<Arc<dyn StorageNodeClient>>,
     runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
@@ -428,7 +429,7 @@ pub struct ObjectPayloadLease {
 impl ObjectPayloadLease {
     fn new(
         cluster: Weak<StorageCluster>,
-        storage_nodes: Vec<Arc<SharedStorageNode>>,
+        storage_clients: Vec<Arc<dyn StorageNodeClient>>,
         runtime_state: Arc<LocalClusterRuntimeState>,
         bucket: BucketName,
         key: ObjectKey,
@@ -436,7 +437,7 @@ impl ObjectPayloadLease {
     ) -> Self {
         Self {
             cluster,
-            storage_nodes,
+            storage_clients,
             runtime_state,
             bucket,
             key,
@@ -446,8 +447,8 @@ impl ObjectPayloadLease {
     }
 
     pub fn release(mut self) -> ReleasedObjectPayloadLease {
-        let remaining = release_object_payload_lease_from_storage_nodes(
-            &self.storage_nodes,
+        let remaining = release_object_payload_lease_from_storage_clients(
+            &self.storage_clients,
             &self.bucket,
             &self.key,
             self.generation_id,
@@ -467,8 +468,8 @@ impl ObjectPayloadLease {
 impl Drop for ObjectPayloadLease {
     fn drop(&mut self) {
         if !self.released {
-            let _ = release_object_payload_lease_from_storage_nodes(
-                &self.storage_nodes,
+            let _ = release_object_payload_lease_from_storage_clients(
+                &self.storage_clients,
                 &self.bucket,
                 &self.key,
                 self.generation_id,
@@ -477,13 +478,13 @@ impl Drop for ObjectPayloadLease {
     }
 }
 
-fn release_object_payload_lease_from_storage_nodes(
-    storage_nodes: &[Arc<SharedStorageNode>],
+fn release_object_payload_lease_from_storage_clients(
+    storage_clients: &[Arc<dyn StorageNodeClient>],
     bucket: &BucketName,
     key: &ObjectKey,
     generation_id: GenerationId,
 ) -> usize {
-    storage_nodes
+    storage_clients
         .iter()
         .map(|storage_node| storage_node.release_object_payload_lease(bucket, key, generation_id))
         .max()
@@ -4215,7 +4216,8 @@ impl StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
             let primary_node_id = primary_node.node_id().as_u32();
-            let data_pg_id = route.pg_id().get();
+            let data_pg = DataPgId::new(route.pg_id());
+            let data_pg_id = data_pg.get();
             let shard_rows = {
                 let data_pg = primary_node.storage_node().get_pg(data_pg_id)?;
                 data_pg.list_scavenger_shard_rows()?
@@ -4231,7 +4233,7 @@ impl StorageCluster {
                 let Some(node) = self.local_map.node(node_id) else {
                     continue;
                 };
-                match node.storage_node().list_scavenger_shard_files(data_pg_id) {
+                match node.storage_client().list_scavenger_shard_files(data_pg) {
                     Ok(scan) if scan.errors.is_empty() => {
                         files_by_node.push((node_id.as_u32(), scan.files));
                     }

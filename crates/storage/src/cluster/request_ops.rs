@@ -5658,7 +5658,7 @@ impl super::StorageCluster {
         }
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
-            self.local_map.object_payload_lease_storage_nodes(),
+            self.local_map.object_payload_lease_storage_clients(),
             runtime_state,
             bucket.clone(),
             key.clone(),

@@ -117,6 +117,7 @@ direct_shard_matches=$(
         -g '!crates/storage/src/tests/**' \
         -g '!crates/storage/src/cluster.rs' \
         -g '!crates/storage/src/cluster/local.rs' \
+        -g '!crates/storage/src/node_client.rs' \
         -g '!crates/storage/src/pg_store.rs' \
         -g '!crates/storage/src/traits.rs' \
         || true
@@ -128,6 +129,73 @@ unexpected_direct_shard=$(
 fail_with_matches \
     "Production shard IO bypasses StorageCluster placed IO" \
     "$unexpected_direct_shard"
+
+migrated_storage_node_bypasses=$(
+    awk '
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        pending_raw_storage_node = 0
+        in_test_hook = 0
+        in_test_module = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    function is_migrated_node_call(line) {
+        return line ~ /\.(write_shard_file|read_shard_file|read_shard_file_into|delete_shard_file|list_scavenger_shard_files|try_acquire_object_payload_lease|release_object_payload_lease|try_begin_object_payload_reclaim|finish_object_payload_reclaim|clear_object_payload_reclaim_fence|object_payload_lease_count|bucket_object_payload_lease_count)\(/
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            in_test_hook = pending_test_cfg
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (in_test_hook) {
+            next
+        }
+        if ($0 ~ /\.storage_node\(\)\./ && is_migrated_node_call($0)) {
+            print FILENAME ":" FNR ":" $0
+            pending_raw_storage_node = 0
+            next
+        }
+        if (pending_raw_storage_node && is_migrated_node_call($0)) {
+            print FILENAME ":" FNR ":" $0
+            pending_raw_storage_node = 0
+            next
+        }
+        if ($0 ~ /\.storage_node\(\)/) {
+            pending_raw_storage_node = 1
+        }
+        if ($0 ~ /;/) {
+            pending_raw_storage_node = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production storage-node shard-owner operations must go through the node client boundary" \
+    "$migrated_storage_node_bypasses"
 
 payload_shard_delete_callers=$(
     awk '

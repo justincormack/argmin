@@ -30,6 +30,7 @@ pub mod cluster;
 pub mod error;
 pub(crate) mod metadata_command;
 pub mod node;
+pub(crate) mod node_client;
 pub mod pg_store;
 pub mod pg_topology;
 pub mod schema;

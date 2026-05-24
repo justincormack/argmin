@@ -4982,6 +4982,17 @@ Required tests:
 3. boundary guardrail rejects production code that directly calls raw PG access
    for migrated paths
 
+Progress:
+
+- Started Phase 10.2 by introducing a `StorageNodeClient` boundary with a local
+  adapter backed by `SharedStorageNode`.
+- Migrated shard-owner placed shard file IO, shard scavenger file listing, and
+  volatile read-handle/reclaim-fence operations through the local client
+  boundary.
+- Tightened the storage-cluster boundary script so production direct calls to
+  the migrated `SharedStorageNode` shard-owner methods fail outside the node
+  client adapter.
+
 ### Phase 10.3: Unix Socket Storage-Node Server
 
 Add a storage-node process mode that:
