@@ -4801,14 +4801,369 @@ Move from in-process multi-node to local multi-process nodes.
 This phase should not change the logical API. It should only replace local
 `ShardNodeClient` and PG-primary calls with internal connections.
 
-Work items:
+The first implementation should use Unix domain sockets. Remote/TLS transport,
+dynamic membership, failure detection, peering, degraded availability, and
+control-plane replication remain Phase 11/12 work.
 
-1. run one process per storage node with a distinct data directory
-2. expose internal shard and PG-primary APIs over a local transport
-3. keep internal auth disabled or static for this phase
-4. keep the cluster map static at startup
-5. ensure node restart does not corrupt local metadata or shard files
-6. add integration tests that start multiple local processes
+Design decisions:
+
+1. local multi-process mode uses one storage-node process per configured
+   storage node
+2. every storage-node process opens exactly one node data directory and only
+   the PG directories assigned to that node
+3. the cluster map remains static at startup and carries:
+   - cluster epoch
+   - node id
+   - node data directory
+   - node Unix socket path
+   - PG ids
+   - PG routes, including primary and acting set
+   - EC shape
+4. internal authentication is local-only for this phase:
+   - sockets must be created under private runtime directories with restrictive
+     permissions
+   - the client must connect only to configured absolute socket paths
+   - the server should check Unix peer credentials where the platform exposes
+     them, or otherwise document the mode as local-development-only until the
+     Phase 12 control plane introduces real internal identity
+   - startup should reject obviously unsafe socket directory permissions in the
+     multi-process harness
+5. request routing must still be epoch-, PG-, acting-set-, and
+   shard-location-fenced exactly as in the in-process multihost path
+6. RPC is a transport boundary, not a new logical API; `StorageCluster` keeps
+   the same public API and swaps local node calls for typed node clients
+7. RPC messages must be operation-shaped, not raw `PgStore` access over the
+   wire
+
+### Phase 10.1: Codec And Frame Contract
+
+Add a storage-internal RPC frame format using the same style as the existing
+metadata command encoding:
+
+1. fixed magic bytes and encoding version
+2. request id
+3. message kind
+4. payload length
+5. payload CRC64
+6. payload bytes
+
+The receiver must validate the frame magic, version, size limit, and transport
+CRC before decoding the payload. Unknown message kinds, trailing bytes,
+oversized frames, invalid enum tags, and checksum mismatch must fail closed.
+
+The request id is for matching responses to requests, tracing, and duplicate
+diagnostics; it is not by itself an idempotency key. Every side-effecting RPC
+must either be naturally idempotent by operation key or carry a recoverable
+operation/session token that lets the server return the already-completed
+outcome after a lost reply. A successful server-side mutation followed by a
+lost response must not make client retry perform the mutation a second time or
+return an ambiguous success.
+
+Required idempotence rules:
+
+1. metadata command RPCs are keyed by canonical `MetadataCommandEnvelope`
+   identity and existing command-log/pending-slot convergence rules
+2. shard writes are keyed by `ShardLocation`, `ShardKey`, expected size, CRC,
+   and payload bytes; retry with the same bytes returns the same ack, while
+   retry with different bytes for the same key fails closed
+3. shard deletes are idempotent for the same location/key and must treat
+   already-missing as terminal success only when the requested delete is still
+   route/epoch valid
+4. read-handle acquire/read/release must run inside a long-lived per-client
+   storage-node session, not as unrelated one-shot RPCs. The session owns all
+   volatile read handles acquired on that connection. If the acquire response
+   is lost or the client crashes before release, disconnect releases the
+   session's handles. Within a live session, acquire should also be idempotent
+   by a client-supplied read operation id and shard-location set, so retrying a
+   lost acquire response returns the same handle set instead of acquiring a
+   second set.
+5. durable claim heartbeat/release RPCs are fenced by the durable claim token
+   and incarnation/proof fields, so stale retries cannot refresh or release a
+   newer claim
+6. bucket write reservation/drain proof release RPCs are fenced by reservation
+   id/proof identity and are idempotent after the proof has already reached
+   terminal state
+
+Checksum layering is required:
+
+1. every RPC frame has a transport checksum over the exact payload bytes
+2. metadata commands keep their existing canonical command checksum and command
+   bytes unchanged
+3. shard writes keep validating `WriteAck` size and CRC64 semantics
+4. user-provided checksum metadata must remain attached to object/part/session
+   records and must not be stripped or replaced by the RPC transport checksum
+5. persisted command logs and metadata rows store semantic checksums, not the
+   transient RPC frame checksum
+6. a receiver must validate embedded semantic checksums before accepting or
+   applying work when the operation carries such an item
+
+The existing `metadata_command` binary encoding should remain the durable
+metadata mutation identity. Phase 10 may factor shared primitive helpers
+(`put_u*`, `read_u*`, length-prefixed bytes/strings, optional/repeated helpers)
+into a private storage codec module, but RPC message kind ids and metadata
+command kind ids must remain separate.
+
+Required tests:
+
+1. frame round-trip and stable encoding tests
+2. rejects trailing bytes and invalid tags
+3. rejects bad frame checksum before payload decode
+4. rejects oversized frames
+5. metadata-command RPC rejects command bytes whose embedded checksum no longer
+   matches
+6. shard-write RPC rejects corrupted payload bytes even if the transport frame
+   decodes cleanly but the semantic `WriteAck` expectation is wrong
+7. user checksum metadata survives RPC encode/decode and later persistence
+8. response loss after a successful side-effecting RPC is retried safely for
+   metadata commands, shard writes, shard deletes, read-handle acquire/release,
+   claim heartbeat/release, and proof release
+9. lost read-handle acquire response returns the same handle set when retried
+   on the same session, and client disconnect before release frees the handles
+
+### Phase 10.2: Node Client Boundary
+
+Introduce a storage-node client abstraction before adding sockets.
+
+The initial implementation should have a local adapter backed by
+`SharedStorageNode`. `StorageCluster` should call the client abstraction, not
+reach directly into node internals, for migrated operations.
+
+The client boundary must cover two classes of operations:
+
+1. shard-owner operations:
+   - placed shard write
+   - placed shard read and ranged read
+   - placed shard delete
+   - shard read-handle acquire/release
+   - shard scavenger file listing/audit helpers
+   - local physical reclaim helpers
+2. metadata PG-primary and replica operations:
+   - load bucket/object metadata snapshots needed by request paths
+   - allocate/install pending metadata command slots
+   - apply/record metadata command log entries
+   - load/compare replica command state and materialized digests
+   - durable bucket write reservation/drain operations
+   - durable reclaim, finalizer, lifecycle, and scavenger claim operations
+
+The boundary must not expose `MutexGuard<PgStore>`, raw `PgStore`, or generic
+SQL-shaped methods to production coordinator code.
+
+Required tests:
+
+1. in-process local adapter preserves current behavior
+2. migrated operations still reject stale epochs, wrong PG routes, wrong
+   acting-set membership, and stale shard locations
+3. boundary guardrail rejects production code that directly calls raw PG access
+   for migrated paths
+
+### Phase 10.3: Unix Socket Storage-Node Server
+
+Add a storage-node process mode that:
+
+1. opens the configured node data directory
+2. opens only configured PG directories
+3. listens on the configured Unix socket
+4. serves a length-delimited stream of request/response pairs on a long-lived
+   connection; one-shot exchanges may be used for stateless operations, but
+   read-handle acquire/read/release must use the long-lived session model
+5. runs blocking storage work off the async accept loop if using async sockets
+6. rejects requests for unknown node id, unknown PG, wrong cluster epoch,
+   inactive PG route, stale shard location, or non-acting-set access
+7. returns typed storage errors that preserve enough context for caller-side
+   fail-closed behavior and tests
+
+The server must not share a PG directory with another process. Startup must
+reject duplicate node ids and duplicate/canonical-equal data directories in the
+static config.
+
+The multi-process harness must create private socket directories. Tests should
+cover rejection of an incorrectly permissioned socket directory, or explicitly
+mark the configuration as non-production-only if a platform cannot enforce
+peer credentials or directory permissions.
+
+Required tests:
+
+1. node process starts and answers a health/version request
+2. node process rejects unknown PG and wrong node id
+3. node process rejects stale epoch and stale shard location
+4. duplicate data directories are rejected before serving
+5. restart reopens existing metadata and shard files cleanly
+6. incorrectly permissioned socket directories are rejected or reported as
+   non-production-only
+
+### Phase 10.4: Remote Shard IO
+
+Migrate placed shard IO to the node-client boundary first because it is already
+location-routed and owned by the shard storage node. This slice must not create
+a transition where shard files are remote but the data-PG ack rows are still
+written through a shared local PG directory.
+
+There are two acceptable implementation shapes:
+
+1. keep Phase 10.4 file-only for the first landing, with direct PUT and other
+   publishing paths still using the in-process path until Phase 10.5 migrates
+   the data-PG ack-row APIs
+2. include a minimal remote data-PG ack-row API in Phase 10.4 for recording and
+   validating shard acks on the storage-node process that owns the data PG
+
+The preferred shape is the second one if it keeps the slice small enough:
+remote shard writes return an ack, the data-PG owner records the ack row through
+RPC, and publish validation reads/validates the ack rows through the
+node-client boundary before metadata is published. If that proves too wide,
+Phase 10.4 should land as a file-only transport slice and explicitly defer all
+metadata-publishing request paths to Phase 10.5.
+
+RPC messages should be operation-specific, for example:
+
+1. write shard at `ShardLocation`
+2. read shard at `ShardLocation`
+3. read shard range at `ShardLocation`
+4. delete shard at `ShardLocation`
+5. acquire/release volatile read handles for one or more shard locations
+6. list/audit shard files for the scavenger
+
+Large shard payloads must still be checksummed in transport. The shard write
+path must also preserve the existing semantic size/CRC validation used to build
+or verify `WriteAck`.
+
+Publishing metadata after shard IO requires a process-boundary fence:
+
+1. every acknowledged shard must have a durable data-PG ack row on the
+   authoritative data-PG owner
+2. publish validation must compare the expected shard set against those ack
+   rows and their size/CRC before installing metadata
+3. a remote shard file without its matching ack row is not publishable
+4. a stale or wrong-node ack row must not satisfy publish validation
+
+Required tests:
+
+1. direct PUT writes shards through remote node processes and publishes metadata
+   only after all shard acks validate
+2. reads acquire storage-node read handles through RPC and release them on
+   success and error
+3. partial multi-shard handle acquisition failure releases already-acquired
+   remote handles
+4. physical delete waits/fails closed while a remote storage-node read handle
+   is active
+5. corrupted shard RPC payloads are rejected and do not publish metadata
+6. killing a shard-owner process during read/write returns a clear fail-closed
+   error
+7. remote shard file write succeeds but ack-row RPC response is lost; retry
+   records or observes the same ack row and publish validation remains exact
+8. remote shard file exists without a durable ack row and metadata publication
+   fails closed
+9. wrong-node or stale data-PG ack rows do not satisfy publish validation
+10. lost read-handle acquire response is retried on the same session and returns
+    the original handle set without increasing lease counts
+11. client process or connection dies after acquiring read handles and before
+    release; the storage node releases the session-owned handles and physical
+    cleanup can later proceed
+
+### Phase 10.5: Remote Metadata PG Operations
+
+Migrate metadata PG-primary and acting-set replica operations after shard IO.
+
+Metadata command bytes should be reused directly inside RPC messages for
+command install/apply/convergence operations. The RPC envelope routes the
+request; the embedded `MetadataCommandEnvelope` remains the durable mutation
+identity.
+
+Every receiver must validate:
+
+1. route epoch matches the RPC route and embedded command id
+2. PG id matches the RPC route and embedded command id
+3. log index is valid for the PG-primary or replica state transition
+4. command checksum matches canonical command bytes
+5. replica command-log and digest invariants still hold before returning
+   success
+
+Metadata reads and coordination operations get separate RPC messages rather
+than being encoded as metadata commands, because they are not durable metadata
+mutations.
+
+Required tests:
+
+1. create bucket through remote PG-primary state
+2. direct PUT metadata reserve/commit through remote PG-primary and replicas
+3. pending command survives node process restart and is converged by a later
+   request
+4. command-log conflict and digest mismatch fail closed across RPC
+5. corrupted command bytes in transport are rejected before apply
+6. command bytes with matching transport checksum but stale embedded command
+   checksum are rejected
+
+### Phase 10.6: Background Workers Across RPC
+
+Route background workers through the same node-client boundary:
+
+1. object payload reclaim
+2. bucket delete finalization
+3. lifecycle sweep claiming and mutation
+4. shard scavenger audit
+
+Workers must not rely on same-process wakeups. Local wakeups can remain as an
+optimization, but progress must be restartable from durable rows and periodic
+polling.
+
+Required tests:
+
+1. reclaim resumes after coordinator restart
+2. reclaim resumes after storage-node process restart
+3. bucket delete finalization completes after process restart
+4. lifecycle claim heartbeat/release works across RPC and stale claims are
+   cleaned safely
+5. shard scavenger audit can scan remote storage nodes and reports
+   location-keyed observations
+
+### Phase 10.7: Multi-Process Harness
+
+Add an integration harness that starts:
+
+1. one storage-node process per configured node
+2. one coordinator/HTTP process using the static multi-process cluster config
+3. a client test runner pointed at the HTTP endpoint
+
+The normal local in-process mode should remain available for unit and fast
+integration tests. The multi-process mode is the Phase 10 proof that the same
+storage invariants hold without shared memory.
+
+Required harness behavior:
+
+1. creates distinct temporary data directories and socket paths per node
+2. waits for node health before starting HTTP tests
+3. captures node logs on failure
+4. shuts down processes cleanly
+5. can intentionally kill/restart a node process for targeted tests
+
+Required test coverage:
+
+1. local S3 suite passes in multi-process mode
+2. node restart preserves bucket, object, multipart, reclaim, lifecycle, and
+   shard-scavenger state
+3. killing a non-critical node fails closed with clear errors
+4. no test depends on process-local cache invalidation, mutexes, or condition
+   variables for correctness
+
+### Phase 10.8: Closeout Audit
+
+Before closing Phase 10, audit production code for remaining shared-memory
+assumptions.
+
+Required checks:
+
+1. no production coordinator request path calls `SharedStorageNode::get_pg`
+2. no production coordinator request path receives or returns
+   `MutexGuard<PgStore>`
+3. no production path depends on `SharedStorageNode` bucket locks,
+   multipart locks, local reclaim queues, or local condition variables for
+   correctness
+4. raw shard read/write/delete helpers are either RPC-backed, storage-internal,
+   or test-only
+5. process-local caches are either correctness-neutral or protected by the
+   Phase 9.9 freshness checks
+6. every RPC message has explicit size and checksum validation
+7. every semantic checksum already present before RPC remains present after
+   RPC, persistence, replay, and readback
 
 Exit criteria:
 
@@ -4816,6 +5171,10 @@ Exit criteria:
 2. the same S3 suite passes against local multi-process mode
 3. killing a non-critical process fails closed with clear errors
 4. restarting a process preserves its local shard and metadata state
+5. metadata command bytes remain the durable mutation identity across RPC
+6. transport corruption and semantic checksum corruption are both detected
+7. production request paths no longer require same-process storage-node mutexes
+   or condition variables for correctness
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
