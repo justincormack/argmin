@@ -2,10 +2,14 @@ use std::sync::Arc;
 
 use placement::NodeId;
 
-use crate::error::StoreError;
+use crate::error::{BucketSnapshotLoadError, StoreError};
+use crate::metadata_command::MetadataCommandEnvelope;
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
-use crate::types::{BucketName, DataPgId, GenerationId, ObjectKey, ShardKey, WriteAck};
+use crate::traits::PgMetadataStore;
+use crate::types::{
+    BucketName, ClusterEpoch, DataPgId, GenerationId, ObjectKey, PgId, ShardKey, WriteAck,
+};
 
 pub(crate) trait StorageNodeClient: Send + Sync {
     fn node_id(&self) -> NodeId;
@@ -82,6 +86,52 @@ pub(crate) trait StorageNodeClient: Send + Sync {
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize;
+
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError>;
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
+
+    fn try_insert_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError>;
+
+    fn try_insert_bucket_control_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+    ) -> Result<bool, StoreError>;
+
+    fn remove_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError>;
+
+    fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError>;
+
+    fn durable_bucket_write_drain_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError>;
 }
 
 pub(crate) struct LocalStorageNodeClient {
@@ -207,5 +257,81 @@ impl StorageNodeClient for LocalStorageNodeClient {
     #[cfg(any(test, feature = "test-hooks"))]
     fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         self.storage_node.bucket_object_payload_lease_count(bucket)
+    }
+
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.max_metadata_command_log_index(cluster_epoch)
+    }
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.pending_metadata_command_envelope(self.node_id.as_u32(), cluster_epoch)
+    }
+
+    fn try_insert_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.try_insert_pending_metadata_command_slot(self.node_id.as_u32(), command, bucket)
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.try_insert_bucket_control_pending_metadata_command_slot(
+            self.node_id.as_u32(),
+            command,
+            bucket,
+        )
+    }
+
+    fn remove_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.remove_pending_metadata_command_slot(self.node_id.as_u32(), command)
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.replace_pending_metadata_command_slot_for_reissue(
+            self.node_id.as_u32(),
+            previous,
+            replacement,
+            bucket,
+        )
+    }
+
+    fn durable_bucket_write_drain_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?.is_some())
     }
 }

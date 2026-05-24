@@ -1282,31 +1282,28 @@ impl super::StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
-        match pg.try_insert_bucket_control_pending_metadata_command_slot(
-            primary.node_id().as_u32(),
-            command,
-            bucket,
-        ) {
+        match primary
+            .storage_client()
+            .try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket)
+        {
             Ok(true) => Ok(true),
             Ok(false) => {
-                drop(pg);
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
                     self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
                     return Ok(false);
                 }
 
-                let pg = primary.storage_node().get_pg(pg_id.get())?;
-                if PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?.is_some() {
-                    drop(pg);
+                if primary
+                    .storage_client()
+                    .durable_bucket_write_drain_exists(pg_id, bucket)?
+                {
                     self.wait_for_durable_bucket_write_drain(bucket)?;
                     return Ok(false);
                 }
                 Ok(false)
             }
             Err(StoreError::MetadataCommandLogConflict { .. }) => {
-                drop(pg);
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
                     self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;

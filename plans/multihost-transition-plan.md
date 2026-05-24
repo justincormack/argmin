@@ -4992,6 +4992,16 @@ Progress:
 - Tightened the storage-cluster boundary script so production direct calls to
   the migrated `SharedStorageNode` shard-owner methods fail outside the node
   client adapter.
+- Migrated pending metadata command slot install/load/remove/reissue helpers and
+  bucket-control pending-slot install through the local node client, keeping
+  those PG locks behind operation-shaped methods.
+- Extended the boundary guardrail so production pending metadata command slot
+  paths cannot call the migrated raw `PgStore` APIs directly.
+- Deferred the locked-PG command-id allocator pending-slot read as an explicit
+  Phase 10.2 inventory exception: those callers already hold object PG locks for
+  snapshot-sensitive command construction, so re-locking through the client
+  would deadlock until the callers are reshaped. The guardrail permits only that
+  named raw use.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

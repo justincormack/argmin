@@ -1041,16 +1041,15 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
-        let primary_max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
-        drop(pg);
+        let primary_max_log_index = primary
+            .storage_client()
+            .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
         let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
-        if let Some(current) = pg
-            .pending_metadata_command_envelope(primary.node_id().as_u32(), self.operation_epoch())?
+        if let Some(current) = primary
+            .storage_client()
+            .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
         {
             if current != *command {
-                drop(pg);
                 return self
                     .matching_reissued_pending_command_if_safe(
                         pg_id,
@@ -1065,14 +1064,11 @@ impl StorageCluster {
         } else {
             return Ok(None);
         }
-        drop(pg);
         if acting_set_max_log_index > primary_max_log_index {
-            let pg = primary.storage_node().get_pg(pg_id.get())?;
-            if let Some(current) = pg.pending_metadata_command_envelope(
-                primary.node_id().as_u32(),
-                self.operation_epoch(),
-            )? {
-                drop(pg);
+            if let Some(current) = primary
+                .storage_client()
+                .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+            {
                 if current != *command {
                     return self
                         .matching_reissued_pending_command_if_safe(
@@ -1113,37 +1109,36 @@ impl StorageCluster {
             MetadataCommandId::new(self.operation_epoch(), pg_id, next_log_index),
             command.payload().clone(),
         );
-        {
-            let pg = primary.storage_node().get_pg(pg_id.get())?;
-            if !pg.replace_pending_metadata_command_slot_for_reissue(
-                primary.node_id().as_u32(),
+        if !primary
+            .storage_client()
+            .replace_pending_metadata_command_slot_for_reissue(
+                pg_id,
                 command,
                 &replacement,
                 Some(&bucket),
-            )? {
-                let current = pg.pending_metadata_command_envelope(
-                    primary.node_id().as_u32(),
-                    self.operation_epoch(),
-                )?;
-                let primary_max_log_index =
-                    pg.max_metadata_command_log_index(self.operation_epoch())?;
-                drop(pg);
-                let Some(current) = current else {
-                    return Ok(None);
-                };
-                let acting_set_max_log_index =
-                    self.max_metadata_command_log_index_on_acting_set(pg_id)?;
-                return self
-                    .matching_reissued_pending_command_if_safe(
-                        pg_id,
-                        primary.node_id(),
-                        primary_max_log_index,
-                        acting_set_max_log_index,
-                        command,
-                        current,
-                    )
-                    .map_err(BucketSnapshotLoadError::from);
-            }
+            )?
+        {
+            let current = primary
+                .storage_client()
+                .pending_metadata_command_envelope(pg_id, self.operation_epoch())?;
+            let primary_max_log_index = primary
+                .storage_client()
+                .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
+            let Some(current) = current else {
+                return Ok(None);
+            };
+            let acting_set_max_log_index =
+                self.max_metadata_command_log_index_on_acting_set(pg_id)?;
+            return self
+                .matching_reissued_pending_command_if_safe(
+                    pg_id,
+                    primary.node_id(),
+                    primary_max_log_index,
+                    acting_set_max_log_index,
+                    command,
+                    current,
+                )
+                .map_err(BucketSnapshotLoadError::from);
         }
         Ok(Some(replacement))
     }
@@ -1163,9 +1158,10 @@ impl StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            let pg = node.storage_node().get_pg(pg_id.get())?;
-            max_log_index =
-                max_log_index.max(pg.max_metadata_command_log_index(self.operation_epoch())?);
+            max_log_index = max_log_index.max(
+                node.storage_client()
+                    .max_metadata_command_log_index(pg_id, self.operation_epoch())?,
+            );
         }
         Ok(max_log_index)
     }
@@ -1416,12 +1412,10 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
-        match pg.try_insert_pending_metadata_command_slot(
-            primary.node_id().as_u32(),
-            command,
-            Some(bucket),
-        ) {
+        match primary
+            .storage_client()
+            .try_insert_pending_metadata_command_slot(pg_id, command, Some(bucket))
+        {
             Ok(()) => Ok(Some(())),
             Err(StoreError::MetadataCommandPendingConflict { .. }) => Ok(None),
             Err(error) => Err(error),
@@ -1480,8 +1474,9 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
-        pg.pending_metadata_command_envelope(primary.node_id().as_u32(), self.operation_epoch())
+        primary
+            .storage_client()
+            .pending_metadata_command_envelope(pg_id, self.operation_epoch())
     }
 
     fn remove_pending_metadata_command_for_bucket(
@@ -1493,9 +1488,10 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
         let _ = bucket;
-        pg.remove_pending_metadata_command_slot(primary.node_id().as_u32(), command)
+        primary
+            .storage_client()
+            .remove_pending_metadata_command_slot(pg_id, command)
     }
 
     fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
@@ -1538,6 +1534,11 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        // Phase 10.2 inventory exception: this allocator is intentionally
+        // still locked-PG shaped because callers already hold the object PG
+        // lock for snapshot-sensitive command construction. Re-locking through
+        // StorageNodeClient here would deadlock; the boundary guardrail allows
+        // only this raw pending-slot read until these callers are reshaped.
         let max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
         if let Some(slot) =
             pg.pending_metadata_command_slot(primary.node_id().as_u32(), self.operation_epoch())?
