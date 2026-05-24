@@ -5031,6 +5031,12 @@ Progress:
   aborting multipart upload buckets through the local node client, and extended
   the background-worker guardrail so production cluster code cannot call the raw
   lifecycle bucket discovery PG methods directly.
+- Added node-client operations for raw bucket info/record reads and migrated
+  create-bucket existence checks, bucket-delete drain/begin/finalize checks, and
+  object-reclaim bucket-incarnation fencing through those methods. Remaining raw
+  bucket row reads are tied to bucket-control command construction and
+  generation allocation, and need operation-shaped command-build methods rather
+  than a mechanical re-locking pass.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

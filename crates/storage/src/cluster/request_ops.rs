@@ -790,16 +790,23 @@ impl super::StorageCluster {
             }
         })?;
         let pg_id = self.bucket_metadata_pg_id(&bucket);
-        let primary_node = self.bucket_metadata_primary_node(&bucket)?;
+        let primary_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        let primary_node = primary_store.storage_node();
         let _bucket_guard = primary_node.lock_bucket(&bucket);
         {
-            let bucket_pg = primary_node.get_pg(pg_id)?;
-            match PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket) {
+            match primary_store
+                .storage_client()
+                .head_bucket_raw(PgId::new(pg_id), &bucket)
+            {
                 Ok(info) => {
                     return Ok(BucketCreateAttemptOutcome::Exists(info));
                 }
-                Err(MetadataError::BucketNotFound { .. }) => {}
-                Err(other) => return Err(other.into()),
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                    ..
+                })) => {}
+                Err(other) => return Err(other),
             }
         }
 
@@ -1687,22 +1694,26 @@ impl super::StorageCluster {
                             .notify_bucket_coordination_change(bucket);
                         continue;
                     }
-                    let bucket_pg = node.storage_node().get_pg(pg_id)?;
-                    match PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket) {
+                    match node
+                        .storage_client()
+                        .head_bucket_record_raw(PgId::new(pg_id), bucket)
+                    {
                         Ok(current) if current.state == BucketState::Deleting => {
-                            drop(bucket_pg);
                             return Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting);
                         }
                         Ok(_) => {}
-                        Err(MetadataError::BucketNotFound { .. }) => {
+                        Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                            ..
+                        })) => {
                             return Err(MetadataError::BucketNotFound {
                                 name: bucket.clone(),
                             }
                             .into());
                         }
-                        Err(error) => return Err(error.into()),
+                        Err(error) => {
+                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
+                        }
                     }
-                    drop(bucket_pg);
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
@@ -1856,15 +1867,20 @@ impl super::StorageCluster {
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let node = self.bucket_metadata_primary_node(bucket)?;
+        let node_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let node = node_store.storage_node();
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_delete_begin_start",
             Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
         );
         {
-            let bucket_pg = node.get_pg(pg_id.get())?;
-            let current = bucket_pg.head_bucket_record_raw(bucket)?;
+            let current = node_store
+                .storage_client()
+                .head_bucket_record_raw(pg_id, bucket)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if current.state == BucketState::Deleting {
                 node.notify_bucket_coordination_change(bucket);
                 let _ = observability::event(
@@ -2069,7 +2085,11 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        let bucket_node = self.bucket_metadata_primary_node(bucket)?;
+        let bucket_pg_id = self.bucket_metadata_pg_id(bucket);
+        let bucket_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
+        let bucket_node = bucket_store.storage_node();
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_finalize_start",
@@ -2080,12 +2100,15 @@ impl super::StorageCluster {
             )),
         );
         let _bucket_guard = bucket_node.lock_bucket(bucket);
-        let bucket_pg_id = self.bucket_metadata_pg_id(bucket);
         let bucket_incarnation_generation = {
-            let bucket_pg = self.metadata_pg(bucket_pg_id)?;
-            let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
+            let info = match bucket_store
+                .storage_client()
+                .head_bucket_raw(PgId::new(bucket_pg_id), bucket)
+            {
                 Ok(info) => info,
-                Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                    ..
+                })) => {
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_finalize_not_found",
@@ -2093,7 +2116,7 @@ impl super::StorageCluster {
                     );
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
-                Err(other) => return Err(other.into()),
+                Err(other) => return Err(bucket_snapshot_error_to_bucket_write_drain_error(other)),
             };
             if info.state != BucketState::Deleting {
                 let _ = observability::event(
@@ -2452,11 +2475,15 @@ impl super::StorageCluster {
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let primary_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_node = primary_store.storage_node();
         let _bucket_guard = primary_node.lock_bucket(bucket);
         {
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            let info = primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
             if state == BucketVersioningState::Disabled
                 && info.versioning != BucketVersioningState::Disabled
             {
@@ -2562,8 +2589,9 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            let info = primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
     }
@@ -2651,11 +2679,15 @@ impl super::StorageCluster {
         public_write: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let primary_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_node = primary_store.storage_node();
         let _bucket_guard = primary_node.lock_bucket(bucket);
         {
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
         }
 
         loop {
@@ -2745,8 +2777,9 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            let info = primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
     }
@@ -2757,11 +2790,15 @@ impl super::StorageCluster {
         mutation: BucketPropertyMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let primary_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_node = primary_store.storage_node();
         let _bucket_guard = primary_node.lock_bucket(bucket);
         {
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
         }
 
         loop {
@@ -2844,8 +2881,9 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            let info = primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
     }
@@ -2894,11 +2932,15 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let primary_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let primary_node = primary_store.storage_node();
         let _bucket_guard = primary_node.lock_bucket(bucket);
         {
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
         }
         loop {
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
@@ -2959,8 +3001,9 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let info = PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket)?;
+            let info = primary_store
+                .storage_client()
+                .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
     }
@@ -5880,14 +5923,20 @@ impl super::StorageCluster {
         };
 
         let bucket_incarnation_generation = {
-            let bucket_node = self.bucket_metadata_primary_node(bucket)?;
-            let bucket_pg = bucket_node.get_pg(self.bucket_metadata_pg_id(bucket))?;
-            match PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket) {
+            let bucket_pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+            let bucket_store = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), bucket_pg_id)?;
+            match bucket_store
+                .storage_client()
+                .head_bucket_record_raw(bucket_pg_id, bucket)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
+            {
                 Ok(bucket) => bucket.bucket_incarnation_generation,
-                Err(MetadataError::BucketNotFound { .. }) => {
+                Err(ObjectPgActionError::Metadata(MetadataError::BucketNotFound { .. })) => {
                     ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         };
         let reclaim_kind = reclaim.kind();

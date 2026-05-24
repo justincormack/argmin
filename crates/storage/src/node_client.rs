@@ -5,15 +5,15 @@ use placement::NodeId;
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
+    BucketRecord, MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
     ObjectPayloadReclaimCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketName,
-    BucketSnapshot, BucketSnapshotRequest, BucketState, BucketWriteDrainRecord,
+    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo,
+    BucketName, BucketSnapshot, BucketSnapshotRequest, BucketState, BucketWriteDrainRecord,
     BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId, LifecycleSweepBuckets,
     LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord,
     ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey, WriteAck,
@@ -210,6 +210,18 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
+
+    fn head_bucket_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
+    fn head_bucket_record_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketRecord, BucketSnapshotLoadError>;
 
     fn load_bucket_execution_generations(
         &self,
@@ -768,6 +780,24 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)
+    }
+
+    fn head_bucket_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::head_bucket_raw(&*pg, bucket)?)
+    }
+
+    fn head_bucket_record_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?)
     }
 
     fn load_bucket_execution_generations(
