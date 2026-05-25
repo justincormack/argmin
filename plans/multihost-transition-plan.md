@@ -5037,6 +5037,15 @@ Progress:
   bucket row reads are tied to bucket-control command construction and
   generation allocation, and need operation-shaped command-build methods rather
   than a mechanical re-locking pass.
+- Migrated active bucket info reads, bucket subresource reads, lifecycle context
+  bucket reads, and owner bucket listing through the local node client. Added a
+  guardrail so production cluster code cannot call the migrated active
+  bucket/subresource/list PG reads directly.
+- Migrated simple object metadata helper reads for existing-live-object lookup
+  and payload-reclaim existence checks through the local node client. Callback
+  shaped object read snapshots, tag reads, and object-lock reads remain deferred
+  until they have operation-specific RPC shapes that preserve auth-before-extra-IO
+  semantics.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

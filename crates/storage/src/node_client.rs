@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use placement::NodeId;
 
-use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
+use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     BucketRecord, MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
     ObjectPayloadReclaimCommand,
@@ -13,10 +13,11 @@ use crate::pg_store::ScavengerShardFileScan;
 use crate::traits::PgMetadataStore;
 use crate::types::{
     BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo,
-    BucketName, BucketSnapshot, BucketSnapshotRequest, BucketState, BucketWriteDrainRecord,
-    BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId, LifecycleSweepBuckets,
-    LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey, ObjectPayloadReclaimClaimRecord,
-    ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey, WriteAck,
+    BucketName, BucketSnapshot, BucketSnapshotRequest, BucketState, BucketSubresourceKind,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId,
+    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey,
+    StoredObject, WriteAck,
 };
 
 pub(crate) trait StorageNodeClient: Send + Sync {
@@ -217,11 +218,45 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
+    fn head_bucket_info(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
     fn head_bucket_record_raw(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<BucketRecord, BucketSnapshotLoadError>;
+
+    fn get_bucket_subresource(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError>;
+
+    fn list_buckets(
+        &self,
+        pg_id: PgId,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
+
+    fn load_existing_live_object(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+
+    fn payload_reclaim_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError>;
 
     fn load_bucket_execution_generations(
         &self,
@@ -791,6 +826,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::head_bucket_raw(&*pg, bucket)?)
     }
 
+    fn head_bucket_info(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::head_bucket(&*pg, bucket)?)
+    }
+
     fn head_bucket_record_raw(
         &self,
         pg_id: PgId,
@@ -798,6 +842,55 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<BucketRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?)
+    }
+
+    fn get_bucket_subresource(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_bucket_subresource(&*pg, bucket, kind)?.map(|stored| stored.body))
+    }
+
+    fn list_buckets(
+        &self,
+        pg_id: PgId,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?)
+    }
+
+    fn load_existing_live_object(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(StoredObject::Live(object)) => Ok(Some(StoredObject::Live(object))),
+            Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn payload_reclaim_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::payload_reclaim_exists(
+            &*pg,
+            bucket,
+            key,
+            generation_id,
+        )?)
     }
 
     fn load_bucket_execution_generations(

@@ -1638,17 +1638,6 @@ impl StorageCluster {
         self.metadata_pg_primary_node(self.bucket_metadata_pg_id(bucket))
     }
 
-    fn bucket_metadata_primary_node_arc(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<Arc<SharedStorageNode>, StoreError> {
-        let node = self.local_map.metadata_pg_primary_node(
-            self.operation_epoch(),
-            PgId::new(self.bucket_metadata_pg_id(bucket)),
-        )?;
-        Ok(Arc::clone(node.storage_node()))
-    }
-
     fn metadata_command_bucket_write_reservation_proof(
         command: &MetadataCommandEnvelope,
     ) -> Option<&BucketWriteReservationProof> {

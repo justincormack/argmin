@@ -873,8 +873,9 @@ impl super::StorageCluster {
                 | FinishPendingMetadataCommandResult::RetryPartialExactConflict => continue,
             }
 
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let info = PgMetadataStore::head_bucket(&*bucket_pg, &bucket)?;
+            let info = primary_store
+                .storage_client()
+                .head_bucket_info(pg_id, &bucket)?;
             return Ok(BucketCreateAttemptOutcome::Created(info));
         }
     }
@@ -1628,19 +1629,20 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let node = self.bucket_metadata_primary_node_arc(bucket)?;
-        let bucket_pg = node.get_pg(self.bucket_metadata_pg_id(bucket))?;
-        match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        match node.storage_client().head_bucket_info(pg_id, bucket) {
             Ok(_) => {}
-            Err(MetadataError::BucketNotFound { .. }) => {
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
                 return Err(MetadataError::BucketNotFound {
                     name: bucket.clone(),
                 }
                 .into());
             }
-            Err(other) => return Err(other.into()),
+            Err(other) => return Err(other),
         }
-        drop(bucket_pg);
         std::thread::sleep(std::time::Duration::from_millis(1));
         Ok(())
     }
@@ -2442,8 +2444,11 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .head_bucket_info(bucket)
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .head_bucket_info(pg_id, bucket)
     }
 
     pub fn get_bucket_subresource(
@@ -2451,8 +2456,11 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
-            .get_bucket_subresource(bucket, kind)
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .get_bucket_subresource(pg_id, bucket, kind)
     }
 
     fn pending_bucket_command_matches_current(
@@ -3014,8 +3022,13 @@ impl super::StorageCluster {
     ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
         let mut buckets = Vec::new();
         for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            let mut page = pg.list_buckets(owner_canonical_id)?;
+            let pg_id = PgId::new(pg_id);
+            let mut page = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+                .storage_client()
+                .list_buckets(pg_id, owner_canonical_id)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             buckets.append(&mut page);
         }
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3771,8 +3784,11 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_existing_live_object(bucket, key)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_existing_live_object(pg_id, bucket, key)
     }
 
     pub fn load_object_read_snapshot_if<T, E>(
@@ -3793,8 +3809,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .payload_reclaim_exists(bucket, key, generation_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .payload_reclaim_exists(pg_id, bucket, key, generation_id)
     }
 
     pub fn get_object_tags_if<E>(
@@ -4171,21 +4190,31 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<Option<BucketLifecycleContext<'_>>, ObjectPgActionError> {
-        let bucket_node = self.bucket_metadata_primary_node(bucket)?;
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let bucket_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let bucket_node = bucket_store.storage_node();
         let bucket_guard = bucket_node.lock_bucket(bucket);
-        let bucket_pg = bucket_node.get_pg(self.bucket_metadata_pg_id(bucket))?;
-        let bucket_info = match PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
+        let bucket_info = match bucket_store
+            .storage_client()
+            .head_bucket_info(pg_id, bucket)
+        {
             Ok(info) => info,
-            Err(MetadataError::BucketNotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
+                return Ok(None)
+            }
+            Err(error) => {
+                return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                    error,
+                ))
+            }
         };
         let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
-            PgMetadataStore::get_bucket_subresource(
-                &*bucket_pg,
-                bucket,
-                BucketSubresourceKind::Lifecycle,
-            )?
-            .map(|stored| stored.body)
+            bucket_store
+                .storage_client()
+                .get_bucket_subresource(pg_id, bucket, BucketSubresourceKind::Lifecycle)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         } else {
             None
         };
