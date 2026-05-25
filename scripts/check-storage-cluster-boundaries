@@ -574,7 +574,7 @@ migrated_simple_object_read_bypasses=$(
         if ($0 ~ /\.storage_client\(\)/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if)\(/) {
+        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
                 next
@@ -591,6 +591,11 @@ migrated_simple_object_read_bypasses=$(
             && ($0 ~ /PgMetadataStore::get_object_meta\(/ \
                 || $0 ~ /PgMetadataStore::get_object_version\(/ \
                 || $0 ~ /PgMetadataStore::get_object_tags\(/)) {
+            print FILENAME ":" FNR ":" $0
+        }
+        if (current_fn == "load_object_if" \
+            && ($0 ~ /PgMetadataStore::get_object_meta\(/ \
+                || $0 ~ /PgMetadataStore::get_object_version\(/)) {
             print FILENAME ":" FNR ":" $0
         }
         if ((current_fn == "get_object_legal_hold_if" \

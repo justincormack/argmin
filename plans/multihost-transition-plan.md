@@ -5054,6 +5054,10 @@ Progress:
   row cannot drift from the authorized object row. Remaining callback-shaped
   object reads are command-construction helpers and bucket pair snapshots that
   still need operation-specific build/snapshot APIs.
+- Migrated the generic object auth/read callback wrapper used by delete
+  authorization and object ACL reads through the local node client's stored-row
+  subject load, and made the old `SharedStorageNode::load_object_if` test-only
+  so production cannot bypass the boundary for that read shape.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

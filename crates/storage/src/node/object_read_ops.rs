@@ -2,6 +2,7 @@ use super::*;
 use crate::{ObjectLayout, ObjectReadSnapshotMode, VersionId};
 
 impl SharedStorageNode {
+    #[cfg(test)]
     pub fn load_object_if<T, E>(
         &self,
         bucket: &BucketName,

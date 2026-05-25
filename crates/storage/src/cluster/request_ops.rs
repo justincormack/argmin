@@ -3776,8 +3776,13 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_object_if(bucket, key, version_id, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let subject = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+        Ok(action(&subject.stored))
     }
 
     pub fn load_existing_live_object(
