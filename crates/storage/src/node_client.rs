@@ -269,6 +269,40 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
 
+    fn load_object_tag_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
+
+    fn get_object_tags_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: s3_types::VersionId,
+    ) -> Result<Option<String>, ObjectPgActionError>;
+
+    fn load_object_legal_hold_read_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
+
+    fn load_object_retention_read_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
+
     fn payload_reclaim_exists(
         &self,
         pg_id: PgId,
@@ -926,6 +960,65 @@ impl StorageNodeClient for LocalStorageNodeClient {
             version_id,
             expected_identity,
             snapshot_mode,
+        )
+    }
+
+    fn load_object_tag_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_tag_read_auth_subject_from_object_pg(
+            &pg, bucket, key, version_id,
+        )
+    }
+
+    fn get_object_tags_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: s3_types::VersionId,
+    ) -> Result<Option<String>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::get_object_tags_for_subject_from_object_pg(
+            &pg,
+            bucket,
+            key,
+            version_id,
+            expected_identity,
+            authorized_version_id,
+        )
+    }
+
+    fn load_object_legal_hold_read_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_legal_hold_read_subject_from_object_pg(
+            &pg, bucket, key, version_id,
+        )
+    }
+
+    fn load_object_retention_read_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_retention_read_subject_from_object_pg(
+            &pg, bucket, key, version_id,
         )
     }
 

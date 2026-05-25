@@ -3853,10 +3853,41 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
-        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
+        mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .get_object_tags_if(bucket, key, version_id, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let storage_client = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client();
+
+        for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
+            let subject =
+                storage_client.load_object_tag_read_auth_subject(pg_id, bucket, key, version_id)?;
+            let authorized_version_id = match action(&subject.stored) {
+                Ok(authorized_version_id) => authorized_version_id,
+                Err(error) => return Ok(Err(error)),
+            };
+            match storage_client.get_object_tags_for_subject(
+                pg_id,
+                bucket,
+                key,
+                version_id,
+                &subject.identity,
+                authorized_version_id,
+            ) {
+                Ok(tags) => return Ok(Ok(tags)),
+                Err(ObjectPgActionError::StaleObjectReadSubject) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ObjectPgActionError::Store(StoreError::Io {
+            context: "get object tags stale retry limit exceeded",
+            source: std::io::Error::other(
+                "object changed repeatedly while loading authorized tags",
+            ),
+        }))
     }
 
     fn new_put_object_metadata_command(
@@ -4203,8 +4234,13 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<LegalHoldStatus>, E>,
     ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .get_object_legal_hold_if(bucket, key, version_id, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let subject = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_object_legal_hold_read_subject(pg_id, bucket, key, version_id)?;
+        Ok(action(&subject.stored))
     }
 
     pub fn get_object_retention_if<E>(
@@ -4214,8 +4250,13 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<ObjectRetention>, E>,
     ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .get_object_retention_if(bucket, key, version_id, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let subject = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_object_retention_read_subject(pg_id, bucket, key, version_id)?;
+        Ok(action(&subject.stored))
     }
 
     fn load_bucket_lifecycle_context(

@@ -2561,6 +2561,68 @@ mod tests {
         assert_eq!(call_count.get(), 16);
     }
 
+    #[test]
+    fn object_tag_read_retries_when_tags_change_after_auth_subject_load() {
+        let tmp = test_util::tempdir();
+        let map = Arc::new(
+            LocalClusterMap::open(
+                tmp.path(),
+                &trace_node_ids(),
+                &[0],
+                SharedStorageNode::DEFAULT_EC_SHAPE,
+            )
+            .unwrap(),
+        );
+        let cluster = current_cluster(&map);
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let written = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Disabled,
+            [1; 16],
+            [1; 16],
+            b"tagged",
+        );
+        let mutated = std::cell::Cell::new(false);
+        let call_count = std::cell::Cell::new(0);
+
+        let tags = cluster
+            .get_object_tags_if(&bucket, &key, None, |stored| {
+                call_count.set(call_count.get() + 1);
+                let live = stored.as_live().expect("test object should be live");
+                assert_eq!(live.generation_id, written.generation_id);
+                if !mutated.replace(true) {
+                    cluster
+                        .put_object_tags_if(
+                            &bucket,
+                            &key,
+                            None,
+                            "<Tagging><TagSet><Tag><Key>state</Key><Value>new</Value></Tag></TagSet></Tagging>",
+                            |stored| {
+                                Ok::<_, ()>(
+                                    stored.as_live().expect("test object should be live").version_id,
+                                )
+                            },
+                        )
+                        .unwrap()
+                        .unwrap();
+                }
+                Ok::<_, ()>(live.version_id)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(call_count.get(), 2);
+        assert_eq!(
+            tags.as_deref(),
+            Some(
+                "<Tagging><TagSet><Tag><Key>state</Key><Value>new</Value></Tag></TagSet></Tagging>"
+            )
+        );
+    }
+
     fn key_for_object_pg(
         topology: &crate::PgTopology,
         bucket: &crate::BucketName,

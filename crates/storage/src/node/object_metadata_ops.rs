@@ -1,9 +1,10 @@
 use super::*;
+use s3_types::VersionId;
 #[cfg(test)]
-use s3_types::{AclGrants, StoredLegalHoldStatus};
-use s3_types::{LegalHoldStatus, ObjectRetention, VersionId};
+use s3_types::{AclGrants, LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};
 
 impl SharedStorageNode {
+    #[cfg(test)]
     fn with_object_metadata_if<T>(
         &self,
         bucket: &BucketName,
@@ -19,6 +20,7 @@ impl SharedStorageNode {
         action(&pg, &stored)
     }
 
+    #[cfg(test)]
     pub fn get_object_tags_if<E>(
         &self,
         bucket: &BucketName,
@@ -32,6 +34,68 @@ impl SharedStorageNode {
             )?)),
             Err(error) => Ok(Err(error)),
         })
+    }
+
+    pub(crate) fn load_object_tag_read_auth_subject_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        Self::load_object_read_auth_subject_from_object_pg(pg, bucket, key, version_id)
+    }
+
+    pub(crate) fn get_object_tags_for_subject_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: VersionId,
+    ) -> Result<Option<String>, ObjectPgActionError> {
+        let stored = match Self::load_stored_object_from_object_pg(pg, bucket, key, version_id) {
+            Ok(stored) => stored,
+            Err(ObjectPgActionError::Metadata(crate::error::MetadataError::ObjectNotFound)) => {
+                return Err(ObjectPgActionError::StaleObjectReadSubject);
+            }
+            Err(error) => return Err(error),
+        };
+        if !expected_identity.matches_stored(&stored) {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        if stored.version_id() != authorized_version_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object tag action returned version {:?} for stored version {:?}",
+                    authorized_version_id,
+                    stored.version_id()
+                ),
+            });
+        }
+        Ok(PgMetadataStore::get_object_tags(
+            pg,
+            bucket,
+            key,
+            authorized_version_id,
+        )?)
+    }
+
+    pub(crate) fn load_object_legal_hold_read_subject_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        Self::load_object_read_auth_subject_from_object_pg(pg, bucket, key, version_id)
+    }
+
+    pub(crate) fn load_object_retention_read_subject_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        Self::load_object_read_auth_subject_from_object_pg(pg, bucket, key, version_id)
     }
 
     #[cfg(test)]
@@ -129,6 +193,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn get_object_legal_hold_if<E>(
         &self,
         bucket: &BucketName,
@@ -144,6 +209,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn get_object_retention_if<E>(
         &self,
         bucket: &BucketName,

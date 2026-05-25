@@ -5048,8 +5048,12 @@ Progress:
   locally, then storage reloads the object and returns the snapshot only if the
   subject identity still matches. A stale subject is retried by the cluster
   wrapper so a read cannot authorize one object row and snapshot another.
-  Callback-shaped tag reads and object-lock reads remain deferred until they
-  have operation-specific RPC shapes.
+- Migrated object tag reads and object-lock legal-hold/retention reads through
+  operation-shaped node-client methods. Tag reads use the same auth-subject plus
+  identity-validated reload model as object read snapshots so the returned tag
+  row cannot drift from the authorized object row. Remaining callback-shaped
+  object reads are command-construction helpers and bucket pair snapshots that
+  still need operation-specific build/snapshot APIs.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

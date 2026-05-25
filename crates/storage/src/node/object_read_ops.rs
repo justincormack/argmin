@@ -145,7 +145,7 @@ impl SharedStorageNode {
         Ok(result)
     }
 
-    fn load_stored_object_from_object_pg(
+    pub(crate) fn load_stored_object_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
         key: &ObjectKey,
