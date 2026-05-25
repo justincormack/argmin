@@ -5031,10 +5031,7 @@ Progress:
   lifecycle bucket discovery PG methods directly.
 - Added node-client operations for raw bucket info/record reads and migrated
   create-bucket existence checks, bucket-delete drain/begin/finalize checks, and
-  object-reclaim bucket-incarnation fencing through those methods. Remaining raw
-  bucket row reads are tied to bucket-control command construction and
-  generation allocation, and need operation-shaped command-build methods rather
-  than a mechanical re-locking pass.
+  object-reclaim bucket-incarnation fencing through those methods.
 - Migrated active bucket info reads, bucket subresource reads, lifecycle context
   bucket reads, and owner bucket listing through the local node client. Added a
   guardrail so production cluster code cannot call the migrated active
@@ -5078,6 +5075,13 @@ Progress:
 - Made the old `SharedStorageNode` bucket-pair and multipart-read convenience
   wrappers test-only, and added a guardrail so those bypass surfaces cannot
   become public production APIs again.
+- Migrated bucket-control command construction for delete-bucket,
+  put-bucket-versioning, put-bucket-acl, bucket property updates, and bucket
+  subresource updates through operation-shaped node-client builders/validators.
+  `StorageCluster` no longer opens bucket PGs to read raw `BucketRecord` or
+  allocate bucket execution generations for those migrated command-build paths,
+  and the raw bucket-row guardrail no longer carries the former command-build
+  exception.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

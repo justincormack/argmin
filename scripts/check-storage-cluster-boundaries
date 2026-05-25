@@ -451,13 +451,6 @@ migrated_bucket_raw_read_bypasses=$(
             pending_test_cfg = 0
         }
     }
-    function is_allowed_command_build_raw_record_read() {
-        return $0 ~ /\.head_bucket_record_raw\(/ \
-            && (current_fn == "begin_bucket_delete" \
-                || current_fn == "put_bucket_versioning_and_load_info" \
-                || current_fn == "put_bucket_acl_and_load_info" \
-                || current_fn == "put_bucket_property_command_and_load_info")
-    }
     {
         update_function_context()
         if (in_test_hook) {
@@ -469,9 +462,6 @@ migrated_bucket_raw_read_bypasses=$(
         if ($0 ~ /\.(head_bucket_raw|head_bucket_record_raw)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
-                next
-            }
-            if (is_allowed_command_build_raw_record_read()) {
                 next
             }
             print FILENAME ":" FNR ":" $0
@@ -488,7 +478,7 @@ migrated_bucket_raw_read_bypasses=$(
       crates/storage/src/cluster/local.rs
 )
 fail_with_matches \
-    "Production raw bucket row reads must go through the node client boundary or be inventoried command-build reads" \
+    "Production raw bucket row reads must go through the node client boundary" \
     "$migrated_bucket_raw_read_bypasses"
 
 migrated_bucket_public_read_bypasses=$(

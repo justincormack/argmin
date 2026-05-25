@@ -15,17 +15,16 @@ use super::{
 };
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
-    BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
+    BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
     CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
     CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
     DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimClaimProof,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation,
 };
+use crate::node_client::MarkBucketDeletingCommandBuild;
 use crate::traits::PgMetadataStore;
 use crate::*;
 
@@ -1925,21 +1924,12 @@ impl super::StorageCluster {
                     MetadataCommandPayload::MarkBucketDeleting(mark)
                         if mark.bucket_name() == bucket =>
                     {
-                        let bucket_pg = node.get_pg(pg_id.get())?;
-                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
-                        if !Self::pending_bucket_command_matches_current(
-                            current,
-                            &mark.bucket,
-                            |record| {
-                                Ok(MarkBucketDeletingCommand::from_bucket(
-                                    record.with_execution_generation(
-                                        mark.bucket.bucket_execution_generation,
-                                    ),
-                                )
-                                .bucket)
-                            },
-                        )
-                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                        if !node_store
+                            .storage_client()
+                            .pending_mark_bucket_deleting_command_matches_current(
+                                pg_id, bucket, mark,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                         {
                             return Err(bucket_snapshot_error_to_bucket_write_drain_error(
                                 conflicting_pending_metadata_command(
@@ -2030,22 +2020,14 @@ impl super::StorageCluster {
                     Err(StoreError::MetadataCommandLogConflict { .. }) => continue,
                     Err(error) => return Err(BucketWriteDrainError::from(error)),
                 };
-                let bucket_pg = node.get_pg(pg_id.get())?;
-                let current = bucket_pg.head_bucket_record_raw(bucket)?;
-                if current.state == BucketState::Deleting {
-                    return Ok(());
-                }
-                let bucket_execution_generation =
-                    bucket_pg.next_bucket_execution_generation_candidate()?;
-                drop(bucket_pg);
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::MarkBucketDeleting(
-                        MarkBucketDeletingCommand::from_bucket(
-                            current.with_execution_generation(bucket_execution_generation),
-                        ),
-                    ),
-                );
+                let command = match node_store
+                    .storage_client()
+                    .build_mark_bucket_deleting_command(pg_id, bucket, command_id)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                {
+                    MarkBucketDeletingCommandBuild::AlreadyDeleting => return Ok(()),
+                    MarkBucketDeletingCommandBuild::Command(command) => *command,
+                };
                 if !self
                     .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
@@ -2467,20 +2449,6 @@ impl super::StorageCluster {
             .get_bucket_subresource(pg_id, bucket, kind)
     }
 
-    fn pending_bucket_command_matches_current(
-        current: BucketRecord,
-        target: &BucketRecord,
-        build_expected: impl FnOnce(BucketRecord) -> Result<BucketRecord, BucketSnapshotLoadError>,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        if current.bucket_execution_generation == target.bucket_execution_generation {
-            return Ok(current.command_metadata_eq(target));
-        }
-        if current.bucket_execution_generation > target.bucket_execution_generation {
-            return Ok(false);
-        }
-        Ok(build_expected(current)?.command_metadata_eq(target))
-    }
-
     pub fn put_bucket_versioning_and_load_info(
         &self,
         bucket: &BucketName,
@@ -2520,31 +2488,13 @@ impl super::StorageCluster {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
                         if versioning.bucket_name() == bucket =>
                     {
-                        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
                         let same_request = versioning.bucket.versioning == state;
-                        if !Self::pending_bucket_command_matches_current(
-                            current,
-                            &versioning.bucket,
-                            |record| {
-                                if state == BucketVersioningState::Disabled
-                                    && record.versioning != BucketVersioningState::Disabled
-                                {
-                                    return Err(MetadataError::InvalidVersioningTransition {
-                                        from: record.versioning,
-                                        to: state,
-                                    }
-                                    .into());
-                                }
-                                Ok(PutBucketVersioningCommand::from_bucket(
-                                    record.with_execution_generation(
-                                        versioning.bucket.bucket_execution_generation,
-                                    ),
-                                    state,
-                                )
-                                .bucket)
-                            },
-                        )? {
+                        if !primary_store
+                            .storage_client()
+                            .pending_put_bucket_versioning_command_matches_current(
+                                pg_id, bucket, versioning, state,
+                            )?
+                        {
                             if same_request {
                                 return Err(conflicting_pending_metadata_command(
                                     "conflicting pending put bucket versioning command",
@@ -2572,20 +2522,9 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                let current = bucket_pg.head_bucket_record_raw(bucket)?;
-                let bucket_execution_generation =
-                    bucket_pg.next_bucket_execution_generation_candidate()?;
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::PutBucketVersioning(
-                        PutBucketVersioningCommand::from_bucket(
-                            current.with_execution_generation(bucket_execution_generation),
-                            state,
-                        ),
-                    ),
-                );
-                drop(bucket_pg);
+                let command = primary_store
+                    .storage_client()
+                    .build_put_bucket_versioning_command(pg_id, bucket, command_id, state)?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
@@ -2713,26 +2652,20 @@ impl super::StorageCluster {
                 }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketAcl(acl) if acl.bucket_name() == bucket => {
-                        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
                         let same_request = acl.bucket.acl_grants == *acl_grants
                             && acl.bucket.public_read == public_read
                             && acl.bucket.public_write == public_write;
-                        if !Self::pending_bucket_command_matches_current(
-                            current,
-                            &acl.bucket,
-                            |record| {
-                                Ok(PutBucketAclCommand::from_bucket(
-                                    record.with_execution_generation(
-                                        acl.bucket.bucket_execution_generation,
-                                    ),
-                                    acl_grants.clone(),
-                                    public_read,
-                                    public_write,
-                                )
-                                .bucket)
-                            },
-                        )? {
+                        if !primary_store
+                            .storage_client()
+                            .pending_put_bucket_acl_command_matches_current(
+                                pg_id,
+                                bucket,
+                                acl,
+                                acl_grants,
+                                public_read,
+                                public_write,
+                            )?
+                        {
                             if same_request {
                                 return Err(conflicting_pending_metadata_command(
                                     "conflicting pending put bucket acl command",
@@ -2760,20 +2693,16 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                let current = bucket_pg.head_bucket_record_raw(bucket)?;
-                let bucket_execution_generation =
-                    bucket_pg.next_bucket_execution_generation_candidate()?;
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
-                        current.with_execution_generation(bucket_execution_generation),
-                        acl_grants.clone(),
+                let command = primary_store
+                    .storage_client()
+                    .build_put_bucket_acl_command(
+                        pg_id,
+                        bucket,
+                        command_id,
+                        acl_grants,
                         public_read,
                         public_write,
-                    )),
-                );
-                drop(bucket_pg);
+                    )?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
@@ -2827,21 +2756,12 @@ impl super::StorageCluster {
                         if property.bucket_name() == bucket
                             && property.effect == mutation.effect() =>
                     {
-                        let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                        let current = bucket_pg.head_bucket_record_raw(bucket)?;
-                        if !Self::pending_bucket_command_matches_current(
-                            current,
-                            &property.bucket,
-                            |record| {
-                                Ok(PutBucketPropertyCommand::from_bucket_and_mutation(
-                                    record.with_execution_generation(
-                                        property.bucket.bucket_execution_generation,
-                                    ),
-                                    mutation.clone(),
-                                )
-                                .bucket)
-                            },
-                        )? {
+                        if !primary_store
+                            .storage_client()
+                            .pending_put_bucket_property_command_matches_current(
+                                pg_id, bucket, property, &mutation,
+                            )?
+                        {
                             self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
                             continue;
                         }
@@ -2864,20 +2784,9 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                let current = bucket_pg.head_bucket_record_raw(bucket)?;
-                let bucket_execution_generation =
-                    bucket_pg.next_bucket_execution_generation_candidate()?;
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::PutBucketProperty(
-                        PutBucketPropertyCommand::from_bucket_and_mutation(
-                            current.with_execution_generation(bucket_execution_generation),
-                            mutation.clone(),
-                        ),
-                    ),
-                );
-                drop(bucket_pg);
+                let command = primary_store
+                    .storage_client()
+                    .build_put_bucket_property_command(pg_id, bucket, command_id, &mutation)?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
@@ -2986,18 +2895,9 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                let bucket_execution_generation =
-                    bucket_pg.next_bucket_execution_generation_candidate()?;
-                drop(bucket_pg);
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
-                        bucket.clone(),
-                        mutation.clone(),
-                        bucket_execution_generation,
-                    )),
-                );
+                let command = primary_store
+                    .storage_client()
+                    .build_put_bucket_subresource_command(pg_id, bucket, command_id, &mutation)?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
                 }
