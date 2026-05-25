@@ -31,12 +31,11 @@ use crate::types::{
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketSubresourceKind, EcShape, GenerationId,
     ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
     MultipartCompletionSnapshot, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
-    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
-    ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState, WriteAck,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, SessionId, ShardKey,
+    StoredObject, StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 #[cfg(test)]
-use crate::types::{BucketState, ListObjectVersionsReq};
+use crate::types::{BucketState, ListObjectVersionsReq, ObjectReadSnapshotOutcome};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
     CreateStreamUploadReq, ListPartsResp, MultipartPartRecord, MultipartPartSegmentRecord,

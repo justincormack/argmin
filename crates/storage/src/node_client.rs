@@ -923,11 +923,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
-            Ok(StoredObject::Live(object)) => Ok(Some(StoredObject::Live(object))),
-            Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        Ok(SharedStorageNode::load_existing_live_object_from_object_pg(
+            &pg, bucket, key,
+        )?)
     }
 
     fn load_object_read_auth_subject(

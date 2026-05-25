@@ -18,6 +18,7 @@ impl SharedStorageNode {
         Ok(action(&stored))
     }
 
+    #[cfg(test)]
     pub fn load_existing_live_object(
         &self,
         bucket: &BucketName,
@@ -29,6 +30,7 @@ impl SharedStorageNode {
         )?)
     }
 
+    #[cfg(test)]
     pub fn payload_reclaim_exists(
         &self,
         bucket: &BucketName,
@@ -44,7 +46,7 @@ impl SharedStorageNode {
         )?)
     }
 
-    pub(super) fn load_existing_live_object_from_object_pg(
+    pub(crate) fn load_existing_live_object_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -57,6 +59,7 @@ impl SharedStorageNode {
         }
     }
 
+    #[cfg(test)]
     pub fn load_object_read_auth_subject(
         &self,
         bucket: &BucketName,
@@ -80,6 +83,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn load_object_read_snapshot_for_subject(
         &self,
         bucket: &BucketName,
@@ -120,6 +124,7 @@ impl SharedStorageNode {
         Self::snapshot_object_read_from_pg(pg, bucket, key, &stored, snapshot_mode)
     }
 
+    #[cfg(test)]
     pub fn load_object_read_snapshot_if<T, E>(
         &self,
         bucket: &BucketName,

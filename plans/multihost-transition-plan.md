@@ -5058,6 +5058,14 @@ Progress:
   authorization and object ACL reads through the local node client's stored-row
   subject load, and made the old `SharedStorageNode::load_object_if` test-only
   so production cannot bypass the boundary for that read shape.
+- Made the remaining old `SharedStorageNode` object-read convenience wrappers
+  for live-object lookup, payload-reclaim existence, subject/snapshot loading,
+  and callback-shaped read snapshots test-only. Production object-read helpers
+  now have to use the `StorageNodeClient` operation-shaped methods instead of
+  node-local bypasses.
+- Extended the object-read boundary guardrail so production cluster code cannot
+  call the internal `SharedStorageNode::*_from_object_pg` object-read helpers
+  directly; those helpers are reserved for node/node-client implementation code.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
