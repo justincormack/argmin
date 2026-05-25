@@ -1820,47 +1820,50 @@ impl super::StorageCluster {
 
         let source_pg_id = self.bucket_metadata_pg_id(source.0);
         let destination_pg_id = self.bucket_metadata_pg_id(destination.0);
-        if source_pg_id == destination_pg_id {
-            let bucket_pg = self.metadata_pg(source_pg_id)?;
-            return Ok(BucketSnapshotPair::Distinct {
-                source: Box::new(crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket_pg, source.0, source.1,
-                )?),
-                destination: Box::new(crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket_pg,
-                    destination.0,
-                    destination.1,
-                )?),
-            });
+        let source_pg_id = PgId::new(source_pg_id);
+        let destination_pg_id = PgId::new(destination_pg_id);
+        let source_node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), source_pg_id)?;
+        let destination_node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), destination_pg_id)?;
+        if source_node.node_id() == destination_node.node_id() {
+            return source_node.storage_client().load_bucket_snapshot_pair(
+                source_pg_id,
+                source,
+                destination_pg_id,
+                destination,
+            );
         }
 
-        let (source_snapshot, destination_snapshot) = if source_pg_id < destination_pg_id {
-            let source_pg = self.metadata_pg(source_pg_id)?;
-            let destination_pg = self.metadata_pg(destination_pg_id)?;
-            (
-                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &source_pg, source.0, source.1,
-                )?,
-                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &destination_pg,
+        let (source_snapshot, destination_snapshot) =
+            if source_pg_id.get() < destination_pg_id.get() {
+                (
+                    source_node.storage_client().load_bucket_snapshot(
+                        source_pg_id,
+                        source.0,
+                        source.1,
+                    )?,
+                    destination_node.storage_client().load_bucket_snapshot(
+                        destination_pg_id,
+                        destination.0,
+                        destination.1,
+                    )?,
+                )
+            } else {
+                let destination_snapshot = destination_node.storage_client().load_bucket_snapshot(
+                    destination_pg_id,
                     destination.0,
                     destination.1,
-                )?,
-            )
-        } else {
-            let destination_pg = self.metadata_pg(destination_pg_id)?;
-            let source_pg = self.metadata_pg(source_pg_id)?;
-            (
-                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &source_pg, source.0, source.1,
-                )?,
-                crate::SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &destination_pg,
-                    destination.0,
-                    destination.1,
-                )?,
-            )
-        };
+                )?;
+                let source_snapshot = source_node.storage_client().load_bucket_snapshot(
+                    source_pg_id,
+                    source.0,
+                    source.1,
+                )?;
+                (source_snapshot, destination_snapshot)
+            };
 
         Ok(BucketSnapshotPair::Distinct {
             source: Box::new(source_snapshot),
@@ -7183,8 +7186,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_multipart_upload(bucket, key, upload_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_multipart_upload(pg_id, bucket, key, upload_id)
     }
 
     pub fn begin_upload_part_stream_session<T, E>(
@@ -7513,8 +7519,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_in_progress_multipart_upload(bucket, key, upload_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -7534,8 +7543,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_in_progress_multipart_upload_for_listing(bucket, key, upload_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_in_progress_multipart_upload_for_listing(pg_id, bucket, key, upload_id)
     }
 
     pub fn load_multipart_completion_snapshot(
@@ -7543,22 +7555,26 @@ impl super::StorageCluster {
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        self.object_metadata_primary_node(
-            &authorized_upload.record().bucket,
-            &authorized_upload.record().key,
-        )?
-        .load_multipart_completion_snapshot(authorized_upload, requested_part_numbers)
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_multipart_completion_snapshot(pg_id, authorized_upload, requested_part_numbers)
     }
 
     pub fn load_multipart_completion_preflight(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        self.object_metadata_primary_node(
-            &authorized_upload.record().bucket,
-            &authorized_upload.record().key,
-        )?
-        .load_multipart_completion_preflight(authorized_upload)
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .load_multipart_completion_preflight(pg_id, authorized_upload)
     }
 
     fn complete_multipart_outcome_from_command(
@@ -8704,15 +8720,18 @@ impl super::StorageCluster {
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
-        self.object_metadata_primary_node(
-            &authorized_upload.record().bucket,
-            &authorized_upload.record().key,
-        )?
-        .list_multipart_parts_for_authorized_upload(
-            authorized_upload,
-            part_number_marker,
-            max_parts,
-        )
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .list_multipart_parts_for_authorized_upload(
+                pg_id,
+                authorized_upload,
+                part_number_marker,
+                max_parts,
+            )
     }
 
     pub fn lookup_multipart_upload_management(
@@ -8721,8 +8740,11 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .lookup_multipart_upload_management(bucket, key, upload_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .lookup_multipart_upload_management(pg_id, bucket, key, upload_id)
     }
 
     pub fn abort_multipart_upload(

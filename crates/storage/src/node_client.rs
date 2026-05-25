@@ -12,14 +12,70 @@ use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo,
-    BucketName, BucketSnapshot, BucketSnapshotRequest, BucketState, BucketSubresourceKind,
+    AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
+    BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
     BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId,
-    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey,
+    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq,
+    ListedMultipartParts, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, PayloadReclaimRoot,
-    PgId, ShardKey, StoredObject, WriteAck,
+    PgId, ShardKey, StoredObject, UploadId, UploadState, WriteAck,
 };
+
+fn merge_bucket_snapshot_pair_request(
+    source: BucketSnapshotRequest,
+    destination: BucketSnapshotRequest,
+) -> BucketSnapshotRequest {
+    BucketSnapshotRequest {
+        policy: source.policy || destination.policy,
+        tags: match (source.tags, destination.tags) {
+            (BucketSnapshotTagsRequest::Always, _) | (_, BucketSnapshotTagsRequest::Always) => {
+                BucketSnapshotTagsRequest::Always
+            }
+            (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
+            | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
+                BucketSnapshotTagsRequest::IfBucketAbacEnabled
+            }
+            (BucketSnapshotTagsRequest::NotRequested, BucketSnapshotTagsRequest::NotRequested) => {
+                BucketSnapshotTagsRequest::NotRequested
+            }
+        },
+        lifecycle: source.lifecycle || destination.lifecycle,
+        cors: source.cors || destination.cors,
+    }
+}
+
+fn load_multipart_upload_from_pg(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    upload_id: &UploadId,
+) -> Result<MultipartUploadRecord, MetadataError> {
+    let upload = pg.get_multipart_upload(upload_id)?;
+    if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
+        return Err(MetadataError::NoSuchUpload {
+            upload_id: upload_id.to_string(),
+        });
+    }
+    Ok(upload)
+}
+
+fn load_in_progress_multipart_upload_from_pg(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    upload_id: &UploadId,
+) -> Result<MultipartUploadRecord, MetadataError> {
+    let upload = load_multipart_upload_from_pg(pg, bucket, key, upload_id)?;
+    if upload.state != UploadState::InProgress {
+        return Err(MetadataError::NoSuchUpload {
+            upload_id: upload_id.to_string(),
+        });
+    }
+    Ok(upload)
+}
 
 pub(crate) trait StorageNodeClient: Send + Sync {
     fn node_id(&self) -> NodeId;
@@ -213,6 +269,14 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
 
+    fn load_bucket_snapshot_pair(
+        &self,
+        source_pg_id: PgId,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination_pg_id: PgId,
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
+
     fn head_bucket_raw(
         &self,
         pg_id: PgId,
@@ -302,6 +366,59 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         key: &ObjectKey,
         version_id: Option<s3_types::VersionId>,
     ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
+
+    fn load_multipart_upload(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError>;
+
+    fn load_in_progress_multipart_upload(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError>;
+
+    fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError>;
+
+    fn load_multipart_completion_snapshot(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError>;
+
+    fn load_multipart_completion_preflight(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError>;
+
+    fn list_multipart_parts_for_authorized_upload(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError>;
+
+    fn lookup_multipart_upload_management(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError>;
 
     fn payload_reclaim_exists(
         &self,
@@ -870,6 +987,53 @@ impl StorageNodeClient for LocalStorageNodeClient {
         SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)
     }
 
+    fn load_bucket_snapshot_pair(
+        &self,
+        source_pg_id: PgId,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination_pg_id: PgId,
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
+        if source.0 == destination.0 {
+            let merged_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
+            let pg = self.storage_node.get_pg(source_pg_id.get())?;
+            let bucket =
+                SharedStorageNode::load_bucket_snapshot_from_pg(&pg, source.0, merged_request)?;
+            return Ok(BucketSnapshotPair::Same {
+                bucket: Box::new(bucket),
+            });
+        }
+
+        let guards = self
+            .storage_node
+            .lock_bucket_pair_pgs(source_pg_id.get(), destination_pg_id.get())?;
+        match guards {
+            crate::node::BucketPairPgGuards::Same { bucket } => Ok(BucketSnapshotPair::Distinct {
+                source: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket, source.0, source.1,
+                )?),
+                destination: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &bucket,
+                    destination.0,
+                    destination.1,
+                )?),
+            }),
+            crate::node::BucketPairPgGuards::Distinct {
+                source: source_pg,
+                destination: destination_pg,
+            } => Ok(BucketSnapshotPair::Distinct {
+                source: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &source_pg, source.0, source.1,
+                )?),
+                destination: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+                    &destination_pg,
+                    destination.0,
+                    destination.1,
+                )?),
+            }),
+        }
+    }
+
     fn head_bucket_raw(
         &self,
         pg_id: PgId,
@@ -1018,6 +1182,153 @@ impl StorageNodeClient for LocalStorageNodeClient {
         SharedStorageNode::load_object_retention_read_subject_from_object_pg(
             &pg, bucket, key, version_id,
         )
+    }
+
+    fn load_multipart_upload(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(load_multipart_upload_from_pg(&pg, bucket, key, upload_id)?)
+    }
+
+    fn load_in_progress_multipart_upload(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(load_in_progress_multipart_upload_from_pg(
+            &pg, bucket, key, upload_id,
+        )?)
+    }
+
+    fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
+    }
+
+    fn load_multipart_completion_snapshot(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let upload_id = &authorized_upload.record().upload_id;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let upload = load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
+        if upload != *authorized_upload.record() {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        let existing_etag = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        let mut part_records = Vec::with_capacity(requested_part_numbers.len());
+        for &part_number in requested_part_numbers {
+            part_records.push(pg.get_multipart_part(upload_id, part_number)?);
+        }
+        Ok(MultipartCompletionSnapshot {
+            existing_etag,
+            part_records,
+        })
+    }
+
+    fn load_multipart_completion_preflight(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let upload_id = &authorized_upload.record().upload_id;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let upload = load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
+        if upload != *authorized_upload.record() {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        let existing_etag = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+            Err(MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        Ok(MultipartCompletionPreflight { existing_etag })
+    }
+
+    fn list_multipart_parts_for_authorized_upload(
+        &self,
+        pg_id: PgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        let bucket = &authorized_upload.record().bucket;
+        let key = &authorized_upload.record().key;
+        let upload_id = &authorized_upload.record().upload_id;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let upload = load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
+        if upload != *authorized_upload.record() {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        let response = pg.list_multipart_parts(&ListPartsReq {
+            upload_id: upload_id.clone(),
+            part_number_marker,
+            max_parts,
+        })?;
+        Ok(ListedMultipartParts { upload, response })
+    }
+
+    fn lookup_multipart_upload_management(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match load_multipart_upload_from_pg(&pg, bucket, key, upload_id) {
+            Ok(upload) if upload.state == UploadState::InProgress => {
+                return Ok(MultipartUploadManagementLookup::InProgress(Box::new(
+                    upload,
+                )));
+            }
+            Ok(upload) => {
+                return Ok(MultipartUploadManagementLookup::NonInProgress(Box::new(
+                    upload,
+                )));
+            }
+            Err(MetadataError::NoSuchUpload { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if let Some(completed) = pg.get_completed_multipart_upload(upload_id)? {
+            if completed.bucket == *bucket && completed.key == *key {
+                return Ok(MultipartUploadManagementLookup::Completed(completed));
+            }
+        }
+        Ok(MultipartUploadManagementLookup::Missing)
     }
 
     fn payload_reclaim_exists(

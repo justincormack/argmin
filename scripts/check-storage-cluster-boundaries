@@ -26,6 +26,35 @@ fail_with_matches() {
 
 echo "Storage cluster boundary checks"
 
+public_node_read_boundary_bypasses=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*#\[/ {
+        next
+    }
+    /^[[:space:]]*pub fn (load_bucket_snapshot_pair|load_multipart_upload|load_in_progress_multipart_upload|load_multipart_completion_snapshot|load_multipart_completion_preflight|load_in_progress_multipart_upload_for_listing|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management)\(/ {
+        if (!pending_test_cfg) {
+            print FILENAME ":" FNR ":" $0
+        }
+        pending_test_cfg = 0
+        next
+    }
+    $0 !~ /^[[:space:]]*$/ {
+        pending_test_cfg = 0
+    }
+    ' crates/storage/src/node/bucket_ops.rs \
+      crates/storage/src/node/multipart_ops.rs
+)
+fail_with_matches \
+    "SharedStorageNode read convenience wrappers must stay cfg(test); production cluster code must use StorageNodeClient" \
+    "$public_node_read_boundary_bypasses"
+
 unexpected_single_node=$(
     awk '
     function update_function_context() {
@@ -361,9 +390,6 @@ migrated_bucket_snapshot_read_bypasses=$(
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /SharedStorageNode::load_bucket_snapshot_from_pg\(/) {
-            if (current_fn == "load_bucket_snapshot_pair") {
-                next
-            }
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /\.load_bucket_snapshot\(/) {
@@ -583,6 +609,13 @@ migrated_simple_object_read_bypasses=$(
                 next
             }
             if ($0 ~ /cluster\.payload_reclaim_exists\(/ || $0 ~ /self\.payload_reclaim_exists\(/) {
+                next
+            }
+            print FILENAME ":" FNR ":" $0
+        }
+        if ($0 ~ /\.(load_multipart_upload|load_in_progress_multipart_upload|load_in_progress_multipart_upload_for_listing|load_multipart_completion_snapshot|load_multipart_completion_preflight|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management)\(/) {
+            if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
+                pending_storage_client = 0
                 next
             }
             print FILENAME ":" FNR ":" $0

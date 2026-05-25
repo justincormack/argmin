@@ -329,6 +329,7 @@ impl SharedStorageNode {
         }
     }
 
+    #[cfg(test)]
     pub fn load_bucket_snapshot_pair(
         &self,
         source: (&BucketName, BucketSnapshotRequest),

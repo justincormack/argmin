@@ -40,6 +40,19 @@ fn setup_direct_coordinator_with_storage_cluster(
     .unwrap()
 }
 
+fn delete_bucket_metadata_or_accept_reclaim_worker_finalize(
+    storage_cluster: &StorageCluster,
+    bucket: &BucketName,
+) {
+    match storage_cluster.test_delete_bucket_metadata(bucket) {
+        Ok(()) => {}
+        Err(storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
+            ..
+        })) => {}
+        Err(err) => panic!("failed to delete test bucket metadata: {err:?}"),
+    }
+}
+
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
     let lock = Mutex::new(vec![1usize]);
@@ -3507,9 +3520,7 @@ fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
     );
 
     storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
-    storage_cluster
-        .test_delete_bucket_metadata(&bucket_name)
-        .unwrap();
+    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
     storage_cluster
         .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
@@ -3831,9 +3842,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
     );
 
     storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
-    storage_cluster
-        .test_delete_bucket_metadata(&bucket_name)
-        .unwrap();
+    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
     storage_cluster
         .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
@@ -3939,9 +3948,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     );
 
     storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
-    storage_cluster
-        .test_delete_bucket_metadata(&bucket_name)
-        .unwrap();
+    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
 
     let start = std::time::Instant::now();
     while reader.get_bucket_fast_path(&bucket_name).is_some() {

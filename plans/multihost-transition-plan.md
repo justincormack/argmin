@@ -5022,11 +5022,9 @@ Progress:
   through the local node client. Added a guardrail so those production
   single-bucket snapshot and fast-path reads cannot return to direct
   `SharedStorageNode` helpers from cluster code.
-- Left `StorageCluster::load_bucket_snapshot_pair` as the only explicit raw
-  `load_bucket_snapshot_from_pg` inventory exception because it currently
-  preserves ordered multi-PG locking for pair snapshots. The boundary guardrail
-  now allows only that function; migrating pair snapshots needs a pair-shaped
-  client/RPC model rather than accidentally weakening the lock ordering.
+- Removed the earlier `StorageCluster::load_bucket_snapshot_pair` raw
+  `load_bucket_snapshot_from_pg` inventory exception after adding the
+  pair-shaped node-client operation for ordered same-node pair snapshots.
 - Migrated lifecycle sweep bucket discovery for lifecycle-config buckets and
   aborting multipart upload buckets through the local node client, and extended
   the background-worker guardrail so production cluster code cannot call the raw
@@ -5052,8 +5050,8 @@ Progress:
   operation-shaped node-client methods. Tag reads use the same auth-subject plus
   identity-validated reload model as object read snapshots so the returned tag
   row cannot drift from the authorized object row. Remaining callback-shaped
-  object reads are command-construction helpers and bucket pair snapshots that
-  still need operation-specific build/snapshot APIs.
+  object reads are command-construction helpers that still need
+  operation-specific build/snapshot APIs.
 - Migrated the generic object auth/read callback wrapper used by delete
   authorization and object ACL reads through the local node client's stored-row
   subject load, and made the old `SharedStorageNode::load_object_if` test-only
@@ -5066,6 +5064,20 @@ Progress:
 - Extended the object-read boundary guardrail so production cluster code cannot
   call the internal `SharedStorageNode::*_from_object_pg` object-read helpers
   directly; those helpers are reserved for node/node-client implementation code.
+- Migrated bucket pair snapshot loading through a pair-shaped node-client
+  operation. Same-node pairs keep the local adapter's ordered dual-PG lock, and
+  cross-node pairs load through the routed storage clients without exposing raw
+  `PgStore` guards to `StorageCluster`. The boundary guardrail no longer
+  permits direct `SharedStorageNode::load_bucket_snapshot_from_pg` calls from
+  production cluster code.
+- Migrated operation-shaped multipart upload read helpers through the local
+  node client: upload lookup, in-progress upload lookup/listing, completion
+  preflight/snapshot, part listing, and management lookup. Added a guardrail so
+  production cluster code cannot call those `SharedStorageNode` multipart read
+  helpers directly.
+- Made the old `SharedStorageNode` bucket-pair and multipart-read convenience
+  wrappers test-only, and added a guardrail so those bypass surfaces cannot
+  become public production APIs again.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

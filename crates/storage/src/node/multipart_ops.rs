@@ -31,6 +31,7 @@ impl SharedStorageNode {
         Ok(upload)
     }
 
+    #[cfg(test)]
     pub fn load_multipart_upload(
         &self,
         bucket: &BucketName,
@@ -43,6 +44,7 @@ impl SharedStorageNode {
         )?)
     }
 
+    #[cfg(test)]
     pub fn load_in_progress_multipart_upload(
         &self,
         bucket: &BucketName,
@@ -77,6 +79,7 @@ impl SharedStorageNode {
         ))
     }
 
+    #[cfg(test)]
     pub fn load_multipart_completion_snapshot(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
@@ -109,6 +112,7 @@ impl SharedStorageNode {
         })
     }
 
+    #[cfg(test)]
     pub fn load_multipart_completion_preflight(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
@@ -133,6 +137,7 @@ impl SharedStorageNode {
         Ok(MultipartCompletionPreflight { existing_etag })
     }
 
+    #[cfg(test)]
     pub fn load_in_progress_multipart_upload_for_listing(
         &self,
         bucket: &BucketName,
@@ -145,6 +150,7 @@ impl SharedStorageNode {
         )?)
     }
 
+    #[cfg(test)]
     pub fn list_multipart_parts_for_authorized_upload(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
@@ -171,6 +177,7 @@ impl SharedStorageNode {
         Ok(ListedMultipartParts { upload, response })
     }
 
+    #[cfg(test)]
     pub fn lookup_multipart_upload_management(
         &self,
         bucket: &BucketName,
