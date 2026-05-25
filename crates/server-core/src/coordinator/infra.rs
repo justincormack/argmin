@@ -63,6 +63,11 @@ impl Coordinator {
                     ServerError::InvalidRequest { reason }
                 }
                 storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+                storage::ObjectPgActionError::StaleObjectReadSubject => {
+                    ServerError::InternalError {
+                        reason: "stale object read subject escaped storage retry loop".to_string(),
+                    }
+                }
             })?;
 
         Ok(session_id)

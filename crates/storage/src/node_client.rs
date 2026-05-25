@@ -16,8 +16,9 @@ use crate::types::{
     BucketName, BucketSnapshot, BucketSnapshotRequest, BucketState, BucketSubresourceKind,
     BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId,
     LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ObjectKey,
-    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, PayloadReclaimRoot, PgId, ShardKey,
-    StoredObject, WriteAck,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, PayloadReclaimRoot,
+    PgId, ShardKey, StoredObject, WriteAck,
 };
 
 pub(crate) trait StorageNodeClient: Send + Sync {
@@ -249,6 +250,24 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+
+    fn load_object_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
 
     fn payload_reclaim_exists(
         &self,
@@ -875,6 +894,39 @@ impl StorageNodeClient for LocalStorageNodeClient {
             Ok(StoredObject::DeleteMarker(_)) | Err(MetadataError::ObjectNotFound) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn load_object_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_read_auth_subject_from_object_pg(
+            &pg, bucket, key, version_id,
+        )
+    }
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_read_snapshot_for_subject_from_object_pg(
+            &pg,
+            bucket,
+            key,
+            version_id,
+            expected_identity,
+            snapshot_mode,
+        )
     }
 
     fn payload_reclaim_exists(

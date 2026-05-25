@@ -2888,6 +2888,29 @@ pub struct ObjectReadSnapshot {
     pub multipart_part_segments: Vec<MultipartPartSegmentRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectReadAuthSubject {
+    pub stored: StoredObject,
+    pub identity: ObjectReadAuthSubjectIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectReadAuthSubjectIdentity {
+    stored: StoredObject,
+}
+
+impl ObjectReadAuthSubjectIdentity {
+    pub fn for_stored(stored: &StoredObject) -> Self {
+        Self {
+            stored: stored.clone(),
+        }
+    }
+
+    pub fn matches_stored(&self, stored: &StoredObject) -> bool {
+        &self.stored == stored
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectReadSnapshotMode {
     MetadataOnly,

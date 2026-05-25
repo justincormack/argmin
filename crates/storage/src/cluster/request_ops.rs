@@ -33,6 +33,7 @@ const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
+const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
@@ -3797,10 +3798,41 @@ impl super::StorageCluster {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         snapshot_mode: ObjectReadSnapshotMode,
-        action: impl FnOnce(&StoredObject) -> Result<T, E>,
+        mut action: impl FnMut(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_object_read_snapshot_if(bucket, key, version_id, snapshot_mode, action)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let storage_client = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client();
+
+        for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
+            let subject =
+                storage_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            let value = match action(&subject.stored) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            match storage_client.load_object_read_snapshot_for_subject(
+                pg_id,
+                bucket,
+                key,
+                version_id,
+                &subject.identity,
+                snapshot_mode,
+            ) {
+                Ok(snapshot) => return Ok(Ok(ObjectReadSnapshotOutcome { value, snapshot })),
+                Err(ObjectPgActionError::StaleObjectReadSubject) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ObjectPgActionError::Store(StoreError::Io {
+            context: "load object read snapshot stale retry limit exceeded",
+            source: std::io::Error::other(
+                "object changed repeatedly while loading authorized read snapshot",
+            ),
+        }))
     }
 
     pub fn payload_reclaim_exists(

@@ -597,6 +597,12 @@ impl Coordinator {
                             ServerError::InvalidRequest { reason }
                         }
                         storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+                        storage::ObjectPgActionError::StaleObjectReadSubject => {
+                            ServerError::InternalError {
+                                reason: "stale object read subject escaped storage retry loop"
+                                    .to_string(),
+                            }
+                        }
                     })??;
                 let lifecycle_expiration = self
                     .current_object_write_lifecycle_expiration_for_loaded_bucket(

@@ -5042,10 +5042,14 @@ Progress:
   guardrail so production cluster code cannot call the migrated active
   bucket/subresource/list PG reads directly.
 - Migrated simple object metadata helper reads for existing-live-object lookup
-  and payload-reclaim existence checks through the local node client. Callback
-  shaped object read snapshots, tag reads, and object-lock reads remain deferred
-  until they have operation-specific RPC shapes that preserve auth-before-extra-IO
-  semantics.
+  and payload-reclaim existence checks through the local node client.
+- Migrated object read snapshot loading to a two-step node-client protocol:
+  storage returns an exact stored-object auth subject, the coordinator authorizes
+  locally, then storage reloads the object and returns the snapshot only if the
+  subject identity still matches. A stale subject is retried by the cluster
+  wrapper so a read cannot authorize one object row and snapshot another.
+  Callback-shaped tag reads and object-lock reads remain deferred until they
+  have operation-specific RPC shapes.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

@@ -593,4 +593,6 @@ pub enum ObjectPgActionError {
     Metadata(#[from] MetadataError),
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
+    #[error("object read subject changed before snapshot load")]
+    StaleObjectReadSubject,
 }

@@ -105,6 +105,9 @@ impl Coordinator {
             storage::ObjectPgActionError::InvalidRequest { reason } => {
                 ServerError::InvalidRequest { reason }
             }
+            storage::ObjectPgActionError::StaleObjectReadSubject => ServerError::InternalError {
+                reason: "stale object read subject escaped storage retry loop".to_string(),
+            },
         })
     }
 

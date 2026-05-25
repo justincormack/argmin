@@ -574,9 +574,12 @@ migrated_simple_object_read_bypasses=$(
         if ($0 ~ /\.storage_client\(\)/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(load_existing_live_object|payload_reclaim_exists)\(/) {
+        if ($0 ~ /\.(load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|payload_reclaim_exists)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
+                next
+            }
+            if ($0 ~ /cluster\.load_object_read_snapshot_if\(/ || $0 ~ /self\.load_object_read_snapshot_if\(/) {
                 next
             }
             if ($0 ~ /cluster\.payload_reclaim_exists\(/ || $0 ~ /self\.payload_reclaim_exists\(/) {

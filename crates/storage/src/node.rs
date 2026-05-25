@@ -31,8 +31,9 @@ use crate::types::{
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketSubresourceKind, EcShape, GenerationId,
     ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartCompletionPreflight,
     MultipartCompletionSnapshot, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
-    ObjectReadSnapshot, ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
+    ObjectReadSnapshotOutcome, SessionId, ShardKey, StoredObject, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 #[cfg(test)]
 use crate::types::{BucketState, ListObjectVersionsReq};
@@ -1651,6 +1652,46 @@ mod tests {
         BucketName::try_from(name).unwrap()
     }
 
+    fn object_key(key: &str) -> ObjectKey {
+        ObjectKey::try_from(key.to_string()).unwrap()
+    }
+
+    fn put_standard_object_for_snapshot_test(
+        node: &SharedStorageNode,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        size: u64,
+    ) -> StoredObject {
+        let object_pg = node
+            .get_pg(node.pg_topology().object_pg_for(bucket, key))
+            .unwrap();
+        object_pg
+            .put_object_with_segments(
+                &PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id,
+                    size,
+                    etag: crate::ObjectEtag::single_part(size),
+                    ec: SharedStorageNode::DEFAULT_EC_SHAPE,
+                    layout: crate::ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                },
+                &[],
+            )
+            .unwrap();
+        object_pg.get_object_meta(bucket, key).unwrap()
+    }
+
     #[test]
     fn data_dir_accessor() {
         let tmp = test_util::tempdir();
@@ -1872,6 +1913,82 @@ mod tests {
             snapshot.tags,
             crate::types::LoadedBucketSubresource::NotRequested
         ));
+    }
+
+    #[test]
+    fn object_read_snapshot_subject_rejects_changed_object_row() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let key = object_key("key");
+        let original =
+            put_standard_object_for_snapshot_test(&node, &bucket, &key, GenerationId::MIN, 1);
+        let subject = node
+            .load_object_read_auth_subject(&bucket, &key, None)
+            .unwrap();
+        assert_eq!(subject.stored, original);
+
+        put_standard_object_for_snapshot_test(
+            &node,
+            &bucket,
+            &key,
+            GenerationId::new(2).unwrap(),
+            2,
+        );
+
+        let err = node
+            .load_object_read_snapshot_for_subject(
+                &bucket,
+                &key,
+                None,
+                &subject.identity,
+                crate::ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ObjectPgActionError::StaleObjectReadSubject));
+
+        let fresh_subject = node
+            .load_object_read_auth_subject(&bucket, &key, None)
+            .unwrap();
+        let snapshot = node
+            .load_object_read_snapshot_for_subject(
+                &bucket,
+                &key,
+                None,
+                &fresh_subject.identity,
+                crate::ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .unwrap();
+        assert_eq!(snapshot.stored, fresh_subject.stored);
+    }
+
+    #[test]
+    fn object_read_snapshot_subject_treats_missing_object_as_stale() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let key = object_key("key");
+        put_standard_object_for_snapshot_test(&node, &bucket, &key, GenerationId::MIN, 1);
+        let subject = node
+            .load_object_read_auth_subject(&bucket, &key, None)
+            .unwrap();
+
+        let object_pg = node
+            .get_pg(node.pg_topology().object_pg_for(&bucket, &key))
+            .unwrap();
+        object_pg.delete_object_meta(&bucket, &key).unwrap();
+        drop(object_pg);
+
+        let err = node
+            .load_object_read_snapshot_for_subject(
+                &bucket,
+                &key,
+                None,
+                &subject.identity,
+                crate::ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ObjectPgActionError::StaleObjectReadSubject));
     }
 
     #[test]

@@ -56,6 +56,69 @@ impl SharedStorageNode {
         }
     }
 
+    pub fn load_object_read_auth_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Self::load_object_read_auth_subject_from_object_pg(&pg, bucket, key, version_id)
+    }
+
+    pub(crate) fn load_object_read_auth_subject_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let stored = Self::load_stored_object_from_object_pg(pg, bucket, key, version_id)?;
+        Ok(ObjectReadAuthSubject {
+            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
+            stored,
+        })
+    }
+
+    pub fn load_object_read_snapshot_for_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Self::load_object_read_snapshot_for_subject_from_object_pg(
+            &pg,
+            bucket,
+            key,
+            version_id,
+            expected_identity,
+            snapshot_mode,
+        )
+    }
+
+    pub(crate) fn load_object_read_snapshot_for_subject_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
+        let stored = match Self::load_stored_object_from_object_pg(pg, bucket, key, version_id) {
+            Ok(stored) => stored,
+            Err(ObjectPgActionError::Metadata(crate::error::MetadataError::ObjectNotFound)) => {
+                return Err(ObjectPgActionError::StaleObjectReadSubject);
+            }
+            Err(error) => return Err(error),
+        };
+        if !expected_identity.matches_stored(&stored) {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        Self::snapshot_object_read_from_pg(pg, bucket, key, &stored, snapshot_mode)
+    }
+
     pub fn load_object_read_snapshot_if<T, E>(
         &self,
         bucket: &BucketName,
@@ -65,10 +128,7 @@ impl SharedStorageNode {
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
         let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let stored = match version_id {
-            Some(version_id) => PgMetadataStore::get_object_version(&*pg, bucket, key, version_id)?,
-            None => PgMetadataStore::get_object_meta(&*pg, bucket, key)?,
-        };
+        let stored = Self::load_stored_object_from_object_pg(&pg, bucket, key, version_id)?;
         let result = match action(&stored) {
             Ok(value) => Ok(ObjectReadSnapshotOutcome {
                 value,
@@ -83,6 +143,18 @@ impl SharedStorageNode {
             Err(error) => Err(error),
         };
         Ok(result)
+    }
+
+    fn load_stored_object_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        Ok(match version_id {
+            Some(version_id) => PgMetadataStore::get_object_version(pg, bucket, key, version_id)?,
+            None => PgMetadataStore::get_object_meta(pg, bucket, key)?,
+        })
     }
 
     fn snapshot_object_read_from_pg(
