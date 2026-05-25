@@ -5086,6 +5086,11 @@ Progress:
   reserve-version/create-generation command construction through the local node
   client, and added a guardrail so production cluster code cannot call the raw
   allocation helpers directly.
+- Migrated the existing object-generation reservation lookup in
+  `reserve_put_object_generation` through the local node client, so that
+  reserve-generation command construction no longer opens the object PG to check
+  or allocate the reservation. Added a focused guardrail for that migrated
+  reserve-generation lookup.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

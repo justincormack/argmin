@@ -2115,18 +2115,16 @@ impl StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            match PgMetadataStore::get_object_generation_reservation(
-                &*object_pg,
-                bucket,
-                key,
-                reservation_id,
-            ) {
+            match self
+                .object_metadata_primary_client(bucket, key)?
+                .object_generation_reservation(pg_id, bucket, key, reservation_id)
+            {
                 Ok(generation_id) => return Ok(generation_id),
-                Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
-                Err(error) => return Err(error.into()),
+                Err(ObjectPgActionError::Metadata(
+                    MetadataError::ObjectGenerationReservationNotFound { .. },
+                )) => {}
+                Err(error) => return Err(error),
             }
-            drop(object_pg);
             let generation_id = self
                 .object_metadata_primary_client(bucket, key)?
                 .next_object_generation_id(pg_id, bucket, key)?;

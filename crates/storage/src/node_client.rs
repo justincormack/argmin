@@ -24,7 +24,7 @@ use crate::types::{
     MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, PayloadReclaimRoot,
-    PgId, ShardKey, StoredObject, UploadId, UploadState, WriteAck,
+    PgId, SessionId, ShardKey, StoredObject, UploadId, UploadState, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -537,6 +537,14 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError>;
+
+    fn object_generation_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError>;
 
     fn load_bucket_execution_generations(
@@ -1672,6 +1680,22 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<GenerationId, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::next_generation_id(&*pg, bucket, key)?)
+    }
+
+    fn object_generation_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_object_generation_reservation(
+            &*pg,
+            bucket,
+            key,
+            reservation_id,
+        )?)
     }
 
     fn load_bucket_execution_generations(
