@@ -6989,10 +6989,10 @@ impl super::StorageCluster {
                     })));
                 }
 
-                let object_generation_id = {
-                    let object_pg = primary_node.get_pg(pg_id.get())?;
-                    PgMetadataStore::next_generation_id(&*object_pg, bucket, key)?
-                };
+                let object_generation_id = self
+                    .object_metadata_primary_client(bucket, key)?
+                    .next_object_generation_id(pg_id, bucket, key)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                 let command_id = match self.next_object_metadata_command_id(pg_id) {
                     Ok(command_id) => command_id,
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {

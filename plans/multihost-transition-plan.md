@@ -5082,6 +5082,10 @@ Progress:
   allocate bucket execution generations for those migrated command-build paths,
   and the raw bucket-row guardrail no longer carries the former command-build
   exception.
+- Migrated object version-id and generation-id candidate allocation for
+  reserve-version/create-generation command construction through the local node
+  client, and added a guardrail so production cluster code cannot call the raw
+  allocation helpers directly.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

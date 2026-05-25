@@ -525,6 +525,20 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError>;
 
+    fn next_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<s3_types::VersionId, ObjectPgActionError>;
+
+    fn next_object_generation_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError>;
+
     fn load_bucket_execution_generations(
         &self,
         pg_id: PgId,
@@ -1638,6 +1652,26 @@ impl StorageNodeClient for LocalStorageNodeClient {
             key,
             generation_id,
         )?)
+    }
+
+    fn next_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<s3_types::VersionId, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::next_version_id(&*pg, bucket, key)?)
+    }
+
+    fn next_object_generation_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::next_generation_id(&*pg, bucket, key)?)
     }
 
     fn load_bucket_execution_generations(

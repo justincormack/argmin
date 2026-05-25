@@ -1625,6 +1625,16 @@ impl StorageCluster {
         Ok(node.storage_node().as_ref())
     }
 
+    fn metadata_pg_primary_client(
+        &self,
+        pg_id: PgId,
+    ) -> Result<&Arc<dyn StorageNodeClient>, StoreError> {
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        Ok(node.storage_client())
+    }
+
     fn bucket_metadata_pg_id(&self, bucket: &BucketName) -> u32 {
         self.metadata_primary_topology_node()
             .pg_topology()
@@ -1807,6 +1817,14 @@ impl StorageCluster {
         key: &ObjectKey,
     ) -> Result<&SharedStorageNode, StoreError> {
         self.metadata_pg_primary_node(self.object_metadata_pg_id(bucket, key))
+    }
+
+    fn object_metadata_primary_client(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<&Arc<dyn StorageNodeClient>, StoreError> {
+        self.metadata_pg_primary_client(PgId::new(self.object_metadata_pg_id(bucket, key)))
     }
 
     pub fn default_payload_ec_shape(&self) -> EcShape {
@@ -2108,8 +2126,10 @@ impl StorageCluster {
                 Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
-            let generation_id = object_pg.next_generation_id(bucket, key)?;
             drop(object_pg);
+            let generation_id = self
+                .object_metadata_primary_client(bucket, key)?
+                .next_object_generation_id(pg_id, bucket, key)?;
             let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
             else {
                 continue;
@@ -2260,8 +2280,9 @@ impl StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            let pg = node.storage_node().get_pg(pg_id.get())?;
-            let candidate = PgMetadataStore::next_version_id(&*pg, bucket, key)?;
+            let candidate = node
+                .storage_client()
+                .next_object_version_id(pg_id, bucket, key)?;
             if candidate.to_u64() > version_id.to_u64() {
                 version_id = candidate;
             }
