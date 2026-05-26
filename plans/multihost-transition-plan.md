@@ -5182,6 +5182,18 @@ Progress:
   returns the normal `InvalidPart` response rather than publishing stale
   payload. The guardrail blocks raw multipart completion object-PG reads and
   direct command construction in `complete_multipart_upload_commit_serialized`.
+- Migrated direct PUT commit command construction through the local node
+  client. The cluster still owns written-shard ack registration/validation,
+  command-stream version reservation, pending install, and apply behavior; the
+  storage-side builder now reloads the authorized direct-PUT commit snapshot
+  under the object-PG lock before computing stale payload reclaim, write
+  sequence, and metadata command id. If the current object changes between
+  precondition evaluation and command build, the coordinator reruns the normal
+  precondition callback boundedly using the shared client-facing stale-snapshot
+  retry budget, so conditional PUT does not publish a command based on stale
+  current-object state. The guardrail blocks raw direct-PUT
+  object-PG reads and direct `CommitDirectPutObject` construction in
+  `commit_direct_put_object_from_payload_shards`.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

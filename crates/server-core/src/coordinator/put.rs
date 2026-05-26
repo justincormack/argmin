@@ -603,6 +603,13 @@ impl Coordinator {
                                     .to_string(),
                             }
                         }
+                        storage::ObjectPgActionError::StaleDirectPutCommitSnapshot => {
+                            ServerError::InternalError {
+                                reason:
+                                    "stale direct PUT commit snapshot escaped storage retry loop"
+                                        .to_string(),
+                            }
+                        }
                         storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
                             ServerError::InternalError {
                                 reason: "stale stream finalize snapshot escaped storage retry loop"

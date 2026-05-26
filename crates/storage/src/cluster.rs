@@ -11,36 +11,48 @@ use local::LocalClusterRuntimeState;
 pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
+#[cfg(test)]
+use crate::metadata_command::CommitDirectPutObjectCommand;
 use crate::metadata_command::{
     AbortStreamUploadCommand, AppendStreamSegmentCommand, BucketWriteReservationProof,
-    CommitDirectPutObjectCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::node_client::{
-    BuildCreateStreamUploadCommandReq, CreateStreamUploadPrecondition, StorageNodeClient,
+    BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
+    CreateStreamUploadPrecondition, StorageNodeClient,
 };
-use crate::traits::{PgMetadataStore, ShardStore};
+#[cfg(test)]
+use crate::traits::PgMetadataStore;
+use crate::traits::ShardStore;
 use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PgId,
-    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
-    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PrepareStreamUploadSegmentAppendReq,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardScavengerPayloadReference, StoredObject, StreamUploadCommandRecord, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, VersionId, WriteAck,
     WrittenShardAck,
 };
-use crate::{BucketSnapshotLoadError, MetadataError, ObjectEtag, ObjectPgActionError};
+#[cfg(test)]
+use crate::types::{
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, PutLiveObjectReq,
+};
+#[cfg(test)]
+use crate::ObjectEtag;
+use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
 mod local;
 mod request_ops;
+
+const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +176,12 @@ fn object_pg_action_error_to_bucket_snapshot_error(
             BucketSnapshotLoadError::Store(StoreError::Io {
                 context: "object PG action failed during bucket snapshot operation",
                 source: std::io::Error::other("stale object read subject"),
+            })
+        }
+        ObjectPgActionError::StaleDirectPutCommitSnapshot => {
+            BucketSnapshotLoadError::Store(StoreError::Io {
+                context: "object PG action failed during bucket snapshot operation",
+                source: std::io::Error::other("stale direct PUT commit snapshot"),
             })
         }
         ObjectPgActionError::StaleStreamFinalizeSnapshot => {
@@ -1529,6 +1547,7 @@ impl StorageCluster {
         self.next_metadata_command_id_from_locked_pg_at_least(pg_id, &pg, min_log_index)
     }
 
+    #[cfg(test)]
     fn next_metadata_command_id_from_locked_pg(
         &self,
         pg_id: PgId,
@@ -2663,6 +2682,7 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
     fn next_object_metadata_command_id_from_locked_pg(
         &self,
         pg_id: PgId,
@@ -2995,8 +3015,16 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
+        let storage_client = match self.object_metadata_primary_client(&req.bucket, &req.key) {
+            Ok(client) => client,
+            Err(error) => {
+                cleanup_direct_put_attempt_before_command_ownership!();
+                return Err(error.into());
+            }
+        };
 
         let _bucket_guard = object_node.lock_bucket(&req.bucket);
+        let mut stale_commit_snapshot_retries = 0;
         let (command, new_pending_command) = loop {
             let (command, new_pending_command) = loop {
                 let Some(command) =
@@ -3009,34 +3037,28 @@ impl StorageCluster {
                         }
                     })
                 else {
-                    let object_pg = match object_node.get_pg(pg_id.get()) {
-                        Ok(object_pg) => object_pg,
-                        Err(error) => {
-                            drop(_bucket_guard);
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error.into());
-                        }
-                    };
-                    match self.validate_direct_put_commit_preconditions(
-                        &object_pg,
-                        req,
-                        &mut action,
+                    let snapshot = match storage_client.load_direct_put_commit_snapshot(
+                        pg_id,
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                        req.generation_id,
                     ) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            drop(object_pg);
-                            drop(_bucket_guard);
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Ok(Err(error));
-                        }
+                        Ok(snapshot) => snapshot,
                         Err(error) => {
-                            drop(object_pg);
                             drop(_bucket_guard);
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error);
                         }
+                    };
+                    match action(snapshot.auth_snapshot.clone()) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Ok(Err(error));
+                        }
                     }
-                    drop(object_pg);
 
                     let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
                         match self.reserve_next_object_version(
@@ -3055,27 +3077,27 @@ impl StorageCluster {
                     } else {
                         VersionId::Null
                     };
-                    let object_pg = match object_node.get_pg(pg_id.get()) {
-                        Ok(object_pg) => object_pg,
-                        Err(error) => {
-                            drop(_bucket_guard);
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error.into());
-                        }
-                    };
                     self.maybe_run_before_direct_put_command_id_hook();
-                    let command = match self.prepare_commit_direct_put_object_command(
-                        pg_id,
-                        &object_pg,
-                        req,
-                        version_id,
-                        effective_bucket_write_reservation.clone(),
+                    let command = match storage_client.build_direct_put_commit_command(
+                        BuildDirectPutCommitCommandReq {
+                            pg_id,
+                            cluster_epoch: self.operation_epoch(),
+                            request: req,
+                            version_id,
+                            expected_snapshot: &snapshot,
+                            bucket_write_reservation: &effective_bucket_write_reservation,
+                        },
                     ) {
                         Ok(command) => command,
+                        Err(ObjectPgActionError::StaleDirectPutCommitSnapshot)
+                            if stale_commit_snapshot_retries < DIRECT_PUT_STALE_COMMIT_RETRIES =>
+                        {
+                            stale_commit_snapshot_retries += 1;
+                            continue;
+                        }
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            drop(object_pg);
                             let cleanup = self.drain_pending_object_metadata_commands_for_bucket(
                                 pg_id,
                                 &req.bucket,
@@ -3088,13 +3110,11 @@ impl StorageCluster {
                             continue;
                         }
                         Err(error) => {
-                            drop(object_pg);
                             drop(_bucket_guard);
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error);
                         }
                     };
-                    drop(object_pg);
                     break (command, true);
                 };
 
@@ -3393,39 +3413,7 @@ impl StorageCluster {
         }
     }
 
-    fn validate_direct_put_commit_preconditions<E>(
-        &self,
-        object_pg: &crate::PgStore,
-        req: &CommitDirectPutObjectReq,
-        action: &mut impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
-    ) -> Result<Result<(), E>, ObjectPgActionError> {
-        let reserved_generation = object_pg.get_object_generation_reservation(
-            &req.bucket,
-            &req.key,
-            &req.generation_reservation_id,
-        )?;
-        if reserved_generation != req.generation_id {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: format!(
-                    "object generation reservation mismatch: reserved {} but commit requested {}",
-                    reserved_generation.get(),
-                    req.generation_id.get()
-                ),
-            });
-        }
-
-        let existing_etag = match PgMetadataStore::get_object_meta(object_pg, &req.bucket, &req.key)
-        {
-            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-            Err(MetadataError::ObjectNotFound) => None,
-            Err(other) => return Err(other.into()),
-        };
-        if let Err(error) = action(DirectPutCommitSnapshot { existing_etag }) {
-            return Ok(Err(error));
-        }
-        Ok(Ok(()))
-    }
-
+    #[cfg(test)]
     fn prepare_commit_direct_put_object_command(
         &self,
         pg_id: PgId,
@@ -3510,6 +3498,7 @@ impl StorageCluster {
         ))
     }
 
+    #[cfg(test)]
     fn snapshot_direct_put_stale_payload_command(
         &self,
         pg: &crate::PgStore,
@@ -3532,6 +3521,7 @@ impl StorageCluster {
         )?))
     }
 
+    #[cfg(test)]
     fn snapshot_live_object_payload_reclaim_command(
         pg: &crate::PgStore,
         bucket: &BucketName,
@@ -3593,6 +3583,7 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
     fn multipart_reclaim_from_parts(
         bucket: &BucketName,
         key: &ObjectKey,

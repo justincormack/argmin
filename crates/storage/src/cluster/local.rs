@@ -9151,6 +9151,131 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-put-stale-snapshot-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        create_test_bucket(&first_cluster, &bucket);
+
+        let loser_payload = b"loser direct put stale snapshot";
+        let loser_reservation_id =
+            crate::SessionId::try_from("41414141414141414141414141414141".to_string()).unwrap();
+        let loser_generation_id = first_cluster
+            .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
+            .unwrap();
+        let loser_written = first_cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                loser_generation_id,
+                0,
+                &[0xb1; 16],
+                loser_payload,
+            )
+            .unwrap();
+        let loser_req = direct_put_commit_req(
+            &first_cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: loser_reservation_id,
+                generation_id: loser_generation_id,
+                payload: loser_payload,
+                segment_okh: [0xb1; 16],
+                written: &loser_written,
+            },
+        );
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let action_calls = Arc::new(AtomicUsize::new(0));
+        let hook_map = Arc::clone(&first_map);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let hook_calls_for_closure = Arc::clone(&hook_calls);
+        let _hook_guard =
+            first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+                let call = hook_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                if call >= 2 {
+                    return;
+                }
+                let pg_id = PgId::new(2);
+                let primary = hook_map
+                    .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                    .unwrap();
+                let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                let generation_id = crate::GenerationId::new(10_000 + call as u64).unwrap();
+                let size = 100 + call as u64;
+                crate::PgMetadataStore::put_object_meta(
+                    &*pg,
+                    &crate::PutObjectReq::Live(crate::PutLiveObjectReq {
+                        bucket: hook_bucket.clone(),
+                        key: hook_key.clone(),
+                        version_id: crate::VersionId::Null,
+                        owner: crate::OwnerIdentity::from_principal("owner"),
+                        acl_grants: crate::AclGrants::default(),
+                        public_read: false,
+                        generation_id,
+                        size,
+                        etag: crate::ObjectEtag::single_part(10_000 + call as u64),
+                        ec: EcShape { k: 1, m: 0 },
+                        layout: crate::ObjectLayout::Standard,
+                        tags: None,
+                        metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                        system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                        object_lock: crate::ObjectLockState::default(),
+                        encryption: crate::ObjectEncryption::None,
+                    }),
+                )
+                .unwrap();
+                pg.refresh_metadata_command_state_digest().unwrap();
+            }));
+
+        let calls_for_action = Arc::clone(&action_calls);
+        let result = first_cluster
+            .commit_direct_put_object_from_payload_shards(
+                &loser_req,
+                &loser_written.written_shards,
+                move |snapshot| {
+                    calls_for_action.fetch_add(1, Ordering::SeqCst);
+                    if snapshot.existing_etag.is_some() {
+                        Err("object already exists")
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+        assert!(matches!(result, Err("object already exists")));
+        assert!(
+            hook_calls.load(Ordering::SeqCst) >= 1,
+            "test hook must publish competing same-key work before command build"
+        );
+        assert_eq!(super::super::DIRECT_PUT_STALE_COMMIT_RETRIES, 16);
+        assert!(
+            action_calls.load(Ordering::SeqCst) >= 2,
+            "direct PUT precondition must be rerun after storage-side snapshot staleness"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+
+        assert_bucket_write_reservations_released(&first_map, &bucket);
+    }
+
+    #[test]
     fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
         let _guard = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

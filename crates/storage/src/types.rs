@@ -2877,9 +2877,15 @@ pub struct BeginUploadPartStreamSessionReq {
     pub bucket_write_reservation: crate::BucketWriteReservationProof,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectPutCommitSnapshot {
     pub existing_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectPutCommitStorageSnapshot {
+    pub auth_snapshot: DirectPutCommitSnapshot,
+    pub current: Option<StoredObject>,
 }
 
 #[derive(Debug, Clone)]

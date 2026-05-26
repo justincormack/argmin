@@ -26,22 +26,23 @@ use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
     CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
-    CreateStreamUploadReq, DataPgId, EcShape, GenerationId, LifecycleSweepBuckets,
-    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq, ListedMultipartParts,
-    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
-    ShardKey, StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
-    StreamUploadCommandRecord, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
-    UploadId, UploadState, VersionId, WriteAck,
+    CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
+    EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
+    ListPartsReq, ListedMultipartParts, LiveObjectRecord, MultipartCompletionPreflight,
+    MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout,
+    ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
+    ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
+    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey, StoredObject,
+    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
+    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+    VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -245,6 +246,35 @@ fn load_stream_part_finalize_snapshot_from_pg(
         },
         existing_part,
         displaced_segments,
+    })
+}
+
+fn load_direct_put_commit_snapshot_from_pg(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    reservation_id: &SessionId,
+    generation_id: GenerationId,
+) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
+    let reserved_generation =
+        PgMetadataStore::get_object_generation_reservation(pg, bucket, key, reservation_id)?;
+    if reserved_generation != generation_id {
+        return Err(ObjectPgActionError::InvalidRequest {
+            reason: format!(
+                "object generation reservation mismatch: reserved {} but commit requested {}",
+                reserved_generation.get(),
+                generation_id.get()
+            ),
+        });
+    }
+
+    let current = load_current_object_optional_from_pg(pg, bucket, key)?;
+    let existing_etag = current
+        .as_ref()
+        .and_then(|stored| stored.as_live().map(|record| record.etag.format()));
+    Ok(DirectPutCommitStorageSnapshot {
+        auth_snapshot: DirectPutCommitSnapshot { existing_etag },
+        current,
     })
 }
 
@@ -527,6 +557,15 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
     pub(crate) total_size: u64,
     pub(crate) expected_snapshot: &'a StreamPutFinalizeStorageSnapshot,
     pub(crate) commit: &'a StreamPutCommitInput,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) struct BuildDirectPutCommitCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) request: &'a CommitDirectPutObjectReq,
+    pub(crate) version_id: VersionId,
+    pub(crate) expected_snapshot: &'a DirectPutCommitStorageSnapshot,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
@@ -1219,6 +1258,20 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
+
+    fn load_direct_put_commit_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError>;
+
+    fn build_direct_put_commit_command(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_stream_put_finalize_snapshot(
         &self,
@@ -3096,6 +3149,118 @@ impl StorageNodeClient for LocalStorageNodeClient {
             ec_m: ec.m,
         };
         Ok((session.target, segment_record))
+    }
+
+    fn load_direct_put_commit_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        load_direct_put_commit_snapshot_from_pg(&pg, bucket, key, reservation_id, generation_id)
+    }
+
+    fn build_direct_put_commit_command(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = load_direct_put_commit_snapshot_from_pg(
+            &pg,
+            &request.request.bucket,
+            &request.request.key,
+            &request.request.generation_reservation_id,
+            request.request.generation_id,
+        )?;
+        if &current != request.expected_snapshot {
+            return Err(ObjectPgActionError::StaleDirectPutCommitSnapshot);
+        }
+        if request.request.versioning == BucketVersioningState::Enabled
+            && request.version_id.is_null()
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "versioned direct PUT commit requires reserved version id".to_string(),
+            });
+        }
+        if request.request.versioning != BucketVersioningState::Enabled
+            && !request.version_id.is_null()
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "unversioned direct PUT commit must use null version id".to_string(),
+            });
+        }
+
+        let last_modified_millis = crate::clock::current_time_millis();
+        let write_sequence = pg.next_object_write_sequence(
+            request.request.bucket.as_str(),
+            request.request.key.as_str(),
+        )?;
+        let stale_payload = if request.version_id.is_null() {
+            match current.current.as_ref().and_then(StoredObject::as_live) {
+                Some(live) => Some(snapshot_live_object_payload_reclaim_command(
+                    &pg,
+                    &request.request.bucket,
+                    &request.request.key,
+                    live,
+                    last_modified_millis,
+                )?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let segment_record = ObjectSegmentRecord {
+            bucket: request.request.bucket.clone(),
+            key: request.request.key.clone(),
+            version_id: request.version_id,
+            segment_index: request.request.segment_index,
+            size: request.request.size,
+            segment_crc64: request.request.segment_crc64,
+            segment_okh: request.request.segment_okh,
+            segment_vid: request.request.segment_vid,
+            data_pg_id: request.request.data_pg_id,
+            ec_k: request.request.ec.k,
+            ec_m: request.request.ec.m,
+        };
+        let object = PutLiveObjectReq {
+            bucket: request.request.bucket.clone(),
+            key: request.request.key.clone(),
+            version_id: request.version_id,
+            owner: request.request.owner.clone(),
+            acl_grants: request.request.acl_grants.clone(),
+            public_read: request.request.public_read,
+            generation_id: request.request.generation_id,
+            size: request.request.size,
+            etag: ObjectEtag::single_part(request.request.etag_crc64),
+            ec: request.request.ec,
+            layout: ObjectLayout::Standard,
+            tags: request.request.tags.clone(),
+            metadata_blob: Some(request.request.metadata_blob.clone()),
+            system_metadata_blob: Some(request.request.system_metadata_blob.clone()),
+            object_lock: request.request.object_lock,
+            encryption: request.request.encryption.clone(),
+        };
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object,
+                segments: vec![segment_record],
+                generation_reservation_id: request.request.generation_reservation_id.clone(),
+                write_sequence,
+                last_modified_millis,
+                stale_payload,
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+            })),
+        ))
     }
 
     fn load_stream_put_finalize_snapshot(
