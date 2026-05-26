@@ -5137,6 +5137,14 @@ Progress:
   delete-marker stale-payload reclaim snapshots are computed under that
   revalidated storage-side PG lock. The guardrail now covers raw current-object
   lifecycle reads and command-id allocation.
+- Migrated stream-session and multipart-upload create command construction
+  through the local node client. PutObject stream and MPU create paths authorize
+  against current-object snapshots, then storage reloads the same snapshot
+  before allocating ids and building the command; upload-part stream create
+  reloads the authorized multipart upload row before building
+  `CreateStreamUpload`. The guardrail now blocks raw object/MPU reads, raw
+  command-id/generation allocation, and raw create-command construction in those
+  migrated create helpers.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

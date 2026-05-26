@@ -1,6 +1,5 @@
 #[cfg(test)]
 use super::runtime::LifecycleSweepStats;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
@@ -16,10 +15,7 @@ use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use storage::PgTopology;
-use storage::{
-    BucketFastPathInfo, BucketInfo, BucketName, BucketState, ReclaimWorkItem, SessionId,
-    StorageCluster,
-};
+use storage::{BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster};
 
 impl Coordinator {
     pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
@@ -292,6 +288,28 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn new_with_background_sweeper_factories_for_storage_cluster<F, G>(
+        storage_cluster: Arc<StorageCluster>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: Option<StaticManagedKeyProvider>,
+        background_sweepers: (bool, F, G),
+    ) -> Result<Self, ServerError>
+    where
+        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        G: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
+    {
+        Self::new_with_shared_caches_and_background_sweeper_factories(
+            Arc::clone(&storage_cluster),
+            shared_caches_for_storage_cluster(&storage_cluster),
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            background_sweepers,
+        )
+    }
+
     pub(super) fn new_with_shared_caches_and_lifecycle_sweeper_factory<F>(
         storage_cluster: Arc<StorageCluster>,
         shared_caches: Arc<CoordinatorSharedCaches>,
@@ -302,6 +320,32 @@ impl Coordinator {
     ) -> Result<Self, ServerError>
     where
         F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+    {
+        Self::new_with_shared_caches_and_background_sweeper_factories(
+            storage_cluster,
+            shared_caches,
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            (
+                true,
+                lifecycle_sweeper_factory,
+                ShardScavengerSweeper::acquire_shared,
+            ),
+        )
+    }
+
+    pub(super) fn new_with_shared_caches_and_background_sweeper_factories<F, G>(
+        storage_cluster: Arc<StorageCluster>,
+        shared_caches: Arc<CoordinatorSharedCaches>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: Option<StaticManagedKeyProvider>,
+        background_sweepers: (bool, F, G),
+    ) -> Result<Self, ServerError>
+    where
+        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        G: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
     {
         #[cfg(test)]
         let pg_topology = PgTopology::new(storage_cluster.test_pg_ids()).map_err(|reason| {
@@ -319,34 +363,15 @@ impl Coordinator {
             sse_c_validator: sse_c_validator.clone(),
             managed_key_provider: managed_key_provider.clone(),
         };
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker_node = Arc::clone(&storage_cluster);
-        let reclaim_runtime = read_runtime.clone();
-        let handle = std::thread::Builder::new()
-            .name("argmin-reclaim".to_string())
-            .spawn(move || {
-                while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
-                    match work {
-                        ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
-                            let _ = reclaim_runtime.try_reclaim_object_payload_for(
-                                &bucket,
-                                &key,
-                                generation_id,
-                            );
-                        }
-                        ReclaimWorkItem::BucketDelete(bucket) => {
-                            let _ = reclaim_runtime.try_finalize_bucket_delete_for(&bucket);
-                        }
-                    }
-                }
-            })
-            .map_err(|e| ServerError::InternalError {
-                reason: format!("failed to start reclaim worker: {e}"),
-            })?;
+        let (start_reclaim_worker, lifecycle_sweeper_factory, shard_scavenger_sweeper_factory) =
+            background_sweepers;
+        let reclaim_sweeper = if start_reclaim_worker {
+            ReclaimSweeper::spawn(Arc::clone(&storage_cluster), read_runtime.clone())?
+        } else {
+            ReclaimSweeper::disabled(Arc::clone(&storage_cluster))
+        };
         let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
-        let shard_scavenger_sweeper = ShardScavengerSweeper::acquire_shared(&storage_cluster)?;
-        let sweeper_storage_node = Arc::clone(&storage_cluster);
+        let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&storage_cluster)?;
         Ok(Self {
             storage_node: storage_cluster,
             shared_caches,
@@ -354,11 +379,7 @@ impl Coordinator {
             region,
             sse_c_validator,
             managed_key_provider,
-            _reclaim_sweeper: ReclaimSweeper {
-                storage_node: sweeper_storage_node,
-                stop,
-                handle: Some(handle),
-            },
+            _reclaim_sweeper: reclaim_sweeper,
             _shard_scavenger_sweeper: shard_scavenger_sweeper,
             _lifecycle_sweeper: lifecycle_sweeper,
         })

@@ -3853,7 +3853,7 @@ fn bucket_lifecycle_update_is_visible_across_coordinators_on_replace() {
 fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-lifecycle-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -3927,7 +3927,7 @@ fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
 fn put_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-policy-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -3978,7 +3978,7 @@ fn put_object_bucket_policy_same_pg_completes_without_deadlock() {
 fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-create-mpu-lifecycle-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4026,7 +4026,7 @@ fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock()
 fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-begin-part-policy-abac-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
@@ -4109,7 +4109,7 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
 fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-finalize-part-reupload-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4214,7 +4214,7 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
 fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-begin-put-policy-abac-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
@@ -4273,7 +4273,7 @@ fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() 
 fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-finalize-put-lifecycle-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4346,7 +4346,7 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
 fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-lifecycle-policy-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4389,7 +4389,7 @@ fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
 fn put_bucket_acl_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-acl-policy-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4428,7 +4428,7 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-get-object-policy-same-pg";
     let (admin, reader) =
-        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+        setup_same_process_coordinators_with_single_pg_without_background_sweepers(tmp.path());
     admin
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4494,7 +4494,7 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-get-object-tagging-policy-same-pg";
     let (admin, reader) =
-        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+        setup_same_process_coordinators_with_single_pg_without_background_sweepers(tmp.path());
     admin
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4555,7 +4555,7 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
 fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-put-object-tagging-policy-same-pg";
-    let coord = setup_coordinator_with_pg_count_without_lifecycle_sweeper(tmp.path(), 1);
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
     coord
         .create_bucket_for_owner("owner-a", bucket, false)
         .unwrap();
@@ -4615,7 +4615,7 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-get-object-retention-policy-same-pg";
     let (admin, reader) =
-        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+        setup_same_process_coordinators_with_single_pg_without_background_sweepers(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin
@@ -4699,7 +4699,7 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-object-lock-policy-same-pg";
     let (admin, deleter) =
-        setup_same_process_coordinators_with_single_pg_without_lifecycle_sweeper(tmp.path());
+        setup_same_process_coordinators_with_single_pg_without_background_sweepers(tmp.path());
     let owner_requester = test_helpers::requester("owner-a");
 
     admin

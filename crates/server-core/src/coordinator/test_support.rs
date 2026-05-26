@@ -133,18 +133,22 @@ pub(crate) fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coor
     .unwrap()
 }
 
-pub(crate) fn setup_coordinator_with_pg_count_without_lifecycle_sweeper(
+pub(crate) fn setup_coordinator_with_pg_count_without_background_sweepers(
     dir: &Path,
     pg_count: u32,
 ) -> Coordinator {
     let pg_ids: Vec<u32> = (0..pg_count).collect();
     let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
-    Coordinator::new_with_lifecycle_sweeper_factory_for_storage_cluster(
+    Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
         storage_cluster,
         "us-east-1".to_string(),
         None,
         Some(test_sse_s3_provider()),
-        |_, _| Ok(LifecycleSweeper::disabled()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+        ),
     )
     .unwrap()
 }
@@ -210,6 +214,25 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_lifecy
     .unwrap()
 }
 
+pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
+    let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
+    Coordinator::new_with_shared_caches_and_background_sweeper_factories(
+        storage_cluster,
+        shared_caches,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+        ),
+    )
+    .unwrap()
+}
+
 /// Build a coordinator with a fresh cache domain over an existing storage
 /// cluster.
 ///
@@ -263,6 +286,28 @@ pub(crate) fn setup_same_process_coordinators_with_single_pg_without_lifecycle_s
     dir: &Path,
 ) -> (Coordinator, Coordinator) {
     setup_same_process_coordinators_with_pg_count_without_lifecycle_sweeper(dir, 1)
+}
+
+pub(crate) fn setup_same_process_coordinators_with_pg_count_without_background_sweepers(
+    dir: &Path,
+    pg_count: u32,
+) -> (Coordinator, Coordinator) {
+    let pg_ids: Vec<u32> = (0..pg_count).collect();
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    (
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&storage_cluster),
+        ),
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            storage_cluster,
+        ),
+    )
+}
+
+pub(crate) fn setup_same_process_coordinators_with_single_pg_without_background_sweepers(
+    dir: &Path,
+) -> (Coordinator, Coordinator) {
+    setup_same_process_coordinators_with_pg_count_without_background_sweepers(dir, 1)
 }
 
 pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {

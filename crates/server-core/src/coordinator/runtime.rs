@@ -7,8 +7,8 @@ use std::time::Duration;
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketInfo, BucketName, EcShape, GenerationId,
-    ObjectEncryption, ObjectKey, SegmentStoredBytesRequest, StorageCluster, UploadId, UploadState,
-    VersionId,
+    ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
+    UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -75,6 +75,51 @@ impl Drop for ReclaimSweeper {
         self.storage_node.wake_reclaim_workers();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+impl ReclaimSweeper {
+    pub(super) fn spawn(
+        storage_cluster: Arc<StorageCluster>,
+        runtime: ReadRuntime,
+    ) -> Result<Self, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_node = Arc::clone(&storage_cluster);
+        let handle = std::thread::Builder::new()
+            .name("argmin-reclaim".to_string())
+            .spawn(move || {
+                while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
+                    match work {
+                        ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
+                            let _ = runtime.try_reclaim_object_payload_for(
+                                &bucket,
+                                &key,
+                                generation_id,
+                            );
+                        }
+                        ReclaimWorkItem::BucketDelete(bucket) => {
+                            let _ = runtime.try_finalize_bucket_delete_for(&bucket);
+                        }
+                    }
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start reclaim worker: {e}"),
+            })?;
+        Ok(Self {
+            storage_node: storage_cluster,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Self {
+        Self {
+            storage_node: storage_cluster,
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
         }
     }
 }
@@ -228,6 +273,15 @@ impl ShardScavengerSweeper {
             })?;
         *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
         Ok(sweeper)
+    }
+
+    #[cfg(test)]
+    pub(super) fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new((Mutex::new(true), Condvar::new())),
+            handle: Mutex::new(None),
+        })
     }
 }
 

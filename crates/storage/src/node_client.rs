@@ -7,10 +7,10 @@ use s3_types::{AclGrants, BucketVersioningState};
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
-    CommitDirectPutObjectCommand, CommitStreamPartCommand, CreateStreamUploadCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    CommitDirectPutObjectCommand, CommitStreamPartCommand, CreateMultipartUploadCommand,
+    CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
     PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
     PutObjectMetadataCommand, PutObjectMetadataMutation,
@@ -22,20 +22,21 @@ use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CreateStreamUploadReq,
-    DataPgId, EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord,
-    LifecycleSweepRoot, ListPartsReq, ListedMultipartParts, LiveObjectRecord,
-    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag,
-    ObjectKey, ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
-    ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
-    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey, StoredObject,
-    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
-    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, VersionId, WriteAck,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CreateMultipartUploadReq,
+    CreateStreamUploadReq, DataPgId, EcShape, GenerationId, LifecycleSweepBuckets,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq, ListedMultipartParts,
+    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
+    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
+    ShardKey, StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+    StreamUploadCommandRecord, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -124,6 +125,13 @@ fn stream_upload_matches_command(
 ) -> bool {
     StreamUploadCommandRecord::from(existing) == create.session
         && existing.next_segment_vid == create.initial_next_segment_vid
+}
+
+fn multipart_upload_matches_command(
+    existing: &MultipartUploadRecord,
+    create: &CreateMultipartUploadCommand,
+) -> bool {
+    *existing == create.upload
 }
 
 fn reject_duplicate_stream_segment_index(
@@ -467,6 +475,35 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
     pub(crate) total_size: u64,
     pub(crate) expected_snapshot: &'a StreamPutFinalizeStorageSnapshot,
     pub(crate) commit: &'a StreamPutCommitInput,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) enum CreateStreamUploadPrecondition<'a> {
+    PutObjectNoCurrentCheck {
+        require_generation_reservation: bool,
+    },
+    PutObject {
+        expected_current: Option<&'a StoredObject>,
+        require_generation_reservation: bool,
+    },
+    UploadPart {
+        expected_upload: &'a MultipartUploadRecord,
+    },
+}
+
+pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) request: &'a CreateStreamUploadReq,
+    pub(crate) precondition: CreateStreamUploadPrecondition<'a>,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) struct BuildCreateMultipartUploadCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) request: &'a CreateMultipartUploadReq,
+    pub(crate) expected_current: Option<&'a StoredObject>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
@@ -1044,6 +1081,23 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError>;
+
+    fn matching_multipart_upload_initiated_at(
+        &self,
+        pg_id: PgId,
+        create: &CreateMultipartUploadReq,
+        expected_command: Option<&CreateMultipartUploadCommand>,
+    ) -> Result<Option<u64>, ObjectPgActionError>;
+
+    fn build_create_stream_upload_command(
+        &self,
+        request: BuildCreateStreamUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn build_create_multipart_upload_command(
+        &self,
+        request: BuildCreateMultipartUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_stream_upload_segments(
         &self,
@@ -1679,7 +1733,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)
+        let snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)?;
+        drop(pg);
+        Ok(snapshot)
     }
 
     fn load_bucket_snapshot_pair(
@@ -1694,6 +1750,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             let pg = self.storage_node.get_pg(source_pg_id.get())?;
             let bucket =
                 SharedStorageNode::load_bucket_snapshot_from_pg(&pg, source.0, merged_request)?;
+            drop(pg);
             return Ok(BucketSnapshotPair::Same {
                 bucket: Box::new(bucket),
             });
@@ -1703,29 +1760,39 @@ impl StorageNodeClient for LocalStorageNodeClient {
             .storage_node
             .lock_bucket_pair_pgs(source_pg_id.get(), destination_pg_id.get())?;
         match guards {
-            crate::node::BucketPairPgGuards::Same { bucket } => Ok(BucketSnapshotPair::Distinct {
-                source: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket, source.0, source.1,
-                )?),
-                destination: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+            crate::node::BucketPairPgGuards::Same { bucket } => {
+                let source_snapshot =
+                    SharedStorageNode::load_bucket_snapshot_from_pg(&bucket, source.0, source.1)?;
+                let destination_snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(
                     &bucket,
                     destination.0,
                     destination.1,
-                )?),
-            }),
+                )?;
+                drop(bucket);
+                Ok(BucketSnapshotPair::Distinct {
+                    source: Box::new(source_snapshot),
+                    destination: Box::new(destination_snapshot),
+                })
+            }
             crate::node::BucketPairPgGuards::Distinct {
                 source: source_pg,
                 destination: destination_pg,
-            } => Ok(BucketSnapshotPair::Distinct {
-                source: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+            } => {
+                let source_snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(
                     &source_pg, source.0, source.1,
-                )?),
-                destination: Box::new(SharedStorageNode::load_bucket_snapshot_from_pg(
+                )?;
+                let destination_snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(
                     &destination_pg,
                     destination.0,
                     destination.1,
-                )?),
-            }),
+                )?;
+                drop(source_pg);
+                drop(destination_pg);
+                Ok(BucketSnapshotPair::Distinct {
+                    source: Box::new(source_snapshot),
+                    destination: Box::new(destination_snapshot),
+                })
+            }
         }
     }
 
@@ -2538,6 +2605,174 @@ impl StorageNodeClient for LocalStorageNodeClient {
             Err(MetadataError::StreamSessionNotFound { .. }) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn matching_multipart_upload_initiated_at(
+        &self,
+        pg_id: PgId,
+        create: &CreateMultipartUploadReq,
+        expected_command: Option<&CreateMultipartUploadCommand>,
+    ) -> Result<Option<u64>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match pg.get_multipart_upload(&create.upload_id) {
+            Ok(existing)
+                if expected_command.is_some_and(|command| {
+                    multipart_upload_matches_command(&existing, command)
+                }) =>
+            {
+                Ok(Some(existing.initiated_at))
+            }
+            Ok(_) => Err(MetadataError::Db {
+                context: "create multipart upload existing upload mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into()),
+            Err(MetadataError::NoSuchUpload { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn build_create_stream_upload_command(
+        &self,
+        request: BuildCreateStreamUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        match (&request.request.target, request.precondition) {
+            (
+                StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObject {
+                    expected_current,
+                    require_generation_reservation,
+                },
+            ) => {
+                let current = load_current_object_optional_from_pg(
+                    &pg,
+                    &request.request.bucket,
+                    &request.request.key,
+                )?;
+                if current.as_ref() != expected_current {
+                    return Err(ObjectPgActionError::StaleObjectReadSubject);
+                }
+                if require_generation_reservation {
+                    PgMetadataStore::get_object_generation_reservation(
+                        &*pg,
+                        &request.request.bucket,
+                        &request.request.key,
+                        &request.request.session_id,
+                    )?;
+                }
+            }
+            (
+                StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                    require_generation_reservation,
+                },
+            ) => {
+                if require_generation_reservation {
+                    PgMetadataStore::get_object_generation_reservation(
+                        &*pg,
+                        &request.request.bucket,
+                        &request.request.key,
+                        &request.request.session_id,
+                    )?;
+                }
+            }
+            (
+                StreamUploadTarget::UploadPart { upload_id, .. },
+                CreateStreamUploadPrecondition::UploadPart { expected_upload },
+            ) => {
+                let current = load_in_progress_multipart_upload_from_pg(
+                    &pg,
+                    &request.request.bucket,
+                    &request.request.key,
+                    upload_id,
+                )?;
+                if &current != expected_upload {
+                    return Err(MetadataError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    }
+                    .into());
+                }
+            }
+            _ => {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "create stream upload precondition does not match target".to_string(),
+                });
+            }
+        }
+        match pg.get_stream_upload(&request.request.session_id) {
+            Ok(_) => {
+                return Err(MetadataError::Db {
+                    context: "create stream upload existing session mismatch",
+                    source: rusqlite::Error::InvalidQuery,
+                }
+                .into());
+            }
+            Err(MetadataError::StreamSessionNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    request.request.clone(),
+                    crate::clock::current_time_millis(),
+                    request.bucket_write_reservation.clone(),
+                ),
+            )),
+        ))
+    }
+
+    fn build_create_multipart_upload_command(
+        &self,
+        request: BuildCreateMultipartUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = load_current_object_optional_from_pg(
+            &pg,
+            &request.request.bucket,
+            &request.request.key,
+        )?;
+        if current.as_ref() != request.expected_current {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        match pg.get_multipart_upload(&request.request.upload_id) {
+            Ok(_) => {
+                return Err(MetadataError::Db {
+                    context: "create multipart upload existing upload mismatch",
+                    source: rusqlite::Error::InvalidQuery,
+                }
+                .into());
+            }
+            Err(MetadataError::NoSuchUpload { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let object_generation_id = PgMetadataStore::next_generation_id(
+            &*pg,
+            &request.request.bucket,
+            &request.request.key,
+        )?;
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                    request.request.clone(),
+                    object_generation_id,
+                    crate::clock::current_time_millis(),
+                    request.bucket_write_reservation.clone(),
+                ),
+            )),
+        ))
     }
 
     fn load_stream_upload_segments(

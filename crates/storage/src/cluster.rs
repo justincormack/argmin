@@ -19,7 +19,9 @@ use crate::metadata_command::{
     ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::node::SharedStorageNode;
-use crate::node_client::StorageNodeClient;
+use crate::node_client::{
+    BuildCreateStreamUploadCommandReq, CreateStreamUploadPrecondition, StorageNodeClient,
+};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
@@ -216,13 +218,6 @@ fn multipart_create_request_matches_upload(
         && upload.object_lock == create.object_lock
         && upload.checksum == create.checksum
         && upload.encryption == create.encryption
-}
-
-fn multipart_upload_matches_command(
-    existing: &MultipartUploadRecord,
-    create: &CreateMultipartUploadCommand,
-) -> bool {
-    *existing == create.upload
 }
 
 fn applied_multipart_create_command<'a>(
@@ -2679,42 +2674,6 @@ impl StorageCluster {
             .map_err(BucketSnapshotLoadError::from)
     }
 
-    fn matching_stream_upload_exists(
-        &self,
-        pg_id: PgId,
-        create: &CreateStreamUploadReq,
-        expected_command: Option<&CreateStreamUploadCommand>,
-    ) -> Result<bool, ObjectPgActionError> {
-        let storage_client = self.object_metadata_primary_client(&create.bucket, &create.key)?;
-        storage_client.matching_stream_upload_exists(pg_id, create, expected_command)
-    }
-
-    pub(super) fn matching_multipart_upload_initiated_at(
-        &self,
-        pg_id: PgId,
-        create: &crate::CreateMultipartUploadReq,
-        expected_command: Option<&CreateMultipartUploadCommand>,
-    ) -> Result<Option<u64>, ObjectPgActionError> {
-        let object_node = self.object_metadata_primary_node(&create.bucket, &create.key)?;
-        let object_pg = object_node.get_pg(pg_id.get())?;
-        match object_pg.get_multipart_upload(&create.upload_id) {
-            Ok(existing)
-                if expected_command.is_some_and(|command| {
-                    multipart_upload_matches_command(&existing, command)
-                }) =>
-            {
-                Ok(Some(existing.initiated_at))
-            }
-            Ok(_) => Err(MetadataError::Db {
-                context: "create multipart upload existing upload mismatch",
-                source: rusqlite::Error::InvalidQuery,
-            }
-            .into()),
-            Err(MetadataError::NoSuchUpload { .. }) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     fn apply_new_stream_append_command(
         &self,
         pg_id: PgId,
@@ -3782,12 +3741,27 @@ impl StorageCluster {
             let applied_commands =
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
             let expected_command = applied_stream_create_command(&applied_commands, &request);
-            if self.matching_stream_upload_exists(pg_id, &request, expected_command)? {
+            let storage_client = self.object_metadata_primary_client(bucket, key)?;
+            if storage_client.matching_stream_upload_exists(pg_id, &request, expected_command)? {
                 return Ok(BucketWriteReservationDisposition::ReleaseByCaller);
             }
             self.reserve_put_object_generation(bucket, key, session_id)?;
-            let command_id = match self.next_object_metadata_command_id(pg_id) {
-                Ok(command_id) => command_id,
+            let command = match storage_client.build_create_stream_upload_command(
+                BuildCreateStreamUploadCommandReq {
+                    pg_id,
+                    cluster_epoch: self.operation_epoch(),
+                    request: &request,
+                    precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                        require_generation_reservation: true,
+                    },
+                    bucket_write_reservation: &bucket_write_reservation,
+                },
+            ) {
+                Ok(command) => command,
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    self.release_object_generation_reservation(bucket, key, session_id)?;
+                    continue;
+                }
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
@@ -3800,16 +3774,6 @@ impl StorageCluster {
                     return Err(error);
                 }
             };
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::CreateStreamUpload(Box::new(
-                    CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                        request.clone(),
-                        crate::clock::current_time_millis(),
-                        bucket_write_reservation.clone(),
-                    ),
-                )),
-            );
             if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
                 let cleanup = self
                     .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
