@@ -5130,6 +5130,13 @@ Progress:
   immediately and competing with foreground writes. The guardrail now blocks raw
   `list_object_versions_for_key` and command-id allocation in those migrated
   lifecycle cleanup helpers.
+- Migrated lifecycle current-object expiry command construction through the
+  local node client. The coordinator now selects expiry from a current-object
+  snapshot, then storage reloads the same current row before building either the
+  delete command or versioning/suspended delete-marker command; suspended
+  delete-marker stale-payload reclaim snapshots are computed under that
+  revalidated storage-side PG lock. The guardrail now covers raw current-object
+  lifecycle reads and command-id allocation.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

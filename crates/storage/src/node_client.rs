@@ -524,8 +524,13 @@ pub(crate) struct BuildInsertDeleteMarkerCommandReq<'a> {
     pub(crate) expected_current: Option<&'a StoredObject>,
     pub(crate) version_id: VersionId,
     pub(crate) owner: &'a OwnerIdentity,
-    pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
+    pub(crate) stale_payload: InsertDeleteMarkerStalePayload,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) enum InsertDeleteMarkerStalePayload {
+    Explicit(Option<ObjectPayloadReclaimCommand>),
+    SnapshotCurrentNullLive { created_at: u64 },
 }
 
 pub(crate) trait StorageNodeClient: Send + Sync {
@@ -2174,6 +2179,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
         if current.as_ref() != request.expected_current {
             return Err(ObjectPgActionError::StaleObjectReadSubject);
         }
+        let stale_payload = match request.stale_payload {
+            InsertDeleteMarkerStalePayload::Explicit(stale_payload) => stale_payload,
+            InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at } => {
+                snapshot_direct_put_stale_payload_command(
+                    &pg,
+                    request.bucket,
+                    request.key,
+                    created_at,
+                )?
+            }
+        };
         let write_sequence =
             pg.next_object_write_sequence(request.bucket.as_str(), request.key.as_str())?;
         let command_id = self.next_metadata_command_id_from_locked_pg(
@@ -2191,7 +2207,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 owner: request.owner.clone(),
                 write_sequence,
                 last_modified_millis: crate::clock::current_time_millis(),
-                stale_payload: request.stale_payload,
+                stale_payload,
             }),
         ))
     }

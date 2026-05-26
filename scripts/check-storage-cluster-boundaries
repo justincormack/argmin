@@ -650,9 +650,12 @@ migrated_simple_object_read_bypasses=$(
                 || $0 ~ /next_object_metadata_command_id_from_locked_pg\(/)) {
             print FILENAME ":" FNR ":" $0
         }
-        if ((current_fn == "delete_noncurrent_live_versions_if_due" \
+        if ((current_fn == "expire_current_object_if_due" \
+                || current_fn == "delete_noncurrent_live_versions_if_due" \
                 || current_fn == "delete_expired_delete_marker_if_due") \
-            && ($0 ~ /PgMetadataStore::list_object_versions_for_key\(/ \
+            && ($0 ~ /PgMetadataStore::get_object_meta\(/ \
+                || $0 ~ /PgMetadataStore::get_object_version\(/ \
+                || $0 ~ /PgMetadataStore::list_object_versions_for_key\(/ \
                 || $0 ~ /primary_node\.get_pg\(/ \
                 || $0 ~ /next_object_metadata_command_id\(/ \
                 || $0 ~ /next_object_metadata_command_id_from_locked_pg\(/)) {
@@ -1364,7 +1367,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due<E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due<E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if<T, E>:metadata-command-log-conflict
-3 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due<E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream<T, E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream<T, E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
