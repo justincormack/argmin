@@ -16,15 +16,16 @@ use super::{
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
     BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
-    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
-    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimClaimProof,
+    ObjectPayloadReclaimCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
-use crate::node_client::MarkBucketDeletingCommandBuild;
+use crate::node_client::{
+    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, MarkBucketDeletingCommandBuild,
+};
 use crate::traits::PgMetadataStore;
 use crate::*;
 
@@ -6576,6 +6577,7 @@ impl super::StorageCluster {
                 return Err(error.into());
             }
         };
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
         let _bucket_guard = primary_node.lock_bucket(bucket);
 
         let (command, new_pending_command, prepared) = loop {
@@ -6632,19 +6634,13 @@ impl super::StorageCluster {
                 bucket_write_proof_command_owned = true;
             }
 
-            let object_pg = match primary_node.get_pg(pg_id.get()) {
-                Ok(object_pg) => object_pg,
-                Err(error) => {
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            };
-            let session = match object_pg.get_stream_upload(session_id) {
-                Ok(session) => session,
-                Err(MetadataError::StreamSessionNotFound { .. })
-                    if let Some(command) = pending_command.clone() =>
-                {
-                    drop(object_pg);
+            let storage_snapshot = match storage_client
+                .load_stream_put_finalize_snapshot(pg_id, bucket, key, session_id)
+            {
+                Ok(snapshot) => snapshot,
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) if let Some(command) = pending_command.clone() => {
                     if let Err(error) = self.apply_exact_pending_object_metadata_command(
                         pg_id,
                         super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -6655,177 +6651,46 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    drop(object_pg);
                     release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            };
-            if session.state != StreamUploadState::InProgress {
-                drop(object_pg);
-                release_caller_bucket_write_proof_if_unowned!()?;
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: "stream session is not in progress".to_string(),
-                });
-            }
-            if session.bucket != bucket.as_str() || session.key != key.as_str() {
-                drop(object_pg);
-                release_caller_bucket_write_proof_if_unowned!()?;
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: "session bucket/key mismatch".to_string(),
-                });
-            }
-            if !matches!(session.target, StreamUploadTarget::PutObject) {
-                drop(object_pg);
-                release_caller_bucket_write_proof_if_unowned!()?;
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: "session is not a PutObject session".to_string(),
-                });
-            }
-            let existing_etag = match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
-                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                Err(MetadataError::ObjectNotFound) => None,
-                Err(other) => {
-                    drop(object_pg);
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(other.into());
-                }
-            };
-            let staging_segments = match object_pg.list_stream_segments(session_id) {
-                Ok(staging_segments) => staging_segments,
-                Err(error) => {
-                    drop(object_pg);
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             let prepared = match action(StreamPutFinalizeSnapshot {
-                session,
-                existing_etag,
+                session: storage_snapshot.session.clone(),
+                existing_etag: storage_snapshot.existing_etag.clone(),
             }) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    drop(object_pg);
                     release_caller_bucket_write_proof_if_unowned!()?;
                     return Ok(Err(error));
                 }
             };
-            let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
-            if segments_total != total_size {
-                drop(object_pg);
-                release_caller_bucket_write_proof_if_unowned!()?;
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: format!(
-                        "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
-                    ),
-                });
-            }
 
             let (command, new_pending_command) = match pending_command {
-                Some(command) => {
-                    drop(object_pg);
-                    (command, false)
-                }
+                Some(command) => (command, false),
                 None => {
-                    let (version_id, object_pg) =
-                        if prepared.versioning == BucketVersioningState::Enabled {
-                            drop(object_pg);
-                            let version_id = match self.reserve_next_object_version(
-                                pg_id,
-                                bucket,
-                                key,
-                                primary_node,
-                            ) {
-                                Ok(version_id) => version_id,
-                                Err(error) => {
-                                    release_caller_bucket_write_proof_if_unowned!()?;
-                                    return Err(error);
-                                }
-                            };
-                            let object_pg = match primary_node.get_pg(pg_id.get()) {
-                                Ok(object_pg) => object_pg,
-                                Err(error) => {
-                                    release_caller_bucket_write_proof_if_unowned!()?;
-                                    return Err(error.into());
-                                }
-                            };
-                            (version_id, object_pg)
-                        } else {
-                            (VersionId::Null, object_pg)
-                        };
-                    let generation_id = match object_pg
-                        .get_object_generation_reservation(bucket, key, session_id)
-                    {
-                        Ok(generation_id) => generation_id,
-                        Err(error) => {
-                            drop(object_pg);
-                            release_caller_bucket_write_proof_if_unowned!()?;
-                            return Err(error.into());
-                        }
-                    };
-                    let last_modified_millis = crate::clock::current_time_millis();
-                    let write_sequence =
-                        match object_pg.next_object_write_sequence(bucket.as_str(), key.as_str()) {
-                            Ok(write_sequence) => write_sequence,
+                    let version_id = if prepared.versioning == BucketVersioningState::Enabled {
+                        match self.reserve_next_object_version(pg_id, bucket, key, primary_node) {
+                            Ok(version_id) => version_id,
                             Err(error) => {
-                                drop(object_pg);
                                 release_caller_bucket_write_proof_if_unowned!()?;
-                                return Err(error.into());
-                            }
-                        };
-                    let stale_payload = if version_id.is_null() {
-                        match self.snapshot_direct_put_stale_payload_command(
-                            &object_pg,
-                            bucket,
-                            key,
-                            last_modified_millis,
-                        ) {
-                            Ok(stale_payload) => stale_payload,
-                            Err(error) => {
-                                drop(object_pg);
-                                release_caller_bucket_write_proof_if_unowned!()?;
-                                return Err(error.into());
+                                return Err(error);
                             }
                         }
                     } else {
-                        None
+                        VersionId::Null
                     };
-                    let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
-                        .iter()
-                        .map(|segment| ObjectSegmentRecord {
-                            bucket: bucket.clone(),
-                            key: key.clone(),
-                            version_id,
-                            segment_index: segment.segment_index,
-                            size: segment.size,
-                            segment_crc64: segment.segment_crc64,
-                            segment_okh: segment.segment_okh,
-                            segment_vid: segment.segment_vid,
-                            data_pg_id: segment.data_pg_id,
-                            ec_k: segment.ec_k,
-                            ec_m: segment.ec_m,
-                        })
-                        .collect();
-                    let object = PutLiveObjectReq {
-                        bucket: bucket.clone(),
-                        key: key.clone(),
+                    let commit = StreamPutCommitInput {
+                        versioning: prepared.versioning,
                         version_id,
                         owner: prepared.owner.clone(),
                         acl_grants: prepared.acl_grants.clone(),
                         public_read: prepared.public_read,
-                        generation_id,
                         size: prepared.size,
-                        etag: ObjectEtag::single_part(prepared.etag_crc64),
-                        ec: staging_segments.first().map_or(
-                            self.default_payload_ec_shape(),
-                            |segment| EcShape {
-                                k: segment.ec_k,
-                                m: segment.ec_m,
-                            },
-                        ),
-                        layout: ObjectLayout::Standard,
+                        etag_crc64: prepared.etag_crc64,
                         tags: prepared.tags.clone(),
-                        metadata_blob: Some(prepared.metadata_blob.clone()),
-                        system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
+                        metadata_blob: prepared.metadata_blob.clone(),
+                        system_metadata_blob: prepared.system_metadata_blob.clone(),
                         object_lock: prepared.object_lock,
                         encryption: prepared.encryption.clone(),
                     };
@@ -6833,14 +6698,24 @@ impl super::StorageCluster {
                     maybe_run_before_stream_put_finalize_command_id_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                     );
-                    let command_id = match self
-                        .next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg)
-                    {
-                        Ok(command_id) => command_id,
+                    let command = match storage_client.build_stream_put_commit_command(
+                        BuildStreamPutCommitCommandReq {
+                            pg_id,
+                            cluster_epoch: self.operation_epoch(),
+                            bucket,
+                            key,
+                            session_id,
+                            total_size,
+                            expected_snapshot: &storage_snapshot,
+                            commit: &commit,
+                            bucket_write_reservation: &effective_bucket_write_reservation,
+                        },
+                    ) {
+                        Ok(command) => command,
+                        Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => continue,
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            drop(object_pg);
                             if let Err(error) = self
                                 .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                             {
@@ -6850,27 +6725,10 @@ impl super::StorageCluster {
                             continue;
                         }
                         Err(error) => {
-                            drop(object_pg);
                             release_caller_bucket_write_proof_if_unowned!()?;
                             return Err(error);
                         }
                     };
-                    let command = MetadataCommandEnvelope::new(
-                        command_id,
-                        MetadataCommandPayload::CommitDirectPutObject(Box::new(
-                            CommitDirectPutObjectCommand {
-                                object,
-                                segments: committed_segments,
-                                generation_reservation_id: session_id.clone(),
-                                write_sequence,
-                                last_modified_millis,
-                                stale_payload,
-                                bucket_write_reservation: effective_bucket_write_reservation
-                                    .clone(),
-                            },
-                        )),
-                    );
-                    drop(object_pg);
                     let installed = match self
                         .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                     {
@@ -8260,37 +8118,6 @@ impl super::StorageCluster {
         }
     }
 
-    fn validate_upload_part_stream_session(
-        session: &StreamUploadRecord,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        part_number: u32,
-    ) -> Result<(), ObjectPgActionError> {
-        if session.state != StreamUploadState::InProgress {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "stream session is not in progress".to_string(),
-            });
-        }
-        if session.bucket != *bucket || session.key != *key {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-        match &session.target {
-            StreamUploadTarget::UploadPart {
-                upload_id: sess_upload_id,
-                part_number: sess_part_number,
-            } if sess_upload_id == upload_id && *sess_part_number == part_number => Ok(()),
-            StreamUploadTarget::UploadPart { .. } => Err(ObjectPgActionError::InvalidRequest {
-                reason: "session upload_id/part_number mismatch".to_string(),
-            }),
-            StreamUploadTarget::PutObject => Err(ObjectPgActionError::InvalidRequest {
-                reason: "session is not an UploadPart session".to_string(),
-            }),
-        }
-    }
-
     fn commit_stream_part_commands_match_retry(
         pending: &CommitStreamPartCommand,
         candidate: &CommitStreamPartCommand,
@@ -8311,6 +8138,7 @@ impl super::StorageCluster {
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
 
         loop {
             let _bucket_guard = primary_node.lock_bucket(bucket);
@@ -8361,19 +8189,18 @@ impl super::StorageCluster {
                 }};
             }
 
-            let object_pg = match primary_node.get_pg(pg_id.get()) {
-                Ok(object_pg) => object_pg,
-                Err(error) => {
-                    release_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            };
-            let session = match object_pg.get_stream_upload(session_id) {
-                Ok(session) => session,
-                Err(MetadataError::StreamSessionNotFound { .. })
-                    if let Some(command) = pending_command.clone() =>
-                {
-                    drop(object_pg);
+            let storage_snapshot = match storage_client.load_stream_part_finalize_snapshot(
+                pg_id,
+                bucket,
+                key,
+                upload_id,
+                session_id,
+                part_number,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) if let Some(command) = pending_command.clone() => {
                     self.apply_exact_pending_object_metadata_command(
                         pg_id,
                         super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -8381,85 +8208,14 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    drop(object_pg);
                     release_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
-            if let Err(error) = Self::validate_upload_part_stream_session(
-                &session,
-                bucket,
-                key,
-                upload_id,
-                part_number,
-            ) {
-                drop(object_pg);
-                release_bucket_write_proof_if_unowned!()?;
-                return Err(error);
-            }
-            let upload = match PgMetadataStore::get_multipart_upload(&*object_pg, upload_id) {
-                Ok(upload) => upload,
-                Err(error) => {
-                    drop(object_pg);
-                    release_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            };
-            if upload.bucket != *bucket
-                || upload.key != *key
-                || upload.state != UploadState::InProgress
-            {
-                drop(object_pg);
-                release_bucket_write_proof_if_unowned!()?;
-                return Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                }
-                .into());
-            }
-            let existing_part =
-                match PgMetadataStore::get_multipart_part(&*object_pg, upload_id, part_number) {
-                    Ok(existing) => Some(existing),
-                    Err(MetadataError::PartNotFound { .. }) => None,
-                    Err(other) => {
-                        drop(object_pg);
-                        release_bucket_write_proof_if_unowned!()?;
-                        return Err(other.into());
-                    }
-                };
-            let existing_part_generation = existing_part.as_ref().map(|part| part.generation);
-            let staging_segments = match object_pg.list_stream_segments(session_id) {
-                Ok(staging_segments) => staging_segments,
-                Err(error) => {
-                    drop(object_pg);
-                    release_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            };
-            let displaced_segments =
-                match PgMetadataStore::get_all_multipart_part_segments_for_upload(
-                    &*object_pg,
-                    upload_id,
-                ) {
-                    Ok(displaced_segments) => displaced_segments,
-                    Err(error) => {
-                        drop(object_pg);
-                        release_bucket_write_proof_if_unowned!()?;
-                        return Err(error.into());
-                    }
-                }
-                .into_iter()
-                .filter(|segment| segment.part_number == part_number)
-                .collect::<Vec<_>>();
 
-            let prepared = match action(StreamUploadPartSnapshot {
-                session,
-                upload: upload.clone(),
-                existing_part_generation,
-                staging_segments,
-            }) {
+            let prepared = match action(storage_snapshot.auth_snapshot.clone()) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    drop(object_pg);
                     release_bucket_write_proof_if_unowned!()?;
                     return Ok(Err(error));
                 }
@@ -8481,11 +8237,11 @@ impl super::StorageCluster {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 session_id: session_id.clone(),
-                upload,
+                upload: storage_snapshot.auth_snapshot.upload.clone(),
                 part: prepared.part.clone(),
                 segments: prepared.segments.clone(),
-                existing_part,
-                displaced_segments,
+                existing_part: storage_snapshot.existing_part.clone(),
+                displaced_segments: storage_snapshot.displaced_segments.clone(),
                 bucket_write_reservation: command_bucket_write_reservation,
             };
             let command_is_pending = pending_command.is_some();
@@ -8499,36 +8255,45 @@ impl super::StorageCluster {
                         reason: "pending stream part commit does not match retry".to_string(),
                     });
                 }
-                drop(object_pg);
                 command
             } else {
-                let command_id =
-                    match self.next_object_metadata_command_id_from_locked_pg(pg_id, &object_pg) {
-                        Ok(command_id) => command_id,
-                        Err(ObjectPgActionError::Store(
-                            StoreError::MetadataCommandLogConflict { .. },
-                        )) => {
-                            drop(object_pg);
-                            if let Err(error) = self
-                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                            {
-                                release_bucket_write_proof_if_unowned!()?;
-                                return Err(error);
-                            }
-                            release_bucket_write_proof_if_unowned!()?;
-                            continue;
-                        }
-                        Err(error) => {
-                            drop(object_pg);
+                let command = match storage_client.build_stream_part_commit_command(
+                    BuildStreamPartCommitCommandReq {
+                        pg_id,
+                        cluster_epoch: self.operation_epoch(),
+                        bucket,
+                        key,
+                        upload_id,
+                        session_id,
+                        part_number,
+                        expected_snapshot: &storage_snapshot,
+                        part: &prepared.part,
+                        segments: &prepared.segments,
+                        bucket_write_reservation: &expected_command_bucket_write_reservation,
+                    },
+                ) {
+                    Ok(command) => command,
+                    Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
+                        release_bucket_write_proof_if_unowned!()?;
+                        continue;
+                    }
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        if let Err(error) =
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                        {
                             release_bucket_write_proof_if_unowned!()?;
                             return Err(error);
                         }
-                    };
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::CommitStreamPart(Box::new(command_payload)),
-                );
-                drop(object_pg);
+                        release_bucket_write_proof_if_unowned!()?;
+                        continue;
+                    }
+                    Err(error) => {
+                        release_bucket_write_proof_if_unowned!()?;
+                        return Err(error);
+                    }
+                };
                 let installed = match self
                     .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                 {

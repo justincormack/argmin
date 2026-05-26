@@ -50,6 +50,11 @@ impl Coordinator {
             storage::ObjectPgActionError::StaleObjectReadSubject => ServerError::InternalError {
                 reason: "stale object read subject escaped storage retry loop".to_string(),
             },
+            storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+                ServerError::InternalError {
+                    reason: "stale stream finalize snapshot escaped storage retry loop".to_string(),
+                }
+            }
             storage::ObjectPgActionError::Metadata(error) => match error {
                 storage::MetadataError::NoSuchUpload { upload_id } => {
                     ServerError::NoSuchUpload { upload_id }

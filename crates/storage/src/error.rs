@@ -595,4 +595,6 @@ pub enum ObjectPgActionError {
     InvalidRequest { reason: String },
     #[error("object read subject changed before snapshot load")]
     StaleObjectReadSubject,
+    #[error("stream finalize snapshot changed before command build")]
+    StaleStreamFinalizeSnapshot,
 }

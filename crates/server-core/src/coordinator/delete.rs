@@ -70,6 +70,12 @@ impl Coordinator {
                                     .to_string(),
                             }
                         }
+                        storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+                            ServerError::InternalError {
+                                reason: "stale stream finalize snapshot escaped storage retry loop"
+                                    .to_string(),
+                            }
+                        }
                     })??;
 
                 if let storage::DeletedCurrentObject::Live {
@@ -198,6 +204,12 @@ impl Coordinator {
                                     .to_string(),
                             }
                         }
+                        storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+                            ServerError::InternalError {
+                                reason: "stale stream finalize snapshot escaped storage retry loop"
+                                    .to_string(),
+                            }
+                        }
                     })??;
 
                 match deleted.deleted {
@@ -294,6 +306,12 @@ impl Coordinator {
                         storage::ObjectPgActionError::StaleObjectReadSubject => {
                             ServerError::InternalError {
                                 reason: "stale object read subject escaped storage retry loop"
+                                    .to_string(),
+                            }
+                        }
+                        storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+                            ServerError::InternalError {
+                                reason: "stale stream finalize snapshot escaped storage retry loop"
                                     .to_string(),
                             }
                         }

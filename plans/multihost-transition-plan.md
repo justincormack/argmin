@@ -5103,6 +5103,12 @@ Progress:
   best-effort stream-session listing through the local node client. The remaining
   raw stream-session reads are stream finalize command-construction snapshots
   that need their own operation-shaped builder API to preserve TOCTOU fences.
+- Migrated stream PUT and stream upload-part finalize command construction
+  through operation-shaped node-client snapshot/build APIs. The coordinator now
+  authorizes a typed stream-finalize snapshot and storage revalidates that exact
+  snapshot before allocating ids and building the pending metadata command, so
+  stream finalization no longer opens object PGs directly for session/segment
+  reads.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

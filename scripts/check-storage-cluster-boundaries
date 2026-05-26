@@ -266,7 +266,9 @@ migrated_metadata_pg_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if ($0 ~ /\.storage_client\(\)/) {
+        if ($0 ~ /\.storage_client\(\)/ \
+            || $0 ~ /object_metadata_primary_client\(/ \
+            || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
         if ($0 ~ /\.(pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
@@ -384,7 +386,9 @@ migrated_bucket_snapshot_read_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if ($0 ~ /\.storage_client\(\)/) {
+        if ($0 ~ /\.storage_client\(\)/ \
+            || $0 ~ /object_metadata_primary_client\(/ \
+            || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
         if ($0 ~ /\.(load_bucket_execution_generations_for_pg|load_bucket_fast_path_identities_for_pg)\(/) {
@@ -588,10 +592,12 @@ migrated_simple_object_read_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if ($0 ~ /\.storage_client\(\)/) {
+        if ($0 ~ /\.storage_client\(\)/ \
+            || $0 ~ /object_metadata_primary_client\(/ \
+            || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|prepare_stream_segment_append)\(/) {
+        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|prepare_stream_segment_append|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
                 next

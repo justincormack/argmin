@@ -20064,6 +20064,23 @@ mod tests {
             )
             .unwrap();
 
+        let _serial = lock_metadata_command_apply_hook_test();
+        let reserve_apply_count = Arc::new(AtomicUsize::new(0));
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let reserve_apply_count_hook = Arc::clone(&reserve_apply_count);
+        let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |_node_id, command| {
+                if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
+                {
+                    if reservation.bucket == hook_bucket && reservation.key == hook_key {
+                        reserve_apply_count_hook.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            },
+        ));
+
         let outcome = cluster
             .finalize_put_object_stream(
                 &bucket,
@@ -20095,7 +20112,13 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        drop(hook_guard);
         assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+        assert_eq!(
+            reserve_apply_count.load(Ordering::SeqCst),
+            node_ids.len(),
+            "versioned stream PUT finalization must reserve through the metadata command stream"
+        );
 
         assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
         for node_id in node_ids {

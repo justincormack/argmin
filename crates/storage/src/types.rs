@@ -2788,6 +2788,29 @@ pub struct StreamPutFinalizeSnapshot {
     pub existing_etag: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamPutFinalizeStorageSnapshot {
+    pub session: StreamUploadRecord,
+    pub existing_etag: Option<String>,
+    pub staging_segments: Vec<StreamUploadSegmentRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamPutCommitInput {
+    pub versioning: BucketVersioningState,
+    pub version_id: VersionId,
+    pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
+    pub public_read: bool,
+    pub size: u64,
+    pub etag_crc64: u64,
+    pub tags: Option<SerializedTagSet>,
+    pub metadata_blob: SerializedMetadataBlob,
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
+    pub object_lock: ObjectLockState,
+    pub encryption: ObjectEncryption,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStreamPutCommit<T> {
     pub value: T,
@@ -3497,12 +3520,19 @@ pub struct StreamUploadSegmentRecord {
     pub ec_m: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUploadPartSnapshot {
     pub session: StreamUploadRecord,
     pub upload: MultipartUploadRecord,
     pub existing_part_generation: Option<u32>,
     pub staging_segments: Vec<StreamUploadSegmentRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUploadPartStorageSnapshot {
+    pub auth_snapshot: StreamUploadPartSnapshot,
+    pub existing_part: Option<MultipartPartRecord>,
+    pub displaced_segments: Vec<MultipartPartSegmentRecord>,
 }
 
 #[derive(Debug)]
