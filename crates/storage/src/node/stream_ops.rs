@@ -1,7 +1,7 @@
 use super::*;
-use crate::{EcShape, StreamUploadRecord, WrittenShardAck};
+use crate::{EcShape, WrittenShardAck};
 #[cfg(test)]
-use crate::{PrepareStreamUploadSegmentAppendReq, StreamUploadSegmentRecord};
+use crate::{PrepareStreamUploadSegmentAppendReq, StreamUploadRecord, StreamUploadSegmentRecord};
 
 impl SharedStorageNode {
     pub(crate) fn write_erasure_coded_segment_shards_with<F>(
@@ -228,6 +228,7 @@ impl SharedStorageNode {
         Ok((session.target, segment_record))
     }
 
+    #[cfg(test)]
     pub fn list_all_stream_uploads_best_effort(&self) -> Vec<StreamUploadRecord> {
         let mut sessions = Vec::new();
         for &pg_id in &self.pg_id_list {

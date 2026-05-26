@@ -5098,6 +5098,11 @@ Progress:
   through the local node client. The old `SharedStorageNode` stream-session
   convenience helpers are now test-only, and the boundary guardrail covers those
   migrated stream-session read/prepare paths.
+- Migrated stream-create retry matching, stream-segment listing for append/abort
+  retry paths, stream-upload visibility checks during bucket delete, and
+  best-effort stream-session listing through the local node client. The remaining
+  raw stream-session reads are stream finalize command-construction snapshots
+  that need their own operation-shaped builder API to preserve TOCTOU fences.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

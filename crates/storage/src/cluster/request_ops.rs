@@ -2229,32 +2229,43 @@ impl super::StorageCluster {
         include_stream_uploads: bool,
     ) -> Result<bool, BucketWriteDrainError> {
         for pg_id in self.metadata_pg_ids() {
-            let pg = self.metadata_pg(pg_id)?;
-            let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: bucket.clone(),
-                prefix: None,
-                key_marker: None,
-                version_id_marker: None,
-                start_at: None,
-                max_keys: 1,
-            })?;
-            if !versions.versions.is_empty() {
-                return Ok(true);
-            }
+            {
+                let pg = self.metadata_pg(pg_id)?;
+                let versions = pg.list_object_versions(&ListObjectVersionsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    start_at: None,
+                    max_keys: 1,
+                })?;
+                if !versions.versions.is_empty() {
+                    return Ok(true);
+                }
 
-            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.clone(),
-                prefix: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: 1,
-            })?;
-            if !uploads.uploads.is_empty() {
-                return Ok(true);
+                let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: None,
+                    upload_id_marker: None,
+                    max_uploads: 1,
+                })?;
+                if !uploads.uploads.is_empty() {
+                    return Ok(true);
+                }
             }
 
             if include_stream_uploads {
-                let sessions = pg.list_all_stream_uploads()?;
+                let pg_id = PgId::new(pg_id);
+                let storage_client = self.metadata_pg_primary_client(pg_id)?;
+                let sessions = match storage_client.list_all_stream_uploads(pg_id) {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                            super::object_pg_action_error_to_bucket_snapshot_error(error),
+                        ));
+                    }
+                };
                 if sessions
                     .iter()
                     .any(|session| session.bucket == bucket.as_str())

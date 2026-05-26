@@ -6,10 +6,11 @@ use s3_types::{AclGrants, BucketVersioningState};
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
-    BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, MarkBucketDeletingCommand,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, CreateStreamUploadCommand,
+    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
@@ -18,15 +19,15 @@ use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, DataPgId, GenerationId,
-    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq,
-    ListedMultipartParts, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CreateStreamUploadReq,
+    DataPgId, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
+    ListPartsReq, ListedMultipartParts, MultipartCompletionPreflight, MultipartCompletionSnapshot,
     MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, PayloadReclaimRoot,
     PgId, PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StoredObject,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
-    UploadState, WriteAck,
+    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -87,17 +88,34 @@ fn validate_stream_upload_session_binding(
     bucket: &BucketName,
     key: &ObjectKey,
 ) -> Result<(), ObjectPgActionError> {
+    validate_stream_upload_session_bucket_key(session, bucket, key)?;
     if session.state != StreamUploadState::InProgress {
         return Err(ObjectPgActionError::InvalidRequest {
             reason: "stream session is not in progress".to_string(),
         });
     }
+    Ok(())
+}
+
+fn validate_stream_upload_session_bucket_key(
+    session: &StreamUploadRecord,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> Result<(), ObjectPgActionError> {
     if session.bucket != bucket.as_str() || session.key != key.as_str() {
         return Err(ObjectPgActionError::InvalidRequest {
             reason: "session bucket/key mismatch".to_string(),
         });
     }
     Ok(())
+}
+
+fn stream_upload_matches_command(
+    existing: &StreamUploadRecord,
+    create: &CreateStreamUploadCommand,
+) -> bool {
+    StreamUploadCommandRecord::from(existing) == create.session
+        && existing.next_segment_vid == create.initial_next_segment_vid
 }
 
 fn reject_duplicate_stream_segment_index(
@@ -591,6 +609,26 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError>;
+
+    fn matching_stream_upload_exists(
+        &self,
+        pg_id: PgId,
+        create: &CreateStreamUploadReq,
+        expected_command: Option<&CreateStreamUploadCommand>,
+    ) -> Result<bool, ObjectPgActionError>;
+
+    fn load_stream_upload_segments(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
+
+    fn list_all_stream_uploads(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError>;
 
     fn prepare_stream_segment_append(
         &self,
@@ -1762,6 +1800,51 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let session = pg.get_stream_upload(session_id)?;
         validate_stream_upload_session_binding(&session, bucket, key)?;
         Ok(session)
+    }
+
+    fn matching_stream_upload_exists(
+        &self,
+        pg_id: PgId,
+        create: &CreateStreamUploadReq,
+        expected_command: Option<&CreateStreamUploadCommand>,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match pg.get_stream_upload(&create.session_id) {
+            Ok(existing)
+                if expected_command
+                    .is_some_and(|command| stream_upload_matches_command(&existing, command)) =>
+            {
+                Ok(true)
+            }
+            Ok(_) => Err(MetadataError::Db {
+                context: "create stream upload existing session mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into()),
+            Err(MetadataError::StreamSessionNotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn load_stream_upload_segments(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let session = pg.get_stream_upload(session_id)?;
+        validate_stream_upload_session_bucket_key(&session, bucket, key)?;
+        Ok(pg.list_stream_segments(session_id)?)
+    }
+
+    fn list_all_stream_uploads(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_all_stream_uploads()?)
     }
 
     fn prepare_stream_segment_append(

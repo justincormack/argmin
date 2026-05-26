@@ -179,14 +179,6 @@ fn stream_create_request_matches_session(
         && session.encryption == create.encryption
 }
 
-fn stream_upload_matches_command(
-    existing: &StreamUploadRecord,
-    create: &CreateStreamUploadCommand,
-) -> bool {
-    StreamUploadCommandRecord::from(existing) == create.session
-        && existing.next_segment_vid == create.initial_next_segment_vid
-}
-
 fn applied_stream_create_command<'a>(
     applied_commands: &'a [MetadataCommandEnvelope],
     create: &CreateStreamUploadReq,
@@ -2687,23 +2679,8 @@ impl StorageCluster {
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
-        let object_node = self.object_metadata_primary_node(&create.bucket, &create.key)?;
-        let object_pg = object_node.get_pg(pg_id.get())?;
-        match object_pg.get_stream_upload(&create.session_id) {
-            Ok(existing)
-                if expected_command
-                    .is_some_and(|command| stream_upload_matches_command(&existing, command)) =>
-            {
-                Ok(true)
-            }
-            Ok(_) => Err(MetadataError::Db {
-                context: "create stream upload existing session mismatch",
-                source: rusqlite::Error::InvalidQuery,
-            }
-            .into()),
-            Err(MetadataError::StreamSessionNotFound { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
+        let storage_client = self.object_metadata_primary_client(&create.bucket, &create.key)?;
+        storage_client.matching_stream_upload_exists(pg_id, create, expected_command)
     }
 
     pub(super) fn matching_multipart_upload_initiated_at(
@@ -3920,6 +3897,22 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
+        let storage_client = match self.object_metadata_primary_client(bucket, key) {
+            Ok(client) => client,
+            Err(error) => {
+                self.delete_payload_shard_keys_best_effort(
+                    segment_record.data_pg_id,
+                    EcShape {
+                        k: segment_record.ec_k,
+                        m: segment_record.ec_m,
+                    },
+                    &segment_record.segment_okh,
+                    segment_record.segment_vid,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                );
+                return Err(error.into());
+            }
+        };
         let _bucket_guard = object_node.lock_bucket(bucket);
         loop {
             if let Err(error) =
@@ -3937,60 +3930,25 @@ impl StorageCluster {
                 );
                 return Err(error);
             }
-            let object_pg = match object_node.get_pg(pg_id.get()) {
-                Ok(pg) => pg,
-                Err(error) => {
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
-                    return Err(error.into());
-                }
-            };
-            let session = match object_pg.get_stream_upload(session_id) {
-                Ok(session) => session,
-                Err(error) => {
-                    drop(object_pg);
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
-                    return Err(error.into());
-                }
-            };
-            let existing_stream_segment = match object_pg.list_stream_segments(session_id) {
-                Ok(segments) => segments
-                    .into_iter()
-                    .find(|segment| segment.segment_index == segment_index),
-                Err(error) => {
-                    drop(object_pg);
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
-                    return Err(error.into());
-                }
-            };
-            drop(object_pg);
-            let _ = session;
+            let existing_stream_segment =
+                match storage_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
+                    Ok(segments) => segments
+                        .into_iter()
+                        .find(|segment| segment.segment_index == segment_index),
+                    Err(error) => {
+                        self.delete_payload_shard_keys_best_effort(
+                            segment_record.data_pg_id,
+                            EcShape {
+                                k: segment_record.ec_k,
+                                m: segment_record.ec_m,
+                            },
+                            &segment_record.segment_okh,
+                            segment_record.segment_vid,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        );
+                        return Err(error);
+                    }
+                };
             match existing_stream_segment {
                 Some(existing) if existing == *segment_record => return Ok(()),
                 Some(_) => {
@@ -4486,18 +4444,20 @@ impl StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let node = self.object_metadata_primary_node(bucket, key)?;
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
         let mut pending_completed_session =
             self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
         {
-            let object_pg = node.get_pg(pg_id.get())?;
-            match object_pg.get_stream_upload(session_id) {
+            match storage_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
                 Ok(_) => {}
-                Err(MetadataError::StreamSessionNotFound { .. }) if pending_completed_session => {
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) if pending_completed_session => {
                     return Ok(());
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
 
@@ -4510,17 +4470,16 @@ impl StorageCluster {
                 self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
-            let object_pg = node.get_pg(pg_id.get())?;
-            let session = match object_pg.get_stream_upload(session_id) {
-                Ok(session) => session,
-                Err(MetadataError::StreamSessionNotFound { .. }) if pending_completed_session => {
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let _ = session;
-            let staged_segments = object_pg.list_stream_segments(session_id)?;
-            drop(object_pg);
+            let staged_segments =
+                match storage_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
+                    Ok(staged_segments) => staged_segments,
+                    Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                        ..
+                    })) if pending_completed_session => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
             let command_id = match self.next_object_metadata_command_id(pg_id) {
                 Ok(command_id) => command_id,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
@@ -4550,13 +4509,10 @@ impl StorageCluster {
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
         let mut sessions = Vec::new();
         for &pg_id in self.metadata_primary_topology_node().pg_ids() {
-            let Ok(node) = self.metadata_pg_primary_node(pg_id) else {
+            let Ok(storage_client) = self.metadata_pg_primary_client(PgId::new(pg_id)) else {
                 continue;
             };
-            let Ok(pg) = node.get_pg(pg_id) else {
-                continue;
-            };
-            let Ok(mut local) = pg.list_all_stream_uploads() else {
+            let Ok(mut local) = storage_client.list_all_stream_uploads(PgId::new(pg_id)) else {
                 continue;
             };
             sessions.append(&mut local);
