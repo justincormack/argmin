@@ -5210,6 +5210,12 @@ Progress:
   calls now run behind storage-client methods on the routed PG primary. The
   guardrail blocks raw shard scavenger metadata calls from production cluster
   code.
+- Migrated lifecycle MPU abort upload reload through the local node client. The
+  lifecycle path still owns bucket/object lock ordering, pending-command drain,
+  lifecycle predicate evaluation, and abort command publishing, but the upload
+  row used for `should_abort` now comes from an operation-shaped storage-client
+  read instead of direct object-PG access. The guardrail blocks raw upload row
+  reloads in `abort_multipart_upload_if_due`.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

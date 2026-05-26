@@ -869,6 +869,11 @@ migrated_simple_object_read_bypasses=$(
                 || $0 ~ /CommitMultipartObjectCommand[[:space:]]*\{/)) {
             print FILENAME ":" FNR ":" $0
         }
+        if (current_fn == "abort_multipart_upload_if_due" \
+            && ($0 ~ /PgMetadataStore::get_multipart_upload\(/ \
+                || $0 ~ /primary_node\.get_pg\(/)) {
+            print FILENAME ":" FNR ":" $0
+        }
         if ($0 ~ /SharedStorageNode::(load_existing_live_object_from_object_pg|load_object_read_auth_subject_from_object_pg|load_object_read_snapshot_for_subject_from_object_pg|load_stored_object_from_object_pg|load_object_tag_read_auth_subject_from_object_pg|get_object_tags_for_subject_from_object_pg|load_object_legal_hold_read_subject_from_object_pg|load_object_retention_read_subject_from_object_pg)\(/ \
             || $0 ~ /crate::SharedStorageNode::(load_existing_live_object_from_object_pg|load_object_read_auth_subject_from_object_pg|load_object_read_snapshot_for_subject_from_object_pg|load_stored_object_from_object_pg|load_object_tag_read_auth_subject_from_object_pg|get_object_tags_for_subject_from_object_pg|load_object_legal_hold_read_subject_from_object_pg|load_object_retention_read_subject_from_object_pg)\(/ \
             || $0 ~ /crate::node::SharedStorageNode::(load_existing_live_object_from_object_pg|load_object_read_auth_subject_from_object_pg|load_object_read_snapshot_for_subject_from_object_pg|load_stored_object_from_object_pg|load_object_tag_read_auth_subject_from_object_pg|get_object_tags_for_subject_from_object_pg|load_object_legal_hold_read_subject_from_object_pg|load_object_retention_read_subject_from_object_pg)\(/) {

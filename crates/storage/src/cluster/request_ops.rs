@@ -8014,17 +8014,18 @@ impl super::StorageCluster {
             self.drain_pending_object_metadata_command(pg_id, &command)?;
         }
 
-        let upload = {
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            match PgMetadataStore::get_multipart_upload(&*object_pg, upload_id) {
-                Ok(upload) => {
-                    if upload.bucket != *bucket || upload.key != *key {
-                        return Ok(Ok(false));
-                    }
-                    upload
-                }
-                Err(MetadataError::NoSuchUpload { .. }) => return Ok(Ok(false)),
-                Err(error) => return Err(error.into()),
+        let upload = match self
+            .object_metadata_primary_client(bucket, key)?
+            .load_multipart_upload(pg_id, bucket, key, upload_id)
+        {
+            Ok(upload) => upload,
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                return Ok(Ok(false));
+            }
+            Err(error) => {
+                return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                    error,
+                ))
             }
         };
 
