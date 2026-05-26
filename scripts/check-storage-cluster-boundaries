@@ -590,7 +590,7 @@ migrated_simple_object_read_bypasses=$(
         if ($0 ~ /\.storage_client\(\)/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if)\(/) {
+        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|prepare_stream_segment_append)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
                 next

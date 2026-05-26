@@ -35,8 +35,8 @@ use crate::types::{
 use crate::types::{
     BucketInfo, BucketName, BucketSnapshot, BucketSnapshotRequest, BucketSubresourceKind, EcShape,
     GenerationId, LoadedBucketSubresource, MultipartUploadRecord, ObjectKey, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, SessionId, ShardKey, StoredObject,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, WriteAck,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, SessionId, ShardKey, StoredObject, UploadId,
+    UploadState, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
@@ -45,6 +45,8 @@ use crate::types::{
     ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq, StreamUploadRecord,
     StreamUploadSegmentRecord,
 };
+#[cfg(test)]
+use crate::types::{StreamUploadState, StreamUploadTarget};
 
 const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);

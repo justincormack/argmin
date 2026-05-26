@@ -1,8 +1,7 @@
 use super::*;
-use crate::{
-    EcShape, PrepareStreamUploadSegmentAppendReq, StreamUploadRecord, StreamUploadSegmentRecord,
-    WrittenShardAck,
-};
+use crate::{EcShape, StreamUploadRecord, WrittenShardAck};
+#[cfg(test)]
+use crate::{PrepareStreamUploadSegmentAppendReq, StreamUploadSegmentRecord};
 
 impl SharedStorageNode {
     pub(crate) fn write_erasure_coded_segment_shards_with<F>(
@@ -103,6 +102,7 @@ impl SharedStorageNode {
             .collect())
     }
 
+    #[cfg(test)]
     fn validate_stream_upload_session_binding(
         session: &StreamUploadRecord,
         bucket: &BucketName,
@@ -121,6 +121,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
+    #[cfg(test)]
     fn reject_duplicate_stream_segment_index(
         pg: &PgStore,
         session_id: &SessionId,
@@ -138,6 +139,7 @@ impl SharedStorageNode {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn load_stream_upload_session(
         &self,
         bucket: &BucketName,
@@ -150,6 +152,7 @@ impl SharedStorageNode {
         Ok(session)
     }
 
+    #[cfg(test)]
     pub fn prepare_stream_segment_append(
         &self,
         bucket: &BucketName,

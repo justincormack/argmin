@@ -3857,8 +3857,9 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
-            .load_stream_upload_session(bucket, key, session_id)
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        storage_client.load_stream_upload_session(pg_id, bucket, key, session_id)
     }
 
     pub fn prepare_stream_segment_append(
@@ -3871,7 +3872,8 @@ impl StorageCluster {
         let object_node = self.object_metadata_primary_node(bucket, key)?;
         let _bucket_guard = object_node.lock_bucket(bucket);
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-        object_node.prepare_stream_segment_append(bucket, key, request)
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        storage_client.prepare_stream_segment_append(pg_id, bucket, key, request)
     }
 
     pub fn write_stream_segment_payload_shards(

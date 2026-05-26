@@ -5094,6 +5094,10 @@ Progress:
 - Migrated the post-publish live-object lookups used to build direct PUT and
   stream PUT outcomes through the local node client, removing another raw object
   PG open from the successful PUT return path.
+- Migrated stream-upload session loading and stream-segment append preparation
+  through the local node client. The old `SharedStorageNode` stream-session
+  convenience helpers are now test-only, and the boundary guardrail covers those
+  migrated stream-session read/prepare paths.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

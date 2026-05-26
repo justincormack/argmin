@@ -24,7 +24,9 @@ use crate::types::{
     MultipartUploadManagementLookup, MultipartUploadRecord, ObjectKey,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, PayloadReclaimRoot,
-    PgId, SessionId, ShardKey, StoredObject, UploadId, UploadState, WriteAck,
+    PgId, PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StoredObject,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    UploadState, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -78,6 +80,41 @@ fn load_in_progress_multipart_upload_from_pg(
         });
     }
     Ok(upload)
+}
+
+fn validate_stream_upload_session_binding(
+    session: &StreamUploadRecord,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> Result<(), ObjectPgActionError> {
+    if session.state != StreamUploadState::InProgress {
+        return Err(ObjectPgActionError::InvalidRequest {
+            reason: "stream session is not in progress".to_string(),
+        });
+    }
+    if session.bucket != bucket.as_str() || session.key != key.as_str() {
+        return Err(ObjectPgActionError::InvalidRequest {
+            reason: "session bucket/key mismatch".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn reject_duplicate_stream_segment_index(
+    pg: &crate::PgStore,
+    session_id: &SessionId,
+    segment_index: u32,
+) -> Result<(), ObjectPgActionError> {
+    let existing_segments = pg.list_stream_segments(session_id)?;
+    if existing_segments
+        .iter()
+        .any(|segment| segment.segment_index == segment_index)
+    {
+        return Err(ObjectPgActionError::InvalidRequest {
+            reason: format!("duplicate segment_index {segment_index}"),
+        });
+    }
+    Ok(())
 }
 
 fn pending_bucket_command_matches_current(
@@ -546,6 +583,22 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError>;
+
+    fn load_stream_upload_session(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError>;
+
+    fn prepare_stream_segment_append(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
 
     fn load_bucket_execution_generations(
         &self,
@@ -1696,6 +1749,91 @@ impl StorageNodeClient for LocalStorageNodeClient {
             key,
             reservation_id,
         )?)
+    }
+
+    fn load_stream_upload_session(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let session = pg.get_stream_upload(session_id)?;
+        validate_stream_upload_session_binding(&session, bucket, key)?;
+        Ok(session)
+    }
+
+    fn prepare_stream_segment_append(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let session = pg.get_stream_upload(&request.session_id)?;
+        validate_stream_upload_session_binding(&session, bucket, key)?;
+        reject_duplicate_stream_segment_index(&pg, &request.session_id, request.segment_index)?;
+        let pg_topology = self.storage_node.pg_topology();
+        let (segment_okh, segment_vid, data_pg_id) = match session.target {
+            StreamUploadTarget::PutObject => {
+                let generation_id =
+                    pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    crate::segment_key_hash(
+                        bucket.as_str(),
+                        key.as_str(),
+                        generation_id,
+                        request.segment_index,
+                    ),
+                    segment_vid,
+                    pg_topology
+                        .object_generation_segment_data_pg(
+                            bucket,
+                            key,
+                            generation_id,
+                            request.segment_index,
+                        )
+                        .get(),
+                )
+            }
+            StreamUploadTarget::UploadPart {
+                ref upload_id,
+                part_number,
+            } => {
+                let upload =
+                    load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    request.segment_okh,
+                    segment_vid,
+                    pg_topology
+                        .object_generation_multipart_part_segment_data_pg(
+                            bucket,
+                            key,
+                            upload.object_generation_id,
+                            part_number,
+                            request.segment_index,
+                        )
+                        .get(),
+                )
+            }
+        };
+        let ec = self.storage_node.default_ec_shape();
+        let segment_record = StreamUploadSegmentRecord {
+            session_id: request.session_id.clone(),
+            segment_index: request.segment_index,
+            size: request.size,
+            segment_crc64: request.segment_crc64,
+            segment_okh,
+            segment_vid,
+            data_pg_id,
+            ec_k: ec.k,
+            ec_m: ec.m,
+        };
+        Ok((session.target, segment_record))
     }
 
     fn load_bucket_execution_generations(
