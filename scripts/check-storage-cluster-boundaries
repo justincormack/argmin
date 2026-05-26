@@ -597,7 +597,7 @@ migrated_simple_object_read_bypasses=$(
             || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_put_object_metadata_snapshot|build_put_object_metadata_command|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|prepare_stream_segment_append|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command)\(/) {
+        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_put_object_metadata_snapshot|build_put_object_metadata_command|load_current_object_delete_snapshot|load_specific_object_delete_snapshot|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|prepare_stream_segment_append|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
                 next
@@ -635,6 +635,15 @@ migrated_simple_object_read_bypasses=$(
             print FILENAME ":" FNR ":" $0
         }
         if (current_fn == "put_object_metadata_if" \
+            && ($0 ~ /PgMetadataStore::get_object_meta\(/ \
+                || $0 ~ /PgMetadataStore::get_object_version\(/ \
+                || $0 ~ /primary_node\.get_pg\(/ \
+                || $0 ~ /next_object_metadata_command_id_from_locked_pg\(/)) {
+            print FILENAME ":" FNR ":" $0
+        }
+        if ((current_fn == "delete_specific_object_version_if" \
+                || current_fn == "delete_current_object_if" \
+                || current_fn == "insert_current_delete_marker_if") \
             && ($0 ~ /PgMetadataStore::get_object_meta\(/ \
                 || $0 ~ /PgMetadataStore::get_object_version\(/ \
                 || $0 ~ /primary_node\.get_pg\(/ \

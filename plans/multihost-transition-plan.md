@@ -5115,6 +5115,12 @@ Progress:
   same stored row before allocating the command id and building the
   `PutObjectMetadata` command. The guardrail now blocks raw object-row loads and
   locked-PG command-id allocation inside that cluster helper.
+- Migrated direct delete command construction for specific-version deletes,
+  current-object deletes, and explicit delete-marker insertion through
+  node-client snapshot/build APIs. The cluster now runs delete precondition
+  callbacks against a typed current/specific object snapshot, while the storage
+  node reloads the same row before computing reclaim targets, write sequence, and
+  metadata command id. The guardrail covers those migrated delete helpers.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
