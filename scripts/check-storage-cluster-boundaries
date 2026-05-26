@@ -227,6 +227,63 @@ fail_with_matches \
     "Production storage-node shard-owner operations must go through the node client boundary" \
     "$migrated_storage_node_bypasses"
 
+migrated_shard_scavenger_metadata_bypasses=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+        pending_storage_client = 0
+        in_test_hook = 0
+        in_test_module = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            in_test_hook = pending_test_cfg
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (in_test_hook) {
+            next
+        }
+        if ($0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client[[:space:]]*$/) {
+            pending_storage_client = 1
+        }
+        if ($0 ~ /\.(list_scavenger_shard_rows|list_shard_scavenger_payload_references|record_shard_scavenger_observation|list_shard_scavenger_observations|resolve_shard_scavenger_observation)\(/) {
+            if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
+                pending_storage_client = 0
+                next
+            }
+            print FILENAME ":" FNR ":" $0
+        }
+        if ($0 ~ /;/) {
+            pending_storage_client = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production shard scavenger metadata operations must go through the node client boundary" \
+    "$migrated_shard_scavenger_metadata_bypasses"
+
 migrated_payload_ack_bypasses=$(
     awk '
     FNR == 1 {

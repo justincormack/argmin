@@ -20,7 +20,7 @@ use crate::metadata_command::{
     PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
-use crate::pg_store::ScavengerShardFileScan;
+use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
@@ -39,10 +39,12 @@ use crate::types::{
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
     PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
-    ShardKey, StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
-    StreamUploadCommandRecord, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
-    UploadId, UploadState, VersionId, WriteAck,
+    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference, StoredObject,
+    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
+    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+    VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -699,6 +701,30 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         &self,
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError>;
+
+    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError>;
+
+    fn list_shard_scavenger_payload_references(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;
+
+    fn record_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError>;
+
+    fn list_shard_scavenger_observations(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError>;
+
+    fn resolve_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError>;
 
     fn list_completed_multipart_upload_records_for_bucket(
         &self,
@@ -1592,6 +1618,45 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<ScavengerShardFileScan, StoreError> {
         self.storage_node
             .list_scavenger_shard_files(data_pg_id.get())
+    }
+
+    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_scavenger_shard_rows()
+    }
+
+    fn list_shard_scavenger_payload_references(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_shard_scavenger_payload_references()
+    }
+
+    fn record_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_shard_scavenger_observation(observation)
+    }
+
+    fn list_shard_scavenger_observations(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_shard_scavenger_observations()
+    }
+
+    fn resolve_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.resolve_shard_scavenger_observation(key).map(|_| ())
     }
 
     fn list_completed_multipart_upload_records_for_bucket(

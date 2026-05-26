@@ -5204,6 +5204,12 @@ Progress:
   bucket delete and tombstone pruning, but individual per-PG tombstone reads now
   run behind storage-client methods. The guardrail blocks raw completed-MPU
   tombstone scans from production cluster code.
+- Migrated shard scavenger audit metadata through the local node client. The
+  cluster still computes cross-node file/row/reference comparisons, but shard
+  row scans, durable payload-reference scans, and observation record/list/resolve
+  calls now run behind storage-client methods on the routed PG primary. The
+  guardrail blocks raw shard scavenger metadata calls from production cluster
+  code.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
