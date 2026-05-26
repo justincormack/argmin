@@ -24,7 +24,8 @@ use crate::metadata_command::{
     ObjectPayloadReclaimCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node_client::{
-    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, MarkBucketDeletingCommandBuild,
+    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
+    BuildStreamPutCommitCommandReq, MarkBucketDeletingCommandBuild,
 };
 use crate::traits::PgMetadataStore;
 use crate::*;
@@ -3810,22 +3811,6 @@ impl super::StorageCluster {
         }))
     }
 
-    fn new_put_object_metadata_command(
-        &self,
-        pg_id: PgId,
-        object_pg: &crate::PgStore,
-        object: LiveObjectRecord,
-        bucket_write_reservation: BucketWriteReservationProof,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        Ok(MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id_from_locked_pg(pg_id, object_pg)?,
-            MetadataCommandPayload::PutObjectMetadata(Box::new(PutObjectMetadataCommand {
-                bucket_write_reservation,
-                object,
-            })),
-        ))
-    }
-
     fn put_object_metadata_command_from_stored(
         stored: &StoredObject,
         version_id: VersionId,
@@ -3860,40 +3845,35 @@ impl super::StorageCluster {
     ) -> Result<Result<T, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
 
         loop {
             let bucket_guard = primary_node.lock_bucket(bucket);
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
-                        let object_pg = primary_node.get_pg(pg_id.get())?;
-                        let stored = match requested_version_id {
+                        let snapshot_version_id = match requested_version_id {
                             Some(version_id) => {
                                 if version_id != update.object.version_id {
-                                    drop(object_pg);
                                     drop(bucket_guard);
                                     self.drain_pending_object_metadata_command(pg_id, &command)?;
                                     continue;
                                 }
-                                PgMetadataStore::get_object_version(
-                                    &*object_pg,
-                                    bucket,
-                                    key,
-                                    version_id,
-                                )?
+                                Some(version_id)
                             }
-                            None => {
-                                let stored =
-                                    PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
-                                if stored.version_id() != update.object.version_id {
-                                    drop(object_pg);
-                                    drop(bucket_guard);
-                                    self.drain_pending_object_metadata_command(pg_id, &command)?;
-                                    continue;
-                                }
-                                stored
-                            }
+                            None => None,
                         };
+                        let stored = storage_client.load_put_object_metadata_snapshot(
+                            pg_id,
+                            bucket,
+                            key,
+                            snapshot_version_id,
+                        )?;
+                        if stored.version_id() != update.object.version_id {
+                            drop(bucket_guard);
+                            self.drain_pending_object_metadata_command(pg_id, &command)?;
+                            continue;
+                        }
                         let (value, version_id, mutation) = match action(&stored) {
                             Ok(command) => command,
                             Err(error) => return Ok(Err(error)),
@@ -3909,7 +3889,6 @@ impl super::StorageCluster {
                                 "conflicting pending command for object metadata update",
                             ));
                         }
-                        drop(object_pg);
                         drop(bucket_guard);
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
@@ -3960,84 +3939,60 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let object_pg = match primary_node.get_pg(pg_id.get()) {
-                Ok(object_pg) => object_pg,
-                Err(error) => {
-                    drop(bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Err(error.into());
-                }
-            };
-            let stored = match requested_version_id {
-                Some(version_id) => {
-                    match PgMetadataStore::get_object_version(&*object_pg, bucket, key, version_id)
-                    {
-                        Ok(stored) => stored,
-                        Err(error) => {
-                            drop(object_pg);
-                            drop(bucket_guard);
-                            release_bucket_write_proof!()?;
-                            return Err(error.into());
-                        }
-                    }
-                }
-                None => match PgMetadataStore::get_object_meta(&*object_pg, bucket, key) {
-                    Ok(stored) => stored,
-                    Err(error) => {
-                        drop(object_pg);
-                        drop(bucket_guard);
-                        release_bucket_write_proof!()?;
-                        return Err(error.into());
-                    }
-                },
-            };
-            let (value, version_id, mutation) = match action(&stored) {
-                Ok(command) => command,
-                Err(error) => {
-                    drop(object_pg);
-                    drop(bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Ok(Err(error));
-                }
-            };
-            let update = match Self::put_object_metadata_command_from_stored(
-                &stored,
-                version_id,
-                mutation,
-                bucket_write_reservation.clone(),
+            let stored = match storage_client.load_put_object_metadata_snapshot(
+                pg_id,
+                bucket,
+                key,
+                requested_version_id,
             ) {
-                Ok(update) => update,
+                Ok(stored) => stored,
                 Err(error) => {
-                    drop(object_pg);
                     drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
             };
-            let command = match self.new_put_object_metadata_command(
-                pg_id,
-                &object_pg,
-                update.object,
-                bucket_write_reservation.clone(),
+            let (value, version_id, mutation) = match action(&stored) {
+                Ok(command) => command,
+                Err(error) => {
+                    drop(bucket_guard);
+                    release_bucket_write_proof!()?;
+                    return Ok(Err(error));
+                }
+            };
+            let command = match storage_client.build_put_object_metadata_command(
+                BuildPutObjectMetadataCommandReq {
+                    pg_id,
+                    cluster_epoch: self.operation_epoch(),
+                    bucket,
+                    key,
+                    requested_version_id,
+                    expected_stored: &stored,
+                    version_id,
+                    mutation,
+                    bucket_write_reservation: &bucket_write_reservation,
+                },
             ) {
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    drop(bucket_guard);
+                    release_bucket_write_proof!()?;
+                    continue;
+                }
                 Ok(command) => command,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    drop(object_pg);
                     drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue;
                 }
                 Err(error) => {
-                    drop(object_pg);
                     drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
             };
-            drop(object_pg);
             drop(bucket_guard);
             let install = match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)

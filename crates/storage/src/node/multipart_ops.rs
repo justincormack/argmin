@@ -1,6 +1,7 @@
 use super::*;
 
 impl SharedStorageNode {
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn load_in_progress_multipart_upload_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
@@ -16,6 +17,7 @@ impl SharedStorageNode {
         Ok(upload)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn load_multipart_upload_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,

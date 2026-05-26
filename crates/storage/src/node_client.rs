@@ -12,6 +12,7 @@ use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
     PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
@@ -422,6 +423,18 @@ pub(crate) struct BuildStreamPartCommitCommandReq<'a> {
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
+pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) bucket: &'a BucketName,
+    pub(crate) key: &'a ObjectKey,
+    pub(crate) requested_version_id: Option<VersionId>,
+    pub(crate) expected_stored: &'a StoredObject,
+    pub(crate) version_id: VersionId,
+    pub(crate) mutation: PutObjectMetadataMutation,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
 pub(crate) trait StorageNodeClient: Send + Sync {
     fn node_id(&self) -> NodeId;
 
@@ -733,6 +746,19 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+
+    fn load_put_object_metadata_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError>;
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_object_read_auth_subject(
         &self,
@@ -1820,6 +1846,72 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(SharedStorageNode::load_existing_live_object_from_object_pg(
             &pg, bucket, key,
         )?)
+    }
+
+    fn load_put_object_metadata_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match version_id {
+            Some(version_id) => Ok(PgMetadataStore::get_object_version(
+                &*pg, bucket, key, version_id,
+            )?),
+            None => Ok(PgMetadataStore::get_object_meta(&*pg, bucket, key)?),
+        }
+    }
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = match request.requested_version_id {
+            Some(version_id) => {
+                PgMetadataStore::get_object_version(&*pg, request.bucket, request.key, version_id)
+            }
+            None => PgMetadataStore::get_object_meta(&*pg, request.bucket, request.key),
+        };
+        let current = match current {
+            Ok(current) => current,
+            Err(MetadataError::ObjectNotFound) => {
+                return Err(ObjectPgActionError::StaleObjectReadSubject);
+            }
+            Err(other) => return Err(other.into()),
+        };
+        if &current != request.expected_stored {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        if current.version_id() != request.version_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object metadata action returned version {:?} for stored version {:?}",
+                    request.version_id,
+                    current.version_id()
+                ),
+            });
+        }
+        let live = current
+            .as_live()
+            .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutObjectMetadata(Box::new(
+                PutObjectMetadataCommand::from_live_object_and_mutation(
+                    live.clone(),
+                    request.mutation,
+                    request.bucket_write_reservation.clone(),
+                ),
+            )),
+        ))
     }
 
     fn load_object_read_auth_subject(

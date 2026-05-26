@@ -5109,6 +5109,12 @@ Progress:
   snapshot before allocating ids and building the pending metadata command, so
   stream finalization no longer opens object PGs directly for session/segment
   reads.
+- Migrated object metadata update command construction for tags, object ACL,
+  legal hold, and retention through a two-phase node-client API. The coordinator
+  authorizes against a stored-object snapshot, and the storage node reloads the
+  same stored row before allocating the command id and building the
+  `PutObjectMetadata` command. The guardrail now blocks raw object-row loads and
+  locked-PG command-id allocation inside that cluster helper.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
