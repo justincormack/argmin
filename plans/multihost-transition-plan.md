@@ -5121,6 +5121,15 @@ Progress:
   callbacks against a typed current/specific object snapshot, while the storage
   node reloads the same row before computing reclaim targets, write sequence, and
   metadata command id. The guardrail covers those migrated delete helpers.
+- Migrated lifecycle noncurrent-version expiry and expired-delete-marker cleanup
+  off raw object-PG version scans. Lifecycle selection now runs against a
+  node-client version snapshot, then storage reloads the exact selected version
+  and validates the full version-list identity before building the delete
+  command, because eligibility can depend on neighboring versions. If the list
+  changed, lifecycle defers the candidate to a later sweep rather than retrying
+  immediately and competing with foreground writes. The guardrail now blocks raw
+  `list_object_versions_for_key` and command-id allocation in those migrated
+  lifecycle cleanup helpers.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

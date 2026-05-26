@@ -503,6 +503,7 @@ pub(crate) struct BuildDeleteSpecificObjectVersionCommandReq<'a> {
     pub(crate) key: &'a ObjectKey,
     pub(crate) version_id: VersionId,
     pub(crate) expected_stored: Option<&'a StoredObject>,
+    pub(crate) expected_version_list: Option<&'a [StoredObject]>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
@@ -866,6 +867,13 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+
+    fn list_object_versions_for_lifecycle(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError>;
 
     fn build_delete_specific_object_version_command(
         &self,
@@ -2059,17 +2067,49 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )?)
     }
 
+    fn list_object_versions_for_lifecycle(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match PgMetadataStore::list_object_versions_for_key(&*pg, bucket, key) {
+            Ok(versions) => Ok(versions),
+            Err(MetadataError::ObjectNotFound) => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn build_delete_specific_object_version_command(
         &self,
         request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = load_object_version_optional_from_pg(
-            &pg,
-            request.bucket,
-            request.key,
-            request.version_id,
-        )?;
+        let current = if let Some(expected_version_list) = request.expected_version_list {
+            let versions = match PgMetadataStore::list_object_versions_for_key(
+                &*pg,
+                request.bucket,
+                request.key,
+            ) {
+                Ok(versions) => versions,
+                Err(MetadataError::ObjectNotFound) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            if versions.as_slice() != expected_version_list {
+                return Err(ObjectPgActionError::StaleObjectReadSubject);
+            }
+            versions
+                .into_iter()
+                .find(|stored| stored.version_id() == request.version_id)
+        } else {
+            load_object_version_optional_from_pg(
+                &pg,
+                request.bucket,
+                request.key,
+                request.version_id,
+            )?
+        };
         if current.as_ref() != request.expected_stored {
             return Err(ObjectPgActionError::StaleObjectReadSubject);
         }

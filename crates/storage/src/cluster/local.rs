@@ -25850,19 +25850,39 @@ mod tests {
             b"current version",
         );
 
-        let reclaimed = cluster
+        let mut reclaimed = cluster
             .delete_noncurrent_live_versions_if_due(&bucket, &key, |raw, versions| {
                 assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                assert!(versions
-                    .iter()
-                    .any(|stored| stored.version_id() == older.version_id));
-                assert!(versions
-                    .iter()
-                    .any(|stored| stored.version_id() == middle.version_id));
-                Ok::<_, ()>(HashSet::from([older.version_id, middle.version_id]))
+                Ok::<_, ()>(
+                    [older.version_id, middle.version_id]
+                        .into_iter()
+                        .filter(|version_id| {
+                            versions
+                                .iter()
+                                .any(|stored| stored.version_id() == *version_id)
+                        })
+                        .collect(),
+                )
             })
             .unwrap()
             .unwrap();
+        let next_reclaimed = cluster
+            .delete_noncurrent_live_versions_if_due(&bucket, &key, |raw, versions| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                Ok::<_, ()>(
+                    [older.version_id, middle.version_id]
+                        .into_iter()
+                        .filter(|version_id| {
+                            versions
+                                .iter()
+                                .any(|stored| stored.version_id() == *version_id)
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        reclaimed.extend(next_reclaimed);
         assert_eq!(reclaimed.len(), 2);
         assert!(reclaimed.contains(&older.generation_id));
         assert!(reclaimed.contains(&middle.generation_id));
@@ -26249,6 +26269,219 @@ mod tests {
             .unwrap());
         }
         assert_clean_metadata_command_stream(&first_map, &[2]);
+    }
+
+    #[test]
+    fn lifecycle_noncurrent_version_list_change_defers_delete() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "lifecycle-version-list-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket_with_versioning(
+            &first_cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&first_cluster, &bucket);
+        let older = write_committed_direct_segment_for_with_versioning(
+            &first_cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xe1; 16],
+            [0xf1; 16],
+            b"older",
+        );
+        let _current = write_committed_direct_segment_for_with_versioning(
+            &first_cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0xe2; 16],
+            [0xf2; 16],
+            b"current",
+        );
+
+        let selector_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_selector = Arc::clone(&selector_calls);
+        let race_bucket = bucket.clone();
+        let race_key = key.clone();
+        let reclaimed = first_cluster
+            .delete_noncurrent_live_versions_if_due(&bucket, &key, move |raw, versions| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                let call = calls_for_selector.fetch_add(1, Ordering::SeqCst);
+                assert!(versions
+                    .iter()
+                    .any(|stored| stored.version_id() == older.version_id));
+                if call == 0 {
+                    write_committed_direct_segment_for_with_versioning(
+                        &second_cluster,
+                        &race_bucket,
+                        &race_key,
+                        crate::BucketVersioningState::Enabled,
+                        [0xe3; 16],
+                        [0xf3; 16],
+                        b"racing current",
+                    );
+                    Ok::<_, ()>(HashSet::from([older.version_id]))
+                } else {
+                    Ok(HashSet::new())
+                }
+            })
+            .unwrap()
+            .unwrap();
+        assert!(reclaimed.is_empty());
+        assert_eq!(
+            selector_calls.load(Ordering::SeqCst),
+            1,
+            "version-list drift must defer lifecycle work to a later sweep"
+        );
+
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, older.version_id)
+                    .unwrap();
+            assert!(stored.as_live().is_some());
+            assert!(!crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                older.generation_id
+            )
+            .unwrap());
+        }
+        assert_clean_metadata_command_stream(&first_map, &[2]);
+        assert_bucket_write_reservations_released(&first_map, &bucket);
+    }
+
+    #[test]
+    fn lifecycle_expired_marker_version_list_change_defers_delete() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut first_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = first_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "lifecycle-marker-list-race-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut first_map, 1, NodeId::new(1));
+        set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+        let mut second_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        set_route_primary(&mut second_map, 1, NodeId::new(1));
+        set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+        let first_map = Arc::new(first_map);
+        let second_map = Arc::new(second_map);
+        let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+        let second_cluster =
+            crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+        create_test_bucket_with_versioning(
+            &first_cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        put_test_lifecycle(&first_cluster, &bucket);
+        let marker = first_cluster
+            .insert_current_delete_marker_if(
+                &bucket,
+                &key,
+                crate::OwnerIdentity::from_principal("owner"),
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let selector_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_selector = Arc::clone(&selector_calls);
+        let race_bucket = bucket.clone();
+        let race_key = key.clone();
+        let deleted = first_cluster
+            .delete_expired_delete_marker_if_due(
+                &bucket,
+                &key,
+                marker.version_id,
+                move |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    let call = calls_for_selector.fetch_add(1, Ordering::SeqCst);
+                    assert!(versions.iter().any(|stored| {
+                        stored.version_id() == marker.version_id
+                            && matches!(stored, crate::StoredObject::DeleteMarker(_))
+                    }));
+                    if call == 0 {
+                        assert_eq!(versions.len(), 1);
+                        write_committed_direct_segment_for_with_versioning(
+                            &second_cluster,
+                            &race_bucket,
+                            &race_key,
+                            crate::BucketVersioningState::Enabled,
+                            [0xe4; 16],
+                            [0xf4; 16],
+                            b"racing live",
+                        );
+                        Ok::<_, ()>(true)
+                    } else {
+                        panic!("version-list drift should defer lifecycle work without retrying")
+                    }
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!deleted);
+        assert_eq!(
+            selector_calls.load(Ordering::SeqCst),
+            1,
+            "delete-marker version-list drift must defer lifecycle work to a later sweep"
+        );
+
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, marker.version_id)
+                    .unwrap();
+            assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
+        }
+        assert_clean_metadata_command_stream(&first_map, &[2]);
+        assert_bucket_write_reservations_released(&first_map, &bucket);
     }
 
     #[test]

@@ -4479,6 +4479,7 @@ impl super::StorageCluster {
                     key,
                     version_id,
                     expected_stored: stored.as_ref(),
+                    expected_version_list: None,
                     bucket_write_reservation: &bucket_write_reservation,
                 },
             );
@@ -5263,6 +5264,7 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
         let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
             .then(|| primary_node.lock_bucket(bucket));
         let mut completed_reclaimed_generation_ids = Vec::new();
@@ -5271,25 +5273,17 @@ impl super::StorageCluster {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
-                        let object_pg = primary_node.get_pg(pg_id.get())?;
-                        let versions = match PgMetadataStore::list_object_versions_for_key(
-                            &*object_pg,
-                            bucket,
-                            key,
-                        ) {
-                            Ok(versions) => versions,
-                            Err(MetadataError::ObjectNotFound) => {
-                                drop(object_pg);
-                                self.apply_exact_pending_object_metadata_command(
-                                    pg_id,
-                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
-                                        &command,
-                                    ),
-                                )?;
-                                return Ok(Ok(Vec::new()));
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
+                        let versions = storage_client
+                            .list_object_versions_for_lifecycle(pg_id, bucket, key)?;
+                        if versions.is_empty() {
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &command,
+                                ),
+                            )?;
+                            return Ok(Ok(Vec::new()));
+                        }
                         let due_version_ids =
                             match select_versions(raw_lifecycle.as_deref(), &versions) {
                                 Ok(version_ids) => version_ids,
@@ -5301,7 +5295,6 @@ impl super::StorageCluster {
                                 super::delete_object_version_reclaim_generation(&delete.target)
                             })
                             .flatten();
-                        drop(object_pg);
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -5313,13 +5306,10 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            let versions =
-                match PgMetadataStore::list_object_versions_for_key(&*object_pg, bucket, key) {
-                    Ok(versions) => versions,
-                    Err(MetadataError::ObjectNotFound) => return Ok(Ok(Vec::new())),
-                    Err(error) => return Err(error.into()),
-                };
+            let versions = storage_client.list_object_versions_for_lifecycle(pg_id, bucket, key)?;
+            if versions.is_empty() {
+                return Ok(Ok(Vec::new()));
+            }
             let due_version_ids = match select_versions(raw_lifecycle.as_deref(), &versions) {
                 Ok(version_ids) => version_ids,
                 Err(error) => return Ok(Err(error)),
@@ -5336,14 +5326,11 @@ impl super::StorageCluster {
                 if !due_version_ids.contains(&record.version_id) {
                     continue;
                 }
-                let target = self.live_delete_command_target(&object_pg, bucket, key, record)?;
-                let reclaim_generation_id =
-                    super::delete_object_version_reclaim_generation(&target);
-                delete_targets.push((record.version_id, target, reclaim_generation_id));
+                delete_targets.push(stored.clone());
             }
-            drop(object_pg);
 
-            for (version_id, target, reclaim_generation_id) in delete_targets {
+            for stored in delete_targets {
+                let version_id = stored.version_id();
                 let bucket_write_reservation = match self
                     .try_acquire_bucket_write_proof_for_object_metadata_command(
                         bucket,
@@ -5354,8 +5341,26 @@ impl super::StorageCluster {
                     Some(proof) => proof,
                     None => return Ok(Ok(completed_reclaimed_generation_ids)),
                 };
-                let command_id = match self.next_object_metadata_command_id(pg_id) {
-                    Ok(command_id) => command_id,
+                let command = storage_client.build_delete_specific_object_version_command(
+                    BuildDeleteSpecificObjectVersionCommandReq {
+                        pg_id,
+                        cluster_epoch: self.operation_epoch(),
+                        bucket,
+                        key,
+                        version_id,
+                        expected_stored: Some(&stored),
+                        expected_version_list: Some(&versions),
+                        bucket_write_reservation: &bucket_write_reservation,
+                    },
+                );
+                let command = match command {
+                    Ok(Some(command)) => command,
+                    Ok(None) | Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Ok(Ok(completed_reclaimed_generation_ids));
+                    }
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                         ..
                     })) => {
@@ -5372,18 +5377,6 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::DeleteObjectVersion(Box::new(
-                        DeleteObjectVersionCommand {
-                            bucket_write_reservation: bucket_write_reservation.clone(),
-                            bucket: bucket.clone(),
-                            key: key.clone(),
-                            version_id,
-                            target,
-                        },
-                    )),
-                );
                 let install = match self
                     .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
                 {
@@ -5405,8 +5398,12 @@ impl super::StorageCluster {
                     }
                 }
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-                if let Some(generation_id) = reclaim_generation_id {
-                    completed_reclaimed_generation_ids.push(generation_id);
+                if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
+                    if let Some(generation_id) =
+                        super::delete_object_version_reclaim_generation(&delete.target)
+                    {
+                        completed_reclaimed_generation_ids.push(generation_id);
+                    }
                 }
             }
             return Ok(Ok(completed_reclaimed_generation_ids));
@@ -5435,6 +5432,7 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
         let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
             .then(|| primary_node.lock_bucket(bucket));
 
@@ -5444,30 +5442,21 @@ impl super::StorageCluster {
                     if delete.matches_request(bucket, key, expected_version_id)
                         && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
                     {
-                        let object_pg = primary_node.get_pg(pg_id.get())?;
-                        let versions = match PgMetadataStore::list_object_versions_for_key(
-                            &*object_pg,
-                            bucket,
-                            key,
-                        ) {
-                            Ok(versions) => versions,
-                            Err(MetadataError::ObjectNotFound) => {
-                                drop(object_pg);
-                                self.apply_exact_pending_object_metadata_command(
-                                    pg_id,
-                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
-                                        &command,
-                                    ),
-                                )?;
-                                return Ok(Ok(false));
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
+                        let versions = storage_client
+                            .list_object_versions_for_lifecycle(pg_id, bucket, key)?;
+                        if versions.is_empty() {
+                            self.apply_exact_pending_object_metadata_command(
+                                pg_id,
+                                super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                    &command,
+                                ),
+                            )?;
+                            return Ok(Ok(false));
+                        }
                         let due = match should_delete(raw_lifecycle.as_deref(), &versions) {
                             Ok(due) => due,
                             Err(error) => return Ok(Err(error)),
                         };
-                        drop(object_pg);
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -5489,37 +5478,25 @@ impl super::StorageCluster {
                 Some(proof) => proof,
                 None => return Ok(Ok(false)),
             };
-            let object_pg = match primary_node.get_pg(pg_id.get()) {
-                Ok(object_pg) => object_pg,
-                Err(error) => {
-                    self.release_bucket_write_proof_for_object_metadata_command(
-                        &bucket_write_reservation,
-                    )?;
-                    return Err(error.into());
-                }
-            };
             let versions =
-                match PgMetadataStore::list_object_versions_for_key(&*object_pg, bucket, key) {
+                match storage_client.list_object_versions_for_lifecycle(pg_id, bucket, key) {
                     Ok(versions) => versions,
-                    Err(MetadataError::ObjectNotFound) => {
-                        drop(object_pg);
-                        self.release_bucket_write_proof_for_object_metadata_command(
-                            &bucket_write_reservation,
-                        )?;
-                        return Ok(Ok(false));
-                    }
                     Err(error) => {
-                        drop(object_pg);
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
                         )?;
-                        return Err(error.into());
+                        return Err(error);
                     }
                 };
+            if versions.is_empty() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Ok(Ok(false));
+            }
             let due = match should_delete(raw_lifecycle.as_deref(), &versions) {
                 Ok(due) => due,
                 Err(error) => {
-                    drop(object_pg);
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -5527,29 +5504,44 @@ impl super::StorageCluster {
                 }
             };
             if !due {
-                drop(object_pg);
                 self.release_bucket_write_proof_for_object_metadata_command(
                     &bucket_write_reservation,
                 )?;
                 return Ok(Ok(false));
             }
-            let command = self.new_delete_object_version_command(
-                pg_id,
-                &object_pg,
-                DeleteObjectVersionDraft {
+            let Some(expected_marker) = versions
+                .iter()
+                .find(|stored| stored.version_id() == expected_version_id)
+                .filter(|stored| matches!(stored, StoredObject::DeleteMarker(_)))
+            else {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Ok(Ok(false));
+            };
+            let command = storage_client.build_delete_specific_object_version_command(
+                BuildDeleteSpecificObjectVersionCommandReq {
+                    pg_id,
+                    cluster_epoch: self.operation_epoch(),
                     bucket,
                     key,
                     version_id: expected_version_id,
-                    target: DeleteObjectVersionTarget::DeleteMarker,
-                    bucket_write_reservation: bucket_write_reservation.clone(),
+                    expected_stored: Some(expected_marker),
+                    expected_version_list: Some(&versions),
+                    bucket_write_reservation: &bucket_write_reservation,
                 },
             );
             let command = match command {
-                Ok(command) => command,
+                Ok(Some(command)) => command,
+                Ok(None) | Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Ok(false));
+                }
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    drop(object_pg);
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -5557,14 +5549,12 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    drop(object_pg);
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
                     return Err(error);
                 }
             };
-            drop(object_pg);
             let install = match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
