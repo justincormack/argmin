@@ -4,17 +4,20 @@ use std::sync::Arc;
 use placement::NodeId;
 use s3_types::{AclGrants, BucketVersioningState};
 
-use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
+use crate::error::{
+    BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
+};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
     BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
-    CommitDirectPutObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
-    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MarkBucketDeletingCommand,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
+    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
@@ -23,21 +26,22 @@ use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CreateBucketConfig,
-    CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, EcShape, GenerationId,
-    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq,
-    ListedMultipartParts, LiveObjectRecord, MultipartCompletionPreflight,
-    MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout,
-    ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
-    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey, StoredObject,
-    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
-    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, VersionId, WriteAck,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
+    CreateStreamUploadReq, DataPgId, EcShape, GenerationId, LifecycleSweepBuckets,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq, ListedMultipartParts,
+    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
+    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
+    ShardKey, StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+    StreamUploadCommandRecord, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
+    UploadId, UploadState, VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -242,6 +246,47 @@ fn load_stream_part_finalize_snapshot_from_pg(
         existing_part,
         displaced_segments,
     })
+}
+
+fn snapshot_upload_part_stream_cleanup_from_pg(
+    pg: &crate::PgStore,
+    upload_id: &UploadId,
+) -> Result<
+    (
+        Vec<TerminalStreamCleanupRecord>,
+        Vec<StreamUploadSegmentRecord>,
+    ),
+    ObjectPgActionError,
+> {
+    let mut stream_uploads = PgMetadataStore::list_all_stream_uploads(pg)?
+        .into_iter()
+        .filter(|session| {
+            matches!(
+                &session.target,
+                StreamUploadTarget::UploadPart {
+                    upload_id: session_upload_id,
+                    ..
+                } if session_upload_id == upload_id
+            )
+        })
+        .collect::<Vec<_>>();
+    stream_uploads.sort_by(|a, b| a.session_id.as_str().cmp(b.session_id.as_str()));
+
+    let mut stream_upload_segments = Vec::new();
+    for session in &stream_uploads {
+        stream_upload_segments.extend(PgMetadataStore::list_stream_segments(
+            pg,
+            &session.session_id,
+        )?);
+    }
+
+    Ok((
+        stream_uploads
+            .iter()
+            .map(TerminalStreamCleanupRecord::from)
+            .collect(),
+        stream_upload_segments,
+    ))
 }
 
 fn snapshot_direct_put_stale_payload_command(
@@ -528,6 +573,15 @@ pub(crate) struct BuildStreamPartCommitCommandReq<'a> {
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
+pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) request: &'a CompleteMultipartCommitRequest,
+    pub(crate) version_id: VersionId,
+    pub(crate) completion_order: u64,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
 pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
     pub(crate) pg_id: PgId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -794,6 +848,12 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<BucketRecord, BucketSnapshotLoadError>;
+
+    fn delete_finalized_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError>;
 
     fn build_create_bucket_command(
         &self,
@@ -1186,6 +1246,11 @@ pub(crate) trait StorageNodeClient: Send + Sync {
     fn build_stream_part_commit_command(
         &self,
         request: BuildStreamPartCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_bucket_execution_generations(
@@ -1861,6 +1926,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<BucketRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?)
+    }
+
+    fn delete_finalized_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        PgMetadataStore::delete_finalized_bucket(&*pg, bucket)?;
+        pg.refresh_metadata_command_state_digest()?;
+        Ok(())
     }
 
     fn build_create_bucket_command(
@@ -3204,6 +3280,198 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 existing_part: current.existing_part,
                 displaced_segments: current.displaced_segments,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),
+            })),
+        ))
+    }
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let complete = request.request;
+        let upload = PgMetadataStore::get_multipart_upload(&*pg, &complete.upload_id)?;
+        if upload.bucket != complete.bucket
+            || upload.key != complete.key
+            || upload.state != UploadState::InProgress
+        {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: complete.upload_id.to_string(),
+            }
+            .into());
+        }
+        if upload.object_generation_id != complete.generation_id {
+            return Err(MetadataError::Db {
+                context: "complete multipart command generation mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into());
+        }
+        if complete.part_records.is_empty() {
+            return Err(MetadataError::Db {
+                context: "complete multipart command empty parts",
+                source: rusqlite::Error::InvalidQuery,
+            }
+            .into());
+        }
+        if complete.versioning == BucketVersioningState::Enabled && request.version_id.is_null() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "versioned multipart completion requires reserved version id".to_string(),
+            });
+        }
+        if complete.versioning != BucketVersioningState::Enabled && !request.version_id.is_null() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "unversioned multipart completion must use null version id".to_string(),
+            });
+        }
+
+        let parts_len =
+            u32::try_from(complete.part_records.len()).map_err(|_| MetadataError::Db {
+                context: "complete multipart command too many parts",
+                source: rusqlite::Error::InvalidQuery,
+            })?;
+        let parts_count = std::num::NonZeroU32::new(parts_len).ok_or(MetadataError::Db {
+            context: "complete multipart command empty parts",
+            source: rusqlite::Error::InvalidQuery,
+        })?;
+        let selected_part_numbers: std::collections::BTreeSet<u32> = complete
+            .part_records
+            .iter()
+            .map(|part| part.part_number)
+            .collect();
+        for expected_part in &complete.part_records {
+            let current_part = PgMetadataStore::get_multipart_part(
+                &*pg,
+                &complete.upload_id,
+                expected_part.part_number,
+            )
+            .map_err(|error| match error {
+                MetadataError::PartNotFound { .. } => {
+                    ObjectPgActionError::StaleMultipartCompletionSnapshot
+                }
+                other => other.into(),
+            })?;
+            if current_part != *expected_part {
+                return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);
+            }
+        }
+        let object_parts = complete
+            .part_records
+            .iter()
+            .map(|part| {
+                let data_pg_id = self
+                    .storage_node
+                    .pg_topology()
+                    .object_generation_multipart_part_data_pg(
+                        &complete.bucket,
+                        &complete.key,
+                        complete.generation_id,
+                        part.part_number,
+                    )
+                    .get();
+                ObjectPartRecord {
+                    bucket: complete.bucket.clone(),
+                    key: complete.key.clone(),
+                    version_id: request.version_id,
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag: part.etag.clone(),
+                    etag_kind: part.etag_kind,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec_k: part.ec_k,
+                    ec_m: part.ec_m,
+                    data_pg_id,
+                    checksum: part.checksum.clone(),
+                }
+            })
+            .collect();
+
+        let all_parts = PgMetadataStore::list_multipart_parts(
+            &*pg,
+            &ListPartsReq {
+                upload_id: complete.upload_id.clone(),
+                part_number_marker: None,
+                max_parts: u32::MAX,
+            },
+        )?
+        .parts;
+        let omitted_parts = all_parts
+            .into_iter()
+            .filter(|part| !selected_part_numbers.contains(&part.part_number))
+            .collect::<Vec<_>>();
+        let all_streaming_segments =
+            PgMetadataStore::get_all_multipart_part_segments_for_upload(&*pg, &complete.upload_id)?;
+        let mut selected_streaming_segments = Vec::new();
+        let mut omitted_streaming_segments = Vec::new();
+        for mut segment in all_streaming_segments {
+            if selected_part_numbers.contains(&segment.part_number) {
+                segment.version_id = request.version_id.to_u64();
+                selected_streaming_segments.push(segment);
+            } else {
+                omitted_streaming_segments.push(segment);
+            }
+        }
+        let (stream_uploads, stream_upload_segments) =
+            snapshot_upload_part_stream_cleanup_from_pg(&pg, &complete.upload_id)?;
+
+        let last_modified_millis = crate::clock::current_time_millis();
+        let completed_at_millis = last_modified_millis;
+        let write_sequence =
+            pg.next_object_write_sequence(complete.bucket.as_str(), complete.key.as_str())?;
+        let stale_payload = if request.version_id.is_null() {
+            snapshot_direct_put_stale_payload_command(
+                &pg,
+                &complete.bucket,
+                &complete.key,
+                last_modified_millis,
+            )?
+        } else {
+            None
+        };
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
+                upload_id: complete.upload_id.clone(),
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+                object: PutLiveObjectReq {
+                    bucket: complete.bucket.clone(),
+                    key: complete.key.clone(),
+                    version_id: request.version_id,
+                    owner: complete.owner.clone(),
+                    acl_grants: complete.acl_grants.clone(),
+                    public_read: complete.public_read,
+                    generation_id: complete.generation_id,
+                    size: complete.size,
+                    etag: ObjectEtag::MultipartComposite {
+                        crc64: complete.etag_crc64,
+                        parts: parts_count,
+                    },
+                    ec: EcShape { k: 0, m: 0 },
+                    layout: ObjectLayout::MultipartManifest { parts_count },
+                    tags: complete.tags.clone(),
+                    metadata_blob: complete.metadata_blob.clone(),
+                    system_metadata_blob: complete.system_metadata_blob.clone(),
+                    object_lock: complete.object_lock,
+                    encryption: complete.encryption.clone(),
+                },
+                parts: object_parts,
+                selected_streaming_segments,
+                omitted_parts,
+                omitted_streaming_segments,
+                stream_uploads,
+                stream_upload_segments,
+                write_sequence,
+                completion_order: request.completion_order,
+                completed_at_millis,
+                initiator: upload.initiator.clone(),
+                last_modified_millis,
+                stale_payload,
             })),
         ))
     }

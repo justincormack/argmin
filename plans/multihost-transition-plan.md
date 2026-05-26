@@ -5165,6 +5165,23 @@ Progress:
   cluster retains proof acquisition, pending install, drain, and apply behavior
   without opening the object PG for abort-command construction. The guardrail
   covers the migrated abort-command helper paths.
+- Migrated finalized bucket deletion fanout through the local node client. Each
+  acting node now deletes the finalized bucket and refreshes its metadata digest
+  behind the node-client boundary, while `StorageCluster` retains the primary
+  missing-bucket outcome and replica-missing tolerance. The guardrail blocks raw
+  finalized-bucket delete PG access in `delete_bucket_from_acting_set`.
+- Migrated multipart completion command construction through the local node
+  client. The cluster still owns the durable bucket-write proof, command-stream
+  version reservation, completed-MPU order reservation, pending install, and
+  apply loop; the storage-side builder now revalidates the upload row under the
+  object-PG lock, reloads each selected part row to fence UploadPart replacement
+  races, snapshots omitted parts/stream cleanup/stale null-version payload,
+  allocates the object write sequence and command id, and returns the
+  `CommitMultipartObject` envelope. A stale selected part row makes the
+  coordinator retry the normal completion validation once, so a real replacement
+  returns the normal `InvalidPart` response rather than publishing stale
+  payload. The guardrail blocks raw multipart completion object-PG reads and
+  direct command construction in `complete_multipart_upload_commit_serialized`.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

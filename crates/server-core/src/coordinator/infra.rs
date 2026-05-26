@@ -70,6 +70,12 @@ impl Coordinator {
                             .to_string(),
                     }
                 }
+                storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                    ServerError::InternalError {
+                        reason: "stale multipart completion snapshot escaped storage retry loop"
+                            .to_string(),
+                    }
+                }
             })?;
 
         Ok(session_id)

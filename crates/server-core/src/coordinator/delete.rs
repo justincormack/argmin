@@ -76,6 +76,13 @@ impl Coordinator {
                                     .to_string(),
                             }
                         }
+                        storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                            ServerError::InternalError {
+                                reason:
+                                    "stale multipart completion snapshot escaped storage retry loop"
+                                        .to_string(),
+                            }
+                        }
                     })??;
 
                 if let storage::DeletedCurrentObject::Live {
@@ -210,6 +217,13 @@ impl Coordinator {
                                     .to_string(),
                             }
                         }
+                        storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                            ServerError::InternalError {
+                                reason:
+                                    "stale multipart completion snapshot escaped storage retry loop"
+                                        .to_string(),
+                            }
+                        }
                     })??;
 
                 match deleted.deleted {
@@ -313,6 +327,13 @@ impl Coordinator {
                             ServerError::InternalError {
                                 reason: "stale stream finalize snapshot escaped storage retry loop"
                                     .to_string(),
+                            }
+                        }
+                        storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                            ServerError::InternalError {
+                                reason:
+                                    "stale multipart completion snapshot escaped storage retry loop"
+                                        .to_string(),
                             }
                         }
                     })??;

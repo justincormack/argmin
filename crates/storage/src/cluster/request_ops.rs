@@ -22,11 +22,12 @@ use crate::metadata_command::{
     PutObjectMetadataMutation,
 };
 use crate::node_client::{
-    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
-    BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
-    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
-    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
-    CreateStreamUploadPrecondition, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
+    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
+    BuildDeleteSpecificObjectVersionCommandReq, BuildInsertDeleteMarkerCommandReq,
+    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
+    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
+    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
 use crate::traits::PgMetadataStore;
 use crate::*;
@@ -1340,10 +1341,8 @@ impl super::StorageCluster {
 
         for node in nodes {
             let node_id = node.node_id();
-            let pg = node.storage_node().get_pg(pg_id.get())?;
-            match PgMetadataStore::delete_finalized_bucket(&*pg, bucket) {
+            match node.storage_client().delete_finalized_bucket(pg_id, bucket) {
                 Ok(()) => {
-                    pg.refresh_metadata_command_state_digest()?;
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_finalize_delete_node_ok",
@@ -1355,7 +1354,7 @@ impl super::StorageCluster {
                         )),
                     );
                 }
-                Err(crate::error::MetadataError::BucketNotFound { .. })
+                Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. }))
                     if node_id == primary_node_id =>
                 {
                     let _ = observability::event(
@@ -1370,7 +1369,7 @@ impl super::StorageCluster {
                     );
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
-                Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. })) => {
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_finalize_delete_replica_missing",
@@ -1394,7 +1393,7 @@ impl super::StorageCluster {
                             other
                         )),
                     );
-                    return Err(other.into());
+                    return Err(other);
                 }
             }
         }
@@ -7013,98 +7012,6 @@ impl super::StorageCluster {
         }
     }
 
-    fn snapshot_completed_multipart_stale_payload(
-        object_pg: &crate::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<CompletedMultipartStalePayload>, ObjectPgActionError> {
-        let stored =
-            match PgMetadataStore::get_object_version(object_pg, bucket, key, VersionId::Null) {
-                Ok(stored) => stored,
-                Err(MetadataError::ObjectNotFound) => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
-        let StoredObject::Live(record) = stored else {
-            return Ok(None);
-        };
-
-        match record.layout {
-            ObjectLayout::Standard => {
-                let segments =
-                    PgMetadataStore::get_object_segments(object_pg, bucket, key, VersionId::Null)?;
-                Ok(Some(CompletedMultipartStalePayload::Segments {
-                    generation_id: record.generation_id,
-                    segments,
-                }))
-            }
-            ObjectLayout::MultipartManifest { .. } => {
-                let parts =
-                    PgMetadataStore::get_object_parts(object_pg, bucket, key, VersionId::Null)?;
-                let mut streaming_segments = Vec::new();
-                for part in &parts {
-                    if part.part_okh == [0u8; 16] {
-                        streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
-                            object_pg,
-                            bucket,
-                            key,
-                            VersionId::Null,
-                            part.part_number,
-                        )?);
-                    }
-                }
-                Ok(Some(CompletedMultipartStalePayload::Multipart {
-                    generation_id: record.generation_id,
-                    parts,
-                    streaming_segments,
-                }))
-            }
-        }
-    }
-
-    fn completed_multipart_stale_payload_to_reclaim_command(
-        bucket: &BucketName,
-        key: &ObjectKey,
-        created_at: u64,
-        payload: &CompletedMultipartStalePayload,
-    ) -> ObjectPayloadReclaimCommand {
-        match payload {
-            CompletedMultipartStalePayload::Segments {
-                generation_id,
-                segments,
-            } => ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                generation_id: *generation_id,
-                created_at,
-                segments: segments
-                    .iter()
-                    .map(|segment| ObjectSegmentsReclaimSegmentRecord {
-                        segment_index: segment.segment_index,
-                        segment_okh: segment.segment_okh,
-                        segment_vid: segment.segment_vid,
-                        data_pg_id: segment.data_pg_id,
-                        ec: EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                    })
-                    .collect(),
-            }),
-            CompletedMultipartStalePayload::Multipart {
-                generation_id,
-                parts,
-                streaming_segments,
-            } => ObjectPayloadReclaimCommand::Multipart(Self::multipart_reclaim_from_parts(
-                bucket,
-                key,
-                *generation_id,
-                created_at,
-                parts,
-                streaming_segments,
-            )),
-        }
-    }
-
     pub(super) fn complete_multipart_command_cleanup(
         command: &CommitMultipartObjectCommand,
     ) -> CompleteMultipartCommitCleanup {
@@ -7114,35 +7021,6 @@ impl super::StorageCluster {
             stream_uploads: command.stream_uploads.clone(),
             stream_upload_segments: command.stream_upload_segments.clone(),
         }
-    }
-
-    fn snapshot_upload_part_stream_cleanup(
-        object_pg: &crate::PgStore,
-        upload_id: &UploadId,
-    ) -> Result<(Vec<StreamUploadRecord>, Vec<StreamUploadSegmentRecord>), ObjectPgActionError>
-    {
-        let mut stream_uploads = PgMetadataStore::list_all_stream_uploads(object_pg)?
-            .into_iter()
-            .filter(|session| {
-                matches!(
-                    &session.target,
-                    StreamUploadTarget::UploadPart {
-                        upload_id: session_upload_id,
-                        ..
-                    } if session_upload_id == upload_id
-                )
-            })
-            .collect::<Vec<_>>();
-        stream_uploads.sort_by(|a, b| a.session_id.as_str().cmp(b.session_id.as_str()));
-
-        let mut stream_upload_segments = Vec::new();
-        for session in &stream_uploads {
-            stream_upload_segments.extend(PgMetadataStore::list_stream_segments(
-                object_pg,
-                &session.session_id,
-            )?);
-        }
-        Ok((stream_uploads, stream_upload_segments))
     }
 
     fn reserve_completed_multipart_upload_order(
@@ -7303,6 +7181,7 @@ impl super::StorageCluster {
         let bucket_primary_node = self.bucket_metadata_primary_node(&bucket)?;
         let _completion_guard = bucket_primary_node.lock_multipart_completion_bucket(&bucket);
         let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
+        let storage_client = self.object_metadata_primary_client(&bucket, &key)?;
 
         'retry_after_pending_conflict: loop {
             let reservation = match self.acquire_durable_bucket_write_reservation(
@@ -7358,47 +7237,7 @@ impl super::StorageCluster {
                 }
             }
 
-            let object_pg = match primary_node.get_pg(pg_id.get()) {
-                Ok(object_pg) => object_pg,
-                Err(error) => {
-                    drop(_bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Err(error.into());
-                }
-            };
-            let upload = match PgMetadataStore::get_multipart_upload(&*object_pg, &upload_id) {
-                Ok(upload) => upload,
-                Err(error) => {
-                    drop(object_pg);
-                    drop(_bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Err(error.into());
-                }
-            };
-            if upload.bucket != bucket
-                || upload.key != key
-                || upload.state != UploadState::InProgress
-            {
-                drop(object_pg);
-                drop(_bucket_guard);
-                release_bucket_write_proof!()?;
-                return Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                }
-                .into());
-            }
-            if upload.object_generation_id != generation_id {
-                drop(object_pg);
-                drop(_bucket_guard);
-                release_bucket_write_proof!()?;
-                return Err(MetadataError::Db {
-                    context: "complete multipart command generation mismatch",
-                    source: rusqlite::Error::InvalidQuery,
-                }
-                .into());
-            }
             if req.part_records.is_empty() {
-                drop(object_pg);
                 drop(_bucket_guard);
                 release_bucket_write_proof!()?;
                 return Err(MetadataError::Db {
@@ -7408,183 +7247,18 @@ impl super::StorageCluster {
                 .into());
             }
 
-            let (version_id, object_pg) = if req.versioning == BucketVersioningState::Enabled {
-                drop(object_pg);
-                let version_id =
-                    match self.reserve_next_object_version(pg_id, &bucket, &key, primary_node) {
-                        Ok(version_id) => version_id,
-                        Err(error) => {
-                            drop(_bucket_guard);
-                            release_bucket_write_proof!()?;
-                            return Err(error);
-                        }
-                    };
-                let object_pg = match primary_node.get_pg(pg_id.get()) {
-                    Ok(object_pg) => object_pg,
+            let version_id = if req.versioning == BucketVersioningState::Enabled {
+                match self.reserve_next_object_version(pg_id, &bucket, &key, primary_node) {
+                    Ok(version_id) => version_id,
                     Err(error) => {
-                        drop(_bucket_guard);
-                        release_bucket_write_proof!()?;
-                        return Err(error.into());
-                    }
-                };
-                (version_id, object_pg)
-            } else {
-                (VersionId::Null, object_pg)
-            };
-            let stale_payload = if version_id.is_null() {
-                match Self::snapshot_completed_multipart_stale_payload(&object_pg, &bucket, &key) {
-                    Ok(stale_payload) => stale_payload,
-                    Err(error) => {
-                        drop(object_pg);
                         drop(_bucket_guard);
                         release_bucket_write_proof!()?;
                         return Err(error);
                     }
                 }
             } else {
-                None
+                VersionId::Null
             };
-            let parts_len = match u32::try_from(req.part_records.len()) {
-                Ok(parts_len) => parts_len,
-                Err(_) => {
-                    drop(object_pg);
-                    drop(_bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Err(MetadataError::Db {
-                        context: "complete multipart command too many parts",
-                        source: rusqlite::Error::InvalidQuery,
-                    }
-                    .into());
-                }
-            };
-            let parts_count = match std::num::NonZeroU32::new(parts_len) {
-                Some(parts_count) => parts_count,
-                None => {
-                    drop(object_pg);
-                    drop(_bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Err(MetadataError::Db {
-                        context: "complete multipart command empty parts",
-                        source: rusqlite::Error::InvalidQuery,
-                    }
-                    .into());
-                }
-            };
-            let object_parts: Vec<ObjectPartRecord> = req
-                .part_records
-                .iter()
-                .map(|part| {
-                    let data_pg_id = self
-                        .metadata_primary_topology_node()
-                        .pg_topology()
-                        .object_generation_multipart_part_data_pg(
-                            &bucket,
-                            &key,
-                            generation_id,
-                            part.part_number,
-                        )
-                        .get();
-                    ObjectPartRecord {
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        version_id,
-                        part_number: part.part_number,
-                        size: part.size,
-                        etag: part.etag.clone(),
-                        etag_kind: part.etag_kind,
-                        part_okh: part.part_okh,
-                        part_vid: part.part_vid,
-                        ec_k: part.ec_k,
-                        ec_m: part.ec_m,
-                        data_pg_id,
-                        checksum: part.checksum.clone(),
-                    }
-                })
-                .collect();
-            let selected_part_numbers: std::collections::BTreeSet<u32> = req
-                .part_records
-                .iter()
-                .map(|part| part.part_number)
-                .collect();
-            let all_parts = match PgMetadataStore::list_multipart_parts(
-                &*object_pg,
-                &ListPartsReq {
-                    upload_id: upload_id.clone(),
-                    part_number_marker: None,
-                    max_parts: u32::MAX,
-                },
-            ) {
-                Ok(parts) => parts.parts,
-                Err(error) => {
-                    drop(object_pg);
-                    drop(_bucket_guard);
-                    release_bucket_write_proof!()?;
-                    return Err(error.into());
-                }
-            };
-            let omitted_parts = all_parts
-                .into_iter()
-                .filter(|part| !selected_part_numbers.contains(&part.part_number))
-                .collect::<Vec<_>>();
-            let all_streaming_segments =
-                match PgMetadataStore::get_all_multipart_part_segments_for_upload(
-                    &*object_pg,
-                    &upload_id,
-                ) {
-                    Ok(segments) => segments,
-                    Err(error) => {
-                        drop(object_pg);
-                        drop(_bucket_guard);
-                        release_bucket_write_proof!()?;
-                        return Err(error.into());
-                    }
-                };
-            let mut selected_streaming_segments = Vec::new();
-            let mut omitted_streaming_segments = Vec::new();
-            for mut segment in all_streaming_segments {
-                if selected_part_numbers.contains(&segment.part_number) {
-                    segment.version_id = version_id.to_u64();
-                    selected_streaming_segments.push(segment);
-                } else {
-                    omitted_streaming_segments.push(segment);
-                }
-            }
-            let (stream_uploads, stream_upload_segments) =
-                match Self::snapshot_upload_part_stream_cleanup(&object_pg, &upload_id) {
-                    Ok(cleanup) => cleanup,
-                    Err(error) => {
-                        drop(object_pg);
-                        drop(_bucket_guard);
-                        release_bucket_write_proof!()?;
-                        return Err(error);
-                    }
-                };
-            let stream_uploads = stream_uploads
-                .iter()
-                .map(TerminalStreamCleanupRecord::from)
-                .collect();
-
-            let last_modified_millis = crate::clock::current_time_millis();
-            let completed_at_millis = last_modified_millis;
-            let write_sequence =
-                match object_pg.next_object_write_sequence(bucket.as_str(), key.as_str()) {
-                    Ok(write_sequence) => write_sequence,
-                    Err(error) => {
-                        drop(object_pg);
-                        drop(_bucket_guard);
-                        release_bucket_write_proof!()?;
-                        return Err(error.into());
-                    }
-                };
-            let stale_payload_command = stale_payload.as_ref().map(|payload| {
-                Self::completed_multipart_stale_payload_to_reclaim_command(
-                    &bucket,
-                    &key,
-                    last_modified_millis,
-                    payload,
-                )
-            });
-            drop(object_pg);
             let completion_order = match self.reserve_completed_multipart_upload_order(&bucket) {
                 Ok(completion_order) => completion_order,
                 Err(error) => {
@@ -7593,8 +7267,17 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let command_id = match self.next_object_metadata_command_id(pg_id) {
-                Ok(command_id) => command_id,
+            let command = match storage_client.build_complete_multipart_object_command(
+                BuildCompleteMultipartObjectCommandReq {
+                    pg_id,
+                    cluster_epoch: self.operation_epoch(),
+                    request: &req,
+                    version_id,
+                    completion_order,
+                    bucket_write_reservation: &bucket_write_reservation,
+                },
+            ) {
+                Ok(command) => command,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
@@ -7615,48 +7298,6 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::CommitMultipartObject(Box::new(
-                    CommitMultipartObjectCommand {
-                        upload_id: upload_id.clone(),
-                        bucket_write_reservation: bucket_write_reservation.clone(),
-                        object: PutLiveObjectReq {
-                            bucket: bucket.clone(),
-                            key: key.clone(),
-                            version_id,
-                            owner: req.owner.clone(),
-                            acl_grants: req.acl_grants.clone(),
-                            public_read: req.public_read,
-                            generation_id,
-                            size: req.size,
-                            etag: ObjectEtag::MultipartComposite {
-                                crc64: req.etag_crc64,
-                                parts: parts_count,
-                            },
-                            ec: EcShape { k: 0, m: 0 },
-                            layout: ObjectLayout::MultipartManifest { parts_count },
-                            tags: req.tags.clone(),
-                            metadata_blob: req.metadata_blob.clone(),
-                            system_metadata_blob: req.system_metadata_blob.clone(),
-                            object_lock: req.object_lock,
-                            encryption: req.encryption.clone(),
-                        },
-                        parts: object_parts,
-                        selected_streaming_segments,
-                        omitted_parts,
-                        omitted_streaming_segments,
-                        stream_uploads,
-                        stream_upload_segments,
-                        write_sequence,
-                        completion_order,
-                        completed_at_millis,
-                        initiator: upload.initiator.clone(),
-                        last_modified_millis,
-                        stale_payload: stale_payload_command,
-                    },
-                )),
-            );
             // A matching completion contender carries the exact outcome this caller must return.
             // Let the retry loop observe it instead of draining it generically and losing that
             // request-shaped result.

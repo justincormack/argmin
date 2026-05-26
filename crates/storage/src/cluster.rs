@@ -172,6 +172,12 @@ fn object_pg_action_error_to_bucket_snapshot_error(
                 source: std::io::Error::other("stale stream finalize snapshot"),
             })
         }
+        ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+            BucketSnapshotLoadError::Store(StoreError::Io {
+                context: "object PG action failed during bucket snapshot operation",
+                source: std::io::Error::other("stale multipart completion snapshot"),
+            })
+        }
     }
 }
 

@@ -609,6 +609,13 @@ impl Coordinator {
                                     .to_string(),
                             }
                         }
+                        storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                            ServerError::InternalError {
+                                reason:
+                                    "stale multipart completion snapshot escaped storage retry loop"
+                                        .to_string(),
+                            }
+                        }
                     })??;
                 let lifecycle_expiration = self
                     .current_object_write_lifecycle_expiration_for_loaded_bucket(

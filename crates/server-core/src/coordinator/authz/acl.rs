@@ -1066,6 +1066,12 @@ impl Coordinator {
                     reason: "stale stream finalize snapshot escaped storage retry loop".to_string(),
                 }
             }
+            storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                ServerError::InternalError {
+                    reason: "stale multipart completion snapshot escaped storage retry loop"
+                        .to_string(),
+                }
+            }
         }
     }
 

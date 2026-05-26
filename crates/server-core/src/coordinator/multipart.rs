@@ -40,6 +40,8 @@ use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::system_metadata::SystemMetadata;
 
+const COMPLETE_MULTIPART_STALE_COMMIT_RETRIES: usize = 1;
+
 impl Coordinator {
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         match error {
@@ -53,6 +55,12 @@ impl Coordinator {
             storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
                 ServerError::InternalError {
                     reason: "stale stream finalize snapshot escaped storage retry loop".to_string(),
+                }
+            }
+            storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                ServerError::InternalError {
+                    reason: "stale multipart completion snapshot escaped storage retry loop"
+                        .to_string(),
                 }
             }
             storage::ObjectPgActionError::Metadata(error) => match error {
@@ -331,54 +339,57 @@ impl Coordinator {
             req.upload.upload_id(),
             req.parts.len()
         );
-        let AuthorizedCompleteMultipartUpload {
-            bucket_info,
-            bucket,
-            key,
-            upload_id,
-            upload,
-            multipart_write_encryption,
-        } = self.authorize_complete_multipart_upload(req)?;
-        let parts = req.parts;
-        let claimed_checksum = req.claimed_checksum;
-        let expected_object_size = req.expected_object_size;
-        let completion_preflight = self
-            .storage_node
-            .load_multipart_completion_preflight(&upload)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+        let mut stale_commit_retries = 0usize;
+        'retry_stale_commit_snapshot: loop {
+            let AuthorizedCompleteMultipartUpload {
+                bucket_info,
+                bucket,
+                key,
+                upload_id,
+                upload,
+                multipart_write_encryption,
+            } = self.authorize_complete_multipart_upload(req)?;
+            let parts = req.parts;
+            let claimed_checksum = req.claimed_checksum;
+            let expected_object_size = req.expected_object_size;
+            let completion_preflight = self
+                .storage_node
+                .load_multipart_completion_preflight(&upload)
+                .map_err(Coordinator::map_object_pg_action_error)?;
 
-        if !req.cond.is_empty() {
-            let existing_etag = completion_preflight.existing_etag.as_deref();
-            if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                return Err(ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+            if !req.cond.is_empty() {
+                let existing_etag = completion_preflight.existing_etag.as_deref();
+                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                    return Err(ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    });
+                }
+                check_write_conditions(req.cond, existing_etag)?;
+            }
+            if parts.is_empty() {
+                return Err(ServerError::InvalidRequest {
+                    reason: "part list must not be empty".to_string(),
                 });
             }
-            check_write_conditions(req.cond, existing_etag)?;
-        }
-        if parts.is_empty() {
-            return Err(ServerError::InvalidRequest {
-                reason: "part list must not be empty".to_string(),
-            });
-        }
-        if parts.len() > MAX_PARTS {
-            return Err(ServerError::InvalidRequest {
-                reason: format!(
-                    "part list exceeds maximum of {MAX_PARTS} parts, got {}",
-                    parts.len()
-                ),
-            });
-        }
-        for window in parts.windows(2) {
-            if window[0].part_number >= window[1].part_number {
-                return Err(ServerError::InvalidPartOrder);
+            if parts.len() > MAX_PARTS {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "part list exceeds maximum of {MAX_PARTS} parts, got {}",
+                        parts.len()
+                    ),
+                });
             }
-        }
+            for window in parts.windows(2) {
+                if window[0].part_number >= window[1].part_number {
+                    return Err(ServerError::InvalidPartOrder);
+                }
+            }
 
-        let requested_part_numbers: Vec<u32> = parts.iter().map(|part| part.part_number).collect();
-        let completion_snapshot =
-            self.storage_node
+            let requested_part_numbers: Vec<u32> =
+                parts.iter().map(|part| part.part_number).collect();
+            let completion_snapshot = self
+                .storage_node
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
                 .map_err(|error| match error {
                     storage::ObjectPgActionError::Metadata(
@@ -387,110 +398,110 @@ impl Coordinator {
                     other => Coordinator::map_object_pg_action_error(other),
                 })?;
 
-        let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
-        let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
+            let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
+            let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
 
-        let mut part_records: Vec<MultipartPartRecord> =
-            Vec::with_capacity(completion_snapshot.part_records.len());
-        for (cp, part) in parts.iter().zip(completion_snapshot.part_records) {
-            if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
-                (checksum_algo, checksum_type, cp.checksum.as_ref())
-            {
-                return Err(ServerError::CompleteMultipartMissingPartChecksum {
-                    algorithm: upload_algo.as_str().to_ascii_lowercase(),
-                    part_number: cp.part_number,
-                });
-            }
-
-            let stored_etag = etag_bytes_to_crc64(&part.etag)
-                .map(format_etag)
-                .unwrap_or_default();
-            if stored_etag != cp.etag {
-                return Err(ServerError::InvalidPart {
-                    part_number: cp.part_number,
-                });
-            }
-
-            if let Some(ref claim) = cp.checksum {
-                if let Some(upload_algo) = checksum_algo {
-                    if claim.algorithm() != upload_algo {
-                        return Err(ServerError::InvalidRequest {
-                            reason: format!(
-                                "checksum element type {} does not match upload algorithm {}",
-                                claim.algorithm().as_str(),
-                                upload_algo.as_str()
-                            ),
-                        });
-                    }
+            let mut part_records: Vec<MultipartPartRecord> =
+                Vec::with_capacity(completion_snapshot.part_records.len());
+            for (cp, part) in parts.iter().zip(completion_snapshot.part_records) {
+                if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
+                    (checksum_algo, checksum_type, cp.checksum.as_ref())
+                {
+                    return Err(ServerError::CompleteMultipartMissingPartChecksum {
+                        algorithm: upload_algo.as_str().to_ascii_lowercase(),
+                        part_number: cp.part_number,
+                    });
                 }
-                match &part.checksum {
-                    Some(stored_bytes) => {
-                        if claim.expected_bytes() != stored_bytes.as_slice() {
+
+                let stored_etag = etag_bytes_to_crc64(&part.etag)
+                    .map(format_etag)
+                    .unwrap_or_default();
+                if stored_etag != cp.etag {
+                    return Err(ServerError::InvalidPart {
+                        part_number: cp.part_number,
+                    });
+                }
+
+                if let Some(ref claim) = cp.checksum {
+                    if let Some(upload_algo) = checksum_algo {
+                        if claim.algorithm() != upload_algo {
+                            return Err(ServerError::InvalidRequest {
+                                reason: format!(
+                                    "checksum element type {} does not match upload algorithm {}",
+                                    claim.algorithm().as_str(),
+                                    upload_algo.as_str()
+                                ),
+                            });
+                        }
+                    }
+                    match &part.checksum {
+                        Some(stored_bytes) => {
+                            if claim.expected_bytes() != stored_bytes.as_slice() {
+                                return Err(ServerError::InvalidRequest {
+                                    reason: "part checksum mismatch".to_string(),
+                                });
+                            }
+                        }
+                        None => {
                             return Err(ServerError::InvalidRequest {
                                 reason: "part checksum mismatch".to_string(),
                             });
                         }
                     }
-                    None => {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "part checksum mismatch".to_string(),
+                }
+
+                part_records.push(part);
+            }
+
+            if part_records.len() > 1 {
+                for part in &part_records[..part_records.len() - 1] {
+                    if part.size < MIN_PART_SIZE {
+                        return Err(ServerError::EntityTooSmall {
+                            part_number: part.part_number,
+                            size: part.size,
+                            min: MIN_PART_SIZE,
                         });
                     }
                 }
             }
 
-            part_records.push(part);
-        }
+            let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
+            let (etag_bytes_vec, etag_str) = compute_multipart_etag(&part_etags);
+            let mut etag_crc64 = [0u8; 8];
+            etag_crc64.copy_from_slice(&etag_bytes_vec);
 
-        if part_records.len() > 1 {
-            for part in &part_records[..part_records.len() - 1] {
-                if part.size < MIN_PART_SIZE {
-                    return Err(ServerError::EntityTooSmall {
-                        part_number: part.part_number,
-                        size: part.size,
-                        min: MIN_PART_SIZE,
-                    });
-                }
-            }
-        }
-
-        let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
-        let (etag_bytes_vec, etag_str) = compute_multipart_etag(&part_etags);
-        let mut etag_crc64 = [0u8; 8];
-        etag_crc64.copy_from_slice(&etag_bytes_vec);
-
-        let total_size: u64 = part_records.iter().map(|p| p.size).sum();
-        if let Some(expected) = expected_object_size {
-            if expected != total_size {
-                return Err(ServerError::InvalidRequest {
+            let total_size: u64 = part_records.iter().map(|p| p.size).sum();
+            if let Some(expected) = expected_object_size {
+                if expected != total_size {
+                    return Err(ServerError::InvalidRequest {
                     reason: format!(
                         "x-amz-mp-object-size {expected} does not match actual object size {total_size}"
                     ),
                 });
+                }
             }
-        }
-        #[cfg(feature = "deep-tracing")]
-        if let Some(trace) = observability::current_context() {
-            let _ = observability::event_in_context(
-                &trace,
-                TRACE_TARGET,
-                "complete_multipart_layout",
-                Some(format_args!(
-                    "bucket={:?} key={:?} upload_id={:?} parts={} total_size={}",
-                    bucket,
-                    key,
-                    upload_id,
-                    part_records.len(),
-                    total_size
-                )),
-            );
-            let mut object_offset_start = 0u64;
-            for (part_order, (requested_part, stored_part)) in
-                parts.iter().zip(part_records.iter()).enumerate()
-            {
-                let object_offset_len = stored_part.size;
-                let object_offset_end_exclusive = object_offset_start + object_offset_len;
+            #[cfg(feature = "deep-tracing")]
+            if let Some(trace) = observability::current_context() {
                 let _ = observability::event_in_context(
+                    &trace,
+                    TRACE_TARGET,
+                    "complete_multipart_layout",
+                    Some(format_args!(
+                        "bucket={:?} key={:?} upload_id={:?} parts={} total_size={}",
+                        bucket,
+                        key,
+                        upload_id,
+                        part_records.len(),
+                        total_size
+                    )),
+                );
+                let mut object_offset_start = 0u64;
+                for (part_order, (requested_part, stored_part)) in
+                    parts.iter().zip(part_records.iter()).enumerate()
+                {
+                    let object_offset_len = stored_part.size;
+                    let object_offset_end_exclusive = object_offset_start + object_offset_len;
+                    let _ = observability::event_in_context(
                     &trace,
                     TRACE_TARGET,
                     "complete_multipart_part_layout",
@@ -508,37 +519,36 @@ impl Coordinator {
                         requested_part.etag
                     )),
                 );
-                object_offset_start = object_offset_end_exclusive;
+                    object_offset_start = object_offset_end_exclusive;
+                }
             }
-        }
 
-        let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD;
-            match ctype {
-                ChecksumType::Composite => {
-                    let mut concat = Vec::new();
-                    for part in &part_records {
-                        match &part.checksum {
-                            Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
-                            None => {
-                                return Err(ServerError::InvalidRequest {
+            let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD;
+                match ctype {
+                    ChecksumType::Composite => {
+                        let mut concat = Vec::new();
+                        for part in &part_records {
+                            match &part.checksum {
+                                Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
+                                None => {
+                                    return Err(ServerError::InvalidRequest {
                                     reason:
                                         "COMPOSITE checksum requires all parts to have checksums"
                                             .to_string(),
                                 });
+                                }
                             }
                         }
+                        let hash = compute_checksum(algo, &concat);
+                        Some(format!(
+                            "{}-{}",
+                            b64.encode(hash.bytes()),
+                            part_records.len()
+                        ))
                     }
-                    let hash = compute_checksum(algo, &concat);
-                    Some(format!(
-                        "{}-{}",
-                        b64.encode(hash.bytes()),
-                        part_records.len()
-                    ))
-                }
-                ChecksumType::FullObject => {
-                    match algo {
+                    ChecksumType::FullObject => match algo {
                         ChecksumAlgorithm::Crc32 => {
                             let mut combined: u32 = 0;
                             for part in &part_records {
@@ -604,116 +614,126 @@ impl Coordinator {
                                 ),
                             });
                         }
+                    },
+                }
+            } else {
+                None
+            };
+
+            if let Some(claimed) = claimed_checksum {
+                match checksum_algo {
+                    Some(upload_algo) if claimed.algorithm() != upload_algo => {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "checksum header algorithm {} does not match upload algorithm {}",
+                                claimed.algorithm().as_str(),
+                                upload_algo.as_str()
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "checksum header sent but upload has no checksum algorithm"
+                                .to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+                if let Some(ref computed) = checksum_value {
+                    if computed != claimed.encoded_value() {
+                        let header_name = match claimed.algorithm() {
+                            ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
+                            ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
+                            ChecksumAlgorithm::Crc64nvme => "x-amz-checksum-crc64nvme",
+                            ChecksumAlgorithm::Sha1 => "x-amz-checksum-sha1",
+                            ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
+                        };
+                        return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
+                            header_name: header_name.to_string(),
+                        });
                     }
                 }
             }
-        } else {
-            None
-        };
 
-        if let Some(claimed) = claimed_checksum {
-            match checksum_algo {
-                Some(upload_algo) if claimed.algorithm() != upload_algo => {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!(
-                            "checksum header algorithm {} does not match upload algorithm {}",
-                            claimed.algorithm().as_str(),
-                            upload_algo.as_str()
-                        ),
-                    });
-                }
-                None => {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "checksum header sent but upload has no checksum algorithm"
-                            .to_string(),
-                    });
-                }
-                _ => {}
+            let mut system_metadata =
+                SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
+            if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
+                system_metadata.set_checksum(algo, checksum_type, val.clone());
             }
-            if let Some(ref computed) = checksum_value {
-                if computed != claimed.encoded_value() {
-                    let header_name = match claimed.algorithm() {
-                        ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
-                        ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
-                        ChecksumAlgorithm::Crc64nvme => "x-amz-checksum-crc64nvme",
-                        ChecksumAlgorithm::Sha1 => "x-amz-checksum-sha1",
-                        ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
-                    };
-                    return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
-                        header_name: header_name.to_string(),
-                    });
+            self.ensure_write_encryption_supported(&upload.encryption)?;
+            let (system_metadata_bytes, final_encryption) = Self::prepare_stored_system_metadata(
+                &system_metadata,
+                &multipart_write_encryption,
+            )?;
+            let managed_encryption = final_encryption.managed_encryption_algorithm();
+
+            #[cfg(test)]
+            maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
+
+            let completion_outcome = match self
+                .storage_node
+                .complete_multipart_upload_commit_serialized(
+                    storage::CompleteMultipartCommitRequest {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
+                        versioning: bucket_info.versioning,
+                        owner: upload.owner.clone(),
+                        acl_grants: upload.acl_grants.clone(),
+                        public_read: upload.public_read,
+                        generation_id: upload.object_generation_id,
+                        size: total_size,
+                        etag_crc64,
+                        tags: upload.tags.clone(),
+                        metadata_blob: Some(upload.metadata_blob.clone()),
+                        system_metadata_blob: Some(system_metadata_bytes),
+                        object_lock: Self::resolve_new_object_lock_state(
+                            &bucket_info,
+                            upload.object_lock,
+                        )?,
+                        encryption: final_encryption,
+                        part_records: part_records.clone(),
+                    },
+                    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
+                ) {
+                Ok(outcome) => outcome,
+                Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot)
+                    if stale_commit_retries < COMPLETE_MULTIPART_STALE_COMMIT_RETRIES =>
+                {
+                    stale_commit_retries += 1;
+                    continue 'retry_stale_commit_snapshot;
                 }
+                Err(error) => return Err(Coordinator::map_object_pg_action_error(error)),
+            };
+            let version_id = completion_outcome.version_id;
+            let stale_payload = completion_outcome
+                .stale_payload
+                .map(StaleObjectPayload::from);
+            let lifecycle_tags = completion_outcome.live_tags;
+            let lifecycle_size = completion_outcome.live_size;
+            let lifecycle_last_modified = completion_outcome.live_last_modified;
+
+            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
+                &bucket_info,
+                key.as_str(),
+                lifecycle_tags.as_deref(),
+                lifecycle_size,
+                lifecycle_last_modified,
+            )?;
+            if let Some(ref payload) = stale_payload {
+                self.delete_stale_object_payload(&bucket, &key, payload);
             }
+
+            return Ok(CompleteMultipartUploadResult {
+                etag: etag_str,
+                version_id,
+                managed_encryption,
+                checksum_algorithm: checksum_algo,
+                checksum_type,
+                checksum_value,
+                lifecycle_expiration,
+            });
         }
-
-        let mut system_metadata =
-            SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
-        if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
-            system_metadata.set_checksum(algo, checksum_type, val.clone());
-        }
-        self.ensure_write_encryption_supported(&upload.encryption)?;
-        let (system_metadata_bytes, final_encryption) =
-            Self::prepare_stored_system_metadata(&system_metadata, &multipart_write_encryption)?;
-        let managed_encryption = final_encryption.managed_encryption_algorithm();
-
-        #[cfg(test)]
-        maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
-
-        let completion_outcome = self
-            .storage_node
-            .complete_multipart_upload_commit_serialized(
-                storage::CompleteMultipartCommitRequest {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    upload_id: upload_id.clone(),
-                    versioning: bucket_info.versioning,
-                    owner: upload.owner.clone(),
-                    acl_grants: upload.acl_grants.clone(),
-                    public_read: upload.public_read,
-                    generation_id: upload.object_generation_id,
-                    size: total_size,
-                    etag_crc64,
-                    tags: upload.tags.clone(),
-                    metadata_blob: Some(upload.metadata_blob.clone()),
-                    system_metadata_blob: Some(system_metadata_bytes),
-                    object_lock: Self::resolve_new_object_lock_state(
-                        &bucket_info,
-                        upload.object_lock,
-                    )?,
-                    encryption: final_encryption,
-                    part_records: part_records.clone(),
-                },
-                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
-            )
-            .map_err(Coordinator::map_object_pg_action_error)?;
-        let version_id = completion_outcome.version_id;
-        let stale_payload = completion_outcome
-            .stale_payload
-            .map(StaleObjectPayload::from);
-        let lifecycle_tags = completion_outcome.live_tags;
-        let lifecycle_size = completion_outcome.live_size;
-        let lifecycle_last_modified = completion_outcome.live_last_modified;
-
-        let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-            &bucket_info,
-            key.as_str(),
-            lifecycle_tags.as_deref(),
-            lifecycle_size,
-            lifecycle_last_modified,
-        )?;
-        if let Some(ref payload) = stale_payload {
-            self.delete_stale_object_payload(&bucket, &key, payload);
-        }
-
-        Ok(CompleteMultipartUploadResult {
-            etag: etag_str,
-            version_id,
-            managed_encryption,
-            checksum_algorithm: checksum_algo,
-            checksum_type,
-            checksum_value,
-            lifecycle_expiration,
-        })
     }
 
     /// Abort an in-progress multipart upload.

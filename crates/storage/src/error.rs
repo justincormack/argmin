@@ -597,4 +597,6 @@ pub enum ObjectPgActionError {
     StaleObjectReadSubject,
     #[error("stream finalize snapshot changed before command build")]
     StaleStreamFinalizeSnapshot,
+    #[error("multipart completion snapshot changed before command build")]
+    StaleMultipartCompletionSnapshot,
 }

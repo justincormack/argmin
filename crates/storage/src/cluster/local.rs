@@ -22776,6 +22776,60 @@ mod tests {
     }
 
     #[test]
+    fn multipart_completion_rejects_stale_selected_part_row() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let (req, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key, "stalepart");
+
+        let (_replacement_shards, replacement_part, _replacement_segment) =
+            upload_streamed_test_multipart_part(
+                &cluster,
+                &bucket,
+                &key,
+                &req.upload_id,
+                1,
+                [0x5A; 16],
+                b"replacement part payload",
+            );
+        assert_ne!(
+            replacement_part, req.part_records[0],
+            "test must replace the selected part row after completion snapshot"
+        );
+
+        let err = cluster
+            .complete_multipart_upload_commit_serialized(req.clone(), 16)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::StaleMultipartCompletionSnapshot
+            ),
+            "stale selected part row must fail closed, got {err:?}"
+        );
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none(),
+            "stale multipart completion must not publish a pending command"
+        );
+    }
+
+    #[test]
     fn versioned_direct_put_and_multipart_completion_allocate_versions_via_command_stream() {
         #[derive(Default)]
         struct VersionRaceState {

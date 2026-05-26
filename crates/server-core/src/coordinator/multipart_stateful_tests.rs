@@ -6,6 +6,7 @@ use crate::metadata_blob::MetadataBlob;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
     EcShape, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectSegmentsReclaimRecord,
@@ -502,6 +503,38 @@ fn install_multipart_complete_pre_commit_race_hooks(
         after_multipart_complete_pre_commit: Some(Arc::new(move || {
             reached_hook.wait();
             resume_hook.wait();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompletePreCommitRaceSync {
+        reached,
+        resume,
+        _serial_guard: serial,
+        _guard: guard,
+    }
+}
+
+fn install_one_shot_multipart_complete_pre_commit_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompletePreCommitRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let reached_hook = Arc::clone(&reached);
+    let resume_hook = Arc::clone(&resume);
+    let first = Arc::new(AtomicBool::new(true));
+    let first_hook = Arc::clone(&first);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        after_multipart_complete_pre_commit: Some(Arc::new(move || {
+            if first_hook.swap(false, Ordering::SeqCst) {
+                reached_hook.wait();
+                resume_hook.wait();
+            }
         })),
         ..ReclamationTestHooks::default()
     });
@@ -1235,6 +1268,91 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
             .is_empty(),
         "{invariant}: abort winner should leave no committed multipart segment rows"
     );
+}
+
+#[test]
+fn upload_part_replace_after_complete_snapshot_is_revalidated_before_publish() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let completer =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let uploader = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-complete-part-replace";
+    let key = "race-complete-part-key";
+    let invariant =
+        "CompleteMultipartUpload must not publish a part row that was replaced after snapshot";
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, b"old part")]);
+
+    let sync = install_one_shot_multipart_complete_pre_commit_race_hooks(bucket, key);
+    let upload_id_for_complete = upload_id.clone();
+    let parts_for_complete = parts.clone();
+    let t_complete = std::thread::spawn(move || {
+        completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                bucket,
+                key,
+                &upload_id_for_complete,
+                test_requester(),
+            ),
+            parts: &parts_for_complete,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    sync.reached.wait();
+    let replacement = test_helpers::upload_part(
+        &uploader,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number: 1,
+            data: b"replacement part",
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    assert_ne!(
+        replacement.etag, parts[0].etag,
+        "{invariant}: replacement part must change the selected row identity"
+    );
+    sync.resume.wait();
+
+    let err = t_complete.join().unwrap().unwrap_err();
+    assert!(
+        matches!(err, ServerError::InvalidPart { part_number: 1 }),
+        "{invariant}: stale completion should retry and return InvalidPart, got {err:?}"
+    );
+
+    let err = admin
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(bucket, key, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::ObjectNotFound { .. }),
+        "{invariant}: stale completion must not expose a visible object, got {err:?}"
+    );
+
+    let listed = admin
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert_eq!(listed.parts.len(), 1, "{invariant}");
+    assert_eq!(listed.parts[0].etag, replacement.etag, "{invariant}");
 }
 
 #[test]

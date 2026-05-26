@@ -677,6 +677,23 @@ migrated_simple_object_read_bypasses=$(
                 || $0 ~ /CreateMultipartUploadCommand::from_request/)) {
             print FILENAME ":" FNR ":" $0
         }
+        if (current_fn == "complete_multipart_upload_commit_serialized" \
+            && ($0 ~ /PgMetadataStore::get_multipart_upload\(/ \
+                || $0 ~ /PgMetadataStore::list_multipart_parts\(/ \
+                || $0 ~ /PgMetadataStore::get_all_multipart_part_segments_for_upload\(/ \
+                || $0 ~ /PgMetadataStore::list_all_stream_uploads\(/ \
+                || $0 ~ /PgMetadataStore::list_stream_segments\(/ \
+                || $0 ~ /PgMetadataStore::get_object_meta\(/ \
+                || $0 ~ /PgMetadataStore::get_object_version\(/ \
+                || $0 ~ /PgMetadataStore::get_object_segments\(/ \
+                || $0 ~ /PgMetadataStore::get_object_parts\(/ \
+                || $0 ~ /PgMetadataStore::get_multipart_part_segments\(/ \
+                || $0 ~ /primary_node\.get_pg\(/ \
+                || $0 ~ /next_object_metadata_command_id\(/ \
+                || $0 ~ /next_object_metadata_command_id_from_locked_pg\(/ \
+                || $0 ~ /CommitMultipartObjectCommand[[:space:]]*\{/)) {
+            print FILENAME ":" FNR ":" $0
+        }
         if ($0 ~ /SharedStorageNode::(load_existing_live_object_from_object_pg|load_object_read_auth_subject_from_object_pg|load_object_read_snapshot_for_subject_from_object_pg|load_stored_object_from_object_pg|load_object_tag_read_auth_subject_from_object_pg|get_object_tags_for_subject_from_object_pg|load_object_legal_hold_read_subject_from_object_pg|load_object_retention_read_subject_from_object_pg)\(/ \
             || $0 ~ /crate::SharedStorageNode::(load_existing_live_object_from_object_pg|load_object_read_auth_subject_from_object_pg|load_object_read_snapshot_for_subject_from_object_pg|load_stored_object_from_object_pg|load_object_tag_read_auth_subject_from_object_pg|get_object_tags_for_subject_from_object_pg|load_object_legal_hold_read_subject_from_object_pg|load_object_retention_read_subject_from_object_pg)\(/ \
             || $0 ~ /crate::node::SharedStorageNode::(load_existing_live_object_from_object_pg|load_object_read_auth_subject_from_object_pg|load_object_read_snapshot_for_subject_from_object_pg|load_stored_object_from_object_pg|load_object_tag_read_auth_subject_from_object_pg|get_object_tags_for_subject_from_object_pg|load_object_legal_hold_read_subject_from_object_pg|load_object_retention_read_subject_from_object_pg)\(/) {
@@ -867,6 +884,49 @@ multipart_abort_command_build_bypasses=$(
 fail_with_matches \
     "Production multipart abort command construction must go through the node client boundary" \
     "$multipart_abort_command_build_bypasses"
+
+bucket_finalize_delete_bypasses=$(
+    awk '
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (current_fn == "delete_bucket_from_acting_set" \
+            && ($0 ~ /\.get_pg\(/ \
+                || $0 ~ /PgMetadataStore::delete_finalized_bucket\(/ \
+                || $0 ~ /\.refresh_metadata_command_state_digest\(/)) {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production finalized bucket deletion fanout must go through the node client boundary" \
+    "$bucket_finalize_delete_bypasses"
 
 object_generation_reservation_bypasses=$(
     awk '
