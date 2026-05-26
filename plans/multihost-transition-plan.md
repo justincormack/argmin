@@ -5194,6 +5194,11 @@ Progress:
   current-object state. The guardrail blocks raw direct-PUT
   object-PG reads and direct `CommitDirectPutObject` construction in
   `commit_direct_put_object_from_payload_shards`.
+- Migrated payload shard ack metadata operations through the local node client.
+  The cluster still computes placement and validates shard-file contents, but
+  registering, validating, loading, and deleting per-shard `WriteAck` rows now
+  happen behind storage-client methods on the routed metadata-PG primary. The
+  guardrail blocks raw shard ack row operations from production cluster code.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

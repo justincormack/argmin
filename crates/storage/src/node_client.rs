@@ -21,7 +21,7 @@ use crate::metadata_command::{
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
-use crate::traits::PgMetadataStore;
+use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
@@ -699,6 +699,23 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         &self,
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError>;
+
+    fn register_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError>;
+
+    fn validate_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+        ack: WriteAck,
+    ) -> Result<(), StoreError>;
+
+    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
+
+    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
 
     fn try_acquire_object_payload_lease(
         &self,
@@ -1569,6 +1586,39 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<ScavengerShardFileScan, StoreError> {
         self.storage_node
             .list_scavenger_shard_files(data_pg_id.get())
+    }
+
+    fn register_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.register_written_shards_batch(shard_batch)
+    }
+
+    fn validate_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+        ack: WriteAck,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.validate_written_shard_ack(key, ack)
+    }
+
+    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let stat = pg.stat_shard(key)?;
+        Ok(WriteAck {
+            crc64: stat.crc64,
+            stored_size: stat.size,
+        })
+    }
+
+    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.delete_shard_record(key)
     }
 
     fn try_acquire_object_payload_lease(
