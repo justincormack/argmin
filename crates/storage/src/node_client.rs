@@ -27,22 +27,22 @@ use crate::types::{
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
     BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
-    CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
-    CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
-    EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
-    ListPartsReq, ListedMultipartParts, LiveObjectRecord, MultipartCompletionPreflight,
-    MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout,
-    ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
-    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey, StoredObject,
-    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
-    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-    VersionId, WriteAck,
+    CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
+    CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
+    DirectPutCommitStorageSnapshot, EcShape, GenerationId, LifecycleSweepBuckets,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq, ListedMultipartParts,
+    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
+    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
+    ShardKey, StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+    StreamUploadCommandRecord, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
+    UploadId, UploadState, VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -699,6 +699,12 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         &self,
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError>;
+
+    fn list_completed_multipart_upload_records_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
 
     fn register_written_shard_acks(
         &self,
@@ -1586,6 +1592,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<ScavengerShardFileScan, StoreError> {
         self.storage_node
             .list_scavenger_shard_files(data_pg_id.get())
+    }
+
+    fn list_completed_multipart_upload_records_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?)
     }
 
     fn register_written_shard_acks(

@@ -2303,10 +2303,14 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
             for node in nodes {
-                let pg = node.storage_node().get_pg(pg_id.get())?;
-                for record in
-                    pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?
-                {
+                let page = node
+                    .storage_client()
+                    .list_completed_multipart_upload_records_for_bucket(pg_id, bucket)
+                    .map_err(|error| match error {
+                        BucketSnapshotLoadError::Store(error) => E::from(error),
+                        BucketSnapshotLoadError::Metadata(error) => E::from(error),
+                    })?;
+                for record in page {
                     let key = (pg_id.get(), record.upload_id.clone());
                     match records.entry(key) {
                         std::collections::hash_map::Entry::Vacant(entry) => {

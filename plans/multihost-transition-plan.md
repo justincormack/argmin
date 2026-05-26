@@ -5199,6 +5199,11 @@ Progress:
   registering, validating, loading, and deleting per-shard `WriteAck` rows now
   happen behind storage-client methods on the routed metadata-PG primary. The
   guardrail blocks raw shard ack row operations from production cluster code.
+- Migrated completed multipart upload tombstone scans through the local node
+  client. The cluster still merges and conflict-checks acting-node results for
+  bucket delete and tombstone pruning, but individual per-PG tombstone reads now
+  run behind storage-client methods. The guardrail blocks raw completed-MPU
+  tombstone scans from production cluster code.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
