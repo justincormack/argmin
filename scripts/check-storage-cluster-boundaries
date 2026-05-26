@@ -736,6 +736,138 @@ fail_with_matches \
     "Production object version/generation id allocation must go through the node client boundary" \
     "$object_version_allocator_bypasses"
 
+create_bucket_command_build_bypasses=$(
+    awk '
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (current_fn == "create_bucket_with_config_and_load_info" \
+            && ($0 ~ /PgMetadataStore::head_bucket_raw\(/ \
+                || $0 ~ /primary_node\.get_pg\(/ \
+                || $0 ~ /\.next_bucket_execution_generation_candidate\(/ \
+                || $0 ~ /CreateBucketCommand::from_config\(/)) {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production create-bucket command construction must go through the node client boundary" \
+    "$create_bucket_command_build_bypasses"
+
+completed_multipart_order_bypasses=$(
+    awk '
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (current_fn == "reserve_completed_multipart_upload_order" \
+            && ($0 ~ /primary_node\.get_pg\(/ \
+                || $0 ~ /\.completed_multipart_upload_sequence_for_bucket\(/ \
+                || $0 ~ /AdvanceCompletedMultipartUploadSequenceCommand/)) {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production completed-multipart order reservation must go through the node client boundary" \
+    "$completed_multipart_order_bypasses"
+
+multipart_abort_command_build_bypasses=$(
+    awk '
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if ((current_fn == "prepare_abort_multipart_upload_command" \
+                || current_fn == "prepare_authorized_abort_multipart_upload_command") \
+            && ($0 ~ /primary_node\.get_pg\(/ \
+                || $0 ~ /prepare_(authorized_)?abort_multipart_upload_cleanup\(/ \
+                || $0 ~ /next_object_metadata_command_id\(/ \
+                || $0 ~ /AbortMultipartUploadCommand/)) {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production multipart abort command construction must go through the node client boundary" \
+    "$multipart_abort_command_build_bypasses"
+
 object_generation_reservation_bypasses=$(
     awk '
     /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {

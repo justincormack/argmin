@@ -6,14 +6,15 @@ use s3_types::{AclGrants, BucketVersioningState};
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
+    AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
     BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
-    CommitDirectPutObjectCommand, CommitStreamPartCommand, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    CommitDirectPutObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
+    DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MarkBucketDeletingCommand,
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::ScavengerShardFileScan;
@@ -22,21 +23,21 @@ use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
     BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CreateMultipartUploadReq,
-    CreateStreamUploadReq, DataPgId, EcShape, GenerationId, LifecycleSweepBuckets,
-    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq, ListedMultipartParts,
-    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
-    ShardKey, StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
-    StreamUploadCommandRecord, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    VersionId, WriteAck,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CreateBucketConfig,
+    CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, EcShape, GenerationId,
+    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq,
+    ListedMultipartParts, LiveObjectRecord, MultipartCompletionPreflight,
+    MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout,
+    ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
+    ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
+    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey, StoredObject,
+    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
+    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -466,6 +467,12 @@ pub(crate) enum MarkBucketDeletingCommandBuild {
     Command(Box<MetadataCommandEnvelope>),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum CreateBucketCommandBuild {
+    Exists(BucketInfo),
+    Command(Box<MetadataCommandEnvelope>),
+}
+
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
     pub(crate) pg_id: PgId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -788,6 +795,21 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<BucketRecord, BucketSnapshotLoadError>;
 
+    fn build_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
+
+    fn build_advance_completed_multipart_upload_sequence_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
+
     fn pending_mark_bucket_deleting_command_matches_current(
         &self,
         pg_id: PgId,
@@ -1036,6 +1058,24 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError>;
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 
     fn payload_reclaim_exists(
         &self,
@@ -1823,6 +1863,67 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?)
     }
 
+    fn build_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match PgMetadataStore::head_bucket_raw(&*pg, bucket) {
+            Ok(info) => return Ok(CreateBucketCommandBuild::Exists(info)),
+            Err(MetadataError::BucketNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        let command = CreateBucketCommand::from_config(
+            config,
+            crate::clock::current_time_millis(),
+            bucket_execution_generation,
+        )
+        .map_err(|reason| MetadataError::InvalidBucketName { reason })?;
+        Ok(CreateBucketCommandBuild::Command(Box::new(
+            MetadataCommandEnvelope::new(command_id, MetadataCommandPayload::CreateBucket(command)),
+        )))
+    }
+
+    fn build_advance_completed_multipart_upload_sequence_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current_order = pg.completed_multipart_upload_sequence_for_bucket(bucket)?;
+        let completion_order = current_order
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Db {
+                context: "reserve completed multipart upload order overflow",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "completed multipart upload sequence overflow",
+                )),
+            })?;
+        i64::try_from(completion_order).map_err(|_| MetadataError::Db {
+            context: "reserve completed multipart upload order overflow",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                "completed multipart upload sequence exceeds SQLite integer range",
+            )),
+        })?;
+        Ok((
+            completion_order,
+            MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                    AdvanceCompletedMultipartUploadSequenceCommand {
+                        bucket: bucket.clone(),
+                        completion_order,
+                    },
+                ),
+            ),
+        ))
+    }
+
     fn pending_mark_bucket_deleting_command_matches_current(
         &self,
         pg_id: PgId,
@@ -2516,6 +2617,59 @@ impl StorageNodeClient for LocalStorageNodeClient {
             }
         }
         Ok(MultipartUploadManagementLookup::Missing)
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let Some(cleanup) = pg.prepare_abort_multipart_upload_cleanup(bucket, key, upload_id)?
+        else {
+            return Ok(None);
+        };
+        let command_id = self.next_metadata_command_id_from_locked_pg(pg_id, cluster_epoch, &pg)?;
+        Ok(Some(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                cleanup,
+                bucket_write_reservation,
+            })),
+        )))
+    }
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let Some(cleanup) =
+            pg.prepare_authorized_abort_multipart_upload_cleanup(authorized_upload)?
+        else {
+            return Ok(None);
+        };
+        let command_id = self.next_metadata_command_id_from_locked_pg(pg_id, cluster_epoch, &pg)?;
+        Ok(Some(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: authorized_upload.record().bucket.clone(),
+                key: authorized_upload.record().key.clone(),
+                upload_id: authorized_upload.record().upload_id.clone(),
+                cleanup,
+                bucket_write_reservation,
+            })),
+        )))
     }
 
     fn payload_reclaim_exists(

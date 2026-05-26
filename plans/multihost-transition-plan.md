@@ -5145,6 +5145,26 @@ Progress:
   `CreateStreamUpload`. The guardrail now blocks raw object/MPU reads, raw
   command-id/generation allocation, and raw create-command construction in those
   migrated create helpers.
+- Migrated create-bucket command construction through the local node client.
+  The storage-side builder rechecks bucket absence under the bucket-PG lock
+  before allocating the execution generation and building `CreateBucket`, so the
+  cluster no longer opens the bucket PG for the create-command path. The
+  guardrail now blocks raw bucket-PG opens, execution-generation allocation, and
+  raw `CreateBucketCommand::from_config` construction in
+  `create_bucket_with_config_and_load_info`.
+- Migrated completed-multipart order reservation command construction through
+  the local node client. The storage-side builder reads and bounds-checks the
+  bucket completion sequence under the bucket-PG lock and returns the
+  `AdvanceCompletedMultipartUploadSequence` command with its reserved order; the
+  cluster keeps the pending/apply retry loop but no longer opens the bucket PG
+  for sequence allocation. The guardrail covers that migrated reservation
+  helper.
+- Migrated multipart abort command construction through the local node client.
+  The storage-side builders snapshot abort cleanup and allocate the metadata
+  command id under the object-PG lock for both direct and authorized aborts; the
+  cluster retains proof acquisition, pending install, drain, and apply behavior
+  without opening the object PG for abort-command construction. The guardrail
+  covers the migrated abort-command helper paths.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

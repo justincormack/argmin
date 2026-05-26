@@ -14,19 +14,18 @@ use super::{
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
 };
 use crate::metadata_command::{
-    AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
     BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
-    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
-    DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimClaimProof,
-    ObjectPayloadReclaimCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    CommitMultipartObjectCommand, CommitStreamPartCommand, DeleteCompletedMultipartUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::node_client::{
     BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
     BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
     BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
-    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq,
+    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
     CreateStreamUploadPrecondition, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
 use crate::traits::PgMetadataStore;
@@ -827,22 +826,15 @@ impl super::StorageCluster {
                     else {
                         continue;
                     };
-                    let bucket_pg = primary_node.get_pg(pg_id.get())?;
-                    let bucket_execution_generation =
-                        bucket_pg.next_bucket_execution_generation_candidate()?;
-                    drop(bucket_pg);
-                    let command = CreateBucketCommand::from_config(
-                        config,
-                        crate::clock::current_time_millis(),
-                        bucket_execution_generation,
-                    )
-                    .map_err(|reason| MetadataError::InvalidBucketName {
-                        reason: reason.to_string(),
-                    })?;
-                    let command = MetadataCommandEnvelope::new(
-                        command_id,
-                        MetadataCommandPayload::CreateBucket(command),
-                    );
+                    let command = match primary_store
+                        .storage_client()
+                        .build_create_bucket_command(pg_id, &bucket, command_id, config)?
+                    {
+                        CreateBucketCommandBuild::Exists(info) => {
+                            return Ok(BucketCreateAttemptOutcome::Exists(info));
+                        }
+                        CreateBucketCommandBuild::Command(command) => *command,
+                    };
                     if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, &bucket, &command)? {
                         continue;
                     }
@@ -7158,7 +7150,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<u64, ObjectPgActionError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let primary_node = self.bucket_metadata_primary_node(bucket)?;
+        let storage_client = self.metadata_pg_primary_client(pg_id)?;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if self
@@ -7195,25 +7187,6 @@ impl super::StorageCluster {
                 }
             }
 
-            let bucket_pg = primary_node.get_pg(pg_id.get())?;
-            let current_order = bucket_pg.completed_multipart_upload_sequence_for_bucket(bucket)?;
-            let completion_order =
-                current_order
-                    .checked_add(1)
-                    .ok_or_else(|| MetadataError::Db {
-                        context: "reserve completed multipart upload order overflow",
-                        source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                            "completed multipart upload sequence overflow",
-                        )),
-                    })?;
-            i64::try_from(completion_order).map_err(|_| MetadataError::Db {
-                context: "reserve completed multipart upload order overflow",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                    "completed multipart upload sequence exceeds SQLite integer range",
-                )),
-            })?;
-            drop(bucket_pg);
-
             #[cfg(test)]
             maybe_run_before_completed_multipart_order_command_id_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
@@ -7224,15 +7197,11 @@ impl super::StorageCluster {
             else {
                 continue;
             };
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                    AdvanceCompletedMultipartUploadSequenceCommand {
-                        bucket: bucket.clone(),
-                        completion_order,
-                    },
-                ),
-            );
+            let (completion_order, command) = storage_client
+                .build_advance_completed_multipart_upload_sequence_command(
+                    pg_id, bucket, command_id,
+                )
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             if !self
                 .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
@@ -8332,26 +8301,15 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let cleanup = {
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            object_pg.prepare_abort_multipart_upload_cleanup(bucket, key, upload_id)?
-        };
-        let cleanup = match cleanup {
-            Some(cleanup) => cleanup,
-            None => return Ok(None),
-        };
-
-        Ok(Some(MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id)?,
-            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                upload_id: upload_id.clone(),
-                cleanup,
+        self.object_metadata_primary_client(bucket, key)?
+            .build_abort_multipart_upload_command(
+                pg_id,
+                self.operation_epoch(),
+                bucket,
+                key,
+                upload_id,
                 bucket_write_reservation,
-            })),
-        )))
+            )
     }
 
     fn prepare_authorized_abort_multipart_upload_command(
@@ -8360,29 +8318,16 @@ impl super::StorageCluster {
         authorized_upload: &AuthorizedMultipartUploadRecord,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let primary_node = self.object_metadata_primary_node(
+        self.object_metadata_primary_client(
             &authorized_upload.record().bucket,
             &authorized_upload.record().key,
-        )?;
-        let cleanup = {
-            let object_pg = primary_node.get_pg(pg_id.get())?;
-            object_pg.prepare_authorized_abort_multipart_upload_cleanup(authorized_upload)?
-        };
-        let cleanup = match cleanup {
-            Some(cleanup) => cleanup,
-            None => return Ok(None),
-        };
-
-        Ok(Some(MetadataCommandEnvelope::new(
-            self.next_object_metadata_command_id(pg_id)?,
-            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
-                bucket: authorized_upload.record().bucket.clone(),
-                key: authorized_upload.record().key.clone(),
-                upload_id: authorized_upload.record().upload_id.clone(),
-                cleanup,
-                bucket_write_reservation,
-            })),
-        )))
+        )?
+        .build_authorized_abort_multipart_upload_command(
+            pg_id,
+            self.operation_epoch(),
+            authorized_upload,
+            bucket_write_reservation,
+        )
     }
 
     pub fn abort_multipart_upload_if_due<E>(
