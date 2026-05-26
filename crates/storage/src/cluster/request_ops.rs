@@ -6898,12 +6898,15 @@ impl super::StorageCluster {
             )?;
         }
 
-        let object_pg = primary_node.get_pg(pg_id.get())?;
-        let stored = PgMetadataStore::get_object_meta(&*object_pg, bucket, key)?;
-        let live_record = stored.as_live().ok_or_else(|| MetadataError::Db {
-            context: "stored object missing live record after stream put",
-            source: rusqlite::Error::QueryReturnedNoRows,
-        })?;
+        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let stored = storage_client.load_existing_live_object(pg_id, bucket, key)?;
+        let Some(StoredObject::Live(live_record)) = stored else {
+            return Err(MetadataError::Db {
+                context: "stored object missing live record after stream put",
+                source: rusqlite::Error::QueryReturnedNoRows,
+            }
+            .into());
+        };
         let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
             unreachable!("stream put commit pending command kind changed");
         };

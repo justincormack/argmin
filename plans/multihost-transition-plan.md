@@ -5091,6 +5091,9 @@ Progress:
   reserve-generation command construction no longer opens the object PG to check
   or allocate the reservation. Added a focused guardrail for that migrated
   reserve-generation lookup.
+- Migrated the post-publish live-object lookups used to build direct PUT and
+  stream PUT outcomes through the local node client, removing another raw object
+  PG open from the successful PUT return path.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

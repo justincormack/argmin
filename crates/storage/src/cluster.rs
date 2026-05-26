@@ -31,7 +31,7 @@ use crate::types::{
     PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SegmentStoredBytesRequest, SessionId,
     ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
     ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, StreamUploadCommandRecord, StreamUploadRecord,
+    ShardScavengerPayloadReference, StoredObject, StreamUploadCommandRecord, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, VersionId, WriteAck,
     WrittenShardAck,
 };
@@ -3413,12 +3413,15 @@ impl StorageCluster {
             self.metadata_primary_test_hook_node().test_hook_scope_id(),
         )?;
 
-        let object_pg = object_node.get_pg(pg_id.get())?;
-        let stored = PgMetadataStore::get_object_meta(&*object_pg, &req.bucket, &req.key)?;
-        let live_record = stored.as_live().ok_or_else(|| MetadataError::Db {
-            context: "stored object missing live record after direct put",
-            source: rusqlite::Error::QueryReturnedNoRows,
-        })?;
+        let storage_client = self.object_metadata_primary_client(&req.bucket, &req.key)?;
+        let stored = storage_client.load_existing_live_object(pg_id, &req.bucket, &req.key)?;
+        let Some(StoredObject::Live(live_record)) = stored else {
+            return Err(MetadataError::Db {
+                context: "stored object missing live record after direct put",
+                source: rusqlite::Error::QueryReturnedNoRows,
+            }
+            .into());
+        };
 
         match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
