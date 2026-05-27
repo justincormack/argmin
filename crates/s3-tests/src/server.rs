@@ -33,6 +33,7 @@ const TEST_TLS_KEY_PEM: &[u8] = include_bytes!("../testdata/localhost-key.pem");
 /// All frontends share one local storage cluster.
 /// This controls the parallelism level for request processing.
 const POOL_SIZE: usize = 4;
+const TEST_PG_COUNT: u32 = 1;
 const TEST_MAX_CONNECTIONS: u32 = 512;
 const TEST_MAX_INFLIGHT_REQUESTS: u32 = 32;
 const SHARD_SCAVENGER_CLEAN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -136,8 +137,7 @@ impl TestServer {
         // Run EC self-test once
         ec::self_test().expect("EC self-test");
 
-        let pg_count: u32 = 1;
-        let pg_ids: Vec<u32> = (0..pg_count).collect();
+        let pg_ids: Vec<u32> = (0..TEST_PG_COUNT).collect();
 
         // Create one shared local storage cluster for all frontends.
         let storage_cluster = open_test_storage_cluster(&data_path, &pg_ids);

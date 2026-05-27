@@ -3425,16 +3425,12 @@ impl StorageNodeClient for LocalStorageNodeClient {
             request.request.key.as_str(),
         )?;
         let stale_payload = if request.version_id.is_null() {
-            match current.current.as_ref().and_then(StoredObject::as_live) {
-                Some(live) => Some(snapshot_live_object_payload_reclaim_command(
-                    &pg,
-                    &request.request.bucket,
-                    &request.request.key,
-                    live,
-                    last_modified_millis,
-                )?),
-                None => None,
-            }
+            snapshot_direct_put_stale_payload_command(
+                &pg,
+                &request.request.bucket,
+                &request.request.key,
+                last_modified_millis,
+            )?
         } else {
             None
         };

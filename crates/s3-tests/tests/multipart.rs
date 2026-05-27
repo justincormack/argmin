@@ -171,13 +171,20 @@ async fn setup_bucket() -> String {
 
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
-    for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
-    }
 
     // AWS can keep failed or recently aborted multipart uploads visible briefly,
     // causing DeleteBucket to return OperationAborted or BucketNotEmpty.
-    for _ in 0..10 {
+    let mut last_cleanup_error = None;
+    for _ in 0..30 {
+        for key in keys {
+            if let Err(err) = client.delete_object().bucket(bucket).key(*key).send().await {
+                let raw = format!("{err:?}");
+                if !raw.contains("NoSuchBucket") && !raw.contains("NoSuchKey") {
+                    last_cleanup_error = Some(format!("delete_object {key:?}: {raw}"));
+                }
+            }
+        }
+
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
@@ -207,7 +214,13 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         }
     }
 
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    let result = client.delete_bucket().bucket(bucket).send().await;
+    if let Err(err) = result {
+        panic!(
+            "delete_bucket did not converge: {err:?}; last cleanup error: {}",
+            last_cleanup_error.as_deref().unwrap_or("none")
+        );
+    }
 }
 
 fn expected_raw_list_value(value: &str) -> String {

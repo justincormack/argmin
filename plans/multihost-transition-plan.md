@@ -5247,6 +5247,32 @@ Progress:
   tests should continue to enter through coordinator or `StorageCluster` methods,
   and new raw helper usage needs the same exception shape rather than becoming a
   second production path.
+- Status: complete. Phase 10.2 now routes the production storage-cluster
+  operations covered by the phase through `StorageNodeClient` or `LocalClusterMap`
+  helper boundaries, with guardrails for the migrated raw PG/node access shapes.
+  Closeout keeps the local `s3-tests` embedded server on a single PG with
+  automatic lifecycle and reclaim sweepers enabled, so the end-to-end harness
+  continues to exercise same-PG pressure instead of avoiding it through topology
+  fanout. Bucket-delete convergence was fixed directly: bucket finalization
+  drains unleased durable payload-reclaim roots while holding the durable
+  finalizer claim, so same-name bucket reuse does not depend solely on
+  background reclaim worker scheduling, and the trace models cover the inline
+  reclaim plus follow-on finalizer hint behavior. The direct PUT
+  suspended-versioning reclaim
+  edge case was fixed so replacing an existing null version under a numbered
+  current version reclaims the old null payload without reclaiming the numbered
+  current payload. Terminal bucket finalization now also clears the durable
+  finalizer claim, accepting the bucket-row delete's FK-cascaded claim removal
+  as a successful clear so later same-PG bucket finalizers are not held until
+  lease expiry. Lifecycle root discovery now surfaces non-expired lifecycle
+  claims as busy roots, and the local deterministic lifecycle sweep hook waits
+  boundedly for those production background-sweeper claims to clear instead of
+  disabling the sweeper or treating a busy claim as successful progress.
+  Verification on 2026-05-27 included
+  `cargo test --all-targets --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `./scripts/check-storage-cluster-boundaries`, and `git diff --check`; all
+  passed.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

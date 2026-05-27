@@ -10501,8 +10501,9 @@ fn lifecycle_sweep_root_from_row(
     let source_raw: i64 = row.get(2)?;
     let source = match source_raw {
         0 => LifecycleSweepRootSource::ExpiredClaim,
-        1 => LifecycleSweepRootSource::LifecycleConfig,
-        2 => LifecycleSweepRootSource::AbortingMultipartUpload,
+        1 => LifecycleSweepRootSource::BusyClaim,
+        2 => LifecycleSweepRootSource::LifecycleConfig,
+        3 => LifecycleSweepRootSource::AbortingMultipartUpload,
         _ => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 2,
@@ -13200,6 +13201,71 @@ impl PgMetadataStore for PgStore {
 
                 let remaining_limit =
                     i64::try_from(limit - roots.len()).map_err(|source| MetadataError::Db {
+                        context: "get lifecycle busy roots remaining limit",
+                        source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    })?;
+
+                let mut busy_stmt = store
+                    .conn
+                    .prepare_cached(&format!(
+                        "SELECT c.bucket, c.bucket_incarnation_generation, 1 AS source \
+                         FROM lifecycle_sweep_claims c \
+                         JOIN buckets b \
+                           ON b.name = c.bucket \
+                          AND b.bucket_incarnation_generation = c.bucket_incarnation_generation \
+                         WHERE b.state = ?1 \
+                           AND (c.lease_deadline IS NULL OR c.lease_deadline > ?2) \
+                           AND NOT EXISTS ( \
+                             SELECT 1 FROM bucket_write_drains d WHERE d.bucket_name = b.name \
+                           ) \
+                           AND ( \
+                             EXISTS ( \
+                               SELECT 1 FROM bucket_subresources lifecycle \
+                               WHERE lifecycle.bucket_name = b.name \
+                                 AND lifecycle.kind = {LIFECYCLE_SUBRESOURCE_KIND_SQL} \
+                                 AND lifecycle.body IS NOT NULL \
+                             ) \
+                             OR EXISTS ( \
+                               SELECT 1 FROM multipart_uploads m \
+                               WHERE m.bucket = b.name AND m.state = ?3 \
+                             ) \
+                           ) \
+                         ORDER BY c.bucket ASC, c.bucket_incarnation_generation ASC \
+                         LIMIT ?4"
+                    ))
+                    .map_err(|source| MetadataError::Db {
+                        context: "prepare get busy lifecycle sweep roots",
+                        source,
+                    })?;
+                let busy_rows = busy_stmt
+                    .query_map(
+                        params![
+                            BucketState::Active as u8,
+                            now,
+                            UploadState::Aborting as u8,
+                            remaining_limit,
+                        ],
+                        lifecycle_sweep_root_from_row,
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "query get busy lifecycle sweep roots",
+                        source,
+                    })?;
+                for row in busy_rows {
+                    let root = row.map_err(|source| MetadataError::Db {
+                        context: "row get busy lifecycle sweep roots",
+                        source,
+                    })?;
+                    roots.push(root);
+                }
+                drop(busy_stmt);
+
+                if roots.len() == limit {
+                    return Ok(roots);
+                }
+
+                let remaining_limit =
+                    i64::try_from(limit - roots.len()).map_err(|source| MetadataError::Db {
                         context: "get lifecycle sweep roots remaining limit",
                         source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
                     })?;
@@ -13214,8 +13280,8 @@ impl PgMetadataStore for PgStore {
                                     WHERE lifecycle.bucket_name = b.name \
                                       AND lifecycle.kind = {LIFECYCLE_SUBRESOURCE_KIND_SQL} \
                                       AND lifecycle.body IS NOT NULL \
-                                  ) THEN 1 \
-                                  ELSE 2 \
+                                  ) THEN 2 \
+                                  ELSE 3 \
                                 END AS source \
                          FROM buckets b \
                          WHERE b.state = ?1 \
@@ -17597,20 +17663,32 @@ mod tests {
             .unwrap()
             .expect("later lifecycle bucket should be claimable");
 
-        assert!(
-            store.get_lifecycle_sweep_roots(21, 16).unwrap().is_empty(),
-            "non-expiring lifecycle claims should remain busy, not expired scan work"
+        assert_eq!(
+            store.get_lifecycle_sweep_roots(21, 16).unwrap(),
+            vec![LifecycleSweepRoot {
+                bucket: bucket_b.clone(),
+                bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+                source: LifecycleSweepRootSource::BusyClaim,
+            }],
+            "non-expiring lifecycle claims should surface as busy work, not disappear from the scan"
         );
 
         put_probe_lifecycle_direct(&store, &bucket_a);
         let bucket_a_record = store.head_bucket_record_raw(&bucket_a).unwrap();
         assert_eq!(
             store.get_lifecycle_sweep_roots(21, 16).unwrap(),
-            vec![LifecycleSweepRoot {
-                bucket: bucket_a,
-                bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
-                source: LifecycleSweepRootSource::LifecycleConfig,
-            }],
+            vec![
+                LifecycleSweepRoot {
+                    bucket: bucket_b,
+                    bucket_incarnation_generation: bucket_b_record.bucket_incarnation_generation,
+                    source: LifecycleSweepRootSource::BusyClaim,
+                },
+                LifecycleSweepRoot {
+                    bucket: bucket_a,
+                    bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
+                    source: LifecycleSweepRootSource::LifecycleConfig,
+                },
+            ],
             "busy claimed buckets should not hide unrelated unclaimed lifecycle roots"
         );
     }
@@ -18160,6 +18238,66 @@ mod tests {
                 ClusterEpoch::INITIAL,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn delete_finalized_bucket_clears_finalizer_claim() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 11).unwrap();
+        let bucket_a = trusted_bucket_name("finalize-claim-clear-a");
+        let bucket_b = trusted_bucket_name("finalize-claim-clear-b");
+        create_probe_bucket_direct(&store, &bucket_a);
+        create_probe_bucket_direct(&store, &bucket_b);
+
+        store.mark_bucket_deleting(&bucket_a).unwrap();
+        let deleting_a = store.head_bucket_record_raw(&bucket_a).unwrap();
+        store
+            .acquire_bucket_delete_finalize_claim(
+                &bucket_a,
+                deleting_a.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(70_000),
+                10,
+            )
+            .unwrap()
+            .expect("deleting bucket should be finalizer-claimable");
+
+        store.delete_finalized_bucket(&bucket_a).unwrap();
+        let released = store
+            .release_bucket_delete_finalize_claim(
+                &bucket_a,
+                deleting_a.bucket_incarnation_generation,
+                "claim-a",
+                "owner-a",
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            released,
+            MetadataError::ReclaimClaimNotFound { .. }
+        ));
+
+        store.mark_bucket_deleting(&bucket_b).unwrap();
+        let deleting_b = store.head_bucket_record_raw(&bucket_b).unwrap();
+        assert!(
+            store
+                .acquire_bucket_delete_finalize_claim(
+                    &bucket_b,
+                    deleting_b.bucket_incarnation_generation,
+                    "claim-b",
+                    "owner-b",
+                    ClusterEpoch::INITIAL,
+                    11,
+                    Some(70_000),
+                    11,
+                )
+                .unwrap()
+                .is_some(),
+            "finalized bucket deletion must clear the singleton PG claim before later bucket work"
+        );
     }
 
     #[test]

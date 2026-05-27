@@ -2617,6 +2617,18 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
         let live = stored.as_live().unwrap();
         (live.became_noncurrent_at.unwrap(), live.generation_id)
     };
+    assert!(
+        coord
+            .storage_node
+            .test_get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
+            .unwrap()
+            .is_none(),
+        "suspended null-version write must not enqueue reclaim for the numbered version"
+    );
     let lease = coord
         .read_runtime()
         .acquire_object_payload_lease("bucket", "key", generation_id);
@@ -2652,6 +2664,142 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
         .unwrap()
         .is_some());
     drop(lease);
+}
+
+#[test]
+fn suspended_direct_put_reclaims_replaced_null_under_numbered_current() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
+    let metadata = MetadataBlob::default();
+    let system_metadata = SystemMetadata::default();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Suspended,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let first_null = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"old-null",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first_null.version_id, VersionId::Null);
+
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let numbered = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"numbered",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    assert_ne!(numbered.version_id, VersionId::Null);
+
+    let (old_null_generation, numbered_generation) = {
+        let old_null = coord
+            .storage_node
+            .test_get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                VersionId::Null,
+            )
+            .unwrap();
+        let numbered = coord
+            .storage_node
+            .test_get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                numbered.version_id,
+            )
+            .unwrap();
+        (
+            old_null.as_live().unwrap().generation_id,
+            numbered.as_live().unwrap().generation_id,
+        )
+    };
+
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Suspended,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let replacement_null = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"new-null",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement_null.version_id, VersionId::Null);
+
+    assert!(
+        coord
+            .storage_node
+            .test_get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                old_null_generation,
+            )
+            .unwrap()
+            .is_some(),
+        "suspended null-version direct PUT must reclaim the replaced null payload"
+    );
+    assert!(
+        coord
+            .storage_node
+            .test_get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                numbered_generation,
+            )
+            .unwrap()
+            .is_none(),
+        "suspended null-version direct PUT must not reclaim the displaced numbered payload"
+    );
 }
 
 #[test]

@@ -66,6 +66,7 @@ pub(super) struct LifecycleSweepStats {
     pub(super) expired_current_objects: u64,
     pub(super) expired_noncurrent_versions: u64,
     pub(super) expired_delete_markers: u64,
+    pub(super) skipped_expired_delete_markers: u64,
     pub(super) aborted_multipart_uploads: u64,
 }
 
@@ -375,6 +376,7 @@ impl ReadRuntime {
             expired_current_objects: 0,
             expired_noncurrent_versions: 0,
             expired_delete_markers: 0,
+            skipped_expired_delete_markers: 0,
             aborted_multipart_uploads: 0,
         };
         let mut processed_buckets: HashSet<(BucketName, u64)> = HashSet::new();
@@ -503,7 +505,7 @@ impl ReadRuntime {
             TRACE_TARGET,
             "lifecycle_sweep_pass_complete",
             Some(format_args!(
-                "roots={} acquired_claims={} busy_claims={} recovered_expired_claims={} released_claims={} failed_claims={} scanned_buckets={} expired_current_objects={} expired_noncurrent_versions={} expired_delete_markers={} aborted_multipart_uploads={}",
+                "roots={} acquired_claims={} busy_claims={} recovered_expired_claims={} released_claims={} failed_claims={} scanned_buckets={} expired_current_objects={} expired_noncurrent_versions={} expired_delete_markers={} skipped_expired_delete_markers={} aborted_multipart_uploads={}",
                 stats.discovered_roots,
                 stats.acquired_claims,
                 stats.busy_claims,
@@ -514,6 +516,7 @@ impl ReadRuntime {
                 stats.expired_current_objects,
                 stats.expired_noncurrent_versions,
                 stats.expired_delete_markers,
+                stats.skipped_expired_delete_markers,
                 stats.aborted_multipart_uploads
             )),
         );
@@ -828,6 +831,8 @@ impl ReadRuntime {
             self.heartbeat_lifecycle_sweep_claim(claim)?;
             if self.expire_delete_marker_if_due(&bucket_info.name, &key, version_id, now_millis)? {
                 stats.expired_delete_markers += 1;
+            } else {
+                stats.skipped_expired_delete_markers += 1;
             }
         }
 

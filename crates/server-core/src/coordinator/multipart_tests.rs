@@ -1439,6 +1439,51 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
 }
 
 #[test]
+fn create_bucket_reuse_drains_unleased_multipart_reclaim_without_worker() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"first")]);
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request("bucket", "key", &upload_id, test_requester()),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let err = coord
+        .abort_multipart_upload(&multipart_object_request(
+            "bucket",
+            "key",
+            &upload_id,
+            test_requester(),
+        ))
+        .unwrap_err();
+    assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+}
+
+#[test]
 fn no_such_upload_from_storage() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

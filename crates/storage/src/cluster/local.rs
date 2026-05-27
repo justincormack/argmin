@@ -30735,6 +30735,44 @@ mod tests {
     }
 
     #[test]
+    fn finalized_bucket_delete_releases_finalizer_claim_for_next_same_pg_bucket() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let (bucket_a, bucket_b) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, 1, "delete-finalize-release-a-"),
+                bucket_for_pg(topology, 1, "delete-finalize-release-b-"),
+            )
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket_a);
+        create_test_bucket(&cluster, &bucket_b);
+
+        cluster.begin_bucket_delete(&bucket_a).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket_a).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+
+        cluster.begin_bucket_delete(&bucket_b).unwrap();
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket_b).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized,
+            "a terminal bucket finalizer must release its singleton PG claim before unrelated same-PG work"
+        );
+    }
+
+    #[test]
     fn finalized_bucket_delete_waits_for_reclaim_then_finalizes_after_worker_progress() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

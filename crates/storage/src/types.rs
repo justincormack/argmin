@@ -1975,6 +1975,7 @@ pub struct LifecycleSweepClaimRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleSweepRootSource {
     ExpiredClaim,
+    BusyClaim,
     LifecycleConfig,
     AbortingMultipartUpload,
 }

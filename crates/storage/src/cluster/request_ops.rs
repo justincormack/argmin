@@ -76,8 +76,9 @@ fn metadata_command_is_matching_multipart_abort(
 fn lifecycle_sweep_root_source_rank(source: LifecycleSweepRootSource) -> u8 {
     match source {
         LifecycleSweepRootSource::ExpiredClaim => 0,
-        LifecycleSweepRootSource::LifecycleConfig => 1,
-        LifecycleSweepRootSource::AbortingMultipartUpload => 2,
+        LifecycleSweepRootSource::BusyClaim => 1,
+        LifecycleSweepRootSource::LifecycleConfig => 2,
+        LifecycleSweepRootSource::AbortingMultipartUpload => 3,
     }
 }
 
@@ -2112,8 +2113,8 @@ impl super::StorageCluster {
                 self.bucket_metadata_pg_id(bucket)
             )),
         );
-        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         let bucket_incarnation_generation = {
+            let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
             let info = match bucket_store
                 .storage_client()
                 .head_bucket_raw(PgId::new(bucket_pg_id), bucket)
@@ -2189,9 +2190,16 @@ impl super::StorageCluster {
 
         let result = self.try_finalize_bucket_delete_claimed(bucket, bucket_pg_id);
         match result {
-            Ok(BucketDeleteFinalizeOutcome::Finalized | BucketDeleteFinalizeOutcome::NotFound) => {
-                result
-            }
+            Ok(
+                outcome @ (BucketDeleteFinalizeOutcome::Finalized
+                | BucketDeleteFinalizeOutcome::NotFound),
+            ) => match release_finalizer_claim() {
+                Ok(()) => Ok(outcome),
+                Err(BucketWriteDrainError::Metadata(MetadataError::ReclaimClaimNotFound {
+                    ..
+                })) => Ok(outcome),
+                Err(error) => Err(error),
+            },
             Ok(outcome) => {
                 release_finalizer_claim()?;
                 Ok(outcome)
@@ -2208,28 +2216,58 @@ impl super::StorageCluster {
         bucket: &BucketName,
         bucket_pg_id: u32,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        if self.bucket_has_visible_data(bucket, false)? {
-            let _ = observability::event(
-                super::TRACE_TARGET,
-                "bucket_finalize_pending_visible_data",
-                Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
-            );
-            return Ok(BucketDeleteFinalizeOutcome::Pending);
-        }
-
-        let reclaim_roots = self.bucket_payload_reclaim_roots(bucket)?;
-        for root in &reclaim_roots {
-            if self.local_map.object_payload_lease_count(
-                &root.bucket,
-                &root.key,
-                root.generation_id,
-            ) == 0
-            {
-                self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
+        loop {
+            if self.bucket_has_visible_data(bucket, false)? {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_finalize_pending_visible_data",
+                    Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
+                );
+                return Ok(BucketDeleteFinalizeOutcome::Pending);
             }
-        }
 
-        if !reclaim_roots.is_empty() {
+            let reclaim_roots = self.bucket_payload_reclaim_roots(bucket)?;
+            if reclaim_roots.is_empty() {
+                break;
+            }
+
+            let mut reclaimed_any = false;
+            for root in &reclaim_roots {
+                if self.local_map.object_payload_lease_count(
+                    &root.bucket,
+                    &root.key,
+                    root.generation_id,
+                ) != 0
+                {
+                    continue;
+                }
+                if self
+                    .reclaim_object_payload_if_unleased(&root.bucket, &root.key, root.generation_id)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                {
+                    reclaimed_any = true;
+                }
+            }
+
+            if reclaimed_any {
+                continue;
+            }
+
+            for root in &reclaim_roots {
+                if self.local_map.object_payload_lease_count(
+                    &root.bucket,
+                    &root.key,
+                    root.generation_id,
+                ) == 0
+                {
+                    self.enqueue_object_payload_reclaim(
+                        &root.bucket,
+                        &root.key,
+                        root.generation_id,
+                    );
+                }
+            }
             let _ = observability::event(
                 super::TRACE_TARGET,
                 "bucket_finalize_pending_reclaim",

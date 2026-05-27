@@ -522,7 +522,8 @@ pub(crate) trait PgMetadataStore {
     ///
     /// Expired lifecycle claims are returned first so their exact bucket
     /// incarnation remains recoverable even when another lifecycle bucket sorts
-    /// earlier. Busy claims are skipped by ordinary lifecycle root scanning.
+    /// earlier. Non-expired lifecycle claims are returned as busy roots so
+    /// callers can distinguish active sweep ownership from an empty root scan.
     fn get_lifecycle_sweep_roots(
         &self,
         now: u64,

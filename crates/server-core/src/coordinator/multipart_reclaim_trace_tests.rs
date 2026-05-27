@@ -626,14 +626,21 @@ impl TwoGenerationReclaimTraceModel {
             WorkerBucketDeleteStep => {
                 assert_eq!(self.queue.remove(0), GenerationReclaimHint::BucketDelete);
                 if self.bucket_deleting {
-                    match self.current_bucket_root() {
-                        Some(TraceGeneration::Old) if !self.old_lease_held => {
-                            self.enqueue_generation(TraceGeneration::Old);
+                    loop {
+                        match self.current_bucket_root() {
+                            Some(TraceGeneration::Old) if !self.old_lease_held => {
+                                self.old_metadata_exists = false;
+                                self.enqueue_bucket_delete();
+                                continue;
+                            }
+                            Some(TraceGeneration::New) if !self.new_lease_held => {
+                                self.new_metadata_exists = false;
+                                self.enqueue_bucket_delete();
+                                continue;
+                            }
+                            _ => {}
                         }
-                        Some(TraceGeneration::New) if !self.new_lease_held => {
-                            self.enqueue_generation(TraceGeneration::New);
-                        }
-                        _ => {}
+                        break;
                     }
                     if !self.old_metadata_exists && !self.new_metadata_exists {
                         self.bucket_exists = false;
@@ -763,14 +770,21 @@ impl TwoKeyReclaimTraceModel {
             WorkerBucketDeleteStep => {
                 assert_eq!(self.queue.remove(0), KeyReclaimHint::BucketDelete);
                 if self.bucket_deleting {
-                    match self.current_bucket_root() {
-                        Some(TraceKey::A) if !self.key_a_lease_held => {
-                            self.enqueue_key(TraceKey::A)
+                    loop {
+                        match self.current_bucket_root() {
+                            Some(TraceKey::A) if !self.key_a_lease_held => {
+                                self.key_a_metadata_exists = false;
+                                self.enqueue_bucket_delete();
+                                continue;
+                            }
+                            Some(TraceKey::B) if !self.key_b_lease_held => {
+                                self.key_b_metadata_exists = false;
+                                self.enqueue_bucket_delete();
+                                continue;
+                            }
+                            _ => {}
                         }
-                        Some(TraceKey::B) if !self.key_b_lease_held => {
-                            self.enqueue_key(TraceKey::B)
-                        }
-                        _ => {}
+                        break;
                     }
                     if !self.key_a_metadata_exists && !self.key_b_metadata_exists {
                         self.bucket_exists = false;
@@ -1815,44 +1829,48 @@ fn deleting_bucket_finalize_advances_from_old_generation_to_new_generation_root(
     harness
         .execute(&TwoGenerationReclaimTraceOp::WorkerBucketDeleteStep)
         .unwrap();
-    harness
-        .execute_worker_object_step(TraceGeneration::Old)
-        .unwrap();
 
     assert!(
         !harness.metadata_exists(TraceGeneration::Old),
         "reclaiming the old generation should clear its durable reclaim metadata"
     );
     assert!(
-        harness.metadata_exists(TraceGeneration::New),
-        "the newer generation should still be present before bucket-delete finalize advances the root"
+        !harness.metadata_exists(TraceGeneration::New),
+        "bucket-delete finalization should keep advancing through unleased durable roots"
     );
-
-    harness
-        .execute(&TwoGenerationReclaimTraceOp::WorkerBucketDeleteStep)
-        .unwrap();
 
     match harness.take_next_work().unwrap() {
         Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
             if bucket == trusted_bucket_name(TRACE_BUCKET)
                 && key == trusted_object_key(TRACE_KEY)
-                && generation_id == trace_generation_id_new() => {}
+                && generation_id == trace_generation_id() => {}
         Some(ReclaimWorkItem::ObjectPayload((_bucket, _key, generation_id))) => panic!(
-            "bucket-delete finalize should advance to the new generation root, got generation {generation_id:?}"
+            "expected stale old-generation object hint after inline bucket-delete finalization, got generation {generation_id:?}"
         ),
         Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
-            "expected advanced object reclaim work for the new generation, got bucket delete for {bucket}"
+            "expected stale object reclaim hint after inline bucket-delete finalization, got bucket delete for {bucket}"
         ),
-        None => panic!("expected bucket-delete finalize to enqueue reclaim for the new generation root"),
+        None => panic!("expected stale object reclaim hint from the pre-existing queue"),
     }
 
+    match harness.take_next_work().unwrap() {
+        Some(ReclaimWorkItem::BucketDelete(bucket))
+            if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
+            "expected bucket-delete follow-on after inline reclaim progress, got bucket delete for {bucket}"
+        ),
+        Some(ReclaimWorkItem::ObjectPayload(_)) => {
+            panic!("inline bucket-delete finalization should not enqueue additional object reclaim for roots it already drained")
+        }
+        None => panic!("expected bucket-delete follow-on after inline reclaim progress"),
+    }
     harness
         .runtime
-        .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id_new())
+        .try_finalize_bucket_delete_for(&trusted_bucket_name(TRACE_BUCKET))
         .unwrap();
     assert!(
         !harness.metadata_exists(TraceGeneration::New),
-        "reclaiming the advanced new-generation root should clear its durable metadata"
+        "stale new-generation queued work should be harmless after inline finalization"
     );
 }
 

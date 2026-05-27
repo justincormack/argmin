@@ -5,6 +5,7 @@ use crate::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_C_CUSTO
 use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use storage::{NodeId, StorageCluster};
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
@@ -450,7 +451,8 @@ pub(crate) fn begin_stream_put_with_authorized_request_test<'a>(
 }
 
 pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
-    for _ in 0..200 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
         coord
             .read_runtime()
             .try_finalize_bucket_delete_for(&trusted_bucket_name(name))
@@ -465,6 +467,10 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
         {
             return;
         }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
     panic!("bucket {name} was not fully removed");
 }

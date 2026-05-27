@@ -4235,10 +4235,10 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
     let bucket = "bucket-complete-no-lock";
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&storage_cluster),
     );
-    let completer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+    let completer = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&storage_cluster),
     );
     admin

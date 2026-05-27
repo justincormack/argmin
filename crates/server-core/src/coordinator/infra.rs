@@ -1,6 +1,7 @@
 #[cfg(test)]
 use super::runtime::LifecycleSweepStats;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::PayloadBufferPool;
@@ -424,10 +425,24 @@ impl Coordinator {
     /// This is a local integration-test hook used by `s3-local-tests` so
     /// lifecycle execution can be driven deterministically without sleeps.
     pub fn run_lifecycle_sweep_for_test(&self, now_millis: u64) -> Result<(), ServerError> {
-        storage::clock::with_time_override(now_millis, || {
-            self.read_runtime().run_lifecycle_sweep_at(now_millis)
-        })?;
-        Ok(())
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = storage::clock::with_time_override(now_millis, || {
+                self.read_runtime().run_lifecycle_sweep_at(now_millis)
+            })?;
+            if stats.busy_claims == 0 && stats.skipped_expired_delete_markers == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ServerError::InternalError {
+                    reason: format!(
+                        "lifecycle test sweep still had {} busy claims and {} skipped expired delete-marker candidates after bounded wait",
+                        stats.busy_claims, stats.skipped_expired_delete_markers
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn region(&self) -> &str {
