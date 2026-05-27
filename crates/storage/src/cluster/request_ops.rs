@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::MutexGuard;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{Mutex, OnceLock};
@@ -29,6 +30,7 @@ use crate::node_client::{
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
+#[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;
 use crate::*;
 
@@ -745,8 +747,48 @@ impl super::StorageCluster {
         self.metadata_primary_topology_node().pg_ids().to_vec()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
         self.metadata_pg_primary_node(pg_id)?.get_pg(pg_id)
+    }
+
+    fn list_objects_page(
+        &self,
+        pg_id: u32,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, ObjectPgActionError> {
+        let pg_id = PgId::new(pg_id);
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .list_objects(pg_id, req)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
+    }
+
+    fn list_object_versions_page(
+        &self,
+        pg_id: u32,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, ObjectPgActionError> {
+        let pg_id = PgId::new(pg_id);
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .list_object_versions(pg_id, req)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
+    }
+
+    fn list_multipart_uploads_page(
+        &self,
+        pg_id: u32,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, ObjectPgActionError> {
+        let pg_id = PgId::new(pg_id);
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_client()
+            .list_multipart_uploads(pg_id, req)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -2209,26 +2251,37 @@ impl super::StorageCluster {
     ) -> Result<bool, BucketWriteDrainError> {
         for pg_id in self.metadata_pg_ids() {
             {
-                let pg = self.metadata_pg(pg_id)?;
-                let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    key_marker: None,
-                    version_id_marker: None,
-                    start_at: None,
-                    max_keys: 1,
-                })?;
+                let pg_id = PgId::new(pg_id);
+                let storage_client = self.metadata_pg_primary_client(pg_id)?;
+                let versions = storage_client
+                    .list_object_versions(
+                        pg_id,
+                        &ListObjectVersionsReq {
+                            bucket: bucket.clone(),
+                            prefix: None,
+                            key_marker: None,
+                            version_id_marker: None,
+                            start_at: None,
+                            max_keys: 1,
+                        },
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                 if !versions.versions.is_empty() {
                     return Ok(true);
                 }
 
-                let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    key_marker: None,
-                    upload_id_marker: None,
-                    max_uploads: 1,
-                })?;
+                let uploads = storage_client
+                    .list_multipart_uploads(
+                        pg_id,
+                        &ListMultipartUploadsReq {
+                            bucket: bucket.clone(),
+                            prefix: None,
+                            key_marker: None,
+                            upload_id_marker: None,
+                            max_uploads: 1,
+                        },
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                 if !uploads.uploads.is_empty() {
                     return Ok(true);
                 }
@@ -3111,15 +3164,16 @@ impl super::StorageCluster {
         for pg_id in self.metadata_pg_ids() {
             let mut start_after = None;
             loop {
-                let pg = self.metadata_pg(pg_id)?;
-                let resp = pg.list_objects(&ListObjectsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    start_after: start_after.clone(),
-                    start_at: None,
-                    max_keys: INTERNAL_LIST_PAGE_SIZE,
-                })?;
-                drop(pg);
+                let resp = self.list_objects_page(
+                    pg_id,
+                    &ListObjectsReq {
+                        bucket: bucket.clone(),
+                        prefix: None,
+                        start_after: start_after.clone(),
+                        start_at: None,
+                        max_keys: INTERNAL_LIST_PAGE_SIZE,
+                    },
+                )?;
                 all_objects.extend(resp.objects);
                 if !resp.is_truncated {
                     break;
@@ -3142,16 +3196,17 @@ impl super::StorageCluster {
             let mut version_id_marker = None;
             let mut versions = Vec::new();
             loop {
-                let pg = self.metadata_pg(pg_id)?;
-                let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    key_marker: key_marker.clone(),
-                    version_id_marker,
-                    start_at: None,
-                    max_keys: INTERNAL_LIST_PAGE_SIZE,
-                })?;
-                drop(pg);
+                let resp = self.list_object_versions_page(
+                    pg_id,
+                    &ListObjectVersionsReq {
+                        bucket: bucket.clone(),
+                        prefix: None,
+                        key_marker: key_marker.clone(),
+                        version_id_marker,
+                        start_at: None,
+                        max_keys: INTERNAL_LIST_PAGE_SIZE,
+                    },
+                )?;
                 versions.extend(resp.versions);
                 if !resp.is_truncated {
                     break;
@@ -3195,15 +3250,16 @@ impl super::StorageCluster {
             let mut key_marker = None;
             let mut upload_id_marker = None;
             loop {
-                let pg = self.metadata_pg(pg_id)?;
-                let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    key_marker: key_marker.clone(),
-                    upload_id_marker: upload_id_marker.clone(),
-                    max_uploads: INTERNAL_LIST_PAGE_SIZE,
-                })?;
-                drop(pg);
+                let resp = self.list_multipart_uploads_page(
+                    pg_id,
+                    &ListMultipartUploadsReq {
+                        bucket: bucket.clone(),
+                        prefix: None,
+                        key_marker: key_marker.clone(),
+                        upload_id_marker: upload_id_marker.clone(),
+                        max_uploads: INTERNAL_LIST_PAGE_SIZE,
+                    },
+                )?;
                 uploads.extend(resp.uploads);
                 if !resp.is_truncated {
                     break;
@@ -3249,14 +3305,16 @@ impl super::StorageCluster {
                 if hit_record_cap {
                     break;
                 }
-                let pg = self.metadata_pg(pg_id)?;
-                let resp = pg.list_objects(&ListObjectsReq {
-                    bucket: bucket.clone(),
-                    prefix: prefix.clone(),
-                    start_after: continuation_token.clone(),
-                    start_at: None,
-                    max_keys: fetch_limit,
-                })?;
+                let resp = self.list_objects_page(
+                    pg_id,
+                    &ListObjectsReq {
+                        bucket: bucket.clone(),
+                        prefix: prefix.clone(),
+                        start_after: continuation_token.clone(),
+                        start_at: None,
+                        max_keys: fetch_limit,
+                    },
+                )?;
                 all_objects.extend(resp.objects);
                 if all_objects.len() >= record_cap {
                     all_objects.truncate(record_cap);
@@ -3322,14 +3380,16 @@ impl super::StorageCluster {
                 Some(ListObjectsPageStart::At(key)) => (None, Some(key)),
                 None => (None, None),
             };
-            let pg = self.metadata_pg(cursor.pg_id)?;
-            let resp = pg.list_objects(&ListObjectsReq {
-                bucket: bucket.clone(),
-                prefix: prefix.clone(),
-                start_after,
-                start_at,
-                max_keys: fetch_limit,
-            })?;
+            let resp = self.list_objects_page(
+                cursor.pg_id,
+                &ListObjectsReq {
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                    start_after,
+                    start_at,
+                    max_keys: fetch_limit,
+                },
+            )?;
             cursor.objects = resp.objects;
             cursor.next_index = 0;
             cursor.next_page_start = resp.next_start_after.map(ListObjectsPageStart::After);
@@ -3491,15 +3551,17 @@ impl super::StorageCluster {
                 Some(ListVersionsPageStart::At(key)) => (None, None, Some(key)),
                 None => (None, None, None),
             };
-            let pg = self.metadata_pg(cursor.pg_id)?;
-            let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: bucket.clone(),
-                prefix: prefix.clone(),
-                key_marker,
-                version_id_marker,
-                start_at,
-                max_keys: fetch_limit,
-            })?;
+            let resp = self.list_object_versions_page(
+                cursor.pg_id,
+                &ListObjectVersionsReq {
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                    key_marker,
+                    version_id_marker,
+                    start_at,
+                    max_keys: fetch_limit,
+                },
+            )?;
             cursor.versions = resp.versions;
             cursor.next_index = 0;
             cursor.next_page_start =
@@ -7624,14 +7686,16 @@ impl super::StorageCluster {
             if hit_record_cap {
                 break;
             }
-            let pg = self.metadata_pg(pg_id)?;
-            let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.clone(),
-                prefix: prefix.cloned(),
-                key_marker: key_marker.cloned(),
-                upload_id_marker: upload_id_marker.cloned(),
-                max_uploads: max_uploads.saturating_add(1),
-            })?;
+            let resp = self.list_multipart_uploads_page(
+                pg_id,
+                &ListMultipartUploadsReq {
+                    bucket: bucket.clone(),
+                    prefix: prefix.cloned(),
+                    key_marker: key_marker.cloned(),
+                    upload_id_marker: upload_id_marker.cloned(),
+                    max_uploads: max_uploads.saturating_add(1),
+                },
+            )?;
             uploads.extend(resp.uploads);
             if uploads.len() >= record_cap {
                 uploads.truncate(record_cap);

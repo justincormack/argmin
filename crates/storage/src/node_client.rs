@@ -30,21 +30,22 @@ use crate::types::{
     CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
     CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutCommitStorageSnapshot, EcShape, GenerationId, LifecycleSweepBuckets,
-    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListPartsReq, ListedMultipartParts,
-    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
-    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference, StoredObject,
-    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
-    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-    VersionId, WriteAck,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListMultipartUploadsReq,
+    ListMultipartUploadsResp, ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq,
+    ListObjectsResp, ListPartsReq, ListedMultipartParts, LiveObjectRecord,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+    MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag,
+    ObjectKey, ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
+    ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
+    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
+    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, StoredObject, StreamPutCommitInput,
+    StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord, StreamUploadPartStorageSnapshot,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -731,6 +732,24 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
+
+    fn list_objects(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, BucketSnapshotLoadError>;
+
+    fn list_object_versions(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError>;
+
+    fn list_multipart_uploads(
+        &self,
+        pg_id: PgId,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError>;
 
     fn register_written_shard_acks(
         &self,
@@ -1666,6 +1685,33 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?)
+    }
+
+    fn list_objects(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_objects(req)?)
+    }
+
+    fn list_object_versions(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_object_versions(req)?)
+    }
+
+    fn list_multipart_uploads(
+        &self,
+        pg_id: PgId,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_multipart_uploads(req)?)
     }
 
     fn register_written_shard_acks(

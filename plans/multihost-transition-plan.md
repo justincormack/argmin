@@ -5216,6 +5216,12 @@ Progress:
   row used for `should_abort` now comes from an operation-shaped storage-client
   read instead of direct object-PG access. The guardrail blocks raw upload row
   reloads in `abort_multipart_upload_if_due`.
+- Migrated bucket listing page reads through the local node client. The cluster
+  still owns cross-PG merge, delimiter/common-prefix handling, record caps, and
+  delete-bucket emptiness policy, but object, object-version, and multipart
+  upload pages now load through storage-client methods on each routed PG
+  primary. The guardrail blocks raw bucket listing PG reads from production
+  cluster code.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
