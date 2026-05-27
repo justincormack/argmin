@@ -495,7 +495,7 @@ migrated_metadata_pg_bypasses=$(
             || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(max_metadata_command_log_index|pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
+        if ($0 ~ /\.(max_metadata_command_log_index|pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|validate_metadata_command_replay_state|validate_metadata_command_replay_state_preserving_pending_slot|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/) {
                 pending_storage_client = 0
                 next

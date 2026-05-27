@@ -1247,25 +1247,20 @@ fn validate_metadata_command_replay_state(
         let mut primary_pending_command = None;
         for node in nodes.values() {
             let node_id = node.node_id();
-            let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-                ClusterBuildError::OpenLocalNode {
-                    node_id: node_id.as_u32(),
-                    source,
-                }
-            })?;
             let state = if node_id == primary_node_id {
-                pg.validate_metadata_command_replay_state_preserving_pending_slot(
-                    node_id.as_u32(),
-                    cluster_epoch,
-                )
+                node.storage_client()
+                    .validate_metadata_command_replay_state_preserving_pending_slot(
+                        pg_id,
+                        cluster_epoch,
+                    )
             } else {
-                pg.validate_metadata_command_replay_state(node_id.as_u32(), cluster_epoch)
+                node.storage_client()
+                    .validate_metadata_command_replay_state(pg_id, cluster_epoch)
             }
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
                 source,
             })?;
-            drop(pg);
             let pending_command = node
                 .storage_client()
                 .pending_metadata_command_envelope(pg_id, cluster_epoch)
@@ -1437,14 +1432,9 @@ fn converge_in_flight_metadata_command_on_open(
     let mut converged_states = Vec::new();
     for node in nodes.values() {
         let node_id = node.node_id();
-        let pg = node.storage_node().get_pg(pg_id.get()).map_err(|source| {
-            ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            }
-        })?;
-        let state = pg
-            .validate_metadata_command_replay_state(node_id.as_u32(), cluster_epoch)
+        let state = node
+            .storage_client()
+            .validate_metadata_command_replay_state(pg_id, cluster_epoch)
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
                 source,

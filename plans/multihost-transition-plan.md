@@ -5007,6 +5007,11 @@ Progress:
 - Included `cluster/local.rs` command acceptance and open-time command-log
   convergence in that migration, so the guardrail now scans local cluster
   production code for the migrated command-log operations too.
+- Migrated local-cluster open-time metadata command replay-state validation
+  through the local node client. Startup still owns replica agreement and
+  in-flight recovery policy, but individual PG replay validation no longer
+  exposes raw `PgStore` guards to local-cluster code; the command-log guardrail
+  now covers those validation calls.
 - Migrated durable bucket write reservation/drain acquire, validation, release,
   drain begin/clear, and reservation-list operations through the local node
   client, including open-time reservation validation/release. Added a guardrail

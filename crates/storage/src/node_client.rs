@@ -1514,6 +1514,18 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
+    fn validate_metadata_command_replay_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn validate_metadata_command_replay_state_preserving_pending_slot(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,
@@ -4126,6 +4138,27 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.metadata_command_replica_state()
+    }
+
+    fn validate_metadata_command_replay_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.validate_metadata_command_replay_state(self.node_id.as_u32(), cluster_epoch)
+    }
+
+    fn validate_metadata_command_replay_state_preserving_pending_slot(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.validate_metadata_command_replay_state_preserving_pending_slot(
+            self.node_id.as_u32(),
+            cluster_epoch,
+        )
     }
 
     fn metadata_command_acceptance(
