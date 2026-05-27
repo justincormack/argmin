@@ -820,6 +820,13 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<u64, StoreError>;
 
+    fn next_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError>;
+
     fn pending_metadata_command_envelope(
         &self,
         pg_id: PgId,
@@ -1570,6 +1577,21 @@ impl LocalStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         pg: &crate::PgStore,
     ) -> Result<MetadataCommandId, StoreError> {
+        self.next_metadata_command_id_from_locked_pg_at_least(
+            pg_id,
+            cluster_epoch,
+            pg,
+            MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
+        )
+    }
+
+    fn next_metadata_command_id_from_locked_pg_at_least(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        pg: &crate::PgStore,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
         let max_log_index = pg.max_metadata_command_log_index(cluster_epoch)?;
         if let Some(slot) =
             pg.pending_metadata_command_slot(self.node_id.as_u32(), cluster_epoch)?
@@ -1583,6 +1605,7 @@ impl LocalStorageNodeClient {
         }
         let next_log_index = max_log_index
             .checked_add(1)
+            .map(|next| next.max(min_log_index.get()))
             .and_then(MetadataCommandLogIndex::new)
             .ok_or(StoreError::MetadataCommandLogConflict {
                 node_id: self.node_id.as_u32(),
@@ -1820,6 +1843,21 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<u64, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.max_metadata_command_log_index(cluster_epoch)
+    }
+
+    fn next_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        self.next_metadata_command_id_from_locked_pg_at_least(
+            pg_id,
+            cluster_epoch,
+            &pg,
+            min_log_index,
+        )
     }
 
     fn pending_metadata_command_envelope(

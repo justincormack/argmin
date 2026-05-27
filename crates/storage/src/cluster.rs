@@ -1542,8 +1542,11 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let pg = primary.storage_node().get_pg(pg_id.get())?;
-        self.next_metadata_command_id_from_locked_pg_at_least(pg_id, &pg, min_log_index)
+        primary.storage_client().next_metadata_command_id_at_least(
+            pg_id,
+            self.operation_epoch(),
+            min_log_index,
+        )
     }
 
     #[cfg(test)]
@@ -1559,6 +1562,7 @@ impl StorageCluster {
         )
     }
 
+    #[cfg(test)]
     fn next_metadata_command_id_from_locked_pg_at_least(
         &self,
         pg_id: PgId,
@@ -1568,11 +1572,6 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        // Phase 10.2 inventory exception: this allocator is intentionally
-        // still locked-PG shaped because callers already hold the object PG
-        // lock for snapshot-sensitive command construction. Re-locking through
-        // StorageNodeClient here would deadlock; the boundary guardrail allows
-        // only this raw pending-slot read until these callers are reshaped.
         let max_log_index = pg.max_metadata_command_log_index(self.operation_epoch())?;
         if let Some(slot) =
             pg.pending_metadata_command_slot(primary.node_id().as_u32(), self.operation_epoch())?

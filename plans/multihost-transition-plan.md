@@ -4997,11 +4997,10 @@ Progress:
   those PG locks behind operation-shaped methods.
 - Extended the boundary guardrail so production pending metadata command slot
   paths cannot call the migrated raw `PgStore` APIs directly.
-- Deferred the locked-PG command-id allocator pending-slot read as an explicit
-  Phase 10.2 inventory exception: those callers already hold object PG locks for
-  snapshot-sensitive command construction, so re-locking through the client
-  would deadlock until the callers are reshaped. The guardrail permits only that
-  named raw use.
+- Migrated generic metadata command-id allocation through the local node client,
+  including the pending-slot conflict check used before command construction.
+  Locked-PG allocation remains only inside storage-client builders and
+  test-only helpers where the PG is already owned by the storage side.
 - Migrated metadata command replica state/log hash checks, apply-and-record, and
   abandoned-log record/read through the local node client, and extended the
   guardrail to keep those command-log paths behind the boundary.
@@ -5222,6 +5221,11 @@ Progress:
   upload pages now load through storage-client methods on each routed PG
   primary. The guardrail blocks raw bucket listing PG reads from production
   cluster code.
+- Migrated the remaining cluster-side metadata command-id allocation through the
+  local node client. Bucket/object command paths still own retry/drain policy,
+  but max-log and pending-slot checks for fresh command ids now happen behind
+  storage-client methods; the boundary guardrail no longer carries the
+  cluster-side allocator exception.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
