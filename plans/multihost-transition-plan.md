@@ -1142,9 +1142,8 @@ Work items:
        longer use the metadata-primary bridge or direct single-node shortcuts
      - the remaining `metadata_primary_bridge_node` callers are
        `#[cfg(any(test, feature = "test-hooks"))]` test helpers only
-     - `metadata_primary_topology_node` remains as a read-only topology/config
-       helper for PG mapping and default EC shape until cluster topology becomes
-       first-class state
+     - PG mapping and default EC shape are now held by `LocalClusterMap`, not by
+       the metadata-primary bridge
      - payload lease bookkeeping and reclaim/finalize queues are now
        local-cluster runtime coordination state; this is intentionally
        single-process and must become durable/replicated in a later
@@ -5105,8 +5104,9 @@ Progress:
 - Migrated stream-create retry matching, stream-segment listing for append/abort
   retry paths, stream-upload visibility checks during bucket delete, and
   best-effort stream-session listing through the local node client. The remaining
-  raw stream-session reads are stream finalize command-construction snapshots
-  that need their own operation-shaped builder API to preserve TOCTOU fences.
+  raw stream-session reads were stream finalize command-construction snapshots;
+  those were migrated in the next slice through operation-shaped snapshot/build
+  APIs to preserve TOCTOU fences.
 - Migrated stream PUT and stream upload-part finalize command construction
   through operation-shaped node-client snapshot/build APIs. The coordinator now
   authorizes a typed stream-finalize snapshot and storage revalidates that exact
@@ -5231,6 +5231,22 @@ Progress:
   but max-log and pending-slot checks for fresh command ids now happen behind
   storage-client methods; the boundary guardrail no longer carries the
   cluster-side allocator exception.
+- Migrated remaining production cluster topology, local lock, local notification,
+  and EC shard-encoding use cases behind `LocalClusterMap` helpers. PG id
+  derivation, default EC shape, EC scratch-pool-backed encoding,
+  bucket/object-scoped local locks, multipart completion contention locks, and
+  bucket coordination notifications are no longer reached through ad hoc
+  `SharedStorageNode` calls from `StorageCluster`/`request_ops`; the local map is
+  the only in-process implementation boundary for those local-only operations.
+  The boundary guardrail now rejects production cluster code that calls direct
+  node `get_pg`, `lock_bucket`, `lock_multipart_completion_bucket`, or
+  `notify_bucket_coordination_change` helpers outside cfg-gated test hooks.
+- Reviewed remaining direct test/helper use. The retained raw test hooks are
+  state assertions, lock probes, crash-state seeders, lifecycle-claim seeders,
+  or deliberately divergent replica/local-state setup; production-shaped request
+  tests should continue to enter through coordinator or `StorageCluster` methods,
+  and new raw helper usage needs the same exception shape rather than becoming a
+  second production path.
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 

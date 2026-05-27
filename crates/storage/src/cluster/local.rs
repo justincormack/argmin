@@ -12,10 +12,12 @@ use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
+use crate::node::BucketLockGuard;
 use crate::node_client::{LocalStorageNodeClient, StorageNodeClient};
+use crate::pg_topology::PgTopology;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
-    PgState, ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck,
+    PgState, ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck, WrittenShardAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -346,6 +348,9 @@ pub struct LocalClusterMap {
     epoch: ClusterEpoch,
     metadata_primary_node_id: NodeId,
     nodes: BTreeMap<NodeId, LocalNodeStore>,
+    pg_ids: Box<[u32]>,
+    pg_topology: PgTopology,
+    default_ec_shape: EcShape,
     pg_routes: BTreeMap<PgId, LocalPgRoute>,
     placement_map: placement::ClusterMap,
     runtime_state: Arc<LocalClusterRuntimeState>,
@@ -417,13 +422,18 @@ impl LocalClusterMap {
         }
 
         let acting_set = Arc::<[NodeId]>::from(node_ids.iter().copied().collect::<Vec<_>>());
+        let storage_pg_ids: Vec<u32> = pg_ids.iter().map(|pg_id| pg_id.get()).collect();
+        let pg_topology = PgTopology::new(&storage_pg_ids).map_err(|reason| {
+            ClusterBuildError::InvalidLocalPlacement {
+                reason: reason.to_string(),
+            }
+        })?;
         let pg_routes = build_static_pg_routes(
             ClusterEpoch::INITIAL,
             metadata_primary_node_id,
             Arc::clone(&acting_set),
             &pg_ids,
         );
-        let storage_pg_ids: Vec<u32> = pg_ids.iter().map(|pg_id| pg_id.get()).collect();
 
         let mut nodes = BTreeMap::new();
         for (node_id, canonical_data_dir) in validated_configs {
@@ -450,6 +460,9 @@ impl LocalClusterMap {
         Ok(Self {
             epoch: ClusterEpoch::INITIAL,
             metadata_primary_node_id,
+            pg_ids: storage_pg_ids.into_boxed_slice(),
+            pg_topology,
+            default_ec_shape,
             pg_routes,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
@@ -480,6 +493,10 @@ impl LocalClusterMap {
         self.nodes.keys().copied()
     }
 
+    pub fn pg_ids(&self) -> &[u32] {
+        &self.pg_ids
+    }
+
     pub fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
     }
@@ -494,6 +511,102 @@ impl LocalClusterMap {
 
     pub fn process_local_registry_key(&self) -> usize {
         self.process_local_registry_key
+    }
+
+    pub fn default_ec_shape(&self) -> EcShape {
+        self.default_ec_shape
+    }
+
+    pub fn bucket_pg_for(&self, bucket: &BucketName) -> u32 {
+        self.pg_topology.bucket_pg_for(bucket)
+    }
+
+    pub fn object_pg_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+        self.pg_topology.object_pg_for(bucket, key)
+    }
+
+    pub fn object_generation_segment_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segment_index: u32,
+    ) -> DataPgId {
+        self.pg_topology.object_generation_segment_data_pg(
+            bucket,
+            key,
+            generation_id,
+            segment_index,
+        )
+    }
+
+    pub fn object_generation_multipart_part_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        part_number: u32,
+    ) -> DataPgId {
+        self.pg_topology.object_generation_multipart_part_data_pg(
+            bucket,
+            key,
+            generation_id,
+            part_number,
+        )
+    }
+
+    pub(crate) fn write_erasure_coded_segment_shards_with<F>(
+        &self,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+        ec: EcShape,
+        write_shards: F,
+    ) -> Result<Vec<WrittenShardAck>, StoreError>
+    where
+        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
+    {
+        self.metadata_primary()
+            .storage_node()
+            .write_erasure_coded_segment_shards_with(
+                segment_okh,
+                segment_vid,
+                data,
+                ec,
+                write_shards,
+            )
+    }
+
+    pub(crate) fn lock_bucket_on_metadata_pg_primary(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketLockGuard<'_>, StoreError> {
+        let node = self.metadata_pg_primary_node(operation_epoch, pg_id)?;
+        Ok(node.storage_node().lock_bucket(bucket))
+    }
+
+    pub(crate) fn lock_multipart_completion_bucket_on_metadata_pg_primary(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketLockGuard<'_>, StoreError> {
+        let node = self.metadata_pg_primary_node(operation_epoch, pg_id)?;
+        Ok(node.storage_node().lock_multipart_completion_bucket(bucket))
+    }
+
+    pub(crate) fn notify_bucket_coordination_change(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), StoreError> {
+        let node = self.metadata_pg_primary_node(operation_epoch, pg_id)?;
+        node.storage_node()
+            .notify_bucket_coordination_change(bucket);
+        Ok(())
     }
 
     pub(crate) fn runtime_state(&self) -> Arc<LocalClusterRuntimeState> {
@@ -9400,12 +9513,7 @@ mod tests {
                     .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
                     .unwrap();
                 let version_id = hook_cluster
-                    .reserve_next_object_version(
-                        pg_id,
-                        &hook_bucket,
-                        &hook_key,
-                        primary.storage_node().as_ref(),
-                    )
+                    .reserve_next_object_version(pg_id, &hook_bucket, &hook_key)
                     .unwrap();
                 let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
                 let command = hook_cluster
@@ -11235,8 +11343,10 @@ mod tests {
             },
             bucket_write_proof.clone(),
         );
-        let object_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
-        let object_pg_store = object_node.get_pg(object_pg).unwrap();
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(object_pg))
+            .unwrap();
+        let object_pg_store = primary.storage_node().get_pg(object_pg).unwrap();
         let stale_command = cluster
             .prepare_commit_direct_put_object_command(
                 PgId::new(object_pg),
@@ -12206,8 +12316,10 @@ mod tests {
         );
         let mut abandoned_req = abandoned_req;
         abandoned_req.bucket_write_reservation = bucket_write_proof.clone();
-        let object_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
-        let object_pg_store = object_node.get_pg(object_pg).unwrap();
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(object_pg))
+            .unwrap();
+        let object_pg_store = primary.storage_node().get_pg(object_pg).unwrap();
         let command = cluster
             .prepare_commit_direct_put_object_command(
                 PgId::new(object_pg),
@@ -12808,7 +12920,6 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let primary_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
         let pg_id = PgId::new(object_pg);
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -12839,7 +12950,7 @@ mod tests {
         ));
 
         let err = cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .reserve_next_object_version(pg_id, &bucket, &key)
             .unwrap_err();
         assert!(
             matches!(
@@ -12879,7 +12990,7 @@ mod tests {
         );
 
         let reserved = cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .reserve_next_object_version(pg_id, &bucket, &key)
             .unwrap();
         assert_eq!(reserved, crate::VersionId::from_u64(1));
         assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
@@ -12906,7 +13017,6 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let primary_node = cluster.object_metadata_primary_node(&bucket, &key).unwrap();
         let pg_id = PgId::new(object_pg);
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -12937,7 +13047,7 @@ mod tests {
         ));
 
         let err = cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .reserve_next_object_version(pg_id, &bucket, &key)
             .unwrap_err();
         assert!(
             matches!(
@@ -12989,11 +13099,8 @@ mod tests {
             &key,
             2,
         );
-        let primary_node = reopened_cluster
-            .object_metadata_primary_node(&bucket, &key)
-            .unwrap();
         let reserved = reopened_cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, primary_node)
+            .reserve_next_object_version(pg_id, &bucket, &key)
             .unwrap();
         assert_eq!(reserved, crate::VersionId::from_u64(2));
         assert!(pending_metadata_command_for_test(&reopened_map, pg_id, &bucket).is_none());
@@ -32695,7 +32802,7 @@ mod tests {
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
             .unwrap();
         let marker_version = cluster
-            .reserve_next_object_version(pg_id, &bucket, &key, primary.storage_node().as_ref())
+            .reserve_next_object_version(pg_id, &bucket, &key)
             .unwrap();
         let command_id = cluster.next_object_metadata_command_id(pg_id).unwrap();
         let object_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();

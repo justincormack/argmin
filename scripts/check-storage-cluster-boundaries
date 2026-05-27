@@ -128,6 +128,83 @@ fail_with_matches \
     "metadata_primary_bridge_node used outside cfg-gated test hooks" \
     "$unexpected_metadata_bridge"
 
+production_cluster_direct_local_node_bypasses=$(
+    awk '
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        pending_direct_storage_node = 0
+        pending_direct_get_pg = 0
+        in_test_hook = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*#\[/ {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            in_test_hook = pending_test_cfg
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    function direct_node_local_call(line) {
+        return line ~ /\.(get_pg|lock_bucket|lock_multipart_completion_bucket|notify_bucket_coordination_change)\(/
+    }
+    {
+        update_function_context()
+        if (in_test_hook) {
+            next
+        }
+        if ($0 ~ /metadata_primary_bridge_node\(/) {
+            next
+        }
+        if ($0 ~ /\.storage_node\(\)\./ && direct_node_local_call($0)) {
+            print FILENAME ":" FNR ":" $0
+            pending_direct_storage_node = 0
+            next
+        }
+        if (pending_direct_storage_node && direct_node_local_call($0)) {
+            print FILENAME ":" FNR ":" $0
+            pending_direct_storage_node = 0
+            next
+        }
+        if ($0 ~ /\.storage_node\(\)/) {
+            pending_direct_storage_node = 1
+        }
+        if ($0 ~ /metadata_pg_primary_node\([^)]*\)\?\.get_pg\(/ || $0 ~ /metadata_pg_primary_node\([^)]*\)\.get_pg\(/) {
+            print FILENAME ":" FNR ":" $0
+            next
+        }
+        if (pending_direct_get_pg && $0 ~ /\.get_pg\(/) {
+            print FILENAME ":" FNR ":" $0
+            pending_direct_get_pg = 0
+            next
+        }
+        if ($0 ~ /metadata_pg_primary_node\(/) {
+            pending_direct_get_pg = 1
+        }
+        if ($0 ~ /;/) {
+            pending_direct_storage_node = 0
+            pending_direct_get_pg = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs
+)
+fail_with_matches \
+    "Production StorageCluster code must not call local SharedStorageNode PG/lock/notify helpers directly" \
+    "$production_cluster_direct_local_node_bypasses"
+
 legacy_object_pending_helpers=$(
     rg -n --color=never \
         'apply_pending_object_metadata_command_for_bucket|finish_pending_object_metadata_command_for_bucket' \

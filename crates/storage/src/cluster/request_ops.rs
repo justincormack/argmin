@@ -82,7 +82,7 @@ fn lifecycle_sweep_root_source_rank(source: LifecycleSweepRootSource) -> u8 {
 }
 
 struct BucketLifecycleContext<'a> {
-    bucket_node: &'a SharedStorageNode,
+    bucket_primary_node_id: NodeId,
     _bucket_guard: crate::node::BucketLockGuard<'a>,
     bucket_info: BucketInfo,
     raw_lifecycle: Option<String>,
@@ -740,16 +740,19 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_pg_ids(&self) -> &[u32] {
-        self.metadata_primary_topology_node().pg_ids()
+        self.local_map.pg_ids()
     }
 
     fn metadata_pg_ids(&self) -> Vec<u32> {
-        self.metadata_primary_topology_node().pg_ids().to_vec()
+        self.local_map.pg_ids().to_vec()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
-        self.metadata_pg_primary_node(pg_id)?.get_pg(pg_id)
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.storage_node().get_pg(pg_id)
     }
 
     fn list_objects_page(
@@ -796,7 +799,10 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        self.bucket_metadata_primary_node(bucket)?
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_node()
             .try_probe_bucket_pg_available(bucket)
     }
 
@@ -806,7 +812,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<bool, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_node()
             .try_probe_object_pg_available(bucket, key)
     }
 
@@ -823,8 +832,7 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        let primary_node = primary_store.storage_node();
-        let _bucket_guard = primary_node.lock_bucket(&bucket);
+        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(&bucket)?;
         {
             match primary_store
                 .storage_client()
@@ -1713,8 +1721,7 @@ impl super::StorageCluster {
                                 bucket, pg_id, expired.drain_id
                             )),
                         );
-                        node.storage_node()
-                            .notify_bucket_coordination_change(bucket);
+                        self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                         continue;
                     }
                     match node
@@ -1755,8 +1762,7 @@ impl super::StorageCluster {
         node.storage_client()
             .clear_durable_bucket_write_drain(PgId::new(drain.pg_id), &drain.record)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-        node.storage_node()
-            .notify_bucket_coordination_change(&drain.record.bucket);
+        self.notify_bucket_coordination_change_on_bucket_metadata_primary(&drain.record.bucket)?;
         Ok(())
     }
 
@@ -1896,7 +1902,6 @@ impl super::StorageCluster {
         let node_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let node = node_store.storage_node();
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_delete_begin_start",
@@ -1908,7 +1913,7 @@ impl super::StorageCluster {
                 .head_bucket_record_raw(pg_id, bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if current.state == BucketState::Deleting {
-                node.notify_bucket_coordination_change(bucket);
+                self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
@@ -1920,7 +1925,7 @@ impl super::StorageCluster {
         let durable_drain = match self.begin_durable_bucket_delete_drain(bucket)? {
             super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
             super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
-                node.notify_bucket_coordination_change(bucket);
+                self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
@@ -2075,7 +2080,7 @@ impl super::StorageCluster {
 
         match result {
             Ok(()) => {
-                node.notify_bucket_coordination_change(bucket);
+                self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
@@ -2098,7 +2103,6 @@ impl super::StorageCluster {
         let bucket_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
-        let bucket_node = bucket_store.storage_node();
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_finalize_start",
@@ -2108,7 +2112,7 @@ impl super::StorageCluster {
                 self.bucket_metadata_pg_id(bucket)
             )),
         );
-        let _bucket_guard = bucket_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         let bucket_incarnation_generation = {
             let info = match bucket_store
                 .storage_client()
@@ -2505,8 +2509,7 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_node = primary_store.storage_node();
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             let info = primary_store
                 .storage_client()
@@ -2680,8 +2683,7 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_node = primary_store.storage_node();
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
                 .storage_client()
@@ -2781,8 +2783,7 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_node = primary_store.storage_node();
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
                 .storage_client()
@@ -2903,8 +2904,7 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_node = primary_store.storage_node();
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
                 .storage_client()
@@ -3887,11 +3887,10 @@ impl super::StorageCluster {
         mut action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
 
         loop {
-            let bucket_guard = primary_node.lock_bucket(bucket);
+            let bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
@@ -3972,7 +3971,7 @@ impl super::StorageCluster {
                 }};
             }
 
-            let bucket_guard = primary_node.lock_bucket(bucket);
+            let bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             if self
                 .pending_metadata_command_for_bucket(pg_id, bucket)?
                 .is_some()
@@ -4185,8 +4184,8 @@ impl super::StorageCluster {
         let bucket_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let bucket_node = bucket_store.storage_node();
-        let bucket_guard = bucket_node.lock_bucket(bucket);
+        let bucket_primary_node_id = bucket_store.node_id();
+        let bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         let bucket_info = match bucket_store
             .storage_client()
             .head_bucket_info(pg_id, bucket)
@@ -4210,7 +4209,7 @@ impl super::StorageCluster {
             None
         };
         Ok(Some(BucketLifecycleContext {
-            bucket_node,
+            bucket_primary_node_id,
             _bucket_guard: bucket_guard,
             bucket_info,
             raw_lifecycle,
@@ -4384,9 +4383,8 @@ impl super::StorageCluster {
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -4533,9 +4531,8 @@ impl super::StorageCluster {
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -4696,9 +4693,8 @@ impl super::StorageCluster {
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -4752,16 +4748,15 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
-            let marker_vid =
-                match self.reserve_next_object_version(pg_id, bucket, key, primary_node) {
-                    Ok(marker_vid) => marker_vid,
-                    Err(error) => {
-                        self.release_bucket_write_proof_for_object_metadata_command(
-                            &bucket_write_reservation,
-                        )?;
-                        return Err(error);
-                    }
-                };
+            let marker_vid = match self.reserve_next_object_version(pg_id, bucket, key) {
+                Ok(marker_vid) => marker_vid,
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
             let command = storage_client.build_insert_delete_marker_command(
                 BuildInsertDeleteMarkerCommandReq {
                     pg_id,
@@ -4838,7 +4833,7 @@ impl super::StorageCluster {
             return Ok(Ok(None));
         };
         let BucketLifecycleContext {
-            bucket_node: lifecycle_bucket_node,
+            bucket_primary_node_id,
             _bucket_guard: _lifecycle_bucket_guard,
             bucket_info,
             raw_lifecycle,
@@ -4848,10 +4843,16 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let object_primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .node_id();
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
-            .then(|| primary_node.lock_bucket(bucket));
+        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
+            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
+        } else {
+            None
+        };
         let owner = OwnerIdentity::new(
             bucket_info.owner_principal.clone(),
             bucket_info.owner_canonical_id.clone(),
@@ -4995,16 +4996,15 @@ impl super::StorageCluster {
                     })
                     .and_then(|command| command.ok_or(ObjectPgActionError::StaleObjectReadSubject)),
                 BucketVersioningState::Enabled => {
-                    let marker_vid =
-                        match self.reserve_next_object_version(pg_id, bucket, key, primary_node) {
-                            Ok(marker_vid) => marker_vid,
-                            Err(error) => {
-                                self.release_bucket_write_proof_for_object_metadata_command(
-                                    &bucket_write_reservation,
-                                )?;
-                                return Err(error);
-                            }
-                        };
+                    let marker_vid = match self.reserve_next_object_version(pg_id, bucket, key) {
+                        Ok(marker_vid) => marker_vid,
+                        Err(error) => {
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error);
+                        }
+                    };
                     storage_client.build_insert_delete_marker_command(
                         BuildInsertDeleteMarkerCommandReq {
                             pg_id,
@@ -5104,7 +5104,7 @@ impl super::StorageCluster {
             return Ok(Ok(Vec::new()));
         };
         let BucketLifecycleContext {
-            bucket_node: lifecycle_bucket_node,
+            bucket_primary_node_id,
             _bucket_guard: _lifecycle_bucket_guard,
             bucket_info: _bucket_info,
             raw_lifecycle,
@@ -5114,10 +5114,16 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let object_primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .node_id();
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
-            .then(|| primary_node.lock_bucket(bucket));
+        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
+            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
+        } else {
+            None
+        };
         let mut completed_reclaimed_generation_ids = Vec::new();
 
         'retry: loop {
@@ -5272,7 +5278,7 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         };
         let BucketLifecycleContext {
-            bucket_node: lifecycle_bucket_node,
+            bucket_primary_node_id,
             _bucket_guard: _lifecycle_bucket_guard,
             bucket_info: _bucket_info,
             raw_lifecycle,
@@ -5282,10 +5288,16 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
+        let object_primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .node_id();
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
-            .then(|| primary_node.lock_bucket(bucket));
+        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
+            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
+        } else {
+            None
+        };
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -5485,8 +5497,9 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<std::sync::Arc<LocalClusterRuntimeState>, StoreError> {
-        self.object_metadata_primary_node(bucket, key)?;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let runtime_state = self.local_map.runtime_state();
         if self
             .pending_metadata_command_for_bucket(pg_id, bucket)?
@@ -5607,7 +5620,6 @@ impl super::StorageCluster {
         let node_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let node = node_store.storage_node();
         if self
             .local_map
             .object_payload_lease_count(bucket, key, generation_id)
@@ -5767,7 +5779,7 @@ impl super::StorageCluster {
                 }
             }
 
-            let _bucket_guard = node.lock_bucket(bucket);
+            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             loop {
                 if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let matching_reclaim_delete = matches!(
@@ -5960,8 +5972,7 @@ impl super::StorageCluster {
                 continue;
             }
             let data_pg_id = self
-                .metadata_primary_topology_node()
-                .pg_topology()
+                .local_map
                 .object_generation_multipart_part_data_pg(
                     bucket,
                     key,
@@ -5995,8 +6006,7 @@ impl super::StorageCluster {
             .filter(|part| part.part_okh != [0u8; 16])
         {
             let data_pg_id = self
-                .metadata_primary_topology_node()
-                .pg_topology()
+                .local_map
                 .object_generation_multipart_part_data_pg(
                     &cleanup.upload.bucket,
                     &cleanup.upload.key,
@@ -6026,8 +6036,7 @@ impl super::StorageCluster {
                 continue;
             }
             let data_pg_id = self
-                .metadata_primary_topology_node()
-                .pg_topology()
+                .local_map
                 .object_generation_multipart_part_data_pg(
                     &cleanup.upload.bucket,
                     &cleanup.upload.key,
@@ -6298,15 +6307,14 @@ impl super::StorageCluster {
                 }
             }};
         }
-        let primary_node = match self.object_metadata_primary_node(bucket, key) {
-            Ok(node) => node,
+        let _bucket_guard = match self.lock_bucket_on_object_metadata_primary(bucket, key) {
+            Ok(guard) => guard,
             Err(error) => {
                 release_caller_bucket_write_proof_if_unowned!()?;
                 return Err(error.into());
             }
         };
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
 
         let (command, new_pending_command, prepared) = loop {
             while let Some(command) = match self.pending_metadata_command_for_bucket(pg_id, bucket)
@@ -6398,7 +6406,7 @@ impl super::StorageCluster {
                 Some(command) => (command, false),
                 None => {
                     let version_id = if prepared.versioning == BucketVersioningState::Enabled {
-                        match self.reserve_next_object_version(pg_id, bucket, key, primary_node) {
+                        match self.reserve_next_object_version(pg_id, bucket, key) {
                             Ok(version_id) => version_id,
                             Err(error) => {
                                 release_caller_bucket_write_proof_if_unowned!()?;
@@ -6703,9 +6711,8 @@ impl super::StorageCluster {
             bucket_write_reservation,
         } = req;
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
-        let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
         let storage_client = self.object_metadata_primary_client(&bucket, &key)?;
-        let _bucket_guard = primary_node.lock_bucket(&bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(&bucket, &key)?;
         macro_rules! release_caller_bucket_write_proof {
             () => {{
                 self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -6845,7 +6852,6 @@ impl super::StorageCluster {
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
         loop {
             let reservation = match self.acquire_durable_bucket_write_reservation(
@@ -6866,7 +6872,7 @@ impl super::StorageCluster {
                 }
             };
             let bucket_write_reservation = BucketWriteReservationProof::from(&reservation.record);
-            let _bucket_guard = primary_node.lock_bucket(bucket);
+            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             macro_rules! release_caller_bucket_write_proof {
                 () => {{
                     self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -6999,7 +7005,10 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_node()
             .try_load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
@@ -7244,9 +7253,8 @@ impl super::StorageCluster {
         let upload_id = req.upload_id.clone();
         let generation_id = req.generation_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
-        let bucket_primary_node = self.bucket_metadata_primary_node(&bucket)?;
-        let _completion_guard = bucket_primary_node.lock_multipart_completion_bucket(&bucket);
-        let primary_node = self.object_metadata_primary_node(&bucket, &key)?;
+        let _completion_guard =
+            self.lock_multipart_completion_bucket_on_bucket_metadata_primary(&bucket)?;
         let storage_client = self.object_metadata_primary_client(&bucket, &key)?;
 
         'retry_after_pending_conflict: loop {
@@ -7268,7 +7276,7 @@ impl super::StorageCluster {
                 }
             };
             let bucket_write_reservation = BucketWriteReservationProof::from(&reservation.record);
-            let _bucket_guard = primary_node.lock_bucket(&bucket);
+            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(&bucket, &key)?;
             macro_rules! release_bucket_write_proof {
                 () => {{
                     self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -7314,7 +7322,7 @@ impl super::StorageCluster {
             }
 
             let version_id = if req.versioning == BucketVersioningState::Enabled {
-                match self.reserve_next_object_version(pg_id, &bucket, &key, primary_node) {
+                match self.reserve_next_object_version(pg_id, &bucket, &key) {
                     Ok(version_id) => version_id,
                     Err(error) => {
                         drop(_bucket_guard);
@@ -7450,11 +7458,10 @@ impl super::StorageCluster {
         mut action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
 
         loop {
-            let _bucket_guard = primary_node.lock_bucket(bucket);
+            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             let mut pending_command = None;
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let is_matching_stream_part_commit = matches!(
@@ -7748,8 +7755,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.abort_multipart_upload_locked(
             pg_id,
             bucket,
@@ -7766,8 +7772,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.abort_multipart_upload_locked(
             pg_id,
             bucket,
@@ -7893,8 +7898,7 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.abort_authorized_multipart_upload_locked(pg_id, authorized_upload)
     }
 
@@ -8050,16 +8054,22 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         };
         let BucketLifecycleContext {
-            bucket_node: lifecycle_bucket_node,
+            bucket_primary_node_id,
             _bucket_guard: _lifecycle_bucket_guard,
             raw_lifecycle,
             ..
         } = lifecycle_context;
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _object_bucket_guard = (!std::ptr::eq(lifecycle_bucket_node, primary_node))
-            .then(|| primary_node.lock_bucket(bucket));
+        let object_primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .node_id();
+        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
+            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
+        } else {
+            None
+        };
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_abort = matches!(
                 command.payload(),
@@ -8128,14 +8138,14 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
-        self.metadata_primary_topology_node()
+        self.metadata_primary_bridge_node()
+            .expect("test hook requires a current storage cluster handle")
             .test_ec_scratch_allocation_count(shape)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
-        self.metadata_primary_topology_node()
-            .test_bucket_pg_id_for(bucket)
+        self.bucket_metadata_pg_id(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -8149,8 +8159,7 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
-        self.metadata_primary_topology_node()
-            .test_object_pg_id_for(bucket, key)
+        self.object_metadata_pg_id(bucket, key)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -8160,8 +8169,9 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> u32 {
-        self.metadata_primary_topology_node()
-            .test_data_pg_id_for(bucket, key, generation_id)
+        self.local_map
+            .object_generation_segment_data_pg(bucket, key, generation_id, 0)
+            .get()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -8183,8 +8193,14 @@ impl super::StorageCluster {
         object_generation_id: GenerationId,
         part_number: u32,
     ) -> u32 {
-        self.metadata_primary_topology_node()
-            .test_multipart_part_data_pg_id_for(bucket, key, object_generation_id, part_number)
+        self.local_map
+            .object_generation_multipart_part_data_pg(
+                bucket,
+                key,
+                object_generation_id,
+                part_number,
+            )
+            .get()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -8374,7 +8390,10 @@ impl super::StorageCluster {
         version_id: VersionId,
         became_noncurrent_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        self.object_metadata_primary_node(bucket, key)?
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .storage_node()
             .test_force_became_noncurrent_at(bucket, key, version_id, became_noncurrent_at)
     }
 

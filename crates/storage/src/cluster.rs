@@ -20,6 +20,8 @@ use crate::metadata_command::{
     MetadataCommandReplicaState, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
     ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
+use crate::node::BucketLockGuard;
+#[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
@@ -550,7 +552,6 @@ impl ReleasedObjectPayloadLease {
 /// Cluster-shaped storage handle.
 #[derive(Clone)]
 pub struct StorageCluster {
-    single_node: Arc<SharedStorageNode>,
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1366,9 +1367,7 @@ impl StorageCluster {
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
     ) -> Result<Arc<Self>, ClusterBuildError> {
-        let single_node = Arc::clone(local_map.metadata_primary().storage_node());
         Ok(Arc::new(Self {
-            single_node,
             local_map,
             operation_epoch,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1414,13 +1413,7 @@ impl StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_primary_bridge_node(&self) -> Result<&SharedStorageNode, StoreError> {
         self.require_current_metadata_primary_bridge_epoch()?;
-        Ok(self.single_node.as_ref())
-    }
-
-    // Read-only topology/config helpers still use the metadata-primary node
-    // while PgTopology lives on SharedStorageNode.
-    fn metadata_primary_topology_node(&self) -> &SharedStorageNode {
-        self.single_node.as_ref()
+        Ok(self.local_map.metadata_primary().storage_node().as_ref())
     }
 
     fn try_install_pending_metadata_command_for_bucket(
@@ -1634,13 +1627,6 @@ impl StorageCluster {
         self.local_map.process_local_registry_key()
     }
 
-    fn metadata_pg_primary_node(&self, pg_id: u32) -> Result<&SharedStorageNode, StoreError> {
-        let node = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        Ok(node.storage_node().as_ref())
-    }
-
     fn metadata_pg_primary_client(
         &self,
         pg_id: PgId,
@@ -1652,22 +1638,45 @@ impl StorageCluster {
     }
 
     fn bucket_metadata_pg_id(&self, bucket: &BucketName) -> u32 {
-        self.metadata_primary_topology_node()
-            .pg_topology()
-            .bucket_pg_for(bucket)
+        self.local_map.bucket_pg_for(bucket)
     }
 
     fn object_metadata_pg_id(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
-        self.metadata_primary_topology_node()
-            .pg_topology()
-            .object_pg_for(bucket, key)
+        self.local_map.object_pg_for(bucket, key)
     }
 
-    fn bucket_metadata_primary_node(
+    fn lock_bucket_on_bucket_metadata_primary(
         &self,
         bucket: &BucketName,
-    ) -> Result<&SharedStorageNode, StoreError> {
-        self.metadata_pg_primary_node(self.bucket_metadata_pg_id(bucket))
+    ) -> Result<BucketLockGuard<'_>, StoreError> {
+        self.local_map.lock_bucket_on_metadata_pg_primary(
+            self.operation_epoch(),
+            PgId::new(self.bucket_metadata_pg_id(bucket)),
+            bucket,
+        )
+    }
+
+    fn notify_bucket_coordination_change_on_bucket_metadata_primary(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), StoreError> {
+        self.local_map.notify_bucket_coordination_change(
+            self.operation_epoch(),
+            PgId::new(self.bucket_metadata_pg_id(bucket)),
+            bucket,
+        )
+    }
+
+    fn lock_multipart_completion_bucket_on_bucket_metadata_primary(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketLockGuard<'_>, StoreError> {
+        self.local_map
+            .lock_multipart_completion_bucket_on_metadata_pg_primary(
+                self.operation_epoch(),
+                PgId::new(self.bucket_metadata_pg_id(bucket)),
+                bucket,
+            )
     }
 
     fn metadata_command_bucket_write_reservation_proof(
@@ -1746,8 +1755,7 @@ impl StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         node.storage_client()
             .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
-        node.storage_node()
-            .notify_bucket_coordination_change(&proof.bucket);
+        self.notify_bucket_coordination_change_on_bucket_metadata_primary(&proof.bucket)?;
         Ok(())
     }
 
@@ -1827,12 +1835,16 @@ impl StorageCluster {
         )
     }
 
-    fn object_metadata_primary_node(
+    fn lock_bucket_on_object_metadata_primary(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<&SharedStorageNode, StoreError> {
-        self.metadata_pg_primary_node(self.object_metadata_pg_id(bucket, key))
+    ) -> Result<BucketLockGuard<'_>, StoreError> {
+        self.local_map.lock_bucket_on_metadata_pg_primary(
+            self.operation_epoch(),
+            PgId::new(self.object_metadata_pg_id(bucket, key)),
+            bucket,
+        )
     }
 
     fn object_metadata_primary_client(
@@ -1844,7 +1856,7 @@ impl StorageCluster {
     }
 
     pub fn default_payload_ec_shape(&self) -> EcShape {
-        self.metadata_primary_topology_node().default_ec_shape()
+        self.local_map.default_ec_shape()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2032,8 +2044,7 @@ impl StorageCluster {
     ) -> Result<DirectPutWrittenSegment, StoreError> {
         let ec = self.default_payload_ec_shape();
         let data_pg_id = self
-            .metadata_primary_topology_node()
-            .pg_topology()
+            .local_map
             .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
             .get();
         let data_pg = DataPgId::new(PgId::new(data_pg_id));
@@ -2060,43 +2071,42 @@ impl StorageCluster {
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
-        self.metadata_primary_topology_node()
-            .write_erasure_coded_segment_shards_with(
-                segment_okh,
-                segment_vid,
-                data,
-                ec,
-                |shard_batch| {
-                    let mut written_acks = Vec::with_capacity(shard_batch.len());
-                    let mut written_for_cleanup = Vec::with_capacity(shard_batch.len());
-                    for (location, (shard_key, shard_payload)) in
-                        locations.iter().zip(shard_batch.iter())
-                    {
-                        match self.write_payload_shard(*location, shard_key, shard_payload) {
-                            Ok(ack) => {
-                                written_acks.push((shard_key.clone(), ack));
-                                written_for_cleanup.push(WrittenShardAck {
-                                    key: shard_key.clone(),
-                                    ack,
-                                });
-                            }
-                            Err(error) => {
-                                self.delete_payload_shard_keys_best_effort(
-                                    data_pg.get(),
-                                    ec,
-                                    segment_okh,
-                                    segment_vid,
-                                    written_for_cleanup
-                                        .iter()
-                                        .map(|written| written.key.clone()),
-                                );
-                                return Err(shard_io_error_to_store(error));
-                            }
+        self.local_map.write_erasure_coded_segment_shards_with(
+            segment_okh,
+            segment_vid,
+            data,
+            ec,
+            |shard_batch| {
+                let mut written_acks = Vec::with_capacity(shard_batch.len());
+                let mut written_for_cleanup = Vec::with_capacity(shard_batch.len());
+                for (location, (shard_key, shard_payload)) in
+                    locations.iter().zip(shard_batch.iter())
+                {
+                    match self.write_payload_shard(*location, shard_key, shard_payload) {
+                        Ok(ack) => {
+                            written_acks.push((shard_key.clone(), ack));
+                            written_for_cleanup.push(WrittenShardAck {
+                                key: shard_key.clone(),
+                                ack,
+                            });
+                        }
+                        Err(error) => {
+                            self.delete_payload_shard_keys_best_effort(
+                                data_pg.get(),
+                                ec,
+                                segment_okh,
+                                segment_vid,
+                                written_for_cleanup
+                                    .iter()
+                                    .map(|written| written.key.clone()),
+                            );
+                            return Err(shard_io_error_to_store(error));
                         }
                     }
-                    Ok(written_acks)
-                },
-            )
+                }
+                Ok(written_acks)
+            },
+        )
     }
 
     pub fn reserve_put_object_generation(
@@ -2106,8 +2116,7 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
@@ -2233,7 +2242,6 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         key: &ObjectKey,
-        _primary_node: &SharedStorageNode,
     ) -> Result<VersionId, ObjectPgActionError> {
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -2866,8 +2874,7 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let primary_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = primary_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
@@ -3002,8 +3009,9 @@ impl StorageCluster {
                 release_result?;
             }};
         }
-        let object_node = match self.object_metadata_primary_node(&req.bucket, &req.key) {
-            Ok(node) => node,
+        let _bucket_guard = match self.lock_bucket_on_object_metadata_primary(&req.bucket, &req.key)
+        {
+            Ok(guard) => guard,
             Err(error) => {
                 cleanup_direct_put_attempt_before_command_ownership!();
                 return Err(error.into());
@@ -3021,7 +3029,6 @@ impl StorageCluster {
             }
         };
 
-        let _bucket_guard = object_node.lock_bucket(&req.bucket);
         let mut stale_commit_snapshot_retries = 0;
         let (command, new_pending_command) = loop {
             let (command, new_pending_command) = loop {
@@ -3059,12 +3066,7 @@ impl StorageCluster {
                     }
 
                     let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
-                        match self.reserve_next_object_version(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            object_node,
-                        ) {
+                        match self.reserve_next_object_version(pg_id, &req.bucket, &req.key) {
                             Ok(version_id) => version_id,
                             Err(error) => {
                                 drop(_bucket_guard);
@@ -3811,8 +3813,7 @@ impl StorageCluster {
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let object_node = self.object_metadata_primary_node(bucket, key)?;
-        let _bucket_guard = object_node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
         storage_client.prepare_stream_segment_append(pg_id, bucket, key, request)
@@ -3846,8 +3847,8 @@ impl StorageCluster {
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let object_node = match self.object_metadata_primary_node(bucket, key) {
-            Ok(node) => node,
+        let _bucket_guard = match self.lock_bucket_on_object_metadata_primary(bucket, key) {
+            Ok(guard) => guard,
             Err(error) => {
                 self.delete_payload_shard_keys_best_effort(
                     segment_record.data_pg_id,
@@ -3878,7 +3879,6 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
-        let _bucket_guard = object_node.lock_bucket(bucket);
         loop {
             if let Err(error) =
                 self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
@@ -4345,8 +4345,6 @@ impl StorageCluster {
         &self,
     ) -> Result<HashSet<ShardScavengerLocationIdentity>, StoreError> {
         let mut referenced = HashSet::new();
-        let topology = self.metadata_primary_topology_node().pg_topology();
-
         for route in self.local_pg_routes() {
             let node = self
                 .local_map
@@ -4366,7 +4364,8 @@ impl StorageCluster {
                         )?;
                     }
                     ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
-                        let data_pg_id = topology
+                        let data_pg_id = self
+                            .local_map
                             .object_generation_multipart_part_data_pg(
                                 &reference.bucket,
                                 &reference.key,
@@ -4416,7 +4415,6 @@ impl StorageCluster {
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let node = self.object_metadata_primary_node(bucket, key)?;
         let storage_client = self.object_metadata_primary_client(bucket, key)?;
         let mut pending_completed_session =
             self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
@@ -4437,7 +4435,7 @@ impl StorageCluster {
         #[cfg(any(test, feature = "test-hooks"))]
         self.maybe_run_before_stream_abort_storage_hook();
 
-        let _bucket_guard = node.lock_bucket(bucket);
+        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         loop {
             pending_completed_session =
                 self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
@@ -4481,7 +4479,7 @@ impl StorageCluster {
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
         let mut sessions = Vec::new();
-        for &pg_id in self.metadata_primary_topology_node().pg_ids() {
+        for &pg_id in self.local_map.pg_ids() {
             let Ok(storage_client) = self.metadata_pg_primary_client(PgId::new(pg_id)) else {
                 continue;
             };
