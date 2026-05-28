@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use crate::error::StoreError;
 use crate::node::SharedStorageNode;
 use crate::storage_rpc::{
-    encode_health_response, encode_storage_rpc_error_response, encode_storage_rpc_success_response,
-    read_storage_rpc_frame_from, write_storage_rpc_frame_to, StorageRpcErrorCode,
-    StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse, StorageRpcMessageKind,
-    StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
+    decode_read_handle_acquire_request, encode_health_response, encode_storage_rpc_error_response,
+    encode_storage_rpc_success_response, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
+    StorageRpcMessageKind, StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
-use crate::types::ClusterEpoch;
-use crate::NodeId;
+use crate::types::{ClusterEpoch, PgState};
+use crate::{NodeId, ShardLocation};
 
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
 const LOCK_EX: i32 = 2;
@@ -32,6 +32,15 @@ pub struct StorageNodeProcessConfig {
     pub data_dir: PathBuf,
     pub pg_ids: Vec<u32>,
     pub socket_path: PathBuf,
+    pub pg_routes: Vec<StorageNodePgRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageNodePgRoute {
+    pub pg_id: u32,
+    pub cluster_epoch: ClusterEpoch,
+    pub state: PgState,
+    pub acting_set: Vec<NodeId>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +49,14 @@ pub enum StorageNodeServerError {
     EmptyPgSet,
     #[error("duplicate storage-node PG id {pg_id}")]
     DuplicatePgId { pg_id: u32 },
+    #[error("duplicate storage-node PG route {pg_id}")]
+    DuplicatePgRoute { pg_id: u32 },
+    #[error("storage-node PG {pg_id} is missing a route")]
+    MissingPgRoute { pg_id: u32 },
+    #[error("storage-node PG route {pg_id} is not configured for this node")]
+    RoutePgNotConfigured { pg_id: u32 },
+    #[error("storage-node PG route {pg_id} is inconsistent across static config")]
+    InconsistentPgRoute { pg_id: u32 },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
@@ -91,6 +108,7 @@ pub fn validate_storage_node_process_configs(
     let mut node_ids = BTreeMap::<u32, ()>::new();
     let mut data_dirs = BTreeMap::<PathBuf, NodeId>::new();
     let mut socket_paths = BTreeMap::<PathBuf, NodeId>::new();
+    let mut pg_routes = BTreeMap::<u32, StorageNodePgRoute>::new();
     for config in configs {
         if node_ids.insert(config.node_id.as_u32(), ()).is_some() {
             return Err(StorageNodeServerError::DuplicateNodeId {
@@ -98,6 +116,7 @@ pub fn validate_storage_node_process_configs(
             });
         }
         validate_pg_ids(&config.pg_ids)?;
+        validate_pg_routes(&config.pg_ids, &config.pg_routes)?;
         let data_dir = canonicalize_existing_or_parent(&config.data_dir, "data directory")?;
         if let Some(first_node_id) = data_dirs.insert(data_dir.clone(), config.node_id) {
             return Err(StorageNodeServerError::DuplicateDataDir {
@@ -114,6 +133,17 @@ pub fn validate_storage_node_process_configs(
                 socket_path,
             });
         }
+        for route in &config.pg_routes {
+            match pg_routes.get(&route.pg_id) {
+                Some(existing) if existing != route => {
+                    return Err(StorageNodeServerError::InconsistentPgRoute { pg_id: route.pg_id })
+                }
+                Some(_) => {}
+                None => {
+                    pg_routes.insert(route.pg_id, route.clone());
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -128,6 +158,7 @@ pub struct StorageNodeServer {
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
         validate_pg_ids(&config.pg_ids)?;
+        validate_pg_routes(&config.pg_ids, &config.pg_routes)?;
         validate_socket_directory(&config.socket_path)?;
         let data_dir_lock = StorageNodeDataDirLock::acquire(&config.data_dir)?;
         cleanup_stale_socket_path(&config.socket_path)?;
@@ -187,10 +218,19 @@ impl StorageNodeServer {
                     })
                 }
             }
-            kind => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnsupportedOperation,
-                message: format!("{kind:?} is not implemented by this storage-node server slice"),
-            }),
+            StorageRpcMessageKind::ReadHandlesAcquire => {
+                match decode_read_handle_acquire_request(&frame.payload) {
+                    Ok(request) => match self.validate_shard_locations(&request.locations) {
+                        Ok(()) => self.unsupported_operation_response(frame.kind),
+                        Err(error) => encode_storage_rpc_error_response(&error),
+                    },
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            kind => self.unsupported_operation_response(kind),
         }
         .map_err(|error| StorageNodeServerError::ResponsePayload {
             message: error.to_string(),
@@ -199,6 +239,90 @@ impl StorageNodeServer {
             request_id: frame.request_id,
             kind: frame.kind,
             payload,
+        })
+    }
+
+    fn validate_shard_locations(
+        &self,
+        locations: &[ShardLocation],
+    ) -> Result<(), StorageRpcErrorResponse> {
+        for &location in locations {
+            self.validate_shard_location(location)?;
+        }
+        Ok(())
+    }
+
+    fn validate_shard_location(
+        &self,
+        location: ShardLocation,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if location.node_id() != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    location.node_id().as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        if location.cluster_epoch() != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "request shard location epoch {} does not match storage-node epoch {}",
+                    location.cluster_epoch().get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        let pg_id = location.data_pg_id().get();
+        let Some(route) = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id)
+        else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {pg_id} is not configured on this storage node"),
+            });
+        };
+        if route.cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::WrongClusterEpoch,
+                message: format!(
+                    "PG {pg_id} route epoch {} does not match storage-node epoch {}",
+                    route.cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        if route.state != PgState::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!("PG {pg_id} route is {}", route.state),
+            });
+        }
+        if !route.acting_set.contains(&self.config.node_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not in acting set for PG {pg_id}",
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn unsupported_operation_response(
+        &self,
+        kind: StorageRpcMessageKind,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::UnsupportedOperation,
+            message: format!("{kind:?} is not implemented by this storage-node server slice"),
         })
     }
 }
@@ -278,6 +402,28 @@ fn validate_pg_ids(pg_ids: &[u32]) -> Result<(), StorageNodeServerError> {
     for &pg_id in pg_ids {
         if seen.insert(pg_id, ()).is_some() {
             return Err(StorageNodeServerError::DuplicatePgId { pg_id });
+        }
+    }
+    Ok(())
+}
+
+fn validate_pg_routes(
+    pg_ids: &[u32],
+    routes: &[StorageNodePgRoute],
+) -> Result<(), StorageNodeServerError> {
+    let configured: BTreeMap<u32, ()> = pg_ids.iter().map(|&pg_id| (pg_id, ())).collect();
+    let mut seen = BTreeMap::<u32, ()>::new();
+    for route in routes {
+        if seen.insert(route.pg_id, ()).is_some() {
+            return Err(StorageNodeServerError::DuplicatePgRoute { pg_id: route.pg_id });
+        }
+        if !configured.contains_key(&route.pg_id) {
+            return Err(StorageNodeServerError::RoutePgNotConfigured { pg_id: route.pg_id });
+        }
+    }
+    for &pg_id in pg_ids {
+        if !seen.contains_key(&pg_id) {
+            return Err(StorageNodeServerError::MissingPgRoute { pg_id });
         }
     }
     Ok(())
@@ -428,9 +574,11 @@ mod tests {
     use std::thread;
 
     use crate::storage_rpc::{
-        decode_health_response, decode_storage_rpc_response_payload, encode_storage_rpc_frame,
-        read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        decode_health_response, decode_storage_rpc_response_payload,
+        encode_read_handle_acquire_request, encode_storage_rpc_frame, read_storage_rpc_frame_from,
+        write_storage_rpc_frame_to, StorageRpcReadHandleAcquireRequest,
     };
+    use crate::types::{DataPgId, PgId, ShardIndex};
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
         StorageNodeProcessConfig {
@@ -439,6 +587,12 @@ mod tests {
             data_dir: tmp.path().join("node"),
             pg_ids: vec![0],
             socket_path: tmp.path().join("sock").join("storage.sock"),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: PgState::Active,
+                acting_set: vec![NodeId::new(7)],
+            }],
         }
     }
 
@@ -452,6 +606,47 @@ mod tests {
             Ok(_) => panic!("expected storage-node bind to fail"),
             Err(error) => error,
         }
+    }
+
+    fn read_handle_acquire_payload(location: ShardLocation) -> Vec<u8> {
+        encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+            read_operation_id: "read-op".to_string(),
+            locations: vec![location],
+        })
+        .unwrap()
+    }
+
+    fn test_location(epoch: u64, pg_id: u32, node_id: u32) -> ShardLocation {
+        ShardLocation::new(
+            ClusterEpoch::new(epoch).unwrap(),
+            DataPgId::new(PgId::new(pg_id)),
+            ShardIndex::new(0),
+            NodeId::new(node_id),
+        )
+    }
+
+    fn send_read_handle_acquire(
+        config: StorageNodeProcessConfig,
+        location: ShardLocation,
+    ) -> StorageRpcErrorResponse {
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let request = StorageRpcFrame {
+            request_id: 7,
+            kind: StorageRpcMessageKind::ReadHandlesAcquire,
+            payload: read_handle_acquire_payload(location),
+        };
+        write_storage_rpc_frame_to(&mut client, &request).unwrap();
+        let response = read_storage_rpc_frame_from(&mut client).unwrap();
+        join.join().unwrap();
+
+        decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err()
     }
 
     #[test]
@@ -533,6 +728,82 @@ mod tests {
         assert!(matches!(
             err,
             StorageNodeServerError::DuplicateSocketPath { .. }
+        ));
+    }
+
+    #[test]
+    fn storage_node_static_config_rejects_duplicate_pg_routes() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes.push(config.pg_routes[0].clone());
+
+        let err = validate_storage_node_process_configs(&[config]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::DuplicatePgRoute { pg_id: 0 }
+        ));
+    }
+
+    #[test]
+    fn storage_node_static_config_rejects_unconfigured_pg_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].pg_id = 9;
+
+        let err = validate_storage_node_process_configs(&[config]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::RoutePgNotConfigured { pg_id: 9 }
+        ));
+    }
+
+    #[test]
+    fn storage_node_static_config_rejects_missing_pg_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids.push(1);
+
+        let err = validate_storage_node_process_configs(&[config]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::MissingPgRoute { pg_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn storage_node_bind_rejects_missing_pg_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids.push(1);
+        private_socket_dir(config.socket_path.parent().unwrap());
+
+        let err = bind_error(config);
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::MissingPgRoute { pg_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn storage_node_static_config_rejects_inconsistent_pg_routes() {
+        let tmp = test_util::tempdir();
+        private_socket_dir(&tmp.path().join("sock"));
+        let first = test_config(&tmp);
+        let mut second = first.clone();
+        second.node_id = NodeId::new(8);
+        second.data_dir = tmp.path().join("node-2");
+        second.socket_path = tmp.path().join("sock").join("storage-2.sock");
+        second.pg_routes[0].acting_set = vec![NodeId::new(8)];
+
+        let err = validate_storage_node_process_configs(&[first, second]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::InconsistentPgRoute { pg_id: 0 }
         ));
     }
 
@@ -625,6 +896,79 @@ mod tests {
         let error = decode_storage_rpc_response_payload(&response.payload)
             .unwrap()
             .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::UnsupportedOperation);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_read_handle_acquire_for_wrong_node() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+
+        let error = send_read_handle_acquire(config, test_location(1, 0, 8));
+
+        assert_eq!(error.code, StorageRpcErrorCode::UnknownNode);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_read_handle_acquire_for_stale_location_epoch() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+
+        let error = send_read_handle_acquire(config, test_location(2, 0, 7));
+
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_read_handle_acquire_for_unknown_pg() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+
+        let error = send_read_handle_acquire(config, test_location(1, 9, 7));
+
+        assert_eq!(error.code, StorageRpcErrorCode::UnknownPg);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_read_handle_acquire_for_wrong_route_epoch() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].cluster_epoch = ClusterEpoch::new(2).unwrap();
+
+        let error = send_read_handle_acquire(config, test_location(1, 0, 7));
+
+        assert_eq!(error.code, StorageRpcErrorCode::WrongClusterEpoch);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_read_handle_acquire_for_inactive_pg() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].state = PgState::Peering;
+
+        let error = send_read_handle_acquire(config, test_location(1, 0, 7));
+
+        assert_eq!(error.code, StorageRpcErrorCode::InactivePgRoute);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_read_handle_acquire_for_non_acting_set() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].acting_set = vec![NodeId::new(8)];
+
+        let error = send_read_handle_acquire(config, test_location(1, 0, 7));
+
+        assert_eq!(error.code, StorageRpcErrorCode::NonActingSetAccess);
+    }
+
+    #[test]
+    fn storage_node_server_validates_route_before_returning_unsupported_operation() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+
+        let error = send_read_handle_acquire(config, test_location(1, 0, 7));
+
         assert_eq!(error.code, StorageRpcErrorCode::UnsupportedOperation);
     }
 }
