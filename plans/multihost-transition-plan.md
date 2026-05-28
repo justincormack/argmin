@@ -5276,6 +5276,29 @@ Progress:
 
 ### Phase 10.3: Unix Socket Storage-Node Server
 
+Add an explicit process-role model before moving traffic over sockets. A
+deployment may run frontend-only, storage-only, or combined frontend+storage
+processes, but storage ownership remains one storage-node identity per storage
+data directory:
+
+1. `frontend`: runs the HTTP/coordinator service and talks to storage nodes
+   through `StorageNodeClient`
+2. `storage-node`: opens exactly one storage-node identity, one data directory,
+   its configured PG set, and one Unix socket
+3. `combined`: runs both roles in one OS process for small deployments or local
+   development, but still exposes the storage-node RPC listener and preserves
+   the same node-id/data-dir invariants
+
+Most production hosts with multiple disks should run multiple storage-node
+processes on the same host, one per disk/data directory. This keeps disk
+failure, SQLite/shard-directory failures, process crashes, process locks,
+placement identity, metrics, and logs aligned with a single `NodeId`. A failed
+disk process can crash or restart without taking down other storage-node
+processes on the same host. Phase 10.3 should therefore implement one
+storage-node identity per storage process; multi-node-per-process hosting can
+be added later only if it preserves the same per-node data-dir, socket, PG, and
+failure-domain boundaries.
+
 Add a storage-node process mode that:
 
 1. opens the configured node data directory
@@ -5290,14 +5313,38 @@ Add a storage-node process mode that:
 7. returns typed storage errors that preserve enough context for caller-side
    fail-closed behavior and tests
 
-The server must not share a PG directory with another process. Startup must
-reject duplicate node ids and duplicate/canonical-equal data directories in the
-static config.
+The server must not share a PG directory or node data directory with another
+process. Startup must reject duplicate node ids and duplicate/canonical-equal
+data directories in the static config. It must also reject duplicate or
+canonical-equivalent Unix socket paths before serving, so two node ids cannot
+advertise the same endpoint or fail later during bind/connect. Each
+storage-node process must take an exclusive ownership lock for its node data
+directory before opening PGs. Frontend-only processes must not open PG
+directories.
 
 The multi-process harness must create private socket directories. Tests should
 cover rejection of an incorrectly permissioned socket directory, or explicitly
 mark the configuration as non-production-only if a platform cannot enforce
 peer credentials or directory permissions.
+
+Implementation slices:
+
+1. add RPC response framing, typed error responses, blocking Unix stream
+   read/write helpers, and a health/version request
+2. add process role and storage-node config parsing for node id, cluster epoch,
+   data directory, configured PG ids, socket path, and route/topology validation
+   data
+3. add socket directory validation and storage data-directory ownership locks
+4. add the storage-node listener/accept loop and per-connection session state
+5. add route validation for wrong node id, unknown PG, wrong cluster epoch,
+   inactive PG route, stale shard location, and non-acting-set access
+6. add session-owned read-handle acquire/release idempotency keyed by client
+   read-operation id plus canonical shard-location set; release retries after a
+   lost response must be accepted on the same session and must not leave handle
+   counts wrong
+7. wire the storage-node process role into the binary without changing
+   production coordinator request routing yet; Phase 10.4/10.5 move actual
+   shard and metadata traffic through remote clients
 
 Required tests:
 
@@ -5308,6 +5355,18 @@ Required tests:
 5. restart reopens existing metadata and shard files cleanly
 6. incorrectly permissioned socket directories are rejected or reported as
    non-production-only
+7. frontend-only role does not open PG directories
+8. combined role starts both HTTP/coordinator and storage-node listener while
+   preserving the same storage ownership checks
+9. second storage-node process for the same data directory is rejected by the
+   ownership lock
+10. duplicate/canonical-equivalent Unix socket paths are rejected before serving
+11. lost read-handle acquire response retried on the same session returns the
+    same handle set without increasing lease counts
+12. lost read-handle release response retried on the same session succeeds
+    idempotently and does not leave handle counts wrong
+13. client disconnect after acquiring read handles releases all session-owned
+    handles and later physical cleanup can proceed
 
 ### Phase 10.4: Remote Shard IO
 
