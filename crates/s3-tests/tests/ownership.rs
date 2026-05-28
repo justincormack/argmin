@@ -549,12 +549,8 @@ fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
             .send()
             .await;
 
-        if CTX.region() == "us-east-1" {
-            result.unwrap();
-        } else {
-            assert_eq!(err_status(&result), 409);
-            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
-        }
+        assert_eq!(err_status(&result), 409);
+        assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
 
         let resp = client
             .get_bucket_ownership_controls()

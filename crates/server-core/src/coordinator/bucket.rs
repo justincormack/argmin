@@ -101,6 +101,9 @@ impl Coordinator {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
                 let existing = self.unchecked_active_bucket_summary_for(&authorized.name)?;
+                if !Self::is_bucket_owner_enforced(existing.ownership_controls.as_ref()) {
+                    return Err(ServerError::BucketAlreadyOwnedByYou);
+                }
                 let authorized_acl = self.resolve_create_bucket_recreate_acl_update(
                     &existing,
                     &authorized.owner,

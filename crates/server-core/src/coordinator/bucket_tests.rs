@@ -722,18 +722,10 @@ fn create_bucket_idempotent_in_us_east_1_resets_acl() {
             requester: test_helpers::requester("owner-a"),
             namespace: BucketNamespace::Global,
             acl: CreateBucketAcl::DefaultPrivate,
-            ownership: BucketObjectOwnership::ObjectWriter,
+            ownership: BucketObjectOwnership::BucketOwnerEnforced,
             object_lock_enabled: false,
         })
         .unwrap();
-    put_bucket_canned_acl_test(
-        &coord,
-        "bucket",
-        BucketAcl::PublicRead,
-        test_helpers::requester("owner-a"),
-        None,
-    )
-    .unwrap();
 
     coord
         .create_bucket(&CreateBucketRequest {
@@ -754,6 +746,56 @@ fn create_bucket_idempotent_in_us_east_1_resets_acl() {
         AclPermission::FullControl,
     ));
     assert!(!grants_contain(
+        &acl.acl_grants,
+        &AclGrantee::AllUsers,
+        AclPermission::Read,
+    ));
+}
+
+#[test]
+fn create_bucket_same_owner_acl_enabled_us_east_1_returns_bucket_already_owned_by_you() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: test_helpers::requester("owner-a"),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+    put_bucket_canned_acl_test(
+        &coord,
+        "bucket",
+        BucketAcl::PublicRead,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+
+    let err = coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: test_helpers::requester("owner-a"),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            object_lock_enabled: false,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::BucketAlreadyOwnedByYou));
+
+    let acl =
+        get_bucket_acl_test(&coord, "bucket", test_helpers::requester("owner-a"), None).unwrap();
+    assert!(grants_contain(
+        &acl.acl_grants,
+        &AclGrantee::CanonicalUser(CanonicalUserId::from_principal("owner-a")),
+        AclPermission::FullControl,
+    ));
+    assert!(grants_contain(
         &acl.acl_grants,
         &AclGrantee::AllUsers,
         AclPermission::Read,
@@ -886,6 +928,35 @@ fn create_bucket_different_owner_conflicts() {
         .unwrap();
     let err = coord
         .create_bucket_for_owner("owner-b", "bucket", false)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::BucketAlreadyExists));
+}
+
+#[test]
+fn create_bucket_different_owner_acl_enabled_conflicts() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: test_helpers::requester("owner-a"),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+
+    let err = coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: test_helpers::requester("owner-b"),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
         .unwrap_err();
     assert!(matches!(err, ServerError::BucketAlreadyExists));
 }

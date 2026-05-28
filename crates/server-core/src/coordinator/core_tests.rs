@@ -589,7 +589,7 @@ fn create_bucket_idempotent_create_does_not_overwrite_ownership_controls() {
         })
         .unwrap();
 
-    coord
+    let err = coord
         .create_bucket(&CreateBucketRequest {
             name: trusted_bucket_name("bucket"),
             requester: test_helpers::requester("owner-a"),
@@ -598,7 +598,8 @@ fn create_bucket_idempotent_create_does_not_overwrite_ownership_controls() {
             ownership: BucketObjectOwnership::BucketOwnerEnforced,
             object_lock_enabled: false,
         })
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(err, ServerError::BucketAlreadyOwnedByYou));
 
     let controls = get_bucket_ownership_controls_test(
         &coord,

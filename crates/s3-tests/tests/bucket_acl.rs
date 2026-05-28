@@ -378,29 +378,19 @@ fn test_bucket_recreate_overwrite_acl() {
             .owner()
             .and_then(|owner| owner.id())
             .expect("expected owner ID in GetBucketAcl");
-        if CTX.region() == "us-east-1" {
-            result.unwrap();
-            assert_eq!(acl.grants().len(), 1);
-            assert!(has_canonical_user_grant(
-                acl.grants(),
-                owner_id,
-                Permission::FullControl
-            ));
-            assert!(!has_group_grant(
-                acl.grants(),
-                ALL_USERS_GROUP_URI,
-                Permission::Read
-            ));
-        } else {
-            assert_eq!(err_status(&result), 409);
-            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
-            assert_eq!(acl.grants().len(), 2);
-            assert!(has_group_grant(
-                acl.grants(),
-                ALL_USERS_GROUP_URI,
-                Permission::Read
-            ));
-        }
+        assert_eq!(err_status(&result), 409);
+        assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+        assert_eq!(acl.grants().len(), 2);
+        assert!(has_canonical_user_grant(
+            acl.grants(),
+            owner_id,
+            Permission::FullControl
+        ));
+        assert!(has_group_grant(
+            acl.grants(),
+            ALL_USERS_GROUP_URI,
+            Permission::Read
+        ));
 
         cleanup(&bucket).await;
     });
@@ -495,34 +485,19 @@ fn test_bucket_recreate_new_header_grants() {
             .send()
             .await
             .unwrap();
-        if CTX.region() == "us-east-1" {
-            result.unwrap();
-            assert_eq!(acl.grants().len(), 2);
-            assert!(has_canonical_user_grant(
-                acl.grants(),
-                &owner_id,
-                Permission::FullControl
-            ));
-            assert!(has_canonical_user_grant(
-                acl.grants(),
-                &alt_owner_id,
-                Permission::Read
-            ));
-        } else {
-            assert_eq!(err_status(&result), 409);
-            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
-            assert_eq!(acl.grants().len(), 1);
-            assert!(has_canonical_user_grant(
-                acl.grants(),
-                &owner_id,
-                Permission::FullControl
-            ));
-            assert!(!has_canonical_user_grant(
-                acl.grants(),
-                &alt_owner_id,
-                Permission::Read
-            ));
-        }
+        assert_eq!(err_status(&result), 409);
+        assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+        assert_eq!(acl.grants().len(), 1);
+        assert!(has_canonical_user_grant(
+            acl.grants(),
+            &owner_id,
+            Permission::FullControl
+        ));
+        assert!(!has_canonical_user_grant(
+            acl.grants(),
+            &alt_owner_id,
+            Permission::Read
+        ));
 
         cleanup(&bucket).await;
     });
@@ -743,6 +718,53 @@ fn test_bucket_acl_canned_authenticated_read() {
             .send()
             .await
             .unwrap();
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_recreate_acl_enabled_nonowner_still_bucket_already_exists() {
+    run_bucket_acl_test(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+
+        setup_named_acl_enabled_bucket(client, &bucket).await;
+        let owner_id = bucket_owner_id(&bucket).await;
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+
+        let result = s3_tests::create_bucket_request(alt_client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await;
+
+        assert_eq!(err_status(&result), 409);
+        assert_s3_err_code(&result, "BucketAlreadyExists");
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(acl.grants().len(), 2);
+        assert!(has_canonical_user_grant(
+            acl.grants(),
+            &owner_id,
+            Permission::FullControl
+        ));
+        assert!(has_group_grant(
+            acl.grants(),
+            ALL_USERS_GROUP_URI,
+            Permission::Read
+        ));
 
         cleanup(&bucket).await;
     });
