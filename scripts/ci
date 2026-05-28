@@ -14,8 +14,9 @@ Run the standard local CI checks:
   1. cargo fmt --all --check
   2. cargo clippy --workspace --all-targets --all-features -- -D warnings
   3. cargo build --workspace --all-targets --all-features
-  4. cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
-  5. cargo nextest run --workspace
+  4. cargo test --manifest-path crates/s3-diff-tests/Cargo.toml --no-run
+  5. cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
+  6. cargo nextest run --workspace
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -62,5 +63,6 @@ done
 run_cmd "format" cargo fmt --all --check
 run_cmd "clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run_cmd "workspace compile" cargo build --workspace --all-targets --all-features
+run_cmd "s3-diff-tests compile" cargo test --manifest-path crates/s3-diff-tests/Cargo.toml --no-run
 run_cmd "fuzz target compile" cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
 run_cmd "nextest" cargo nextest run --workspace "${nextest_args[@]}"

@@ -211,10 +211,15 @@ fn send_anonymous_get(
             )
         })
         .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(err) => (String::new(), Some(err.to_string())),
+    };
     RawResponse {
         status: response.status().as_u16(),
         headers,
-        body: response.body_mut().read_to_string().unwrap_or_default(),
+        body,
+        body_read_error,
     }
 }
 
