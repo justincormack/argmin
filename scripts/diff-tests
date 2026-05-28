@@ -18,7 +18,7 @@ Options:
   --region REGION         Override `S3_TEST_REGION` (default: TEST_S3_REGION or us-east-1)
   --endpoint URL          Override `S3_TEST_ENDPOINT` (default: TEST_S3_ENDPOINT or derived from region)
   --bucket-prefix PREFIX  Override `S3_TEST_BUCKET_PREFIX` (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
-  --timeout-secs SECS     Override `S3_TEST_TIMEOUT_SECS` (default: TEST_S3_TIMEOUT_SECS or 30)
+  --timeout-secs SECS     Override `S3_TEST_TIMEOUT_SECS` (default: TEST_S3_TIMEOUT_SECS or 120)
   --dotenv PATH           Read AWS variables from a different env file
   -h, --help              Show this help
 
@@ -82,7 +82,7 @@ cd "$ROOT"
 external_s3_test_load_dotenv "$dotenv_path"
 region="${region:-${TEST_S3_REGION:-us-east-1}}"
 bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
-timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-30}}"
+timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-120}}"
 endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
 endpoint="${endpoint:-$(external_s3_test_default_endpoint "$region")}"
 external_s3_test_export_common_env "$region" "$endpoint" "$bucket_prefix" "$timeout_secs"

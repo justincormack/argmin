@@ -237,6 +237,12 @@ these `.env` values to the `S3_TEST_*` variables expected by the Rust test
 harnesses, and `./scripts/cleanup` maps the primary pair to the standard AWS
 CLI credential variables when it invokes `aws`.
 
+The AWS wrapper scripts default `TEST_S3_TIMEOUT_SECS` to 120 seconds when it is
+not set. This is an AWS SDK per-attempt timeout, not a test-suite timeout; large
+AWS-backed data-plane cases such as SSE-C multipart round trips can legitimately
+need longer than the local harness default. `./scripts/uat-s3-tests` keeps its
+shorter local default so local server stalls surface quickly.
+
 ## Local Deep Tracing
 
 Deep tracing is now a non-default local/test-only facility. Production builds
@@ -449,7 +455,7 @@ S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY" \
 S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY" \
 S3_TEST_REGION="${TEST_S3_REGION:-us-east-1}" \
 S3_TEST_BUCKET_PREFIX="${TEST_S3_BUCKET_PREFIX:-claude-s3-}" \
-S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-30}" \
+S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-120}" \
 cargo test -p s3-http-tests --no-fail-fast
 ```
 
