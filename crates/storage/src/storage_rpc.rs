@@ -154,6 +154,8 @@ pub(crate) enum StorageRpcPayloadError {
     ShardLocationMismatch,
     #[error("invalid read handle acquire request: {0}")]
     InvalidReadHandleAcquireRequest(&'static str),
+    #[error("invalid read handle release request: {0}")]
+    InvalidReadHandleReleaseRequest(&'static str),
     #[error("invalid durable claim token: {0}")]
     InvalidDurableClaimToken(&'static str),
     #[error("invalid bucket write reservation proof: {0}")]
@@ -199,6 +201,19 @@ pub(crate) struct StorageRpcReadHandleAcquireRequest {
     pub(crate) read_operation_id: String,
     pub(crate) locations: Vec<ShardLocation>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcReadHandleAcquireResponse {
+    pub(crate) locations: Vec<ShardLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcReadHandleReleaseRequest {
+    pub(crate) read_operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcReadHandleReleaseResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketClaimToken {
@@ -694,6 +709,86 @@ pub(crate) fn decode_read_handle_acquire_request(
     })
 }
 
+pub(crate) fn encode_read_handle_acquire_response(
+    response: &StorageRpcReadHandleAcquireResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if response.locations.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire response must include at least one shard location",
+        ));
+    }
+    validate_read_handle_locations(&response.locations)?;
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.locations.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.locations.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for location in &response.locations {
+        put_shard_location(&mut out, *location);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_read_handle_acquire_response(
+    bytes: &[u8],
+) -> Result<StorageRpcReadHandleAcquireResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let location_count = decoder.read_u32()? as usize;
+    if location_count == 0 {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire response must include at least one shard location",
+        ));
+    }
+    if location_count > decoder.remaining_len() / STORAGE_RPC_SHARD_LOCATION_LEN {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut locations = Vec::with_capacity(location_count);
+    for _ in 0..location_count {
+        locations.push(decoder.read_shard_location()?);
+    }
+    decoder.finish()?;
+    validate_read_handle_locations(&locations)?;
+    Ok(StorageRpcReadHandleAcquireResponse { locations })
+}
+
+pub(crate) fn encode_read_handle_release_request(
+    request: &StorageRpcReadHandleReleaseRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_read_handle_release_operation_id(&request.read_operation_id)?;
+    let mut out = Vec::new();
+    put_string(&mut out, &request.read_operation_id);
+    Ok(out)
+}
+
+pub(crate) fn decode_read_handle_release_request(
+    bytes: &[u8],
+) -> Result<StorageRpcReadHandleReleaseRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let read_operation_id = decoder.read_string()?;
+    decoder.finish()?;
+    validate_read_handle_release_operation_id(&read_operation_id)?;
+    Ok(StorageRpcReadHandleReleaseRequest { read_operation_id })
+}
+
+pub(crate) fn encode_read_handle_release_response(
+    _response: &StorageRpcReadHandleReleaseResponse,
+) -> Vec<u8> {
+    Vec::new()
+}
+
+pub(crate) fn decode_read_handle_release_response(
+    bytes: &[u8],
+) -> Result<StorageRpcReadHandleReleaseResponse, StorageRpcPayloadError> {
+    let decoder = StorageRpcDecoder::new(bytes);
+    decoder.finish()?;
+    Ok(StorageRpcReadHandleReleaseResponse)
+}
+
 pub(crate) fn encode_claim_heartbeat_request(
     request: &StorageRpcClaimHeartbeatRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -832,6 +927,15 @@ fn validate_shard_location_matches_key(
 fn validate_read_operation_id(id: &str) -> Result<(), StorageRpcPayloadError> {
     if id.is_empty() {
         return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read operation id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_handle_release_operation_id(id: &str) -> Result<(), StorageRpcPayloadError> {
+    if id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
             "read operation id must not be empty",
         ));
     }
@@ -1653,6 +1757,62 @@ mod tests {
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read handle acquire locations must be sorted and unique",
             ))
+        );
+    }
+
+    #[test]
+    fn read_handle_acquire_response_round_trips_canonical_locations() {
+        let response = StorageRpcReadHandleAcquireResponse {
+            locations: vec![test_shard_location(0), test_shard_location(1)],
+        };
+
+        let bytes = encode_read_handle_acquire_response(&response).unwrap();
+        let decoded = decode_read_handle_acquire_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
+        assert_eq!(
+            encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
+                locations: Vec::new(),
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire response must include at least one shard location",
+            ))
+        );
+        assert_eq!(
+            encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
+                locations: vec![test_shard_location(1), test_shard_location(0)],
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire locations must be sorted and unique",
+            ))
+        );
+    }
+
+    #[test]
+    fn read_handle_release_request_and_response_round_trip() {
+        let request = StorageRpcReadHandleReleaseRequest {
+            read_operation_id: "read-op-release".to_string(),
+        };
+
+        let request_bytes = encode_read_handle_release_request(&request).unwrap();
+        let decoded_request = decode_read_handle_release_request(&request_bytes).unwrap();
+
+        assert_eq!(decoded_request, request);
+        assert_eq!(
+            encode_read_handle_release_request(&StorageRpcReadHandleReleaseRequest {
+                read_operation_id: String::new(),
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
+                "read operation id must not be empty",
+            ))
+        );
+        let response_bytes =
+            encode_read_handle_release_response(&StorageRpcReadHandleReleaseResponse);
+        let decoded_response = decode_read_handle_release_response(&response_bytes).unwrap();
+        assert_eq!(decoded_response, StorageRpcReadHandleReleaseResponse);
+        assert_eq!(
+            decode_read_handle_release_response(&[1]),
+            Err(StorageRpcPayloadError::TrailingBytes)
         );
     }
 
