@@ -7,9 +7,10 @@ use crate::{
     },
     BucketName, NodeId,
 };
+use std::io::{Read, Write};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 const STORAGE_RPC_SHARD_LOCATION_LEN: usize = 8 + 4 + 1 + 4;
 
@@ -29,6 +30,41 @@ pub(crate) enum StorageRpcMessageKind {
     ProofRelease = 11,
     ShardAckRecord = 12,
     ShardAckValidate = 13,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub(crate) enum StorageRpcErrorCode {
+    FrameDecode = 1,
+    PayloadDecode = 2,
+    UnknownNode = 3,
+    UnknownPg = 4,
+    WrongClusterEpoch = 5,
+    InactivePgRoute = 6,
+    StaleShardLocation = 7,
+    NonActingSetAccess = 8,
+    UnsupportedOperation = 9,
+    Internal = 10,
+}
+
+impl StorageRpcErrorCode {
+    fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
+        match value {
+            1 => Ok(Self::FrameDecode),
+            2 => Ok(Self::PayloadDecode),
+            3 => Ok(Self::UnknownNode),
+            4 => Ok(Self::UnknownPg),
+            5 => Ok(Self::WrongClusterEpoch),
+            6 => Ok(Self::InactivePgRoute),
+            7 => Ok(Self::StaleShardLocation),
+            8 => Ok(Self::NonActingSetAccess),
+            9 => Ok(Self::UnsupportedOperation),
+            10 => Ok(Self::Internal),
+            _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown storage RPC error code",
+            )),
+        }
+    }
 }
 
 impl StorageRpcMessageKind {
@@ -59,6 +95,19 @@ pub(crate) struct StorageRpcFrame {
     pub(crate) payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcHealthResponse {
+    pub(crate) protocol_version: u16,
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcErrorResponse {
+    pub(crate) code: StorageRpcErrorCode,
+    pub(crate) message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StorageRpcFrameError {
     #[error("storage RPC payload length {len} exceeds limit {limit}")]
@@ -75,6 +124,14 @@ pub(crate) enum StorageRpcFrameError {
     UnknownMessageKind(u16),
     #[error("storage RPC payload checksum mismatch")]
     PayloadChecksumMismatch,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StorageRpcStreamError {
+    #[error("storage RPC stream I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Frame(#[from] StorageRpcFrameError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -105,6 +162,8 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidUtf8,
     #[error("invalid checksum metadata: {0}")]
     InvalidChecksumMetadata(&'static str),
+    #[error("invalid response envelope: {0}")]
+    InvalidResponseEnvelope(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +351,131 @@ pub(crate) fn decode_storage_rpc_frame_with_limit(
         kind,
         payload: payload.to_vec(),
     })
+}
+
+pub(crate) fn write_storage_rpc_frame_to<W: Write>(
+    writer: &mut W,
+    frame: &StorageRpcFrame,
+) -> Result<(), StorageRpcStreamError> {
+    let bytes = encode_storage_rpc_frame(frame.request_id, frame.kind, &frame.payload)?;
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
+pub(crate) fn read_storage_rpc_frame_from<R: Read>(
+    reader: &mut R,
+) -> Result<StorageRpcFrame, StorageRpcStreamError> {
+    read_storage_rpc_frame_from_with_limit(reader, STORAGE_RPC_MAX_PAYLOAD_LEN)
+}
+
+pub(crate) fn read_storage_rpc_frame_from_with_limit<R: Read>(
+    reader: &mut R,
+    max_payload_len: usize,
+) -> Result<StorageRpcFrame, StorageRpcStreamError> {
+    let magic_len = read_u32_from(reader)?;
+    if magic_len as usize != STORAGE_RPC_FRAME_MAGIC.len() {
+        return Err(StorageRpcFrameError::UnknownMagic.into());
+    }
+    let mut bytes = Vec::with_capacity(4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8);
+    put_u32(&mut bytes, magic_len);
+    let mut magic = vec![0; STORAGE_RPC_FRAME_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    bytes.extend_from_slice(&magic);
+    let version = read_u16_from(reader)?;
+    put_u16(&mut bytes, version);
+    let request_id = read_u64_from(reader)?;
+    put_u64(&mut bytes, request_id);
+    let raw_kind = read_u16_from(reader)?;
+    put_u16(&mut bytes, raw_kind);
+    let payload_len = read_u32_from(reader)?;
+    put_u32(&mut bytes, payload_len);
+    if payload_len as usize > max_payload_len {
+        return Err(StorageRpcFrameError::PayloadTooLarge {
+            len: payload_len as usize,
+            limit: max_payload_len,
+        }
+        .into());
+    }
+    let checksum = read_u64_from(reader)?;
+    put_u64(&mut bytes, checksum);
+    let mut payload = vec![0; payload_len as usize];
+    reader.read_exact(&mut payload)?;
+    bytes.extend_from_slice(&payload);
+    Ok(decode_storage_rpc_frame_with_limit(
+        &bytes,
+        max_payload_len,
+    )?)
+}
+
+pub(crate) fn encode_health_response(response: &StorageRpcHealthResponse) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, response.protocol_version);
+    put_u32(&mut out, response.node_id.as_u32());
+    put_u64(&mut out, response.cluster_epoch.get());
+    out
+}
+
+pub(crate) fn decode_health_response(
+    bytes: &[u8],
+) -> Result<StorageRpcHealthResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let protocol_version = decoder.read_u16()?;
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    decoder.finish()?;
+    Ok(StorageRpcHealthResponse {
+        protocol_version,
+        node_id,
+        cluster_epoch,
+    })
+}
+
+pub(crate) fn encode_storage_rpc_success_response(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(&mut out, 0);
+    put_bytes(&mut out, payload);
+    out
+}
+
+pub(crate) fn encode_storage_rpc_error_response(
+    error: &StorageRpcErrorResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if error.message.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "error response message must not be empty",
+        ));
+    }
+    let mut out = Vec::new();
+    put_u8(&mut out, 1);
+    put_u16(&mut out, error.code as u16);
+    put_string(&mut out, &error.message);
+    Ok(out)
+}
+
+pub(crate) fn decode_storage_rpc_response_payload(
+    bytes: &[u8],
+) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let response = match decoder.read_u8()? {
+        0 => Ok(decoder.read_bytes()?.to_vec()),
+        1 => {
+            let code = StorageRpcErrorCode::from_u16(decoder.read_u16()?)?;
+            let message = decoder.read_string()?;
+            if message.is_empty() {
+                return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                    "error response message must not be empty",
+                ));
+            }
+            Err(StorageRpcErrorResponse { code, message })
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown response tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(response)
 }
 
 pub(crate) fn encode_metadata_command_item(
@@ -1052,6 +1236,24 @@ fn put_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
     }
 }
 
+fn read_u16_from<R: Read>(reader: &mut R) -> Result<u16, std::io::Error> {
+    let mut bytes = [0; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32_from<R: Read>(reader: &mut R) -> Result<u32, std::io::Error> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_from<R: Read>(reader: &mut R) -> Result<u64, std::io::Error> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 fn put_u8(out: &mut Vec<u8>, value: u8) {
     out.push(value);
 }
@@ -1071,6 +1273,8 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
     use crate::{
         metadata_command::{
             CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
@@ -1202,6 +1406,69 @@ mod tests {
             decode_storage_rpc_frame_with_limit(&bytes, 3),
             Err(StorageRpcFrameError::PayloadTooLarge { len: 4, limit: 3 })
         );
+    }
+
+    #[test]
+    fn storage_rpc_stream_frame_round_trips() {
+        let frame = StorageRpcFrame {
+            request_id: 11,
+            kind: StorageRpcMessageKind::Health,
+            payload: b"stream".to_vec(),
+        };
+        let mut bytes = Vec::new();
+        write_storage_rpc_frame_to(&mut bytes, &frame).unwrap();
+
+        let decoded = read_storage_rpc_frame_from(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn storage_rpc_stream_frame_rejects_oversized_payload_before_allocating() {
+        let payload = b"abcd";
+        let bytes = encode_storage_rpc_frame(1, StorageRpcMessageKind::Health, payload).unwrap();
+
+        let err = read_storage_rpc_frame_from_with_limit(&mut Cursor::new(bytes), 3).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageRpcStreamError::Frame(StorageRpcFrameError::PayloadTooLarge {
+                len: 4,
+                limit: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn storage_rpc_response_payload_round_trips_success_and_error() {
+        let success = encode_storage_rpc_success_response(b"ok");
+        assert_eq!(
+            decode_storage_rpc_response_payload(&success).unwrap(),
+            Ok(b"ok".to_vec())
+        );
+
+        let error = StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::UnknownPg,
+            message: "unknown PG 9".to_string(),
+        };
+        let error_bytes = encode_storage_rpc_error_response(&error).unwrap();
+        assert_eq!(
+            decode_storage_rpc_response_payload(&error_bytes).unwrap(),
+            Err(error)
+        );
+    }
+
+    #[test]
+    fn storage_rpc_health_response_round_trips() {
+        let response = StorageRpcHealthResponse {
+            protocol_version: STORAGE_RPC_FRAME_ENCODING_VERSION,
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+        };
+
+        let bytes = encode_health_response(&response);
+
+        assert_eq!(decode_health_response(&bytes).unwrap(), response);
     }
 
     #[test]
