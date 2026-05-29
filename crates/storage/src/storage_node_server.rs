@@ -1160,6 +1160,43 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_disconnect_releases_handles_for_cleanup_probe() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server_for_thread.accept_one().unwrap());
+        let location = test_location(1, 0, 7);
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            7,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("read-op", location),
+        );
+        decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(location), 1);
+
+        drop(client);
+        join.join().unwrap();
+        wait_for_read_handle_count(&server, location, 0);
+
+        let mut handles = server
+            .read_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        handles.try_acquire(&[location]).unwrap();
+        assert_eq!(handles.count(location), 1);
+        handles.release(&[location]);
+        assert_eq!(handles.count(location), 0);
+    }
+
+    #[test]
     fn storage_node_server_rejects_non_private_socket_directory() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
