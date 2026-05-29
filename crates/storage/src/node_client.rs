@@ -25,10 +25,13 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
+    decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    encode_read_handle_acquire_request, encode_read_handle_release_request,
     encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_request,
     encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
     StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
 };
@@ -1600,6 +1603,12 @@ pub(crate) struct UnixStorageNodeClient {
     next_request_id: AtomicU64,
 }
 
+pub(crate) struct UnixStorageNodeReadHandleSession {
+    node_id: NodeId,
+    stream: UnixStream,
+    next_request_id: u64,
+}
+
 #[allow(dead_code)]
 impl UnixStorageNodeClient {
     pub(crate) fn new(
@@ -1617,6 +1626,20 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub(crate) fn open_read_handle_session(
+        &self,
+    ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
+            context: "connect storage-node read-handle RPC socket",
+            source,
+        })?;
+        Ok(UnixStorageNodeReadHandleSession {
+            node_id: self.node_id,
+            stream,
+            next_request_id: 1,
+        })
     }
 
     pub(crate) fn write_placed_shard(
@@ -1771,6 +1794,114 @@ impl UnixStorageNodeClient {
             key.shard_index(),
             self.node_id,
         )
+    }
+
+    fn rpc_response_error(
+        &self,
+        kind: StorageRpcMessageKind,
+        error: StorageRpcErrorResponse,
+    ) -> StoreError {
+        StoreError::StorageRpc {
+            node_id: self.node_id.as_u32(),
+            operation: kind.operation_name(),
+            message: format!("{:?}: {}", error.code, error.message),
+        }
+    }
+
+    fn rpc_payload_error(&self, operation: &'static str, message: String) -> StoreError {
+        StoreError::StorageRpc {
+            node_id: self.node_id.as_u32(),
+            operation,
+            message,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl UnixStorageNodeReadHandleSession {
+    pub(crate) fn acquire_read_handles(
+        &mut self,
+        read_operation_id: impl Into<String>,
+        locations: Vec<crate::cluster::ShardLocation>,
+    ) -> Result<Vec<crate::cluster::ShardLocation>, StoreError> {
+        let request = StorageRpcReadHandleAcquireRequest {
+            read_operation_id: read_operation_id.into(),
+            locations,
+        };
+        let payload = encode_read_handle_acquire_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode read handle acquire request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ReadHandlesAcquire, payload)?;
+        let response = decode_read_handle_acquire_response(&response).map_err(|error| {
+            self.rpc_payload_error("decode read handle acquire response", error.to_string())
+        })?;
+        if response.locations != request.locations {
+            return Err(self.rpc_payload_error(
+                "validate read handle acquire response",
+                format!(
+                    "expected locations {:?}, got {:?}",
+                    request.locations, response.locations
+                ),
+            ));
+        }
+        Ok(response.locations)
+    }
+
+    pub(crate) fn release_read_handles(
+        &mut self,
+        read_operation_id: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcReadHandleReleaseRequest {
+            read_operation_id: read_operation_id.into(),
+        };
+        let payload = encode_read_handle_release_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode read handle release request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ReadHandlesRelease, payload)?;
+        decode_read_handle_release_response(&response).map_err(|error| {
+            self.rpc_payload_error("decode read handle release response", error.to_string())
+        })?;
+        Ok(())
+    }
+
+    fn rpc_request(
+        &mut self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, StoreError> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
+            self.rpc_payload_error(
+                "allocate read-handle request id",
+                "storage-node read-handle request id overflowed".to_string(),
+            )
+        })?;
+        let request = StorageRpcFrame {
+            request_id,
+            kind,
+            payload,
+        };
+        write_storage_rpc_frame_to(&mut self.stream, &request).map_err(|error| {
+            self.rpc_payload_error("write read-handle RPC request", error.to_string())
+        })?;
+        let response = read_storage_rpc_frame_from(&mut self.stream).map_err(|error| {
+            self.rpc_payload_error("read read-handle RPC response", error.to_string())
+        })?;
+        if response.request_id != request_id || response.kind != kind {
+            return Err(self.rpc_payload_error(
+                "validate read-handle RPC response",
+                format!(
+                    "expected request {request_id} kind {kind:?}, got request {} kind {:?}",
+                    response.request_id, response.kind
+                ),
+            ));
+        }
+        match decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
+            self.rpc_payload_error("decode read-handle RPC response", error.to_string())
+        })? {
+            Ok(payload) => Ok(payload),
+            Err(error) => Err(self.rpc_response_error(kind, error)),
+        }
     }
 
     fn rpc_response_error(
@@ -4525,10 +4656,16 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::thread;
 
     use crate::storage_node_server::{
         StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+    };
+    use crate::storage_rpc::{
+        encode_read_handle_acquire_response, encode_storage_rpc_success_response,
+        read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        StorageRpcReadHandleAcquireResponse,
     };
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
@@ -4599,5 +4736,103 @@ mod tests {
         ));
         let pg = reopened.get_pg(0).unwrap();
         pg.validate_written_shard_ack(&key, ack).unwrap();
+    }
+
+    #[test]
+    fn unix_storage_node_read_handle_session_is_idempotent_and_disconnect_releases() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let server_thread = thread::spawn(move || server_for_thread.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let location = crate::cluster::ShardLocation::new(
+            config.cluster_epoch,
+            DataPgId::new(PgId::new(0)),
+            crate::ShardIndex::new(0),
+            config.node_id,
+        );
+        let mut session = client.open_read_handle_session().unwrap();
+
+        assert_eq!(
+            session
+                .acquire_read_handles("read-op", vec![location])
+                .unwrap(),
+            vec![location]
+        );
+        assert_eq!(
+            session
+                .acquire_read_handles("read-op", vec![location])
+                .unwrap(),
+            vec![location]
+        );
+        assert_eq!(server.read_handle_count(location), 1);
+        session.release_read_handles("read-op").unwrap();
+        session.release_read_handles("read-op").unwrap();
+        assert_eq!(server.read_handle_count(location), 0);
+        session
+            .acquire_read_handles("read-op-disconnect", vec![location])
+            .unwrap();
+        assert_eq!(server.read_handle_count(location), 1);
+        drop(session);
+        server_thread.join().unwrap();
+        assert_eq!(server.read_handle_count(location), 0);
+    }
+
+    #[test]
+    fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let mismatched_location = crate::cluster::ShardLocation::new(
+                ClusterEpoch::new(1).unwrap(),
+                DataPgId::new(PgId::new(0)),
+                crate::ShardIndex::new(1),
+                NodeId::new(7),
+            );
+            let payload =
+                encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
+                    locations: vec![mismatched_location],
+                })
+                .unwrap();
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+        let requested_location = crate::cluster::ShardLocation::new(
+            ClusterEpoch::new(1).unwrap(),
+            DataPgId::new(PgId::new(0)),
+            crate::ShardIndex::new(0),
+            NodeId::new(7),
+        );
+        let mut session = client.open_read_handle_session().unwrap();
+
+        let err = session
+            .acquire_read_handles("read-op", vec![requested_location])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::StorageRpc {
+                operation: "validate read handle acquire response",
+                ..
+            }
+        ));
+        drop(session);
+        join.join().unwrap();
     }
 }

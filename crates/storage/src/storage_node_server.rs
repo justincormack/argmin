@@ -270,7 +270,7 @@ impl StorageNodeServer {
     }
 
     #[cfg(test)]
-    fn read_handle_count(&self, location: ShardLocation) -> usize {
+    pub(crate) fn read_handle_count(&self, location: ShardLocation) -> usize {
         self.read_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
