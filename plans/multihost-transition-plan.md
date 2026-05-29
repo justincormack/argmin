@@ -5341,7 +5341,11 @@ Implementation slices:
    read/write helpers, and a health/version request
 2. add process role and storage-node config parsing for node id, cluster epoch,
    data directory, configured PG ids, socket path, and route/topology validation
-   data
+   data. The first static config surface uses
+   `ARGMIN_STORAGE_CLUSTER_EPOCH` for the advertised topology epoch and
+   `ARGMIN_STORAGE_PG_IDS` for the comma-separated PG subset a storage-node
+   process opens; absent `ARGMIN_STORAGE_PG_IDS` defaults to all PGs in
+   `0..ARGMIN_PG_COUNT`.
 3. add socket directory validation and storage data-directory ownership locks
 4. add the storage-node listener/accept loop and per-connection session state
 5. add route validation for wrong node id, unknown PG, wrong cluster epoch,

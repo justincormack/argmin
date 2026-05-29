@@ -175,7 +175,9 @@ fn build_storage_node_process_config(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> Result<StorageNodeProcessConfig, String> {
-    let pg_ids: Vec<u32> = (0..config.pg_count).collect();
+    let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
+        .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
+    let pg_ids = config.storage_pg_ids.clone();
     let node_id = NodeId::new(
         config
             .storage_node_id
@@ -193,14 +195,14 @@ fn build_storage_node_process_config(
         .iter()
         .map(|&pg_id| StorageNodePgRoute {
             pg_id,
-            cluster_epoch: ClusterEpoch::INITIAL,
+            cluster_epoch,
             state: PgState::Active,
             acting_set: acting_set.clone(),
         })
         .collect();
     Ok(StorageNodeProcessConfig {
         node_id,
-        cluster_epoch: ClusterEpoch::INITIAL,
+        cluster_epoch,
         data_dir: Path::new(&node_data_dir).to_path_buf(),
         default_ec_shape: EcShape {
             k: ec_config.data_shards,
@@ -334,5 +336,67 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_server_config() -> ServerConfig {
+        ServerConfig {
+            process_role: ProcessRole::StorageNode,
+            listen_addr: "127.0.0.1:9000".to_string(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            data_dir: "/tmp/argmin-test".to_string(),
+            pg_count: 8,
+            local_node_count: 6,
+            storage_node_id: Some(2),
+            storage_node_data_dir: Some("/tmp/argmin-test/node-0002".to_string()),
+            storage_node_socket_path: Some("/tmp/argmin-test/node-0002.sock".to_string()),
+            storage_cluster_epoch: 9,
+            storage_pg_ids: vec![1, 3, 5],
+            ec_k: 4,
+            ec_m: 2,
+            account_id: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            uat_credentials: Vec::new(),
+            host_id: None,
+            sse_c_validator_key_b64: None,
+            sse_s3_wrapping_key_b64: String::new(),
+            region: "us-east-1".to_string(),
+            workers: 4,
+            max_connections: 512,
+            max_inflight_requests: 32,
+            stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
+            panic_on_500: false,
+            abort_on_500: false,
+        }
+    }
+
+    #[test]
+    fn storage_node_process_config_uses_configured_epoch_and_pg_ids() {
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let config = test_server_config();
+
+        let storage_config = build_storage_node_process_config(&config, &ec_config).unwrap();
+
+        assert_eq!(storage_config.node_id, NodeId::new(2));
+        assert_eq!(storage_config.cluster_epoch, ClusterEpoch::new(9).unwrap());
+        assert_eq!(storage_config.pg_ids, vec![1, 3, 5]);
+        assert_eq!(
+            storage_config
+                .pg_routes
+                .iter()
+                .map(|route| (route.pg_id, route.cluster_epoch))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ClusterEpoch::new(9).unwrap()),
+                (3, ClusterEpoch::new(9).unwrap()),
+                (5, ClusterEpoch::new(9).unwrap()),
+            ]
+        );
     }
 }

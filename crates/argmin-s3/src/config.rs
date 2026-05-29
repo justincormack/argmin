@@ -53,6 +53,8 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_id: Option<u32>,
     pub(crate) storage_node_data_dir: Option<String>,
     pub(crate) storage_node_socket_path: Option<String>,
+    pub(crate) storage_cluster_epoch: u64,
+    pub(crate) storage_pg_ids: Vec<u32>,
     pub(crate) ec_k: u8,
     pub(crate) ec_m: u8,
     pub(crate) account_id: String,
@@ -82,6 +84,8 @@ impl ServerConfig {
     ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
     ///   `ARGMIN_DATA_DIR` (./data)
     ///   `ARGMIN_PG_COUNT` (16)
+    ///   `ARGMIN_STORAGE_CLUSTER_EPOCH` (1)
+    ///   `ARGMIN_STORAGE_PG_IDS` (all PGs in `0..ARGMIN_PG_COUNT`)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
@@ -160,6 +164,10 @@ impl ServerConfig {
         let data_dir = get("ARGMIN_DATA_DIR").unwrap_or_else(|| "./data".to_string());
         let storage_node_data_dir = get("ARGMIN_STORAGE_NODE_DATA_DIR");
         let storage_node_socket_path = get("ARGMIN_STORAGE_NODE_SOCKET_PATH");
+        let storage_cluster_epoch: u64 = get("ARGMIN_STORAGE_CLUSTER_EPOCH")
+            .unwrap_or_else(|| "1".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_STORAGE_CLUSTER_EPOCH: {e}"))?;
         let storage_node_id = get("ARGMIN_STORAGE_NODE_ID")
             .map(|value| {
                 value
@@ -216,6 +224,10 @@ impl ServerConfig {
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
         }
+        if storage_cluster_epoch == 0 {
+            return Err("ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string());
+        }
+        let storage_pg_ids = parse_storage_pg_ids(get("ARGMIN_STORAGE_PG_IDS"), pg_count)?;
         if local_node_count == 0 {
             return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
         }
@@ -287,6 +299,8 @@ impl ServerConfig {
             storage_node_id,
             storage_node_data_dir,
             storage_node_socket_path,
+            storage_cluster_epoch,
+            storage_pg_ids,
             ec_k,
             ec_m,
             account_id,
@@ -326,6 +340,38 @@ fn parse_process_role(value: &str) -> Result<ProcessRole, String> {
                 .to_string(),
         ),
     }
+}
+
+fn parse_storage_pg_ids(value: Option<String>, pg_count: u32) -> Result<Vec<u32>, String> {
+    let Some(value) = value else {
+        return Ok((0..pg_count).collect());
+    };
+    if value.trim().is_empty() {
+        return Err("ARGMIN_STORAGE_PG_IDS must not be empty".to_string());
+    }
+    let mut pg_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("ARGMIN_STORAGE_PG_IDS contains an empty PG id".to_string());
+        }
+        let pg_id: u32 = trimmed
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_STORAGE_PG_IDS entry {trimmed:?}: {e}"))?;
+        if pg_id >= pg_count {
+            return Err(format!(
+                "ARGMIN_STORAGE_PG_IDS entry {pg_id} must be less than ARGMIN_PG_COUNT ({pg_count})"
+            ));
+        }
+        if !seen.insert(pg_id) {
+            return Err(format!(
+                "ARGMIN_STORAGE_PG_IDS contains duplicate PG id {pg_id}"
+            ));
+        }
+        pg_ids.push(pg_id);
+    }
+    Ok(pg_ids)
 }
 
 fn process_role_name(role: ProcessRole) -> &'static str {
@@ -550,6 +596,8 @@ mod tests {
         assert_eq!(cfg.storage_node_id, None);
         assert_eq!(cfg.storage_node_data_dir, None);
         assert_eq!(cfg.storage_node_socket_path, None);
+        assert_eq!(cfg.storage_cluster_epoch, 1);
+        assert_eq!(cfg.storage_pg_ids, (0..16).collect::<Vec<_>>());
         assert_eq!(cfg.ec_k, 4);
         assert_eq!(cfg.ec_m, 2);
         assert_eq!(cfg.account_id, "111122223333");
@@ -588,6 +636,8 @@ mod tests {
             ("ARGMIN_TLS_KEY_PATH", "/tmp/key.pem"),
             ("ARGMIN_DATA_DIR", "/tmp/storage"),
             ("ARGMIN_PG_COUNT", "32"),
+            ("ARGMIN_STORAGE_CLUSTER_EPOCH", "7"),
+            ("ARGMIN_STORAGE_PG_IDS", "2, 5, 31"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
@@ -599,6 +649,8 @@ mod tests {
         assert_eq!(cfg.tls_key_path.as_deref(), Some("/tmp/key.pem"));
         assert_eq!(cfg.data_dir, "/tmp/storage");
         assert_eq!(cfg.pg_count, 32);
+        assert_eq!(cfg.storage_cluster_epoch, 7);
+        assert_eq!(cfg.storage_pg_ids, vec![2, 5, 31]);
         assert_eq!(cfg.local_node_count, 12);
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
@@ -654,6 +706,8 @@ mod tests {
             cfg.storage_node_socket_path.as_deref(),
             Some("/tmp/argmin/node-2.sock")
         );
+        assert_eq!(cfg.storage_cluster_epoch, 1);
+        assert_eq!(cfg.storage_pg_ids, (0..16).collect::<Vec<_>>());
     }
 
     #[test]
@@ -720,6 +774,32 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("ARGMIN_STORAGE_NODE_ID"));
+    }
+
+    #[test]
+    fn storage_cluster_epoch_must_be_nonzero() {
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_STORAGE_CLUSTER_EPOCH", "0")]))
+                .unwrap_err();
+
+        assert!(err.contains("ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0"));
+    }
+
+    #[test]
+    fn storage_pg_ids_must_be_unique_and_within_pg_count() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PG_COUNT", "4"),
+            ("ARGMIN_STORAGE_PG_IDS", "1,1"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("duplicate PG id 1"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PG_COUNT", "4"),
+            ("ARGMIN_STORAGE_PG_IDS", "4"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must be less than ARGMIN_PG_COUNT"));
     }
 
     #[test]

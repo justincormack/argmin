@@ -36,6 +36,12 @@ The server is configured via environment variables:
 | `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key path for direct HTTPS |
 | `ARGMIN_DATA_DIR` | `./data` | Data directory |
 | `ARGMIN_PG_COUNT` | `16` | Number of placement groups |
+| `ARGMIN_PROCESS_ROLE` | `legacy-local` | Process role: `legacy-local` or Phase 10.3 `storage-node`; `frontend` and `combined` are parsed but intentionally unsupported until remote storage routing is wired |
+| `ARGMIN_STORAGE_NODE_ID` | *(required for `storage-node`)* | Storage-node identity to serve |
+| `ARGMIN_STORAGE_NODE_DATA_DIR` | `ARGMIN_DATA_DIR/node-NNNN` | Data directory for the storage-node identity |
+| `ARGMIN_STORAGE_NODE_SOCKET_PATH` | *(required for `storage-node`)* | Absolute Unix socket path for the storage-node process |
+| `ARGMIN_STORAGE_CLUSTER_EPOCH` | `1` | Static storage-node topology epoch advertised over the Unix socket |
+| `ARGMIN_STORAGE_PG_IDS` | all PGs in `0..ARGMIN_PG_COUNT` | Comma-separated PG ids opened by this storage-node process |
 | `ARGMIN_EC_K` | `4` | Erasure coding data shards |
 | `ARGMIN_EC_M` | `2` | Erasure coding parity shards |
 | `ARGMIN_LOCAL_NODE_COUNT` | `ARGMIN_EC_K + ARGMIN_EC_M` (`6` with defaults) | In-progress local multihost harness node count |
