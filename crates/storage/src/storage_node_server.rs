@@ -26,6 +26,10 @@ use crate::{EcShape, NodeId, ShardLocation};
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
+const STORAGE_NODE_MAX_ACTIVE_SESSIONS: usize = 1024;
+const STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION: usize = 4096;
+const STORAGE_NODE_MAX_LIVE_READ_OPERATIONS: usize = 16 * 1024;
+const STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS: usize = 64 * 1024;
 
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -107,6 +111,8 @@ pub enum StorageNodeServerError {
     RpcStream { message: String },
     #[error("storage RPC response payload error: {message}")]
     ResponsePayload { message: String },
+    #[error("storage-node active session limit {limit} is exhausted")]
+    TooManyActiveSessions { limit: usize },
 }
 
 pub fn validate_storage_node_process_configs(
@@ -161,6 +167,7 @@ pub struct StorageNodeServer {
     _node: SharedStorageNode,
     listener: UnixListener,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
+    active_sessions: Arc<Mutex<StorageNodeActiveSessionState>>,
 }
 
 impl StorageNodeServer {
@@ -188,6 +195,7 @@ impl StorageNodeServer {
             _node: node,
             listener,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
+            active_sessions: Arc::new(Mutex::new(StorageNodeActiveSessionState::default())),
         })
     }
 
@@ -200,7 +208,13 @@ impl StorageNodeServer {
                     path: self.config.socket_path.clone(),
                     source,
                 })?;
-        self.connection_handler().handle_session(&mut stream)
+        let session_guard =
+            self.try_acquire_session()
+                .ok_or(StorageNodeServerError::TooManyActiveSessions {
+                    limit: STORAGE_NODE_MAX_ACTIVE_SESSIONS,
+                })?;
+        self.connection_handler()
+            .handle_session(&mut stream, session_guard)
     }
 
     pub fn serve_forever(&self) -> Result<(), StorageNodeServerError> {
@@ -219,8 +233,11 @@ impl StorageNodeServer {
                     source,
                 })?;
         let handler = self.connection_handler();
+        let Some(session_guard) = self.try_acquire_session() else {
+            return Ok(());
+        };
         thread::spawn(move || {
-            if let Err(error) = handler.handle_session(&mut stream) {
+            if let Err(error) = handler.handle_session(&mut stream, session_guard) {
                 eprintln!("storage-node connection failed: {error}");
             }
         });
@@ -231,6 +248,20 @@ impl StorageNodeServer {
         StorageNodeConnectionHandler {
             config: self.config.clone(),
             read_handles: Arc::clone(&self.read_handles),
+        }
+    }
+
+    fn try_acquire_session(&self) -> Option<StorageNodeActiveSessionGuard> {
+        let mut active_sessions = self
+            .active_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if active_sessions.try_acquire(STORAGE_NODE_MAX_ACTIVE_SESSIONS) {
+            Some(StorageNodeActiveSessionGuard {
+                active_sessions: Arc::clone(&self.active_sessions),
+            })
+        } else {
+            None
         }
     }
 
@@ -250,7 +281,11 @@ struct StorageNodeConnectionHandler {
 }
 
 impl StorageNodeConnectionHandler {
-    fn handle_session(&self, stream: &mut UnixStream) -> Result<(), StorageNodeServerError> {
+    fn handle_session(
+        &self,
+        stream: &mut UnixStream,
+        _session_guard: StorageNodeActiveSessionGuard,
+    ) -> Result<(), StorageNodeServerError> {
         let mut session = StorageNodeSession::new(&self.read_handles);
         loop {
             let frame = match read_storage_rpc_frame_from(stream) {
@@ -441,21 +476,89 @@ impl StorageNodeConnectionHandler {
 }
 
 #[derive(Debug, Default)]
+struct StorageNodeActiveSessionState {
+    active: usize,
+}
+
+impl StorageNodeActiveSessionState {
+    fn try_acquire(&mut self, limit: usize) -> bool {
+        if self.active >= limit {
+            return false;
+        }
+        self.active += 1;
+        true
+    }
+
+    fn release(&mut self) {
+        self.active = self
+            .active
+            .checked_sub(1)
+            .expect("storage-node active session release without acquire");
+    }
+}
+
+struct StorageNodeActiveSessionGuard {
+    active_sessions: Arc<Mutex<StorageNodeActiveSessionState>>,
+}
+
+impl Drop for StorageNodeActiveSessionGuard {
+    fn drop(&mut self) {
+        self.active_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release();
+    }
+}
+
+#[derive(Debug, Default)]
 struct StorageNodeReadHandleState {
     location_counts: BTreeMap<ShardLocationKey, usize>,
+    live_read_operations: usize,
+    live_read_handle_locations: usize,
 }
 
 impl StorageNodeReadHandleState {
-    fn acquire(&mut self, locations: &[ShardLocation]) {
+    fn try_acquire(&mut self, locations: &[ShardLocation]) -> Result<(), StorageRpcErrorResponse> {
+        if self.live_read_operations >= STORAGE_NODE_MAX_LIVE_READ_OPERATIONS {
+            return Err(resource_exhausted_response(format!(
+                "storage-node live read operation limit {} is exhausted",
+                STORAGE_NODE_MAX_LIVE_READ_OPERATIONS
+            )));
+        }
+        let live_read_handle_locations = self
+            .live_read_handle_locations
+            .checked_add(locations.len())
+            .ok_or_else(|| {
+                resource_exhausted_response(
+                    "storage-node live read handle location counter overflowed".to_string(),
+                )
+            })?;
+        if live_read_handle_locations > STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS {
+            return Err(resource_exhausted_response(format!(
+                "storage-node live read handle location limit {} is exhausted",
+                STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS
+            )));
+        }
         for location in locations {
             *self
                 .location_counts
                 .entry(ShardLocationKey::from(*location))
                 .or_insert(0) += 1;
         }
+        self.live_read_operations += 1;
+        self.live_read_handle_locations = live_read_handle_locations;
+        Ok(())
     }
 
     fn release(&mut self, locations: &[ShardLocation]) {
+        self.live_read_operations = self
+            .live_read_operations
+            .checked_sub(1)
+            .expect("read handle operation release without acquire");
+        self.live_read_handle_locations = self
+            .live_read_handle_locations
+            .checked_sub(locations.len())
+            .expect("read handle location release without acquire");
         for location in locations {
             let key = ShardLocationKey::from(*location);
             let entry = self
@@ -530,11 +633,17 @@ impl<'a> StorageNodeSession<'a> {
             }
             None => {}
         }
+        if self.read_operations.len() >= STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION {
+            return Err(resource_exhausted_response(format!(
+                "storage-node session read operation limit {} is exhausted",
+                STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION
+            )));
+        }
 
         self.shared_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .acquire(&request.locations);
+            .try_acquire(&request.locations)?;
         self.read_operations.insert(
             request.read_operation_id,
             SessionReadHandle {
@@ -583,6 +692,13 @@ struct SessionReadHandle {
 fn rpc_stream_error(error: StorageRpcStreamError) -> StorageNodeServerError {
     StorageNodeServerError::RpcStream {
         message: error.to_string(),
+    }
+}
+
+fn resource_exhausted_response(message: String) -> StorageRpcErrorResponse {
+    StorageRpcErrorResponse {
+        code: StorageRpcErrorCode::ResourceExhausted,
+        message,
     }
 }
 
@@ -1432,6 +1548,63 @@ mod tests {
         drop(client);
         join.join().unwrap();
         assert_eq!(server.read_handle_count(location), 0);
+    }
+
+    #[test]
+    fn storage_node_session_rejects_read_operation_count_over_limit() {
+        let shared_handles = Mutex::new(StorageNodeReadHandleState::default());
+        let mut session = StorageNodeSession::new(&shared_handles);
+        let location = test_location(1, 0, 7);
+
+        for i in 0..STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION {
+            session
+                .acquire_read_handles(StorageRpcReadHandleAcquireRequest {
+                    read_operation_id: format!("read-op-{i}"),
+                    locations: vec![location],
+                })
+                .unwrap();
+        }
+        let error = session
+            .acquire_read_handles(StorageRpcReadHandleAcquireRequest {
+                read_operation_id: "read-op-over-limit".to_string(),
+                locations: vec![location],
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        assert_eq!(
+            shared_handles.lock().unwrap().count(location),
+            STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION
+        );
+    }
+
+    #[test]
+    fn storage_node_read_handle_state_rejects_aggregate_limits() {
+        let location = test_location(1, 0, 7);
+        let mut operations_exhausted = StorageNodeReadHandleState {
+            live_read_operations: STORAGE_NODE_MAX_LIVE_READ_OPERATIONS,
+            ..StorageNodeReadHandleState::default()
+        };
+        let error = operations_exhausted.try_acquire(&[location]).unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+
+        let mut locations_exhausted = StorageNodeReadHandleState {
+            live_read_handle_locations: STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS,
+            ..StorageNodeReadHandleState::default()
+        };
+        let error = locations_exhausted.try_acquire(&[location]).unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn storage_node_active_session_state_rejects_over_limit() {
+        let mut active_sessions = StorageNodeActiveSessionState::default();
+
+        assert!(active_sessions.try_acquire(2));
+        assert!(active_sessions.try_acquire(2));
+        assert!(!active_sessions.try_acquire(2));
+        active_sessions.release();
+        assert!(active_sessions.try_acquire(2));
     }
 
     #[test]

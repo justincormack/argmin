@@ -12,7 +12,15 @@ use std::io::{Read, Write};
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+pub(crate) const STORAGE_RPC_MAX_READ_OPERATION_ID_LEN: usize = 256;
+pub(crate) const STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS: usize = 1024;
 const STORAGE_RPC_SHARD_LOCATION_LEN: usize = 8 + 4 + 1 + 4;
+const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
+    + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN
+    + 4
+    + STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS * STORAGE_RPC_SHARD_LOCATION_LEN;
+const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
+    4 + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -45,6 +53,7 @@ pub(crate) enum StorageRpcErrorCode {
     NonActingSetAccess = 8,
     UnsupportedOperation = 9,
     Internal = 10,
+    ResourceExhausted = 11,
 }
 
 impl StorageRpcErrorCode {
@@ -60,6 +69,7 @@ impl StorageRpcErrorCode {
             8 => Ok(Self::NonActingSetAccess),
             9 => Ok(Self::UnsupportedOperation),
             10 => Ok(Self::Internal),
+            11 => Ok(Self::ResourceExhausted),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -337,13 +347,15 @@ pub(crate) fn decode_storage_rpc_frame_with_limit(
     let raw_kind = decoder
         .read_u16()
         .map_err(|_| StorageRpcFrameError::Truncated)?;
+    let kind = StorageRpcMessageKind::from_u16(raw_kind)?;
     let payload_len = decoder
         .read_u32()
         .map_err(|_| StorageRpcFrameError::Truncated)? as usize;
-    if payload_len > max_payload_len {
+    let effective_max_payload_len = message_kind_max_payload_len(kind, max_payload_len);
+    if payload_len > effective_max_payload_len {
         return Err(StorageRpcFrameError::PayloadTooLarge {
             len: payload_len,
-            limit: max_payload_len,
+            limit: effective_max_payload_len,
         });
     }
     let expected_checksum = decoder
@@ -357,7 +369,6 @@ pub(crate) fn decode_storage_rpc_frame_with_limit(
     {
         return Err(StorageRpcFrameError::PayloadChecksumMismatch);
     }
-    let kind = StorageRpcMessageKind::from_u16(raw_kind)?;
     decoder
         .finish()
         .map_err(|_| StorageRpcFrameError::TrailingBytes)?;
@@ -402,12 +413,14 @@ pub(crate) fn read_storage_rpc_frame_from_with_limit<R: Read>(
     put_u64(&mut bytes, request_id);
     let raw_kind = read_u16_from(reader)?;
     put_u16(&mut bytes, raw_kind);
+    let kind = StorageRpcMessageKind::from_u16(raw_kind)?;
     let payload_len = read_u32_from(reader)?;
     put_u32(&mut bytes, payload_len);
-    if payload_len as usize > max_payload_len {
+    let effective_max_payload_len = message_kind_max_payload_len(kind, max_payload_len);
+    if payload_len as usize > effective_max_payload_len {
         return Err(StorageRpcFrameError::PayloadTooLarge {
             len: payload_len as usize,
-            limit: max_payload_len,
+            limit: effective_max_payload_len,
         }
         .into());
     }
@@ -420,6 +433,22 @@ pub(crate) fn read_storage_rpc_frame_from_with_limit<R: Read>(
         &bytes,
         max_payload_len,
     )?)
+}
+
+fn message_kind_max_payload_len(
+    kind: StorageRpcMessageKind,
+    generic_max_payload_len: usize,
+) -> usize {
+    let kind_max_payload_len = match kind {
+        StorageRpcMessageKind::ReadHandlesAcquire => {
+            STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ReadHandlesRelease => {
+            STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN
+        }
+        _ => generic_max_payload_len,
+    };
+    kind_max_payload_len.min(generic_max_payload_len)
 }
 
 pub(crate) fn encode_health_response(response: &StorageRpcHealthResponse) -> Vec<u8> {
@@ -664,6 +693,7 @@ pub(crate) fn encode_read_handle_acquire_request(
             "read handle acquire must include at least one shard location",
         ));
     }
+    validate_read_handle_location_count(request.locations.len())?;
     validate_read_handle_locations(&request.locations)?;
     let mut out = Vec::new();
     put_string(&mut out, &request.read_operation_id);
@@ -686,13 +716,19 @@ pub(crate) fn decode_read_handle_acquire_request(
     bytes: &[u8],
 ) -> Result<StorageRpcReadHandleAcquireRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let read_operation_id = decoder.read_string()?;
+    let read_operation_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_READ_OPERATION_ID_LEN,
+        StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read operation id exceeds maximum length",
+        ),
+    )?;
     let location_count = decoder.read_u32()? as usize;
     if location_count == 0 {
         return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
             "read handle acquire must include at least one shard location",
         ));
     }
+    validate_read_handle_location_count(location_count)?;
     if location_count > decoder.remaining_len() / STORAGE_RPC_SHARD_LOCATION_LEN {
         return Err(StorageRpcPayloadError::Truncated);
     }
@@ -717,6 +753,7 @@ pub(crate) fn encode_read_handle_acquire_response(
             "read handle acquire response must include at least one shard location",
         ));
     }
+    validate_read_handle_location_count(response.locations.len())?;
     validate_read_handle_locations(&response.locations)?;
     let mut out = Vec::new();
     put_u32(
@@ -769,7 +806,12 @@ pub(crate) fn decode_read_handle_release_request(
     bytes: &[u8],
 ) -> Result<StorageRpcReadHandleReleaseRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let read_operation_id = decoder.read_string()?;
+    let read_operation_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_READ_OPERATION_ID_LEN,
+        StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
+            "read operation id exceeds maximum length",
+        ),
+    )?;
     decoder.finish()?;
     validate_read_handle_release_operation_id(&read_operation_id)?;
     Ok(StorageRpcReadHandleReleaseRequest { read_operation_id })
@@ -930,6 +972,11 @@ fn validate_read_operation_id(id: &str) -> Result<(), StorageRpcPayloadError> {
             "read operation id must not be empty",
         ));
     }
+    if id.len() > STORAGE_RPC_MAX_READ_OPERATION_ID_LEN {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read operation id exceeds maximum length",
+        ));
+    }
     Ok(())
 }
 
@@ -937,6 +984,22 @@ fn validate_read_handle_release_operation_id(id: &str) -> Result<(), StorageRpcP
     if id.is_empty() {
         return Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
             "read operation id must not be empty",
+        ));
+    }
+    if id.len() > STORAGE_RPC_MAX_READ_OPERATION_ID_LEN {
+        return Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
+            "read operation id exceeds maximum length",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_handle_location_count(
+    location_count: usize,
+) -> Result<(), StorageRpcPayloadError> {
+    if location_count > STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire includes too many shard locations",
         ));
     }
     Ok(())
@@ -1061,8 +1124,30 @@ impl<'a> StorageRpcDecoder<'a> {
         self.read_exact(len)
     }
 
+    fn read_bytes_with_limit(
+        &mut self,
+        limit: usize,
+        too_large_error: StorageRpcPayloadError,
+    ) -> Result<&'a [u8], StorageRpcPayloadError> {
+        let len = self.read_u32()? as usize;
+        if len > limit {
+            return Err(too_large_error);
+        }
+        self.read_exact(len)
+    }
+
     fn read_string(&mut self) -> Result<String, StorageRpcPayloadError> {
         std::str::from_utf8(self.read_bytes()?)
+            .map(str::to_owned)
+            .map_err(|_| StorageRpcPayloadError::InvalidUtf8)
+    }
+
+    fn read_string_with_limit(
+        &mut self,
+        limit: usize,
+        too_large_error: StorageRpcPayloadError,
+    ) -> Result<String, StorageRpcPayloadError> {
+        std::str::from_utf8(self.read_bytes_with_limit(limit, too_large_error)?)
             .map(str::to_owned)
             .map_err(|_| StorageRpcPayloadError::InvalidUtf8)
     }
@@ -1717,11 +1802,31 @@ mod tests {
         );
         assert_eq!(
             encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+                read_operation_id: "x".repeat(STORAGE_RPC_MAX_READ_OPERATION_ID_LEN + 1),
+                locations: vec![test_shard_location(0)],
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read operation id exceeds maximum length",
+            ))
+        );
+        assert_eq!(
+            encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
                 read_operation_id: "read-op-2".to_string(),
                 locations: Vec::new(),
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read handle acquire must include at least one shard location",
+            ))
+        );
+        assert_eq!(
+            encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+                read_operation_id: "read-op-too-many-locations".to_string(),
+                locations: (0..=STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS)
+                    .map(test_shard_location_for_data_pg)
+                    .collect(),
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire includes too many shard locations",
             ))
         );
     }
@@ -1734,7 +1839,36 @@ mod tests {
 
         assert_eq!(
             decode_read_handle_acquire_request(&bytes),
-            Err(StorageRpcPayloadError::Truncated)
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read handle acquire includes too many shard locations",
+            ))
+        );
+    }
+
+    #[test]
+    fn read_handle_request_decoders_reject_oversized_ids_before_copying() {
+        let mut acquire_bytes = Vec::new();
+        put_u32(
+            &mut acquire_bytes,
+            u32::try_from(STORAGE_RPC_MAX_READ_OPERATION_ID_LEN + 1).unwrap(),
+        );
+        assert_eq!(
+            decode_read_handle_acquire_request(&acquire_bytes),
+            Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+                "read operation id exceeds maximum length",
+            ))
+        );
+
+        let mut release_bytes = Vec::new();
+        put_u32(
+            &mut release_bytes,
+            u32::try_from(STORAGE_RPC_MAX_READ_OPERATION_ID_LEN + 1).unwrap(),
+        );
+        assert_eq!(
+            decode_read_handle_release_request(&release_bytes),
+            Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
+                "read operation id exceeds maximum length",
+            ))
         );
     }
 
@@ -1758,6 +1892,40 @@ mod tests {
                 "read handle acquire locations must be sorted and unique",
             ))
         );
+    }
+
+    #[test]
+    fn storage_rpc_stream_frame_rejects_read_handle_payload_over_kind_limit_before_allocating() {
+        for (kind, payload_len, limit) in [
+            (
+                StorageRpcMessageKind::ReadHandlesAcquire,
+                STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ReadHandlesRelease,
+                STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN,
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
+            put_u16(&mut bytes, STORAGE_RPC_FRAME_ENCODING_VERSION);
+            put_u64(&mut bytes, 7);
+            put_u16(&mut bytes, kind as u16);
+            put_u32(
+                &mut bytes,
+                u32::try_from(payload_len).expect("test payload length fits in u32"),
+            );
+
+            assert!(matches!(
+                read_storage_rpc_frame_from(&mut Cursor::new(bytes)),
+                Err(StorageRpcStreamError::Frame(StorageRpcFrameError::PayloadTooLarge {
+                    len,
+                    limit: actual_limit,
+                })) if len == payload_len && actual_limit == limit
+            ));
+        }
     }
 
     #[test]
@@ -1804,6 +1972,14 @@ mod tests {
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
                 "read operation id must not be empty",
+            ))
+        );
+        assert_eq!(
+            encode_read_handle_release_request(&StorageRpcReadHandleReleaseRequest {
+                read_operation_id: "x".repeat(STORAGE_RPC_MAX_READ_OPERATION_ID_LEN + 1),
+            }),
+            Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
+                "read operation id exceeds maximum length",
             ))
         );
         let response_bytes =
@@ -1914,6 +2090,17 @@ mod tests {
             DataPgId::new(PgId::new(11)),
             ShardIndex::new(shard_index),
             NodeId::new(u32::from(shard_index) + 100),
+        )
+    }
+
+    fn test_shard_location_for_data_pg(data_pg_id: usize) -> ShardLocation {
+        ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            DataPgId::new(PgId::new(
+                u32::try_from(data_pg_id).expect("test PG id fits in u32"),
+            )),
+            ShardIndex::new(0),
+            NodeId::new(100),
         )
     }
 
