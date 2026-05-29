@@ -4929,21 +4929,23 @@ Required tests:
    proof requests carry full durable reservation proofs.
 9. [pending Phase 10.2-10.5 call-site work] response loss after a successful
    side-effecting RPC is retried safely for metadata commands, shard writes,
-   shard deletes, read-handle acquire/release, claim heartbeat/release, and
-   proof release. The Phase 10.1 codec now makes the required operation keys
-   representable, but the behavioral lost-reply tests belong with the first
-   local client/server implementations.
-10. [pending Phase 10.3 session work] lost read-handle acquire response returns
-    the same handle set when retried on the same session, and client disconnect
-    before release frees the handles. Phase 10.1 carries the client operation
-    id and shard-location set; Phase 10.3 must bind that key to a long-lived
-    storage-node session.
+   shard deletes, claim heartbeat/release, and proof release. The Phase 10.1
+   codec now makes the required operation keys representable, but the
+   behavioral lost-reply tests belong with the first local client/server
+   implementations.
+10. [done] lost read-handle acquire response returns the same handle set when
+    retried on the same session, lost release responses are idempotent on the
+    same session, and client disconnect before release frees the handles. Phase
+    10.1 carries the client operation id and shard-location set; Phase 10.3 now
+    binds that key to a long-lived storage-node session and tests that later
+    cleanup-style handle acquisition can proceed after disconnect.
 
 Phase 10.1 is complete. The frame codec, semantic checksum layering, and
-operation-key payload shapes are in place. The remaining lost-reply guarantees
-must be tested with the first storage-node client/server call sites, because
-the codec alone cannot observe a server-side mutation followed by response
-loss.
+operation-key payload shapes are in place. The read-handle lost-reply and
+disconnect guarantees are now covered by the Phase 10.3 storage-node
+client/server session tests; the remaining side-effecting RPC lost-reply
+guarantees stay with the later call-site phases because the codec alone cannot
+observe a server-side mutation followed by response loss.
 
 ### Phase 10.2: Node Client Boundary
 
@@ -5370,9 +5372,9 @@ Required tests:
    non-production-only
 7. frontend-only and combined roles fail explicitly before opening PG
    directories while remote frontend routing is not wired
-8. combined role starts both HTTP/coordinator and storage-node listener while
-   preserving the same storage ownership checks once remote frontend routing is
-   available in Phase 10.4/10.5
+8. combined role startup is deferred until remote frontend routing is available
+   in Phase 10.4/10.5; 10.3 requires combined to fail explicitly before opening
+   PG directories
 9. second storage-node process for the same data directory is rejected by the
    ownership lock
 10. duplicate/canonical-equivalent Unix socket paths are rejected before serving
@@ -5382,6 +5384,20 @@ Required tests:
     idempotently and does not leave handle counts wrong
 13. client disconnect after acquiring read handles releases all session-owned
     handles and later physical cleanup can proceed
+
+- Status: complete. Phase 10.3 now has a runnable `storage-node` process role
+  with explicit static node id, data directory, Unix socket path, cluster epoch,
+  and configured PG subset parsing. Startup validates socket privacy,
+  absolute/canonical socket uniqueness, duplicate node ids, duplicate/canonical
+  data directories, complete route coverage, and consistent per-PG route views;
+  bind-time ownership locks reject a second process on the same node data
+  directory and stale Unix socket path cleanup is covered. The blocking Unix
+  socket server accepts long-lived sessions without serializing the accept loop,
+  answers health/version, returns typed errors for route/epoch/node failures,
+  enforces read-handle resource limits, and covers lost acquire/release response
+  idempotency plus disconnect cleanup. `frontend` and `combined` roles remain
+  parsed but explicitly unsupported until Phase 10.4/10.5 route actual
+  coordinator storage traffic through remote `StorageNodeClient`s.
 
 ### Phase 10.4: Remote Shard IO
 
