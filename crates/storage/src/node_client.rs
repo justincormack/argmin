@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use placement::NodeId;
@@ -21,6 +24,13 @@ use crate::metadata_command::{
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
+use crate::storage_rpc::{
+    decode_shard_write_ack, decode_storage_rpc_response_payload, encode_shard_ack_batch_request,
+    encode_shard_delete_request, encode_shard_write_request, read_storage_rpc_frame_from,
+    write_storage_rpc_frame_to, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
+    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
+    StorageRpcShardWriteRequest,
+};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
     AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
@@ -1573,6 +1583,188 @@ pub(crate) trait StorageNodeClient: Send + Sync {
 pub(crate) struct LocalStorageNodeClient {
     node_id: NodeId,
     storage_node: Arc<SharedStorageNode>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct UnixStorageNodeClient {
+    node_id: NodeId,
+    cluster_epoch: ClusterEpoch,
+    socket_path: PathBuf,
+    next_request_id: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl UnixStorageNodeClient {
+    pub(crate) fn new(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        socket_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            node_id,
+            cluster_epoch,
+            socket_path: socket_path.into(),
+            next_request_id: AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub(crate) fn write_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        let expected_size = data.len() as u64;
+        let expected_crc64 = checksum::crc64::checksum(data);
+        let request = StorageRpcShardWriteRequest {
+            location: self.shard_location(data_pg_id, key),
+            shard_key: key.clone(),
+            expected_size,
+            expected_crc64,
+            payload: data.to_vec(),
+        };
+        let payload = encode_shard_write_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode shard write request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardWrite, payload)?;
+        decode_shard_write_ack(&response, expected_size, expected_crc64).map_err(|error| {
+            self.rpc_payload_error("decode shard write response", error.to_string())
+        })
+    }
+
+    pub(crate) fn delete_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcShardDeleteRequest {
+            location: self.shard_location(data_pg_id, key),
+            shard_key: key.clone(),
+        };
+        let payload = encode_shard_delete_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode shard delete request", error.to_string())
+        })?;
+        self.rpc_request(StorageRpcMessageKind::ShardDelete, payload)
+            .map(|_| ())
+    }
+
+    pub(crate) fn register_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        let payload = self.encode_shard_ack_batch(pg_id, shard_batch)?;
+        self.rpc_request(StorageRpcMessageKind::ShardAckRecord, payload)
+            .map(|_| ())
+    }
+
+    pub(crate) fn validate_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        let payload = self.encode_shard_ack_batch(pg_id, shard_batch)?;
+        self.rpc_request(StorageRpcMessageKind::ShardAckValidate, payload)
+            .map(|_| ())
+    }
+
+    fn encode_shard_ack_batch(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<Vec<u8>, StoreError> {
+        let request = StorageRpcShardAckBatchRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            items: shard_batch
+                .iter()
+                .map(|(shard_key, ack)| StorageRpcShardAckItem {
+                    shard_key: (*shard_key).clone(),
+                    ack: *ack,
+                })
+                .collect(),
+        };
+        encode_shard_ack_batch_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode shard ack batch request", error.to_string())
+        })
+    }
+
+    fn rpc_request(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, StoreError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
+                context: "connect storage-node RPC socket",
+                source,
+            })?;
+        let request = StorageRpcFrame {
+            request_id,
+            kind,
+            payload,
+        };
+        write_storage_rpc_frame_to(&mut stream, &request).map_err(|error| {
+            self.rpc_payload_error("write storage RPC request", error.to_string())
+        })?;
+        let response = read_storage_rpc_frame_from(&mut stream).map_err(|error| {
+            self.rpc_payload_error("read storage RPC response", error.to_string())
+        })?;
+        if response.request_id != request_id || response.kind != kind {
+            return Err(self.rpc_payload_error(
+                "validate storage RPC response",
+                format!(
+                    "expected request {request_id} kind {kind:?}, got request {} kind {:?}",
+                    response.request_id, response.kind
+                ),
+            ));
+        }
+        match decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
+            self.rpc_payload_error("decode storage RPC response", error.to_string())
+        })? {
+            Ok(payload) => Ok(payload),
+            Err(error) => Err(self.rpc_response_error(kind, error)),
+        }
+    }
+
+    fn shard_location(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> crate::cluster::ShardLocation {
+        crate::cluster::ShardLocation::new(
+            self.cluster_epoch,
+            data_pg_id,
+            key.shard_index(),
+            self.node_id,
+        )
+    }
+
+    fn rpc_response_error(
+        &self,
+        kind: StorageRpcMessageKind,
+        error: StorageRpcErrorResponse,
+    ) -> StoreError {
+        StoreError::StorageRpc {
+            node_id: self.node_id.as_u32(),
+            operation: kind.operation_name(),
+            message: format!("{:?}: {}", error.code, error.message),
+        }
+    }
+
+    fn rpc_payload_error(&self, operation: &'static str, message: String) -> StoreError {
+        StoreError::StorageRpc {
+            node_id: self.node_id.as_u32(),
+            operation,
+            message,
+        }
+    }
 }
 
 impl LocalStorageNodeClient {
@@ -4223,5 +4415,85 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<bool, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.metadata_command_abandoned(self.node_id.as_u32(), command)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+
+    use crate::storage_node_server::{
+        StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+    };
+
+    fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
+        StorageNodeProcessConfig {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
+            pg_ids: vec![0],
+            socket_path: tmp.path().join("sock").join("storage.sock"),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: crate::types::PgState::Active,
+                acting_set: vec![NodeId::new(7)],
+            }],
+        }
+    }
+
+    fn private_socket_dir(path: &std::path::Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..4 {
+                server.accept_one().unwrap();
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let key = ShardKey::new(&[0x55; 16], 11, 0);
+        let data_pg_id = DataPgId::new(PgId::new(0));
+
+        assert_eq!(client.node_id(), NodeId::new(7));
+        let ack = client
+            .write_placed_shard(data_pg_id, &key, b"remote payload")
+            .unwrap();
+        client
+            .register_written_shard_acks(PgId::new(0), &[(&key, ack)])
+            .unwrap();
+        client
+            .validate_written_shard_acks(PgId::new(0), &[(&key, ack)])
+            .unwrap();
+        client.delete_placed_shard(data_pg_id, &key).unwrap();
+        server_thread.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.read_shard_file(0, &key),
+            Err(StoreError::NotFound)
+        ));
+        let pg = reopened.get_pg(0).unwrap();
+        pg.validate_written_shard_ack(&key, ack).unwrap();
     }
 }

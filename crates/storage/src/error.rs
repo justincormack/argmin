@@ -68,6 +68,13 @@ pub enum StoreError {
         source: Box<StoreError>,
     },
 
+    #[error("storage RPC {operation} failed on node {node_id}: {message}")]
+    StorageRpc {
+        node_id: u32,
+        operation: &'static str,
+        message: String,
+    },
+
     #[error(
         "payload operation for PG {pg_id} has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]

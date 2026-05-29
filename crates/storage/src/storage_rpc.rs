@@ -88,6 +88,24 @@ impl StorageRpcErrorCode {
 }
 
 impl StorageRpcMessageKind {
+    pub(crate) fn operation_name(self) -> &'static str {
+        match self {
+            Self::Health => "health",
+            Self::MetadataCommand => "metadata command",
+            Self::ShardWrite => "shard write",
+            Self::ShardRead => "shard read",
+            Self::ShardReadRange => "shard read range",
+            Self::ShardDelete => "shard delete",
+            Self::ReadHandlesAcquire => "read handles acquire",
+            Self::ReadHandlesRelease => "read handles release",
+            Self::ClaimHeartbeat => "claim heartbeat",
+            Self::ClaimRelease => "claim release",
+            Self::ProofRelease => "proof release",
+            Self::ShardAckRecord => "shard ack record",
+            Self::ShardAckValidate => "shard ack validate",
+        }
+    }
+
     fn from_u16(value: u16) -> Result<Self, StorageRpcFrameError> {
         match value {
             1 => Ok(Self::Health),
