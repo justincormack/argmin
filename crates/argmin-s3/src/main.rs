@@ -11,11 +11,14 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
-use storage::{CanonicalUserId, NodeId, StorageCluster};
+use storage::storage_node_server::{
+    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+};
+use storage::{CanonicalUserId, ClusterEpoch, EcShape, NodeId, PgState, StorageCluster};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use config::{ConfiguredCredential, ConfiguredCredentialProfile, ServerConfig};
+use config::{ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig};
 use server_http::http::HttpFrontend;
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -117,7 +120,6 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Build EC config
     let ec_config = match EcConfig::new(config.ec_k, config.ec_m) {
         Ok(c) => c,
         Err(e) => {
@@ -126,6 +128,91 @@ async fn main() {
         }
     };
 
+    if config.process_role == ProcessRole::StorageNode {
+        run_storage_node_process(&config, &ec_config);
+    }
+    if matches!(
+        config.process_role,
+        ProcessRole::Frontend | ProcessRole::Combined
+    ) {
+        eprintln!(
+            "ARGMIN_PROCESS_ROLE={} is parsed but remote frontend routing is not wired until Phase 10.4/10.5",
+            process_role_name(config.process_role)
+        );
+        std::process::exit(1);
+    }
+
+    run_legacy_local_frontend(config, host_id, ec_config).await;
+}
+
+fn run_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> ! {
+    let storage_config = build_storage_node_process_config(config, ec_config).unwrap_or_else(|e| {
+        eprintln!("storage-node configuration error: {e}");
+        std::process::exit(1);
+    });
+    let server = StorageNodeServer::bind(storage_config).unwrap_or_else(|e| {
+        eprintln!("failed to start storage-node server: {e}");
+        std::process::exit(1);
+    });
+    eprintln!(
+        "argmin-s3 storage-node {} listening on {}",
+        config
+            .storage_node_id
+            .expect("storage role must have node id"),
+        config
+            .storage_node_socket_path
+            .as_deref()
+            .expect("storage role must have socket path")
+    );
+    if let Err(error) = server.serve_forever() {
+        eprintln!("storage-node server failed: {error}");
+        std::process::exit(1);
+    }
+    unreachable!("storage-node serve loop should not return successfully")
+}
+
+fn build_storage_node_process_config(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<StorageNodeProcessConfig, String> {
+    let pg_ids: Vec<u32> = (0..config.pg_count).collect();
+    let node_id = NodeId::new(
+        config
+            .storage_node_id
+            .ok_or_else(|| "ARGMIN_STORAGE_NODE_ID is required for storage roles".to_string())?,
+    );
+    let node_data_dir = config
+        .storage_node_data_dir
+        .clone()
+        .unwrap_or_else(|| format!("{}/node-{:04}", config.data_dir, node_id.as_u32()));
+    let socket_path = config.storage_node_socket_path.clone().ok_or_else(|| {
+        "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string()
+    })?;
+    let acting_set: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let pg_routes = pg_ids
+        .iter()
+        .map(|&pg_id| StorageNodePgRoute {
+            pg_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Active,
+            acting_set: acting_set.clone(),
+        })
+        .collect();
+    Ok(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: ClusterEpoch::INITIAL,
+        data_dir: Path::new(&node_data_dir).to_path_buf(),
+        default_ec_shape: EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        },
+        pg_ids,
+        socket_path: Path::new(&socket_path).to_path_buf(),
+        pg_routes,
+    })
+}
+
+async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
     let sse_c_validator = config
@@ -247,5 +334,14 @@ async fn main() {
             )
             .await;
         }
+    }
+}
+
+fn process_role_name(role: ProcessRole) -> &'static str {
+    match role {
+        ProcessRole::LegacyLocal => "legacy-local",
+        ProcessRole::Frontend => "frontend",
+        ProcessRole::StorageNode => "storage-node",
+        ProcessRole::Combined => "combined",
     }
 }

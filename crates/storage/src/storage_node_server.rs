@@ -5,7 +5,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::error::StoreError;
 use crate::node::SharedStorageNode;
@@ -20,7 +21,7 @@ use crate::storage_rpc::{
     STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, PgState};
-use crate::{NodeId, ShardLocation};
+use crate::{EcShape, NodeId, ShardLocation};
 
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
 const LOCK_EX: i32 = 2;
@@ -35,6 +36,7 @@ pub struct StorageNodeProcessConfig {
     pub node_id: NodeId,
     pub cluster_epoch: ClusterEpoch,
     pub data_dir: PathBuf,
+    pub default_ec_shape: EcShape,
     pub pg_ids: Vec<u32>,
     pub socket_path: PathBuf,
     pub pg_routes: Vec<StorageNodePgRoute>,
@@ -158,7 +160,7 @@ pub struct StorageNodeServer {
     _data_dir_lock: StorageNodeDataDirLock,
     _node: SharedStorageNode,
     listener: UnixListener,
-    read_handles: Mutex<StorageNodeReadHandleState>,
+    read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
 }
 
 impl StorageNodeServer {
@@ -168,7 +170,11 @@ impl StorageNodeServer {
         validate_socket_directory(&config.socket_path)?;
         let data_dir_lock = StorageNodeDataDirLock::acquire(&config.data_dir)?;
         cleanup_stale_socket_path(&config.socket_path)?;
-        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids)?;
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )?;
         let listener = UnixListener::bind(&config.socket_path).map_err(|source| {
             StorageNodeServerError::Io {
                 context: "bind storage-node socket",
@@ -181,7 +187,7 @@ impl StorageNodeServer {
             _data_dir_lock: data_dir_lock,
             _node: node,
             listener,
-            read_handles: Mutex::new(StorageNodeReadHandleState::default()),
+            read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
         })
     }
 
@@ -194,9 +200,56 @@ impl StorageNodeServer {
                     path: self.config.socket_path.clone(),
                     source,
                 })?;
-        self.handle_session(&mut stream)
+        self.connection_handler().handle_session(&mut stream)
     }
 
+    pub fn serve_forever(&self) -> Result<(), StorageNodeServerError> {
+        loop {
+            self.accept_and_spawn()?;
+        }
+    }
+
+    fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
+        let (mut stream, _) =
+            self.listener
+                .accept()
+                .map_err(|source| StorageNodeServerError::Io {
+                    context: "accept storage-node connection",
+                    path: self.config.socket_path.clone(),
+                    source,
+                })?;
+        let handler = self.connection_handler();
+        thread::spawn(move || {
+            if let Err(error) = handler.handle_session(&mut stream) {
+                eprintln!("storage-node connection failed: {error}");
+            }
+        });
+        Ok(())
+    }
+
+    fn connection_handler(&self) -> StorageNodeConnectionHandler {
+        StorageNodeConnectionHandler {
+            config: self.config.clone(),
+            read_handles: Arc::clone(&self.read_handles),
+        }
+    }
+
+    #[cfg(test)]
+    fn read_handle_count(&self, location: ShardLocation) -> usize {
+        self.read_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count(location)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StorageNodeConnectionHandler {
+    config: StorageNodeProcessConfig,
+    read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
+}
+
+impl StorageNodeConnectionHandler {
     fn handle_session(&self, stream: &mut UnixStream) -> Result<(), StorageNodeServerError> {
         let mut session = StorageNodeSession::new(&self.read_handles);
         loop {
@@ -384,14 +437,6 @@ impl StorageNodeServer {
             code: StorageRpcErrorCode::UnsupportedOperation,
             message: format!("{kind:?} is not implemented by this storage-node server slice"),
         })
-    }
-
-    #[cfg(test)]
-    fn read_handle_count(&self, location: ShardLocation) -> usize {
-        self.read_handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .count(location)
     }
 }
 
@@ -781,6 +826,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use crate::storage_rpc::{
         decode_health_response, decode_read_handle_acquire_response,
@@ -796,6 +842,7 @@ mod tests {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
             pg_ids: vec![0],
             socket_path: tmp.path().join("sock").join("storage.sock"),
             pg_routes: vec![StorageNodePgRoute {
@@ -892,6 +939,25 @@ mod tests {
             .unwrap_err()
     }
 
+    fn wait_for_read_handle_count(
+        server: &StorageNodeServer,
+        location: ShardLocation,
+        expected: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let actual = server.read_handle_count(location);
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "read handle count for {location:?} stayed at {actual}, expected {expected}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn storage_node_server_answers_health_request() {
         let tmp = test_util::tempdir();
@@ -920,6 +986,51 @@ mod tests {
         let health = decode_health_response(&health_payload).unwrap();
         assert_eq!(health.node_id, NodeId::new(7));
         assert_eq!(health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+    }
+
+    #[test]
+    fn storage_node_server_accepts_second_client_while_first_session_is_held() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let accept_thread = thread::spawn(move || {
+            server_for_thread.accept_and_spawn().unwrap();
+            server_for_thread.accept_and_spawn().unwrap();
+        });
+        let location = test_location(1, 0, 7);
+
+        let mut held_client = UnixStream::connect(&socket_path).unwrap();
+        let acquire = send_frame(
+            &mut held_client,
+            7,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("held-read", location),
+        );
+        decode_storage_rpc_response_payload(&acquire.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(location), 1);
+
+        let mut health_client = UnixStream::connect(socket_path).unwrap();
+        let health = send_frame(
+            &mut health_client,
+            8,
+            StorageRpcMessageKind::Health,
+            Vec::new(),
+        );
+        let health_payload = decode_storage_rpc_response_payload(&health.payload)
+            .unwrap()
+            .unwrap();
+        let health = decode_health_response(&health_payload).unwrap();
+        assert_eq!(health.node_id, NodeId::new(7));
+
+        drop(health_client);
+        drop(held_client);
+        accept_thread.join().unwrap();
+        wait_for_read_handle_count(&server, location, 0);
     }
 
     #[test]

@@ -2,6 +2,24 @@ use ec::EcConfig;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessRole {
+    LegacyLocal,
+    Frontend,
+    StorageNode,
+    Combined,
+}
+
+impl ProcessRole {
+    pub(crate) fn has_storage_node(self) -> bool {
+        matches!(self, Self::StorageNode | Self::Combined)
+    }
+
+    fn has_frontend(self) -> bool {
+        matches!(self, Self::LegacyLocal | Self::Frontend | Self::Combined)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfiguredCredentialProfile {
     Standard,
     OwnerAccountAdmin,
@@ -21,12 +39,16 @@ pub(crate) struct ConfiguredCredential {
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerConfig {
+    pub(crate) process_role: ProcessRole,
     pub(crate) listen_addr: String,
     pub(crate) tls_cert_path: Option<String>,
     pub(crate) tls_key_path: Option<String>,
     pub(crate) data_dir: String,
     pub(crate) pg_count: u32,
     pub(crate) local_node_count: u32,
+    pub(crate) storage_node_id: Option<u32>,
+    pub(crate) storage_node_data_dir: Option<String>,
+    pub(crate) storage_node_socket_path: Option<String>,
     pub(crate) ec_k: u8,
     pub(crate) ec_m: u8,
     pub(crate) account_id: String,
@@ -83,26 +105,67 @@ impl ServerConfig {
     /// Build configuration from an arbitrary key-lookup function.
     /// Used by `from_env` (with `std::env::var`) and directly by tests.
     fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
-        let account_id =
-            get("ARGMIN_ACCOUNT_ID").ok_or_else(|| "ARGMIN_ACCOUNT_ID is required".to_string())?;
-        if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("ARGMIN_ACCOUNT_ID must be a 12-digit AWS account ID".to_string());
+        let process_role = match get("ARGMIN_PROCESS_ROLE") {
+            Some(value) => parse_process_role(&value)?,
+            None => ProcessRole::LegacyLocal,
+        };
+        if matches!(process_role, ProcessRole::Frontend | ProcessRole::Combined) {
+            return Err(format!(
+                "ARGMIN_PROCESS_ROLE={} is parsed but remote frontend routing is not wired until Phase 10.4/10.5",
+                process_role_name(process_role)
+            ));
         }
-        let access_key_id = get("ARGMIN_ACCESS_KEY_ID")
-            .ok_or_else(|| "ARGMIN_ACCESS_KEY_ID is required".to_string())?;
-        let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
-            .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
-        let uat_credentials = read_uat_credentials(&get, &account_id)?;
-        reject_duplicate_access_keys(&access_key_id, &uat_credentials)?;
+        let (
+            account_id,
+            access_key_id,
+            secret_access_key,
+            uat_credentials,
+            sse_s3_wrapping_key_b64,
+        ) = if process_role.has_frontend() {
+            let account_id = get("ARGMIN_ACCOUNT_ID")
+                .ok_or_else(|| "ARGMIN_ACCOUNT_ID is required".to_string())?;
+            if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("ARGMIN_ACCOUNT_ID must be a 12-digit AWS account ID".to_string());
+            }
+            let access_key_id = get("ARGMIN_ACCESS_KEY_ID")
+                .ok_or_else(|| "ARGMIN_ACCESS_KEY_ID is required".to_string())?;
+            let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
+                .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
+            let uat_credentials = read_uat_credentials(&get, &account_id)?;
+            reject_duplicate_access_keys(&access_key_id, &uat_credentials)?;
+            let sse_s3_wrapping_key_b64 = get("ARGMIN_SSE_S3_WRAPPING_KEY")
+                .ok_or_else(|| "ARGMIN_SSE_S3_WRAPPING_KEY is required".to_string())?;
+            (
+                account_id,
+                access_key_id,
+                secret_access_key,
+                uat_credentials,
+                sse_s3_wrapping_key_b64,
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+                String::new(),
+            )
+        };
         let host_id = get("ARGMIN_HOST_ID");
         let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
-        let sse_s3_wrapping_key_b64 = get("ARGMIN_SSE_S3_WRAPPING_KEY")
-            .ok_or_else(|| "ARGMIN_SSE_S3_WRAPPING_KEY is required".to_string())?;
-
         let listen_addr = get("ARGMIN_LISTEN_ADDR").unwrap_or_else(|| "127.0.0.1:9000".to_string());
         let tls_cert_path = get("ARGMIN_TLS_CERT_PATH");
         let tls_key_path = get("ARGMIN_TLS_KEY_PATH");
         let data_dir = get("ARGMIN_DATA_DIR").unwrap_or_else(|| "./data".to_string());
+        let storage_node_data_dir = get("ARGMIN_STORAGE_NODE_DATA_DIR");
+        let storage_node_socket_path = get("ARGMIN_STORAGE_NODE_SOCKET_PATH");
+        let storage_node_id = get("ARGMIN_STORAGE_NODE_ID")
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|e| format!("invalid ARGMIN_STORAGE_NODE_ID: {e}"))
+            })
+            .transpose()?;
         let pg_count: u32 = get("ARGMIN_PG_COUNT")
             .unwrap_or_else(|| "16".to_string())
             .parse()
@@ -155,6 +218,21 @@ impl ServerConfig {
         if local_node_count == 0 {
             return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
         }
+        if process_role.has_storage_node() {
+            let storage_node_id = storage_node_id.ok_or_else(|| {
+                "ARGMIN_STORAGE_NODE_ID is required for storage roles".to_string()
+            })?;
+            if storage_node_id >= local_node_count {
+                return Err(
+                    "ARGMIN_STORAGE_NODE_ID must be less than ARGMIN_LOCAL_NODE_COUNT".to_string(),
+                );
+            }
+            if storage_node_socket_path.is_none() {
+                return Err(
+                    "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string(),
+                );
+            }
+        }
         let local_node_count_usize = usize::try_from(local_node_count)
             .map_err(|_| "ARGMIN_LOCAL_NODE_COUNT is too large for this platform".to_string())?;
         if local_node_count_usize < ec_config.total_shards() {
@@ -198,12 +276,16 @@ impl ServerConfig {
         }
 
         Ok(Self {
+            process_role,
             listen_addr,
             tls_cert_path,
             tls_key_path,
             data_dir,
             pg_count,
             local_node_count,
+            storage_node_id,
+            storage_node_data_dir,
+            storage_node_socket_path,
             ec_k,
             ec_m,
             account_id,
@@ -229,6 +311,28 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool, String> {
         "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes" | "on" | "ON" | "On" => Ok(true),
         "0" | "false" | "FALSE" | "False" | "no" | "NO" | "No" | "off" | "OFF" | "Off" => Ok(false),
         _ => Err(format!("{name} must be a boolean value")),
+    }
+}
+
+fn parse_process_role(value: &str) -> Result<ProcessRole, String> {
+    match value.trim() {
+        "frontend" => Ok(ProcessRole::Frontend),
+        "storage-node" => Ok(ProcessRole::StorageNode),
+        "combined" => Ok(ProcessRole::Combined),
+        "legacy-local" => Ok(ProcessRole::LegacyLocal),
+        _ => Err(
+            "ARGMIN_PROCESS_ROLE must be one of frontend, storage-node, combined, legacy-local"
+                .to_string(),
+        ),
+    }
+}
+
+fn process_role_name(role: ProcessRole) -> &'static str {
+    match role {
+        ProcessRole::LegacyLocal => "legacy-local",
+        ProcessRole::Frontend => "frontend",
+        ProcessRole::StorageNode => "storage-node",
+        ProcessRole::Combined => "combined",
     }
 }
 
@@ -428,12 +532,16 @@ mod tests {
     fn defaults_applied() {
         let m = required_only();
         let cfg = ServerConfig::from_lookup(lookup(&m)).unwrap();
+        assert_eq!(cfg.process_role, ProcessRole::LegacyLocal);
         assert_eq!(cfg.listen_addr, "127.0.0.1:9000");
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.data_dir, "./data");
         assert_eq!(cfg.pg_count, 16);
         assert_eq!(cfg.local_node_count, 6);
+        assert_eq!(cfg.storage_node_id, None);
+        assert_eq!(cfg.storage_node_data_dir, None);
+        assert_eq!(cfg.storage_node_socket_path, None);
         assert_eq!(cfg.ec_k, 4);
         assert_eq!(cfg.ec_m, 2);
         assert_eq!(cfg.account_id, "111122223333");
@@ -499,6 +607,99 @@ mod tests {
         assert_eq!(cfg.host_id.as_deref(), Some("custom-host-id"));
         assert_eq!(cfg.sse_c_validator_key_b64, Some("Zm9v".to_string()));
         assert_eq!(cfg.sse_s3_wrapping_key_b64, "YmFy");
+    }
+
+    #[test]
+    fn process_role_storage_node_requires_storage_identity_and_socket() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_PROCESS_ROLE",
+            "storage-node",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_ID"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "storage-node"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_SOCKET_PATH"));
+    }
+
+    #[test]
+    fn process_role_storage_node_parses_storage_config() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "storage-node"),
+            ("ARGMIN_STORAGE_NODE_ID", "2"),
+            ("ARGMIN_STORAGE_NODE_DATA_DIR", "/tmp/argmin-node-2"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin/node-2.sock"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::StorageNode);
+        assert_eq!(cfg.storage_node_id, Some(2));
+        assert_eq!(
+            cfg.storage_node_data_dir.as_deref(),
+            Some("/tmp/argmin-node-2")
+        );
+        assert_eq!(
+            cfg.storage_node_socket_path.as_deref(),
+            Some("/tmp/argmin/node-2.sock")
+        );
+    }
+
+    #[test]
+    fn process_role_storage_node_does_not_require_frontend_secrets() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "storage-node"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin/node-0.sock"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::StorageNode);
+        assert_eq!(cfg.account_id, "");
+        assert_eq!(cfg.access_key_id, "");
+        assert_eq!(cfg.secret_access_key, "");
+        assert!(cfg.uat_credentials.is_empty());
+        assert_eq!(cfg.sse_s3_wrapping_key_b64, "");
+    }
+
+    #[test]
+    fn process_role_frontend_fails_before_frontend_config_validation() {
+        let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "frontend")]))
+            .unwrap_err();
+
+        assert!(err.contains("remote frontend routing is not wired"));
+    }
+
+    #[test]
+    fn process_role_combined_fails_before_storage_config_validation() {
+        let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "combined")]))
+            .unwrap_err();
+
+        assert!(err.contains("remote frontend routing is not wired"));
+    }
+
+    #[test]
+    fn process_role_rejects_unknown_value() {
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PROCESS_ROLE", "other")]))
+            .unwrap_err();
+
+        assert!(err.contains("ARGMIN_PROCESS_ROLE"));
+    }
+
+    #[test]
+    fn storage_node_id_must_be_in_configured_local_node_set() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "storage-node"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "6"),
+            ("ARGMIN_STORAGE_NODE_ID", "6"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin/node-6.sock"),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("ARGMIN_STORAGE_NODE_ID"));
     }
 
     #[test]
