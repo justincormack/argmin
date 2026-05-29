@@ -14,8 +14,8 @@ use crate::metadata_command::{
 };
 use crate::node::BucketLockGuard;
 use crate::node_client::{
-    LocalStorageNodeClient, PlacedShardNodeClient, ShardAckNodeClient, StorageNodeClient,
-    UnixStorageNodeClient,
+    LocalStorageNodeClient, PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    StorageNodeClient, UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -79,6 +79,7 @@ pub struct LocalNodeStore {
     storage_client: Arc<dyn StorageNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
     shard_ack_client: Arc<dyn ShardAckNodeClient>,
+    shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient>,
 }
 
 impl LocalNodeStore {
@@ -89,7 +90,8 @@ impl LocalNodeStore {
         ));
         let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
         let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
-        let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client;
+        let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
+        let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = local_client;
         Self {
             node_id,
             data_dir,
@@ -97,6 +99,7 @@ impl LocalNodeStore {
             storage_client,
             shard_client,
             shard_ack_client,
+            shard_read_handle_client,
         }
     }
 
@@ -123,6 +126,10 @@ impl LocalNodeStore {
     pub(crate) fn shard_ack_client(&self) -> &Arc<dyn ShardAckNodeClient> {
         &self.shard_ack_client
     }
+
+    pub(crate) fn shard_read_handle_client(&self) -> &Arc<dyn ShardReadHandleNodeClient> {
+        &self.shard_read_handle_client
+    }
 }
 
 impl std::fmt::Debug for LocalNodeStore {
@@ -137,8 +144,10 @@ impl std::fmt::Debug for LocalNodeStore {
 struct LocalShardNodeClient<'a> {
     node_id: NodeId,
     client: &'a dyn PlacedShardNodeClient,
+    read_handle_client: &'a dyn ShardReadHandleNodeClient,
     cluster_epoch: ClusterEpoch,
     data_pg_id: DataPgId,
+    location: ShardLocation,
 }
 
 impl LocalShardNodeClient<'_> {
@@ -149,10 +158,15 @@ impl LocalShardNodeClient<'_> {
     }
 
     fn read_shard(&self, key: &ShardKey, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
-        let data = self
+        let mut read_handle = self.acquire_read_handle(key)?;
+        let data_result = self
             .client
             .read_placed_shard(self.data_pg_id, key, expected)
-            .map_err(|source| self.store_error(source))?;
+            .map_err(|source| self.store_error(source));
+        if let Err(error) = read_handle.release() {
+            return Err(self.store_error(error));
+        }
+        let data = data_result?;
         self.verify_read_ack(expected, &data)?;
         Ok(data)
     }
@@ -169,9 +183,15 @@ impl LocalShardNodeClient<'_> {
                 source: std::io::Error::from(std::io::ErrorKind::InvalidData),
             }));
         }
-        self.client
+        let mut read_handle = self.acquire_read_handle(key)?;
+        let read_result = self
+            .client
             .read_placed_shard_into(self.data_pg_id, key, expected, dst)
-            .map_err(|source| self.store_error(source))?;
+            .map_err(|source| self.store_error(source));
+        if let Err(error) = read_handle.release() {
+            return Err(self.store_error(error));
+        }
+        read_result?;
         self.verify_read_ack(expected, dst)
     }
 
@@ -179,6 +199,27 @@ impl LocalShardNodeClient<'_> {
         self.client
             .delete_placed_shard(self.data_pg_id, key)
             .map_err(|source| self.store_error(source))
+    }
+
+    fn acquire_read_handle(
+        &self,
+        key: &ShardKey,
+    ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, ShardIoError> {
+        self.read_handle_client
+            .acquire_read_handles(&self.read_operation_id(key), vec![self.location])
+            .map_err(|source| self.store_error(source))
+    }
+
+    fn read_operation_id(&self, key: &ShardKey) -> String {
+        let hex_key = key.hex_bytes();
+        let hex_key = std::str::from_utf8(&hex_key).expect("shard key hex is valid ASCII");
+        format!(
+            "read:{}:{}:{}:{}",
+            self.cluster_epoch.get(),
+            self.data_pg_id.get(),
+            self.node_id.as_u32(),
+            hex_key
+        )
     }
 
     fn store_error(&self, source: StoreError) -> ShardIoError {
@@ -576,9 +617,11 @@ impl LocalClusterMap {
                 config.socket_path,
             ));
             let shard_client: Arc<dyn PlacedShardNodeClient> = client.clone();
-            let shard_ack_client: Arc<dyn ShardAckNodeClient> = client;
+            let shard_ack_client: Arc<dyn ShardAckNodeClient> = client.clone();
+            let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = client;
             node.shard_client = shard_client;
             node.shard_ack_client = shard_ack_client;
+            node.shard_read_handle_client = shard_read_handle_client;
         }
         Ok(())
     }
@@ -1370,8 +1413,10 @@ impl LocalClusterMap {
         Ok(LocalShardNodeClient {
             node_id: node.shard_client().node_id(),
             client: node.shard_client().as_ref(),
+            read_handle_client: node.shard_read_handle_client().as_ref(),
             cluster_epoch: self.epoch,
             data_pg_id: location.data_pg_id(),
+            location,
         })
     }
 
@@ -5655,12 +5700,13 @@ mod tests {
                 acting_set: node_ids.to_vec(),
             }],
         };
-        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
-        let server_thread = thread::spawn(move || {
-            for _ in 0..5 {
-                server.accept_one().unwrap();
-            }
-        });
+        let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..10)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
         map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
             NodeId::new(1),
             socket_path,
@@ -5695,9 +5741,32 @@ mod tests {
                 .unwrap(),
             payload
         );
+        assert_eq!(server.read_handle_count(location), 0);
+        let mut read_into = vec![0; payload.len()];
+        map.read_payload_shard_into(ClusterEpoch::INITIAL, location, &key, ack, &mut read_into)
+            .unwrap();
+        assert_eq!(read_into, payload);
+        assert_eq!(server.read_handle_count(location), 0);
+        let missing_key = ShardKey::new(&[0x62; 16], 100, 0);
+        let err = map
+            .read_payload_shard(ClusterEpoch::INITIAL, location, &missing_key, ack)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShardIoError::Store {
+                source: StoreError::StorageRpc {
+                    operation: "shard read",
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(server.read_handle_count(location), 0);
         map.delete_payload_shard(ClusterEpoch::INITIAL, location, &key)
             .unwrap();
-        server_thread.join().unwrap();
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
 
         let remote = SharedStorageNode::open_with_default_ec_shape(
             &server_config.data_dir,
@@ -5798,16 +5867,15 @@ mod tests {
         let mut server_threads = Vec::new();
         for config in server_configs.iter().cloned() {
             let expected_connections = if config.node_id == NodeId::new(0) {
-                6
+                7
             } else {
-                2
+                3
             };
-            let server = StorageNodeServer::bind(config).unwrap();
-            server_threads.push(thread::spawn(move || {
-                for _ in 0..expected_connections {
-                    server.accept_one().unwrap();
-                }
-            }));
+            let server = Arc::new(StorageNodeServer::bind(config).unwrap());
+            for _ in 0..expected_connections {
+                let server = Arc::clone(&server);
+                server_threads.push(thread::spawn(move || server.accept_one().unwrap()));
+            }
         }
         map.install_unix_shard_clients(shard_client_configs)
             .unwrap();

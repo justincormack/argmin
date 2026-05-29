@@ -715,6 +715,18 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError>;
 }
 
+pub(crate) trait ShardReadHandleLease: Send {
+    fn release(&mut self) -> Result<(), StoreError>;
+}
+
+pub(crate) trait ShardReadHandleNodeClient: Send + Sync {
+    fn acquire_read_handles(
+        &self,
+        read_operation_id: &str,
+        locations: Vec<crate::cluster::ShardLocation>,
+    ) -> Result<Box<dyn ShardReadHandleLease>, StoreError>;
+}
+
 pub(crate) trait ShardAckNodeClient: Send + Sync {
     fn register_written_shard_acks(
         &self,
@@ -1609,6 +1621,14 @@ pub(crate) struct UnixStorageNodeReadHandleSession {
     next_request_id: u64,
 }
 
+struct UnixStorageNodeReadHandleLease {
+    session: UnixStorageNodeReadHandleSession,
+    read_operation_id: String,
+    released: bool,
+}
+
+struct LocalStorageNodeReadHandleLease;
+
 #[allow(dead_code)]
 impl UnixStorageNodeClient {
     pub(crate) fn new(
@@ -2048,6 +2068,34 @@ impl LocalStorageNodeClient {
     }
 }
 
+impl ShardReadHandleNodeClient for UnixStorageNodeClient {
+    fn acquire_read_handles(
+        &self,
+        read_operation_id: &str,
+        locations: Vec<crate::cluster::ShardLocation>,
+    ) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
+        let mut session = self.open_read_handle_session()?;
+        session.acquire_read_handles(read_operation_id, locations)?;
+        Ok(Box::new(UnixStorageNodeReadHandleLease {
+            session,
+            read_operation_id: read_operation_id.to_string(),
+            released: false,
+        }))
+    }
+}
+
+impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
+    fn release(&mut self) -> Result<(), StoreError> {
+        if self.released {
+            return Ok(());
+        }
+        self.session
+            .release_read_handles(self.read_operation_id.as_str())?;
+        self.released = true;
+        Ok(())
+    }
+}
+
 impl PlacedShardNodeClient for LocalStorageNodeClient {
     fn node_id(&self) -> NodeId {
         self.node_id
@@ -2085,6 +2133,22 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
 
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
         self.storage_node.delete_shard_file(data_pg_id.get(), key)
+    }
+}
+
+impl ShardReadHandleNodeClient for LocalStorageNodeClient {
+    fn acquire_read_handles(
+        &self,
+        _read_operation_id: &str,
+        _locations: Vec<crate::cluster::ShardLocation>,
+    ) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
+        Ok(Box::new(LocalStorageNodeReadHandleLease))
+    }
+}
+
+impl ShardReadHandleLease for LocalStorageNodeReadHandleLease {
+    fn release(&mut self) -> Result<(), StoreError> {
+        Ok(())
     }
 }
 
