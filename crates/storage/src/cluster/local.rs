@@ -13,7 +13,9 @@ use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
 use crate::node::BucketLockGuard;
-use crate::node_client::{LocalStorageNodeClient, StorageNodeClient};
+use crate::node_client::{
+    LocalStorageNodeClient, PlacedShardNodeClient, ShardAckNodeClient, StorageNodeClient,
+};
 use crate::pg_topology::PgTopology;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
@@ -51,19 +53,26 @@ pub struct LocalNodeStore {
     data_dir: PathBuf,
     storage_node: Arc<SharedStorageNode>,
     storage_client: Arc<dyn StorageNodeClient>,
+    shard_client: Arc<dyn PlacedShardNodeClient>,
+    shard_ack_client: Arc<dyn ShardAckNodeClient>,
 }
 
 impl LocalNodeStore {
     fn new(node_id: NodeId, data_dir: PathBuf, storage_node: Arc<SharedStorageNode>) -> Self {
-        let storage_client: Arc<dyn StorageNodeClient> = Arc::new(LocalStorageNodeClient::new(
+        let local_client = Arc::new(LocalStorageNodeClient::new(
             node_id,
             Arc::clone(&storage_node),
         ));
+        let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
+        let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
+        let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client;
         Self {
             node_id,
             data_dir,
             storage_node,
             storage_client,
+            shard_client,
+            shard_ack_client,
         }
     }
 
@@ -82,6 +91,14 @@ impl LocalNodeStore {
     pub(crate) fn storage_client(&self) -> &Arc<dyn StorageNodeClient> {
         &self.storage_client
     }
+
+    pub(crate) fn shard_client(&self) -> &Arc<dyn PlacedShardNodeClient> {
+        &self.shard_client
+    }
+
+    pub(crate) fn shard_ack_client(&self) -> &Arc<dyn ShardAckNodeClient> {
+        &self.shard_ack_client
+    }
 }
 
 impl std::fmt::Debug for LocalNodeStore {
@@ -95,7 +112,7 @@ impl std::fmt::Debug for LocalNodeStore {
 
 struct LocalShardNodeClient<'a> {
     node_id: NodeId,
-    client: &'a dyn StorageNodeClient,
+    client: &'a dyn PlacedShardNodeClient,
     cluster_epoch: ClusterEpoch,
     data_pg_id: DataPgId,
 }
@@ -499,6 +516,32 @@ impl LocalClusterMap {
 
     pub fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_shard_client_for_tests(
+        &mut self,
+        node_id: NodeId,
+        shard_client: Arc<dyn PlacedShardNodeClient>,
+    ) {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .expect("test shard client node must exist");
+        node.shard_client = shard_client;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_shard_ack_client_for_tests(
+        &mut self,
+        node_id: NodeId,
+        shard_ack_client: Arc<dyn ShardAckNodeClient>,
+    ) {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .expect("test shard ack client node must exist");
+        node.shard_ack_client = shard_ack_client;
     }
 
     pub fn pg_route(&self, pg_id: PgId) -> Option<&LocalPgRoute> {
@@ -1260,8 +1303,8 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             })?;
         Ok(LocalShardNodeClient {
-            node_id: node.storage_client().node_id(),
-            client: node.storage_client().as_ref(),
+            node_id: node.shard_client().node_id(),
+            client: node.shard_client().as_ref(),
             cluster_epoch: self.epoch,
             data_pg_id: location.data_pg_id(),
         })
@@ -5323,6 +5366,190 @@ mod tests {
         assert_ne!(
             map.node(NodeId::new(0)).unwrap().data_dir(),
             map.node(NodeId::new(1)).unwrap().data_dir()
+        );
+    }
+
+    struct RecordingPlacedShardClient {
+        node_id: NodeId,
+        writes: Mutex<Vec<(DataPgId, ShardKey, Vec<u8>)>>,
+    }
+
+    impl RecordingPlacedShardClient {
+        fn new(node_id: NodeId) -> Self {
+            Self {
+                node_id,
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PlacedShardNodeClient for RecordingPlacedShardClient {
+        fn node_id(&self) -> NodeId {
+            self.node_id
+        }
+
+        fn write_placed_shard(
+            &self,
+            data_pg_id: DataPgId,
+            key: &ShardKey,
+            data: &[u8],
+        ) -> Result<WriteAck, StoreError> {
+            self.writes.lock().unwrap_or_else(|e| e.into_inner()).push((
+                data_pg_id,
+                key.clone(),
+                data.to_vec(),
+            ));
+            Ok(WriteAck {
+                crc64: checksum::crc64::checksum(data),
+                stored_size: data.len() as u64,
+            })
+        }
+
+        fn read_placed_shard(
+            &self,
+            _data_pg_id: DataPgId,
+            _key: &ShardKey,
+        ) -> Result<Vec<u8>, StoreError> {
+            Err(StoreError::Io {
+                context: "recording shard client read",
+                source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+            })
+        }
+
+        fn read_placed_shard_into(
+            &self,
+            data_pg_id: DataPgId,
+            key: &ShardKey,
+            dst: &mut [u8],
+        ) -> Result<(), StoreError> {
+            let data = self.read_placed_shard(data_pg_id, key)?;
+            dst.copy_from_slice(&data);
+            Ok(())
+        }
+
+        fn delete_placed_shard(
+            &self,
+            _data_pg_id: DataPgId,
+            _key: &ShardKey,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn payload_shard_writes_route_through_pluggable_shard_client() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let recording_client = Arc::new(RecordingPlacedShardClient::new(NodeId::new(1)));
+        let recording_client_for_assert = Arc::clone(&recording_client);
+        map.replace_shard_client_for_tests(NodeId::new(1), recording_client);
+
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let key = ShardKey::new(&[0x41; 16], 77, 0);
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key.shard_index(),
+            NodeId::new(1),
+        );
+        let payload = b"remote-shard-client-plumbing";
+        let ack = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, payload)
+            .unwrap();
+
+        assert_eq!(ack.stored_size, payload.len() as u64);
+        assert_eq!(ack.crc64, checksum::crc64::checksum(payload));
+        let writes = recording_client_for_assert
+            .writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], (data_pg_id, key, payload.to_vec()));
+    }
+
+    struct RecordingShardAckClient {
+        records: Mutex<Vec<(PgId, ShardKey, WriteAck)>>,
+        validates: Mutex<Vec<(PgId, ShardKey, WriteAck)>>,
+    }
+
+    impl RecordingShardAckClient {
+        fn new() -> Self {
+            Self {
+                records: Mutex::new(Vec::new()),
+                validates: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ShardAckNodeClient for RecordingShardAckClient {
+        fn register_written_shard_acks(
+            &self,
+            pg_id: PgId,
+            shard_batch: &[(&ShardKey, WriteAck)],
+        ) -> Result<(), StoreError> {
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            for (key, ack) in shard_batch {
+                records.push((pg_id, (*key).clone(), *ack));
+            }
+            Ok(())
+        }
+
+        fn validate_written_shard_ack(
+            &self,
+            pg_id: PgId,
+            key: &ShardKey,
+            ack: WriteAck,
+        ) -> Result<(), StoreError> {
+            self.validates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((pg_id, key.clone(), ack));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let recording_client = Arc::new(RecordingShardAckClient::new());
+        let recording_client_for_assert = Arc::clone(&recording_client);
+        map.replace_shard_ack_client_for_tests(NodeId::new(2), recording_client);
+        set_route_primary(&mut map, 1, NodeId::new(2));
+
+        let pg_id = PgId::new(1);
+        let key = ShardKey::new(&[0x51; 16], 88, 0);
+        let ack = WriteAck {
+            crc64: 1234,
+            stored_size: 5678,
+        };
+        let node = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        node.shard_ack_client()
+            .register_written_shard_acks(pg_id, &[(&key, ack)])
+            .unwrap();
+        node.shard_ack_client()
+            .validate_written_shard_ack(pg_id, &key, ack)
+            .unwrap();
+
+        assert_eq!(
+            *recording_client_for_assert
+                .records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            vec![(pg_id, key.clone(), ack)]
+        );
+        assert_eq!(
+            *recording_client_for_assert
+                .validates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            vec![(pg_id, key, ack)]
         );
     }
 

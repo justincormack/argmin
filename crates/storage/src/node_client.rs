@@ -683,7 +683,7 @@ pub(crate) enum InsertDeleteMarkerStalePayload {
     SnapshotCurrentNullLive { created_at: u64 },
 }
 
-pub(crate) trait StorageNodeClient: Send + Sync {
+pub(crate) trait PlacedShardNodeClient: Send + Sync {
     fn node_id(&self) -> NodeId;
 
     fn write_placed_shard(
@@ -707,7 +707,24 @@ pub(crate) trait StorageNodeClient: Send + Sync {
     ) -> Result<(), StoreError>;
 
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError>;
+}
 
+pub(crate) trait ShardAckNodeClient: Send + Sync {
+    fn register_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError>;
+
+    fn validate_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+        ack: WriteAck,
+    ) -> Result<(), StoreError>;
+}
+
+pub(crate) trait StorageNodeClient: PlacedShardNodeClient + ShardAckNodeClient {
     fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,
@@ -760,19 +777,6 @@ pub(crate) trait StorageNodeClient: Send + Sync {
         pg_id: PgId,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError>;
-
-    fn register_written_shard_acks(
-        &self,
-        pg_id: PgId,
-        shard_batch: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), StoreError>;
-
-    fn validate_written_shard_ack(
-        &self,
-        pg_id: PgId,
-        key: &ShardKey,
-        ack: WriteAck,
-    ) -> Result<(), StoreError>;
 
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
 
@@ -1767,6 +1771,76 @@ impl UnixStorageNodeClient {
     }
 }
 
+impl PlacedShardNodeClient for UnixStorageNodeClient {
+    fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    fn write_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::write_placed_shard(self, data_pg_id, key, data)
+    }
+
+    fn read_placed_shard(
+        &self,
+        _data_pg_id: DataPgId,
+        _key: &ShardKey,
+    ) -> Result<Vec<u8>, StoreError> {
+        Err(self.rpc_payload_error(
+            "shard read",
+            "remote shard read RPC is not implemented yet".to_string(),
+        ))
+    }
+
+    fn read_placed_shard_into(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        let data = self.read_placed_shard(data_pg_id, key)?;
+        if data.len() != dst.len() {
+            return Err(self.rpc_payload_error(
+                "shard read range",
+                format!(
+                    "remote shard read returned {} bytes for {} byte buffer",
+                    data.len(),
+                    dst.len()
+                ),
+            ));
+        }
+        dst.copy_from_slice(&data);
+        Ok(())
+    }
+
+    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_placed_shard(self, data_pg_id, key)
+    }
+}
+
+impl ShardAckNodeClient for UnixStorageNodeClient {
+    fn register_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::register_written_shard_acks(self, pg_id, shard_batch)
+    }
+
+    fn validate_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+        ack: WriteAck,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::validate_written_shard_acks(self, pg_id, &[(key, ack)])
+    }
+}
+
 impl LocalStorageNodeClient {
     pub(crate) fn new(node_id: NodeId, storage_node: Arc<SharedStorageNode>) -> Self {
         Self {
@@ -1821,7 +1895,7 @@ impl LocalStorageNodeClient {
     }
 }
 
-impl StorageNodeClient for LocalStorageNodeClient {
+impl PlacedShardNodeClient for LocalStorageNodeClient {
     fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -1857,7 +1931,30 @@ impl StorageNodeClient for LocalStorageNodeClient {
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
         self.storage_node.delete_shard_file(data_pg_id.get(), key)
     }
+}
 
+impl ShardAckNodeClient for LocalStorageNodeClient {
+    fn register_written_shard_acks(
+        &self,
+        pg_id: PgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.register_written_shards_batch_exact(shard_batch)
+    }
+
+    fn validate_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+        ack: WriteAck,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.validate_written_shard_ack(key, ack)
+    }
+}
+
+impl StorageNodeClient for LocalStorageNodeClient {
     fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,
@@ -1939,25 +2036,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(pg.list_multipart_uploads(req)?)
-    }
-
-    fn register_written_shard_acks(
-        &self,
-        pg_id: PgId,
-        shard_batch: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.register_written_shards_batch_exact(shard_batch)
-    }
-
-    fn validate_written_shard_ack(
-        &self,
-        pg_id: PgId,
-        key: &ShardKey,
-        ack: WriteAck,
-    ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.validate_written_shard_ack(key, ack)
     }
 
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {

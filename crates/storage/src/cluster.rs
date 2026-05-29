@@ -25,7 +25,7 @@ use crate::node::BucketLockGuard;
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
-    CreateStreamUploadPrecondition, StorageNodeClient,
+    CreateStreamUploadPrecondition, ShardAckNodeClient, StorageNodeClient,
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
@@ -1635,6 +1635,16 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         Ok(node.storage_client())
+    }
+
+    fn metadata_pg_primary_shard_ack_client(
+        &self,
+        pg_id: PgId,
+    ) -> Result<&Arc<dyn ShardAckNodeClient>, StoreError> {
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        Ok(node.shard_ack_client())
     }
 
     fn bucket_metadata_pg_id(&self, bucket: &BucketName) -> u32 {
@@ -4035,8 +4045,8 @@ impl StorageCluster {
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(data_pg_id);
-        let storage_client = self.metadata_pg_primary_client(pg_id)?;
-        storage_client.register_written_shard_acks(pg_id, shard_batch)?;
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
+        shard_ack_client.register_written_shard_acks(pg_id, shard_batch)?;
         Ok(())
     }
 
@@ -4078,9 +4088,9 @@ impl StorageCluster {
         }
 
         let pg_id = PgId::new(data_pg_id);
-        let storage_client = self.metadata_pg_primary_client(pg_id)?;
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
         for (key, ack) in shard_batch {
-            storage_client.validate_written_shard_ack(pg_id, key, *ack)?;
+            shard_ack_client.validate_written_shard_ack(pg_id, key, *ack)?;
         }
 
         let data_pg = DataPgId::new(PgId::new(data_pg_id));

@@ -427,8 +427,12 @@ migrated_payload_ack_bypasses=$(
         if ($0 ~ /\.(register_written_shards_batch|stat_shard|delete_shard_record)\(/) {
             print FILENAME ":" FNR ":" $0
         }
+        if ($0 ~ /\.register_written_shard_acks\(/ \
+            && $0 !~ /shard_ack_client\.register_written_shard_acks\(/) {
+            print FILENAME ":" FNR ":" $0
+        }
         if ($0 ~ /\.validate_written_shard_ack\(/ \
-            && $0 !~ /storage_client\.validate_written_shard_ack\(/) {
+            && $0 !~ /shard_ack_client\.validate_written_shard_ack\(/) {
             print FILENAME ":" FNR ":" $0
         }
     }
