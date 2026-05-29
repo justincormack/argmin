@@ -127,7 +127,7 @@ impl LocalShardNodeClient<'_> {
     fn read_shard(&self, key: &ShardKey, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
         let data = self
             .client
-            .read_placed_shard(self.data_pg_id, key)
+            .read_placed_shard(self.data_pg_id, key, expected)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, &data)?;
         Ok(data)
@@ -146,7 +146,7 @@ impl LocalShardNodeClient<'_> {
             }));
         }
         self.client
-            .read_placed_shard_into(self.data_pg_id, key, dst)
+            .read_placed_shard_into(self.data_pg_id, key, expected, dst)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, dst)
     }
@@ -5409,6 +5409,7 @@ mod tests {
             &self,
             _data_pg_id: DataPgId,
             _key: &ShardKey,
+            _expected_ack: WriteAck,
         ) -> Result<Vec<u8>, StoreError> {
             Err(StoreError::Io {
                 context: "recording shard client read",
@@ -5420,9 +5421,10 @@ mod tests {
             &self,
             data_pg_id: DataPgId,
             key: &ShardKey,
+            expected_ack: WriteAck,
             dst: &mut [u8],
         ) -> Result<(), StoreError> {
-            let data = self.read_placed_shard(data_pg_id, key)?;
+            let data = self.read_placed_shard(data_pg_id, key, expected_ack)?;
             dst.copy_from_slice(&data);
             Ok(())
         }

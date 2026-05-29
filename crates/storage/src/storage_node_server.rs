@@ -12,15 +12,16 @@ use crate::error::StoreError;
 use crate::node::SharedStorageNode;
 use crate::storage_rpc::{
     decode_read_handle_acquire_request, decode_read_handle_release_request,
-    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_write_request,
-    encode_health_response, encode_read_handle_acquire_response,
-    encode_read_handle_release_response, encode_shard_write_ack, encode_storage_rpc_error_response,
-    encode_storage_rpc_success_response, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
-    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
-    StorageRpcMessageKind, StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
+    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_request,
+    decode_shard_write_request, encode_health_response, encode_read_handle_acquire_response,
+    encode_read_handle_release_response, encode_shard_read_response, encode_shard_write_ack,
+    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    read_storage_rpc_request_frame_from, write_storage_rpc_frame_to, StorageRpcErrorCode,
+    StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse, StorageRpcMessageKind,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
     StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
-    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardWriteRequest,
-    StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
+    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, PgId, PgState, WriteAck};
 use crate::{EcShape, NodeId, ShardLocation};
@@ -292,7 +293,7 @@ impl StorageNodeConnectionHandler {
     ) -> Result<(), StorageNodeServerError> {
         let mut session = StorageNodeSession::new(&self.read_handles);
         loop {
-            let frame = match read_storage_rpc_frame_from(stream) {
+            let frame = match read_storage_rpc_request_frame_from(stream) {
                 Ok(frame) => frame,
                 Err(StorageRpcStreamError::Io(error))
                     if matches!(
@@ -353,6 +354,13 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardWrite => match decode_shard_write_request(&frame.payload) {
                 Ok(request) => self.shard_write_response(request),
+                Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: error.to_string(),
+                }),
+            },
+            StorageRpcMessageKind::ShardRead => match decode_shard_read_request(&frame.payload) {
+                Ok(request) => self.shard_read_response(request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: error.to_string(),
@@ -442,6 +450,26 @@ impl StorageNodeConnectionHandler {
         ) {
             Ok(ack) => {
                 let payload = encode_shard_write_ack(ack);
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn shard_read_response(
+        &self,
+        request: StorageRpcShardReadRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_shard_location(request.location) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self
+            .node
+            .read_shard_file(request.location.data_pg_id().get(), &request.shard_key)
+        {
+            Ok(payload) => {
+                let payload = encode_shard_read_response(&payload, request.expected_ack)?;
                 encode_storage_rpc_success_response(&payload)
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
@@ -1095,14 +1123,14 @@ mod tests {
 
     use crate::storage_rpc::{
         decode_health_response, decode_read_handle_acquire_response,
-        decode_read_handle_release_response, decode_shard_write_ack,
+        decode_read_handle_release_response, decode_shard_read_response, decode_shard_write_ack,
         decode_storage_rpc_response_payload, encode_read_handle_acquire_request,
         encode_read_handle_release_request, encode_shard_ack_batch_request,
-        encode_shard_delete_request, encode_shard_write_request, encode_storage_rpc_frame,
-        read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        encode_shard_delete_request, encode_shard_read_request, encode_shard_write_request,
+        encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
         StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-        StorageRpcShardWriteRequest,
+        StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     };
     use crate::traits::ShardStore;
     use crate::types::{DataPgId, PgId, ShardIndex, ShardKey};
@@ -1599,7 +1627,7 @@ mod tests {
 
         let mut client = UnixStream::connect(socket_path).unwrap();
         let frame_bytes =
-            encode_storage_rpc_frame(9, StorageRpcMessageKind::ShardRead, b"").unwrap();
+            encode_storage_rpc_frame(9, StorageRpcMessageKind::ShardReadRange, b"").unwrap();
         client.write_all(&frame_bytes).unwrap();
         let response = read_storage_rpc_frame_from(&mut client).unwrap();
         drop(client);
@@ -1609,6 +1637,53 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::UnsupportedOperation);
+    }
+
+    #[test]
+    fn storage_node_server_reads_shard_with_expected_ack() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let location = test_location(1, 0, 7);
+        let shard_key = test_shard_key(0);
+        let payload = b"read payload".to_vec();
+        let expected_ack = WriteAck {
+            stored_size: payload.len() as u64,
+            crc64: checksum::crc64::checksum(&payload),
+        };
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        node.write_shard_file(location.data_pg_id().get(), &shard_key, &payload)
+            .unwrap();
+        drop(node);
+        let request = StorageRpcShardReadRequest {
+            location,
+            shard_key,
+            expected_ack,
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardRead,
+            encode_shard_read_request(&request).unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let response_payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let read_payload = decode_shard_read_response(&response_payload, expected_ack).unwrap();
+        assert_eq!(read_payload, payload);
     }
 
     #[test]

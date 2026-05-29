@@ -25,11 +25,12 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
-    decode_shard_write_ack, decode_storage_rpc_response_payload, encode_shard_ack_batch_request,
-    encode_shard_delete_request, encode_shard_write_request, read_storage_rpc_frame_from,
-    write_storage_rpc_frame_to, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
+    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_request,
+    encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-    StorageRpcShardWriteRequest,
+    StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -697,12 +698,14 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
+        expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError>;
 
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
+        expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError>;
 
@@ -1640,6 +1643,26 @@ impl UnixStorageNodeClient {
         })
     }
 
+    pub(crate) fn read_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        let request = StorageRpcShardReadRequest {
+            location: self.shard_location(data_pg_id, key),
+            shard_key: key.clone(),
+            expected_ack,
+        };
+        let payload = encode_shard_read_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode shard read request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardRead, payload)?;
+        decode_shard_read_response(&response, expected_ack).map_err(|error| {
+            self.rpc_payload_error("decode shard read response", error.to_string())
+        })
+    }
+
     pub(crate) fn delete_placed_shard(
         &self,
         data_pg_id: DataPgId,
@@ -1787,22 +1810,21 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
 
     fn read_placed_shard(
         &self,
-        _data_pg_id: DataPgId,
-        _key: &ShardKey,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
-        Err(self.rpc_payload_error(
-            "shard read",
-            "remote shard read RPC is not implemented yet".to_string(),
-        ))
+        UnixStorageNodeClient::read_placed_shard(self, data_pg_id, key, expected_ack)
     }
 
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
+        expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
-        let data = self.read_placed_shard(data_pg_id, key)?;
+        let data = PlacedShardNodeClient::read_placed_shard(self, data_pg_id, key, expected_ack)?;
         if data.len() != dst.len() {
             return Err(self.rpc_payload_error(
                 "shard read range",
@@ -1914,6 +1936,7 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
+        _expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
         self.storage_node.read_shard_file(data_pg_id.get(), key)
     }
@@ -1922,6 +1945,7 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
+        _expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
         self.storage_node
@@ -4536,7 +4560,7 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let server_thread = thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 server.accept_one().unwrap();
             }
         });
@@ -4552,6 +4576,8 @@ mod tests {
         let ack = client
             .write_placed_shard(data_pg_id, &key, b"remote payload")
             .unwrap();
+        let read_back = client.read_placed_shard(data_pg_id, &key, ack).unwrap();
+        assert_eq!(read_back, b"remote payload");
         client
             .register_written_shard_acks(PgId::new(0), &[(&key, ack)])
             .unwrap();
