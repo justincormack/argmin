@@ -5406,20 +5406,17 @@ location-routed and owned by the shard storage node. This slice must not create
 a transition where shard files are remote but the data-PG ack rows are still
 written through a shared local PG directory.
 
-There are two acceptable implementation shapes:
+Phase 10.4 must include the minimal remote data-PG ack-row API needed for
+publishing safety. A file-only remote shard transport is not sufficient because
+it would prove that shard bytes moved while metadata publication still depends
+on shared local PG access. The required fence is:
 
-1. keep Phase 10.4 file-only for the first landing, with direct PUT and other
-   publishing paths still using the in-process path until Phase 10.5 migrates
-   the data-PG ack-row APIs
-2. include a minimal remote data-PG ack-row API in Phase 10.4 for recording and
-   validating shard acks on the storage-node process that owns the data PG
-
-The preferred shape is the second one if it keeps the slice small enough:
-remote shard writes return an ack, the data-PG owner records the ack row through
-RPC, and publish validation reads/validates the ack rows through the
-node-client boundary before metadata is published. If that proves too wide,
-Phase 10.4 should land as a file-only transport slice and explicitly defer all
-metadata-publishing request paths to Phase 10.5.
+1. remote shard writes return a `WriteAck`
+2. the authoritative data-PG owner records the exact `(ShardKey, WriteAck)` row
+   through RPC
+3. publish validation reads/validates those exact ack rows through the
+   node-client boundary before metadata is published
+4. a remote shard file without its matching durable ack row is not publishable
 
 RPC messages should be operation-specific, for example:
 
@@ -5428,11 +5425,18 @@ RPC messages should be operation-specific, for example:
 3. read shard range at `ShardLocation`
 4. delete shard at `ShardLocation`
 5. acquire/release volatile read handles for one or more shard locations
-6. list/audit shard files for the scavenger
+6. record a batch of data-PG shard ack rows
+7. validate a batch of data-PG shard ack rows
+8. list/audit shard files for the scavenger
 
 Large shard payloads must still be checksummed in transport. The shard write
 path must also preserve the existing semantic size/CRC validation used to build
-or verify `WriteAck`.
+or verify `WriteAck`. Data-PG ack recording must be exact-idempotent for lost
+responses: missing row inserts; existing identical row succeeds; existing
+mismatched row fails closed and must not overwrite. The existing local
+`INSERT OR REPLACE` behavior is acceptable for internal helper use only if the
+remote-facing API wraps it with this stricter check or replaces it with an
+exact-idempotent store primitive.
 
 Publishing metadata after shard IO requires a process-boundary fence:
 
@@ -5442,6 +5446,30 @@ Publishing metadata after shard IO requires a process-boundary fence:
    rows and their size/CRC before installing metadata
 3. a remote shard file without its matching ack row is not publishable
 4. a stale or wrong-node ack row must not satisfy publish validation
+
+Implementation slices:
+
+1. add storage RPC payload codecs for shard read/write/delete and batch
+   ack-record/ack-validate requests, including payload-size caps before
+   allocation and semantic checksum validation for shard writes
+2. add storage-node server dispatch for shard file IO plus data-PG ack
+   record/validate, reusing the Phase 10.3 route checks for node id, PG
+   configured locally, cluster epoch, active PG state, and acting-set membership
+3. add exact-idempotent data-PG ack-row recording to the storage store/client
+   boundary; retrying the same ack batch after a lost response must observe
+   success, while a different ack for an existing shard row must fail closed
+4. add a Unix-socket `StorageNodeClient` implementation for one-shot shard file
+   and ack-row RPCs, plus long-lived read-handle sessions for acquire/release
+5. extend cluster construction/config so a frontend can build storage clients
+   from node-id-to-socket routing without opening storage-node data
+   directories; `storage-node` processes remain the only owners of their PG
+   directories
+6. migrate direct PUT as the first publishing path: write remote shard files,
+   record the data-PG ack batch on the authoritative data-PG owner, validate the
+   exact expected shard set, then publish metadata
+7. broaden reads and cleanup to the remote client path: reads acquire/release
+   storage-node read handles over RPC, and physical delete/reclaim fails closed
+   while a remote read handle is active
 
 Required tests:
 
@@ -5456,14 +5484,25 @@ Required tests:
 5. corrupted shard RPC payloads are rejected and do not publish metadata
 6. killing a shard-owner process during read/write returns a clear fail-closed
    error
-7. remote shard file write succeeds but ack-row RPC response is lost; retry
+7. remote shard write succeeds but the `ShardWrite` response is lost; retrying
+   the same `(ShardLocation, ShardKey, payload checksum)` returns the same
+   `WriteAck`, while retrying the same key with different bytes fails closed
+   and does not overwrite the existing shard file or ack
+8. remote shard delete succeeds but the `ShardDelete` response is lost; retrying
+   the same delete under the same valid route/epoch treats an already-missing
+   shard as terminal success, while stale epoch, wrong node, or wrong route
+   still fails closed before treating absence as success
+9. remote shard file write succeeds but ack-row RPC response is lost; retry
    records or observes the same ack row and publish validation remains exact
-8. remote shard file exists without a durable ack row and metadata publication
+10. retrying ack-row record with a mismatched `WriteAck` for an existing shard
+   row fails closed and does not overwrite the original row
+11. remote shard file exists without a durable ack row and metadata publication
    fails closed
-9. wrong-node or stale data-PG ack rows do not satisfy publish validation
-10. lost read-handle acquire response is retried on the same session and returns
+12. wrong-node or stale data-PG ack rows do not satisfy publish validation
+13. frontend-only remote mode does not open storage-node PG directories
+14. lost read-handle acquire response is retried on the same session and returns
     the original handle set without increasing lease counts
-11. client process or connection dies after acquiring read handles and before
+15. client process or connection dies after acquiring read handles and before
     release; the storage node releases the session-owned handles and physical
     cleanup can later proceed
 
