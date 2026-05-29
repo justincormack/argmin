@@ -8,7 +8,10 @@ use placement::NodeId;
 use ring::rand::SecureRandom;
 
 use local::LocalClusterRuntimeState;
-pub use local::{LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute};
+pub use local::{
+    LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
+    LocalUnixShardNodeClientConfig,
+};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]

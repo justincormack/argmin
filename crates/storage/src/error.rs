@@ -418,6 +418,15 @@ pub enum ClusterBuildError {
     #[error("duplicate local node id {id}")]
     DuplicateNodeId { id: u32 },
 
+    #[error("duplicate remote shard client node id {id}")]
+    DuplicateRemoteShardClientNodeId { id: u32 },
+
+    #[error("remote shard client node {id} is not present in the local cluster map")]
+    RemoteShardClientNodeNotFound { id: u32 },
+
+    #[error("remote shard client socket path {path:?} must be absolute")]
+    RemoteShardClientSocketPathNotAbsolute { path: PathBuf },
+
     #[error("metadata primary node {id} is not present in the local cluster map")]
     MetadataPrimaryNotFound { id: u32 },
 

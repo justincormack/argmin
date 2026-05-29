@@ -15,6 +15,7 @@ use crate::metadata_command::{
 use crate::node::BucketLockGuard;
 use crate::node_client::{
     LocalStorageNodeClient, PlacedShardNodeClient, ShardAckNodeClient, StorageNodeClient,
+    UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -45,6 +46,29 @@ impl LocalNodeStoreConfig {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUnixShardNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
+impl LocalUnixShardNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 }
 
@@ -516,6 +540,47 @@ impl LocalClusterMap {
 
     pub fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
+    }
+
+    pub fn install_unix_shard_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixShardNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixShardNodeClientConfig> = configs.into_iter().collect();
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in &configs {
+            if !seen.insert(config.node_id) {
+                return Err(ClusterBuildError::DuplicateRemoteShardClientNodeId {
+                    id: config.node_id.as_u32(),
+                });
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(ClusterBuildError::RemoteShardClientSocketPathNotAbsolute {
+                    path: config.socket_path.clone(),
+                });
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(ClusterBuildError::RemoteShardClientNodeNotFound {
+                    id: config.node_id.as_u32(),
+                });
+            }
+        }
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote shard client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let shard_client: Arc<dyn PlacedShardNodeClient> = client.clone();
+            let shard_ack_client: Arc<dyn ShardAckNodeClient> = client;
+            node.shard_client = shard_client;
+            node.shard_ack_client = shard_ack_client;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2090,11 +2155,16 @@ mod tests {
         PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
         PutObjectMetadataMutation, ReserveObjectGenerationCommand,
     };
+    use crate::storage_node_server::{
+        StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::thread;
     use std::time::Duration;
 
     static METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5552,6 +5622,145 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
             vec![(pg_id, key, ack)]
+        );
+    }
+
+    fn private_socket_dir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let frontend_dir = tmp.path().join("frontend");
+        let mut map = LocalClusterMap::open(&frontend_dir, &node_ids, &[0], ec_shape).unwrap();
+        set_route_primary(&mut map, 0, NodeId::new(1));
+
+        let socket_path = tmp.path().join("sockets").join("node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id: NodeId::new(1),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: tmp.path().join("remote-node-1"),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                acting_set: node_ids.to_vec(),
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..5 {
+                server.accept_one().unwrap();
+            }
+        });
+        map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
+            NodeId::new(1),
+            socket_path,
+        )])
+        .unwrap();
+
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let key = ShardKey::new(&[0x61; 16], 99, 0);
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key.shard_index(),
+            NodeId::new(1),
+        );
+        let payload = b"payload routed over unix socket";
+        let ack = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, payload)
+            .unwrap();
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(0))
+            .unwrap();
+        primary
+            .shard_ack_client()
+            .register_written_shard_acks(PgId::new(0), &[(&key, ack)])
+            .unwrap();
+        primary
+            .shard_ack_client()
+            .validate_written_shard_ack(PgId::new(0), &key, ack)
+            .unwrap();
+        assert_eq!(
+            map.read_payload_shard(ClusterEpoch::INITIAL, location, &key, ack)
+                .unwrap(),
+            payload
+        );
+        map.delete_payload_shard(ClusterEpoch::INITIAL, location, &key)
+            .unwrap();
+        server_thread.join().unwrap();
+
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        remote_pg.validate_written_shard_ack(&key, ack).unwrap();
+        assert!(matches!(
+            map.node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .read_shard_file(0, &key),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            remote.read_shard_file(0, &key),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn unix_shard_client_install_rejects_relative_socket_paths_before_mutation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let err = map
+            .install_unix_shard_clients([
+                LocalUnixShardNodeClientConfig::new(
+                    NodeId::new(0),
+                    tmp.path().join("sockets").join("node-0.sock"),
+                ),
+                LocalUnixShardNodeClientConfig::new(NodeId::new(1), "relative-node-1.sock"),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteShardClientSocketPathNotAbsolute { path }
+                if path == Path::new("relative-node-1.sock")
+        ));
+
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let key = ShardKey::new(&[0x62; 16], 100, 0);
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key.shard_index(),
+            NodeId::new(0),
+        );
+        let payload = b"still-local-after-failed-install";
+        let ack = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, payload)
+            .unwrap();
+        assert_eq!(ack.stored_size, payload.len() as u64);
+        assert_eq!(
+            map.node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .read_shard_file(0, &key)
+                .unwrap(),
+            payload
         );
     }
 
