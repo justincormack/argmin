@@ -951,7 +951,8 @@ mod tests {
         encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
     };
-    use crate::types::{DataPgId, PgId, ShardIndex};
+    use crate::traits::ShardStore;
+    use crate::types::{DataPgId, PgId, ShardIndex, ShardKey};
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
         StorageNodeProcessConfig {
@@ -967,6 +968,15 @@ mod tests {
                 state: PgState::Active,
                 acting_set: vec![NodeId::new(7)],
             }],
+        }
+    }
+
+    fn test_route(pg_id: u32) -> StorageNodePgRoute {
+        StorageNodePgRoute {
+            pg_id,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: PgState::Active,
+            acting_set: vec![NodeId::new(7)],
         }
     }
 
@@ -1260,6 +1270,21 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_opens_only_configured_pg_directories() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![2];
+        config.pg_routes = vec![test_route(2)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+
+        let _server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        assert!(config.data_dir.join("pg-0002").is_dir());
+        assert!(!config.data_dir.join("pg-0000").exists());
+        assert!(!config.data_dir.join("pg-0001").exists());
+    }
+
+    #[test]
     fn storage_node_static_config_rejects_inconsistent_pg_routes() {
         let tmp = test_util::tempdir();
         private_socket_dir(&tmp.path().join("sock"));
@@ -1316,6 +1341,27 @@ mod tests {
         assert!(config.socket_path.exists());
 
         let _server = StorageNodeServer::bind(config).unwrap();
+    }
+
+    #[test]
+    fn storage_node_server_restart_reopens_existing_pg_state() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let shard_key = ShardKey::new(&[0xA5; 16], 7, 0);
+        {
+            let server = StorageNodeServer::bind(config.clone()).unwrap();
+            let pg = server._node.get_pg(0).unwrap();
+            pg.write_shard(&shard_key, b"persistent shard").unwrap();
+        }
+
+        let restarted = StorageNodeServer::bind(config).unwrap();
+        assert_eq!(
+            restarted._node.read_shard_file(0, &shard_key).unwrap(),
+            b"persistent shard"
+        );
+        let pg = restarted._node.get_pg(0).unwrap();
+        assert_eq!(pg.read_shard(&shard_key).unwrap().data, b"persistent shard");
     }
 
     #[test]
