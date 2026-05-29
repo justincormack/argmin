@@ -1,0 +1,219 @@
+Unbounded read-handle session state enables local DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/5e7198c963348191a297b67e165a0e9a?sev=
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: cb7f7ea
+Fixed Commit: aa2eb97
+Author: justin@specialbusservice.com
+Created: 28/05/2026, 21:30:42
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced an availability bug: persistent read-handle sessions retain unbounded per-connection state for attacker-controlled operation IDs and locations until release or disconnect.
+StorageNodeServer now keeps a StorageNodeSession alive for the lifetime of a Unix-stream connection and stores every distinct acquired read_operation_id in a BTreeMap. The acquire path increments shared handle counts and inserts the request locations into the per-session read_operations map, but there is no maximum number of live read operations per session, no aggregate read-handle limit, and no timeout/lease expiry. Cleanup only happens on explicit ReadHandlesRelease or when the connection closes and Drop runs. A malicious or buggy local client with access to the private storage-node socket can send many ReadHandlesAcquire requests with unique IDs and keep the connection open, growing memory without bound and potentially exhausting the storage-node process. The previous implementation handled only one frame and returned UnsupportedOperation for ReadHandlesAcquire, so this persistent unbounded state is introduced by this commit.
+
+# Resolution
+Fixed in `aa2eb97 Bound storage node read handle resources`.
+
+The fix adds finite resource controls at both the storage RPC protocol boundary and the storage-node session boundary:
+- `ReadHandlesAcquire` and `ReadHandlesRelease` now have per-message payload caps enforced by the frame reader before allocating the payload buffer.
+- Read operation IDs are capped at 256 bytes and decoded through a bounded string reader, so oversized IDs are rejected before copying into a `String`.
+- A single acquire request is capped at 1024 shard locations.
+- Each storage-node session is capped at 4096 live read operations.
+- Each storage-node process is capped at 16k aggregate live read operations and 64k aggregate retained read-handle locations.
+- The storage-node listener now tracks active sessions and caps long-lived accepted sessions at 1024, preventing unbounded thread/session growth.
+
+The fix returns `StorageRpcErrorCode::ResourceExhausted` for storage-node resource quota exhaustion while preserving idempotent acquire/release behavior for valid retry traffic. Regression coverage was added for oversized frame rejection before allocation, oversized operation ID rejection before copy, per-session read-operation exhaustion, aggregate read-handle exhaustion, and active-session limit accounting.
+
+Verification run for the fix:
+- `cargo test -p storage storage_rpc -- --nocapture`
+- `cargo test -p storage storage_node_server -- --nocapture`
+- `cargo clippy -p argmin-s3 -p storage --all-targets --all-features -- -D warnings`
+- `git diff --check`
+
+# Validation
+## Rubric
+- [x] Confirm the commit introduced persistent per-connection sessions rather than one-frame handling: `handle_session` loops with one `StorageNodeSession` until EOF/error.
+- [x] Confirm attacker-controlled `ReadHandlesAcquire` messages reach session state over the real Unix-stream RPC path.
+- [x] Confirm distinct `read_operation_id` values are inserted into an unbounded per-session `BTreeMap` and increment retained shared handle counts.
+- [x] Confirm cleanup is limited to explicit `ReadHandlesRelease` or disconnect/drop, with no timeout, lease expiry, or quota.
+- [x] Dynamically demonstrate accumulation and availability impact with a PoC, plus crash/debugger evidence.
+## Report
+Validated the finding. Code review confirmed that `StorageNodeServer::handle_session` creates one `StorageNodeSession` and loops on the same Unix-stream connection until EOF/error (`crates/storage/src/storage_node_server.rs:200-219`). `ReadHandlesAcquire` is dispatched into that session (`storage_node_server.rs:244-282`). Each new `read_operation_id` calls shared handle `acquire` and inserts into `read_operations: BTreeMap<String, SessionReadHandle>` with cloned locations, with no cap (`storage_node_server.rs:456-500`). Cleanup only happens on explicit release or `Drop` at disconnect (`storage_node_server.rs:503-529`). The protocol validator only rejects empty IDs; it does not limit ID length, per-session count, aggregate count, or lifetime (`crates/storage/src/storage_rpc.rs:927-943`).
+
+I added a targeted unit-test PoC that drives the real `StorageNodeServer` over its Unix socket and sends many distinct `ReadHandlesAcquire` requests without release. Bounded run output: `retained_read_handles_while_connection_open=1024` followed by `retained_read_handles_after_disconnect=0`, proving per-session state accumulates while the attacker-controlled connection stays open and is released only on disconnect.
+
+Direct availability crash attempt succeeded under constrained memory: running the same PoC with `POC_OPS=30000 POC_ID_BYTES=20000` and `ulimit -v 350000` aborted with `memory allocation of 20043 bytes failed` and exit 134. This demonstrates the unbounded retained state can exhaust process memory. Valgrind/GDB were attempted but unavailable in the container (`bash: command not found: valgrind`, `bash: command not found: gdb`). I also captured an LLDB trace showing the actual server thread path: `handle_session` -> `dispatch_frame` -> `read_handles_acquire_response` -> `StorageNodeSession::acquire_read_handles` stopped at `self.read_operations.insert(...)` on `storage_node_server.rs:493`.
+
+# Evidence
+crates/storage/src/storage_node_server.rs (L200 to 219)
+  Note: The server now keeps a session alive in an unbounded loop until EOF or an error, so session state persists as long as the client keeps the connection open.
+```
+    fn handle_session(&self, stream: &mut UnixStream) -> Result<(), StorageNodeServerError> {
+        let mut session = StorageNodeSession::new(&self.read_handles);
+        loop {
+            let frame = match read_storage_rpc_frame_from(stream) {
+                Ok(frame) => frame,
+                Err(StorageRpcStreamError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(rpc_stream_error(error)),
+            };
+            let response = self.dispatch_frame(&mut session, &frame)?;
+            write_storage_rpc_frame_to(stream, &response).map_err(rpc_stream_error)?;
+        }
+```
+
+crates/storage/src/storage_node_server.rs (L457 to 500)
+  Note: Each unique read_operation_id is inserted into the per-session BTreeMap with cloned locations after incrementing shared counts; there is no limit on the number of entries.
+```
+    shared_handles: &'a Mutex<StorageNodeReadHandleState>,
+    read_operations: BTreeMap<String, SessionReadHandle>,
+}
+
+impl<'a> StorageNodeSession<'a> {
+    fn new(shared_handles: &'a Mutex<StorageNodeReadHandleState>) -> Self {
+        Self {
+            shared_handles,
+            read_operations: BTreeMap::new(),
+        }
+    }
+
+    fn acquire_read_handles(
+        &mut self,
+        request: StorageRpcReadHandleAcquireRequest,
+    ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
+        match self.read_operations.get(&request.read_operation_id) {
+            Some(existing) if existing.locations == request.locations && existing.is_acquired => {
+                return Ok(existing.locations.clone());
+            }
+            Some(_) => {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::Internal,
+                    message: format!(
+                        "read operation {} was already acquired with different shard locations",
+                        request.read_operation_id
+                    ),
+                });
+            }
+            None => {}
+        }
+
+        self.shared_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acquire(&request.locations);
+        self.read_operations.insert(
+            request.read_operation_id,
+            SessionReadHandle {
+                locations: request.locations.clone(),
+                is_acquired: true,
+            },
+        );
+        Ok(request.locations)
+```
+
+crates/storage/src/storage_node_server.rs (L503 to 529)
+  Note: Read-handle state is released only by an explicit release request or when the session is dropped, so a client can retain the allocations by keeping the connection open.
+```
+    fn release_read_handles(&mut self, read_operation_id: &str) {
+        let Some(existing) = self.read_operations.remove(read_operation_id) else {
+            return;
+        };
+        if !existing.is_acquired {
+            return;
+        }
+        self.shared_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(&existing.locations);
+    }
+}
+
+impl Drop for StorageNodeSession<'_> {
+    fn drop(&mut self) {
+        let mut shared_handles = self
+            .shared_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for existing in self.read_operations.values_mut() {
+            if existing.is_acquired {
+                shared_handles.release(&existing.locations);
+                existing.is_acquired = false;
+            }
+        }
+    }
+```
+
+crates/storage/src/storage_rpc.rs (L927 to 943)
+  Note: Read operation IDs are only checked for non-emptiness; no length, per-session count, or resource quota is enforced at the protocol validation layer.
+```
+fn validate_read_operation_id(id: &str) -> Result<(), StorageRpcPayloadError> {
+    if id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read operation id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_handle_release_operation_id(id: &str) -> Result<(), StorageRpcPayloadError> {
+    if id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleReleaseRequest(
+            "read operation id must not be empty",
+        ));
+    }
+    Ok(())
+}
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from medium to ignore for the primary project scope. The resource-exhaustion bug itself is real and validated, but static service mapping shows the main deployed artifact, argmin-s3, opens local storage nodes directly and serves HTTP; it does not start StorageNodeServer or expose the vulnerable Unix-socket RPC path. Even in a custom deployment, the attack is local/internal and gated by a private socket directory, and the impact is only single-process availability. This does not meet the threat model's important remote S3 attack surface and does not justify medium security criticality for the main product.
+## Likelihood
+low - The vulnerable code is not invoked by the main argmin-s3 binary, no production socket exposure artifact was found, and exploitation requires local access to a private Unix-socket directory. It is straightforward only in a custom deployment that explicitly starts this server and grants a client socket access.
+## Impact
+low - If StorageNodeServer is manually deployed and a local client can access its private Unix socket, the client can consume memory and potentially crash or wedge that one storage-node process. The demonstrated impact is availability-only; there is no data disclosure, integrity impact, privilege escalation, or remote HTTP reachability in the main product.
+## Assumptions
+- The primary deployed product in this repository is the argmin-s3 binary described by the threat model.
+- A deployment would have to explicitly instantiate StorageNodeServer::bind for the vulnerable Unix-socket service to exist; the checked main binary does not do this.
+- If StorageNodeServer is deployed, Unix-socket directory permissions are intended to restrict access to local trusted users or the service account.
+- No cloud, Kubernetes, systemd, or other deployment artifact in the checked repository exposes the StorageNodeServer Unix socket to remote users.
+- StorageNodeServer::bind must be used by a running deployment, which is not done by crates/argmin-s3/src/main.rs
+- The attacker must have local filesystem access to the private storage-node Unix socket directory, effectively the socket owner or equivalent local privilege
+- The attacker must keep a Unix-stream connection open and send many ReadHandlesAcquire frames with distinct non-empty read_operation_id values
+## Path
+local client -> private Unix socket -> handle_session loop -> ReadHandlesAcquire -> unbounded BTreeMap entries -> storage-node memory exhaustion
+## Path evidence
+- `crates/storage/src/storage_node_server.rs:200-219` - One StorageNodeSession is created and reused inside a loop for the lifetime of the UnixStream, so per-session state persists while the client keeps the connection open.
+- `crates/storage/src/storage_node_server.rs:244-282` - ReadHandlesAcquire frames are decoded and dispatched into the persistent session.
+- `crates/storage/src/storage_node_server.rs:457-500` - Each new read_operation_id is stored in read_operations: BTreeMap<String, SessionReadHandle> with cloned locations and no visible quota.
+- `crates/storage/src/storage_node_server.rs:503-529` - State is removed only by explicit release or by Drop when the session ends.
+- `crates/storage/src/storage_rpc.rs:927-943` - Protocol validation only rejects empty read operation IDs; it does not cap ID length, live operation count, or lifetime.
+- `crates/storage/src/storage_node_server.rs:640-665` - The storage-node socket path must be in a private directory, reducing reachability to local/internal users with filesystem access.
+- `crates/argmin-s3/src/main.rs:153-158` - The main product binary opens local storage nodes directly through StorageCluster::open_local_nodes rather than binding StorageNodeServer.
+- `crates/argmin-s3/src/main.rs:222-240` - The main runtime serves the HTTP frontend; this is the exposed product surface in the threat model, not the storage-node Unix socket.
+- `crates/storage/src/lib.rs:38-40` - StorageNodeServer is exported as a storage crate module, but the RPC module is crate-private and no production entrypoint was found starting it.
+## Narrative
+The core bug is valid: a StorageNodeSession persists for the lifetime of a Unix-stream connection, ReadHandlesAcquire reaches that session, distinct attacker-controlled operation IDs are inserted into an unbounded BTreeMap, and cleanup occurs only on release or connection teardown. Earlier validation also demonstrated retained handles and memory-exhaustion under constrained memory. However, static repository mapping shows this server is not started by the main argmin-s3 binary, which instead opens local storage nodes directly and exposes only the S3 HTTP service. The Unix-socket server also requires a private socket directory. Therefore this is best treated as an out-of-scope or future/internal local DoS for the primary project threat model, not a medium externally reachable S3-service vulnerability.
+## Controls
+- Storage-node listener uses a Unix domain socket rather than a TCP port.
+- Storage-node socket parent directory must be private: mode & 0o077 == 0.
+- The primary argmin-s3 HTTP path uses separate controls such as SigV4 authentication and max connection/in-flight limits, but those controls do not apply to this unused Unix-socket server.
+- No per-session read-handle quota, aggregate memory limit, read_operation_id length cap, or read-handle lease timeout is present in the affected code.
+## Blindspots
+- Static review cannot rule out downstream users or external deployment wrappers instantiating StorageNodeServer::bind outside this repository.
+- No systemd, container, Kubernetes, or packaging manifests were found in scope to confirm how a future storage-node process would be deployed.
+- Unix socket file mode after bind is not explicitly set in the reviewed lines; parent directory privacy is enforced, but operator ownership and umask still affect local access.
