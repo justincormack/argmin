@@ -5765,6 +5765,113 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let frontend_dir = tmp.path().join("frontend");
+        let mut map = LocalClusterMap::open(&frontend_dir, &node_ids, &[0], ec_shape).unwrap();
+        let mut server_configs = Vec::new();
+        let mut shard_client_configs = Vec::new();
+        for node_id in node_ids {
+            let socket_path = tmp
+                .path()
+                .join("sockets")
+                .join(format!("node-{}.sock", node_id.as_u32()));
+            private_socket_dir(socket_path.parent().unwrap());
+            server_configs.push(StorageNodeProcessConfig {
+                node_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                data_dir: tmp.path().join(format!("remote-node-{}", node_id.as_u32())),
+                default_ec_shape: ec_shape,
+                pg_ids: vec![0],
+                socket_path: socket_path.clone(),
+                pg_routes: vec![StorageNodePgRoute {
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: PgState::Active,
+                    acting_set: node_ids.to_vec(),
+                }],
+            });
+            shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
+        }
+        let mut server_threads = Vec::new();
+        for config in server_configs.iter().cloned() {
+            let expected_connections = if config.node_id == NodeId::new(0) {
+                6
+            } else {
+                2
+            };
+            let server = StorageNodeServer::bind(config).unwrap();
+            server_threads.push(thread::spawn(move || {
+                for _ in 0..expected_connections {
+                    server.accept_one().unwrap();
+                }
+            }));
+        }
+        map.install_unix_shard_clients(shard_client_configs)
+            .unwrap();
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let committed = write_committed_direct_segment(&cluster, b"direct put remote payload");
+
+        assert_eq!(committed.payload, b"direct put remote payload");
+        assert_eq!(committed.written.written_shards.len(), 3);
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+        for written in &committed.written.written_shards {
+            let location = committed
+                .locations
+                .iter()
+                .copied()
+                .find(|location| location.shard_index() == written.key.shard_index())
+                .unwrap();
+            assert!(matches!(
+                map.node(location.node_id())
+                    .unwrap()
+                    .storage_node()
+                    .read_shard_file(committed.written.data_pg_id, &written.key),
+                Err(StoreError::NotFound)
+            ));
+            let remote_config = server_configs
+                .iter()
+                .find(|config| config.node_id == location.node_id())
+                .unwrap();
+            let remote = SharedStorageNode::open_with_default_ec_shape(
+                &remote_config.data_dir,
+                &remote_config.pg_ids,
+                remote_config.default_ec_shape,
+            )
+            .unwrap();
+            assert_eq!(
+                remote
+                    .read_shard_file(committed.written.data_pg_id, &written.key)
+                    .unwrap()
+                    .len() as u64,
+                written.ack.stored_size
+            );
+        }
+        let data_pg_primary = server_configs
+            .iter()
+            .find(|config| config.node_id == NodeId::new(0))
+            .unwrap();
+        let remote_primary = SharedStorageNode::open_with_default_ec_shape(
+            &data_pg_primary.data_dir,
+            &data_pg_primary.pg_ids,
+            data_pg_primary.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote_primary.get_pg(committed.written.data_pg_id).unwrap();
+        for written in &committed.written.written_shards {
+            remote_pg
+                .validate_written_shard_ack(&written.key, written.ack)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn metadata_pg_primary_node_routes_by_pg_primary_and_fails_closed() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
