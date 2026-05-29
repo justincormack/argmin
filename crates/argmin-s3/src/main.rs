@@ -18,7 +18,10 @@ use storage::{CanonicalUserId, ClusterEpoch, EcShape, NodeId, PgState, StorageCl
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use config::{ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig};
+use config::{
+    unsupported_remote_frontend_role_message, ConfiguredCredential, ConfiguredCredentialProfile,
+    ProcessRole, ServerConfig,
+};
 use server_http::http::HttpFrontend;
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -131,13 +134,10 @@ async fn main() {
     if config.process_role == ProcessRole::StorageNode {
         run_storage_node_process(&config, &ec_config);
     }
-    if matches!(
-        config.process_role,
-        ProcessRole::Frontend | ProcessRole::Combined
-    ) {
+    if config.process_role.requires_remote_frontend_routing() {
         eprintln!(
-            "ARGMIN_PROCESS_ROLE={} is parsed but remote frontend routing is not wired until Phase 10.4/10.5",
-            process_role_name(config.process_role)
+            "{}",
+            unsupported_remote_frontend_role_message(config.process_role)
         );
         std::process::exit(1);
     }
@@ -334,14 +334,5 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
             )
             .await;
         }
-    }
-}
-
-fn process_role_name(role: ProcessRole) -> &'static str {
-    match role {
-        ProcessRole::LegacyLocal => "legacy-local",
-        ProcessRole::Frontend => "frontend",
-        ProcessRole::StorageNode => "storage-node",
-        ProcessRole::Combined => "combined",
     }
 }

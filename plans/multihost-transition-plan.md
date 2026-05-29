@@ -5289,6 +5289,14 @@ data directory:
    development, but still exposes the storage-node RPC listener and preserves
    the same node-id/data-dir invariants
 
+Phase 10.3 only makes the `storage-node` role executable. The `frontend` and
+`combined` roles are parsed as part of the process-role model, but must fail
+with an explicit unsupported-role error before opening PG directories until
+Phase 10.4/10.5 add remote `StorageNodeClient` routing. Starting `combined`
+against the current local frontend would reopen the same node data directory
+through in-process `SharedStorageNode` handles, so it would not prove the socket
+boundary or the one-owner storage invariant.
+
 Most production hosts with multiple disks should run multiple storage-node
 processes on the same host, one per disk/data directory. This keeps disk
 failure, SQLite/shard-directory failures, process crashes, process locks,
@@ -5343,8 +5351,9 @@ Implementation slices:
    lost response must be accepted on the same session and must not leave handle
    counts wrong
 7. wire the storage-node process role into the binary without changing
-   production coordinator request routing yet; Phase 10.4/10.5 move actual
-   shard and metadata traffic through remote clients
+   production coordinator request routing yet; `frontend` and `combined`
+   remain explicit unsupported roles until Phase 10.4/10.5 move actual shard
+   and metadata traffic through remote clients
 
 Required tests:
 
@@ -5355,9 +5364,11 @@ Required tests:
 5. restart reopens existing metadata and shard files cleanly
 6. incorrectly permissioned socket directories are rejected or reported as
    non-production-only
-7. frontend-only role does not open PG directories
+7. frontend-only and combined roles fail explicitly before opening PG
+   directories while remote frontend routing is not wired
 8. combined role starts both HTTP/coordinator and storage-node listener while
-   preserving the same storage ownership checks
+   preserving the same storage ownership checks once remote frontend routing is
+   available in Phase 10.4/10.5
 9. second storage-node process for the same data directory is rejected by the
    ownership lock
 10. duplicate/canonical-equivalent Unix socket paths are rejected before serving

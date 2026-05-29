@@ -17,6 +17,10 @@ impl ProcessRole {
     fn has_frontend(self) -> bool {
         matches!(self, Self::LegacyLocal | Self::Frontend | Self::Combined)
     }
+
+    pub(crate) fn requires_remote_frontend_routing(self) -> bool {
+        matches!(self, Self::Frontend | Self::Combined)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,11 +113,8 @@ impl ServerConfig {
             Some(value) => parse_process_role(&value)?,
             None => ProcessRole::LegacyLocal,
         };
-        if matches!(process_role, ProcessRole::Frontend | ProcessRole::Combined) {
-            return Err(format!(
-                "ARGMIN_PROCESS_ROLE={} is parsed but remote frontend routing is not wired until Phase 10.4/10.5",
-                process_role_name(process_role)
-            ));
+        if process_role.requires_remote_frontend_routing() {
+            return Err(unsupported_remote_frontend_role_message(process_role));
         }
         let (
             account_id,
@@ -334,6 +335,13 @@ fn process_role_name(role: ProcessRole) -> &'static str {
         ProcessRole::StorageNode => "storage-node",
         ProcessRole::Combined => "combined",
     }
+}
+
+pub(crate) fn unsupported_remote_frontend_role_message(role: ProcessRole) -> String {
+    format!(
+        "ARGMIN_PROCESS_ROLE={} is parsed but remote frontend routing is not wired until Phase 10.4/10.5",
+        process_role_name(role)
+    )
 }
 
 fn validate_account_id(name: &str, value: &str) -> Result<(), String> {
@@ -677,6 +685,18 @@ mod tests {
     fn process_role_combined_fails_before_storage_config_validation() {
         let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "combined")]))
             .unwrap_err();
+
+        assert!(err.contains("remote frontend routing is not wired"));
+    }
+
+    #[test]
+    fn process_role_combined_fails_even_with_complete_local_config() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "combined"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin/node-0.sock"),
+        ]))
+        .unwrap_err();
 
         assert!(err.contains("remote frontend routing is not wired"));
     }
