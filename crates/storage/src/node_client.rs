@@ -1755,7 +1755,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.register_written_shards_batch(shard_batch)
+        pg.register_written_shards_batch_exact(shard_batch)
     }
 
     fn validate_written_shard_ack(

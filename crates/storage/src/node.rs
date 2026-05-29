@@ -1180,6 +1180,27 @@ impl SharedStorageNode {
         PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
     }
 
+    pub(crate) fn write_shard_file_if_absent(
+        &self,
+        pg_id: u32,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::write_shard_file_if_absent",
+            "pg_id={} shard={} bytes={}",
+            pg_id,
+            key,
+            data.len()
+        );
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        PgStore::write_shard_file_durable_if_absent(&paths.tmp_dir, &paths.shards_dir, key, data)
+    }
+
     /// Read a shard file directly without taking the per-PG mutex.
     pub(crate) fn read_shard_file(
         &self,

@@ -223,6 +223,7 @@ direct_shard_matches=$(
         ! -path 'crates/storage/src/cluster.rs' \
         ! -path 'crates/storage/src/cluster/local.rs' \
         ! -path 'crates/storage/src/node_client.rs' \
+        ! -path 'crates/storage/src/storage_node_server.rs' \
         ! -path 'crates/storage/src/pg_store.rs' \
         ! -path 'crates/storage/src/traits.rs' \
         -print \

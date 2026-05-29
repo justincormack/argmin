@@ -763,6 +763,7 @@ const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 1024;
 const SQLITE_PROFILE_DISABLED: u64 = u64::MAX;
 const UNCLEAN_METADATA_DIGEST_REVISION: u64 = u64::MAX;
 static SQLITE_PROFILE_THRESHOLD_NANOS: AtomicU64 = AtomicU64::new(SQLITE_PROFILE_DISABLED);
+static SHARD_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct MetadataCommandLogEntry {
@@ -4320,6 +4321,113 @@ impl PgStore {
         })
     }
 
+    pub(crate) fn write_shard_file_durable_if_absent(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        let expected = WriteAck {
+            crc64: checksum::crc64::checksum(data),
+            stored_size: data.len() as u64,
+        };
+        let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+
+        for _ in 0..2 {
+            let sequence = SHARD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let tmp_name = format!("shard-{}-{sequence}-{key}", std::process::id());
+            let tmp_path = tmp_dir.join(&tmp_name);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| StoreError::Io {
+                    context: "create temp shard file",
+                    source: e,
+                })?;
+
+            file.write_all(data).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                StoreError::Io {
+                    context: "write shard data",
+                    source: e,
+                }
+            })?;
+            file.sync_data().map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                StoreError::Io {
+                    context: "fdatasync shard",
+                    source: e,
+                }
+            })?;
+            drop(file);
+
+            if let Some(parent) = shard_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    let _ = fs::remove_file(&tmp_path);
+                    StoreError::Io {
+                        context: "create shard prefix dir",
+                        source: e,
+                    }
+                })?;
+            }
+
+            match fs::hard_link(&tmp_path, &shard_path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    if let Some(parent) = shard_path.parent() {
+                        fsync_dir(parent).map_err(|e| StoreError::Io {
+                            context: "fsync shard parent dir",
+                            source: e,
+                        })?;
+                    }
+                    return Ok(expected);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&tmp_path);
+                    match fs::read(&shard_path) {
+                        Ok(existing) => {
+                            let actual = WriteAck {
+                                crc64: checksum::crc64::checksum(&existing),
+                                stored_size: existing.len() as u64,
+                            };
+                            if actual.stored_size == expected.stored_size
+                                && actual.crc64 == expected.crc64
+                            {
+                                return Ok(actual);
+                            }
+                            return Err(StoreError::ShardAckMismatch {
+                                shard: key.clone(),
+                                expected_size: expected.stored_size,
+                                expected_crc: expected.crc64,
+                                actual_size: actual.stored_size,
+                                actual_crc: actual.crc64,
+                            });
+                        }
+                        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(read_error) => {
+                            return Err(StoreError::Io {
+                                context: "read existing shard file",
+                                source: read_error,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(StoreError::Io {
+                        context: "link shard into place",
+                        source: e,
+                    });
+                }
+            }
+        }
+
+        Err(StoreError::NotFound)
+    }
+
     pub fn register_written_shard(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError> {
         let now = Self::now_secs();
         self.conn
@@ -4443,6 +4551,109 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(StoreError::Db {
                         context: "register written shards batch (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    pub fn register_written_shards_batch_exact(
+        &self,
+        shards: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::register_written_shards_batch_exact",
+            "pg_id={} shards={}",
+            self.pg_id,
+            shards.len()
+        );
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StoreError::Db {
+                context: "register written shards batch exact (begin txn)",
+                source: e,
+            })?;
+
+        let now = Self::now_secs() as i64;
+        let result: Result<(), StoreError> = (|| {
+            let mut lookup = self
+                .conn
+                .prepare_cached(
+                    "SELECT data_size, crc64_nvme, status FROM shards WHERE shard_key = ?1",
+                )
+                .map_err(|e| StoreError::Db {
+                    context: "register written shards batch exact (prepare lookup)",
+                    source: e,
+                })?;
+            let mut insert = self
+                .conn
+                .prepare_cached(
+                    "INSERT INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                )
+                .map_err(|e| StoreError::Db {
+                    context: "register written shards batch exact (prepare insert)",
+                    source: e,
+                })?;
+
+            for (key, ack) in shards {
+                let row: Option<(i64, i64, i64)> = lookup
+                    .query_row(params![key.as_bytes().as_slice()], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()
+                    .map_err(|e| StoreError::Db {
+                        context: "register written shards batch exact (lookup shard record)",
+                        source: e,
+                    })?;
+
+                if let Some((actual_size, actual_crc, status)) = row {
+                    let actual_size = actual_size as u64;
+                    let actual_crc = actual_crc as u64;
+                    if status == ShardStatus::Live as i64
+                        && actual_size == ack.stored_size
+                        && actual_crc == ack.crc64
+                    {
+                        continue;
+                    }
+                    return Err(StoreError::ShardAckMismatch {
+                        shard: (*key).clone(),
+                        expected_size: ack.stored_size,
+                        expected_crc: ack.crc64,
+                        actual_size,
+                        actual_crc,
+                    });
+                }
+
+                insert
+                    .execute(params![
+                        key.as_bytes().as_slice(),
+                        ack.stored_size as i64,
+                        ack.crc64 as i64,
+                        now,
+                    ])
+                    .map_err(|e| StoreError::Db {
+                        context: "register written shards batch exact (insert shard record)",
+                        source: e,
+                    })?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(StoreError::Db {
+                        context: "register written shards batch exact (commit txn)",
                         source: e,
                     });
                 }
@@ -22048,6 +22259,39 @@ mod tests {
             store.validate_written_shard_ack(&key, ack),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn register_written_shards_batch_exact_is_idempotent_but_not_overwriting() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let key = ShardKey::new(&[0xD3; 16], 42, 6);
+        let ack = WriteAck {
+            stored_size: 10,
+            crc64: 0xD3D3,
+        };
+        let batch = vec![(&key, ack)];
+
+        store.register_written_shards_batch_exact(&batch).unwrap();
+        store.register_written_shards_batch_exact(&batch).unwrap();
+        store.validate_written_shard_ack(&key, ack).unwrap();
+
+        let different = WriteAck {
+            stored_size: ack.stored_size + 1,
+            crc64: ack.crc64,
+        };
+        let err = store
+            .register_written_shards_batch_exact(&[(&key, different)])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardAckMismatch {
+                expected_size,
+                actual_size,
+                ..
+            } if expected_size == different.stored_size && actual_size == ack.stored_size
+        ));
+        store.validate_written_shard_ack(&key, ack).unwrap();
     }
 
     // ── connection accessor ───────────────────────────────────────────

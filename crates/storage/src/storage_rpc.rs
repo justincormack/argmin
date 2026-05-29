@@ -3,7 +3,7 @@ use crate::{
     metadata_command::{decode_metadata_command_envelope, BucketWriteReservationProof},
     types::{
         ChecksumBytes, ClusterEpoch, DataPgId, GenerationId, ObjectKey, ObjectPayloadReclaimKind,
-        PgId, ShardIndex, ShardKey, WriteAck,
+        PgId, ShardIndex, ShardKey, WriteAck, SHARD_KEY_LEN,
     },
     BucketName, NodeId,
 };
@@ -14,7 +14,17 @@ pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_READ_OPERATION_ID_LEN: usize = 256;
 pub(crate) const STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS: usize = 1024;
+pub(crate) const STORAGE_RPC_MAX_SHARD_ACK_ITEMS: usize = 4096;
 const STORAGE_RPC_SHARD_LOCATION_LEN: usize = 8 + 4 + 1 + 4;
+const STORAGE_RPC_SHARD_KEY_FIELD_LEN: usize = 4 + SHARD_KEY_LEN;
+const STORAGE_RPC_WRITE_ACK_LEN: usize = 8 + 8;
+const STORAGE_RPC_SHARD_ACK_ROUTE_LEN: usize = 4 + 8 + 4;
+const STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK_ROUTE_LEN
+    + 4
+    + STORAGE_RPC_MAX_SHARD_ACK_ITEMS
+        * (STORAGE_RPC_SHARD_KEY_FIELD_LEN + STORAGE_RPC_WRITE_ACK_LEN);
+const STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
     + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN
     + 4
@@ -166,6 +176,8 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidReadHandleAcquireRequest(&'static str),
     #[error("invalid read handle release request: {0}")]
     InvalidReadHandleReleaseRequest(&'static str),
+    #[error("invalid shard ack batch request: {0}")]
+    InvalidShardAckBatchRequest(&'static str),
     #[error("invalid durable claim token: {0}")]
     InvalidDurableClaimToken(&'static str),
     #[error("invalid bucket write reservation proof: {0}")]
@@ -204,6 +216,20 @@ pub(crate) struct StorageRpcShardWriteRequest {
 pub(crate) struct StorageRpcShardDeleteRequest {
     pub(crate) location: ShardLocation,
     pub(crate) shard_key: ShardKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardAckItem {
+    pub(crate) shard_key: ShardKey,
+    pub(crate) ack: WriteAck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardAckBatchRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) items: Vec<StorageRpcShardAckItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +472,10 @@ fn message_kind_max_payload_len(
         StorageRpcMessageKind::ReadHandlesRelease => {
             STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
+            STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN
+        }
         _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
@@ -681,6 +711,64 @@ pub(crate) fn decode_shard_delete_request(
     Ok(StorageRpcShardDeleteRequest {
         location,
         shard_key,
+    })
+}
+
+pub(crate) fn encode_shard_ack_batch_request(
+    request: &StorageRpcShardAckBatchRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_shard_ack_batch(request.items.len())?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_u32(
+        &mut out,
+        u32::try_from(request.items.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: request.items.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for item in &request.items {
+        put_bytes(&mut out, item.shard_key.as_bytes());
+        put_u64(&mut out, item.ack.stored_size);
+        put_u64(&mut out, item.ack.crc64);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_shard_ack_batch_request(
+    bytes: &[u8],
+) -> Result<StorageRpcShardAckBatchRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let item_count = decoder.read_u32()? as usize;
+    validate_shard_ack_batch(item_count)?;
+    if decoder.remaining_len()
+        != item_count * (STORAGE_RPC_SHARD_KEY_FIELD_LEN + STORAGE_RPC_WRITE_ACK_LEN)
+    {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let shard_key = decoder.read_shard_key()?;
+        let stored_size = decoder.read_u64()?;
+        let crc64 = decoder.read_u64()?;
+        items.push(StorageRpcShardAckItem {
+            shard_key,
+            ack: WriteAck { stored_size, crc64 },
+        });
+    }
+    decoder.finish()?;
+    Ok(StorageRpcShardAckBatchRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        items,
     })
 }
 
@@ -1025,6 +1113,21 @@ fn shard_location_sort_key(location: ShardLocation) -> (u64, u32, u8, u32) {
         location.shard_index().get(),
         location.node_id().as_u32(),
     )
+}
+
+fn validate_shard_ack_batch(item_count: usize) -> Result<(), StorageRpcPayloadError> {
+    if item_count == 0 {
+        return Err(StorageRpcPayloadError::InvalidShardAckBatchRequest(
+            "shard ack batch must include at least one item",
+        ));
+    }
+    if item_count > STORAGE_RPC_MAX_SHARD_ACK_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: item_count,
+            limit: STORAGE_RPC_MAX_SHARD_ACK_ITEMS,
+        });
+    }
+    Ok(())
 }
 
 fn validate_claim_token(token: &StorageRpcDurableClaimToken) -> Result<(), StorageRpcPayloadError> {
@@ -1778,6 +1881,34 @@ mod tests {
         let decoded = decode_shard_delete_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn shard_ack_batch_request_carries_route_and_exact_acks() {
+        let request = StorageRpcShardAckBatchRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(3),
+            items: vec![StorageRpcShardAckItem {
+                shard_key: test_shard_key(2),
+                ack: WriteAck {
+                    stored_size: 123,
+                    crc64: 0xBEEF,
+                },
+            }],
+        };
+
+        let bytes = encode_shard_ack_batch_request(&request).unwrap();
+        let decoded = decode_shard_ack_batch_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert!(matches!(
+            encode_shard_ack_batch_request(&StorageRpcShardAckBatchRequest {
+                items: Vec::new(),
+                ..request
+            }),
+            Err(StorageRpcPayloadError::InvalidShardAckBatchRequest(_))
+        ));
     }
 
     #[test]

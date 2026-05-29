@@ -1343,7 +1343,7 @@ impl std::fmt::Debug for ShardKey {
 }
 
 /// Acknowledgment returned after a successful shard write.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteAck {
     /// CRC64-NVME checksum of the stored data.
     pub crc64: u64,
