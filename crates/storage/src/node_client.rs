@@ -4785,6 +4785,71 @@ mod tests {
     }
 
     #[test]
+    fn unix_storage_node_delete_fails_while_read_handle_active() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..4)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let key = ShardKey::new(&[0x66; 16], 12, 0);
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let location = crate::cluster::ShardLocation::new(
+            config.cluster_epoch,
+            data_pg_id,
+            key.shard_index(),
+            config.node_id,
+        );
+        let mut session = client.open_read_handle_session().unwrap();
+
+        client
+            .write_placed_shard(data_pg_id, &key, b"protected payload")
+            .unwrap();
+        session
+            .acquire_read_handles("protected-read", vec![location])
+            .unwrap();
+        assert_eq!(server.read_handle_count(location), 1);
+
+        let err = client.delete_placed_shard(data_pg_id, &key).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StorageRpc {
+                operation: "shard delete",
+                ref message,
+                ..
+            } if message.contains("ResourceExhausted") && message.contains("active read handles")
+        ));
+
+        session.release_read_handles("protected-read").unwrap();
+        assert_eq!(server.read_handle_count(location), 0);
+        client.delete_placed_shard(data_pg_id, &key).unwrap();
+        drop(session);
+        for join in server_threads {
+            join.join().unwrap();
+        }
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.read_shard_file(0, &key),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("sock").join("storage.sock");

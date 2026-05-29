@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -484,6 +484,10 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_shard_location(request.location) {
             return encode_storage_rpc_error_response(&error);
         }
+        let _delete_fence = match self.try_begin_shard_delete(request.location) {
+            Ok(delete_fence) => delete_fence,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let response = match self
             .node
             .delete_shard_file(request.location.data_pg_id().get(), &request.shard_key)
@@ -555,6 +559,20 @@ impl StorageNodeConnectionHandler {
             self.validate_shard_location(location)?;
         }
         Ok(())
+    }
+
+    fn try_begin_shard_delete(
+        &self,
+        location: ShardLocation,
+    ) -> Result<StorageNodeShardDeleteFence, StorageRpcErrorResponse> {
+        self.read_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_begin_delete(location)?;
+        Ok(StorageNodeShardDeleteFence {
+            read_handles: Arc::clone(&self.read_handles),
+            location,
+        })
     }
 
     fn validate_shard_location(
@@ -683,6 +701,7 @@ impl Drop for StorageNodeActiveSessionGuard {
 #[derive(Debug, Default)]
 struct StorageNodeReadHandleState {
     location_counts: BTreeMap<ShardLocationKey, usize>,
+    delete_fences: BTreeSet<ShardLocationKey>,
     live_read_operations: usize,
     live_read_handle_locations: usize,
 }
@@ -708,6 +727,17 @@ impl StorageNodeReadHandleState {
                 "storage-node live read handle location limit {} is exhausted",
                 STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS
             )));
+        }
+        for location in locations {
+            if self
+                .delete_fences
+                .contains(&ShardLocationKey::from(*location))
+            {
+                return Err(resource_exhausted_response(format!(
+                    "shard at {:?} is being deleted",
+                    location
+                )));
+            }
         }
         for location in locations {
             *self
@@ -742,12 +772,46 @@ impl StorageNodeReadHandleState {
         }
     }
 
-    #[cfg(test)]
     fn count(&self, location: ShardLocation) -> usize {
         self.location_counts
             .get(&ShardLocationKey::from(location))
             .copied()
             .unwrap_or(0)
+    }
+
+    fn try_begin_delete(&mut self, location: ShardLocation) -> Result<(), StorageRpcErrorResponse> {
+        let key = ShardLocationKey::from(location);
+        if self.count(location) > 0 {
+            return Err(resource_exhausted_response(format!(
+                "shard at {:?} has active read handles",
+                location
+            )));
+        }
+        if !self.delete_fences.insert(key) {
+            return Err(resource_exhausted_response(format!(
+                "shard at {:?} is already being deleted",
+                location
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish_delete(&mut self, location: ShardLocation) {
+        self.delete_fences.remove(&ShardLocationKey::from(location));
+    }
+}
+
+struct StorageNodeShardDeleteFence {
+    read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
+    location: ShardLocation,
+}
+
+impl Drop for StorageNodeShardDeleteFence {
+    fn drop(&mut self) {
+        self.read_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_delete(self.location);
     }
 }
 
@@ -1954,6 +2018,25 @@ mod tests {
         let error = send_read_handle_acquire(config, test_location(1, 0, 7));
 
         assert_eq!(error.code, StorageRpcErrorCode::NonActingSetAccess);
+    }
+
+    #[test]
+    fn storage_node_read_handle_state_delete_fence_is_atomic_with_acquire() {
+        let location = test_location(1, 0, 7);
+        let mut state = StorageNodeReadHandleState::default();
+
+        state.try_begin_delete(location).unwrap();
+        let error = state.try_acquire(&[location]).unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        assert!(error.message.contains("being deleted"));
+        state.finish_delete(location);
+
+        state.try_acquire(&[location]).unwrap();
+        let error = state.try_begin_delete(location).unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        assert!(error.message.contains("active read handles"));
+        state.release(&[location]);
+        state.try_begin_delete(location).unwrap();
     }
 
     #[test]
