@@ -6087,6 +6087,159 @@ mod tests {
     }
 
     #[test]
+    fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let wrong_ack_node = NodeId::new(1);
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let frontend_dir = tmp.path().join("frontend");
+        let mut map = LocalClusterMap::open(&frontend_dir, &node_ids, &[0], ec_shape).unwrap();
+        set_route_primary(&mut map, 0, NodeId::new(0));
+        let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let generation_id = crate::GenerationId::new(1).unwrap();
+        let segment_okh = [0x92; 16];
+        let data_pg = map.object_generation_segment_data_pg(&bucket, &key, generation_id, 0);
+        let placement_key =
+            super::super::segment_payload_placement_key(&segment_okh, generation_id);
+        let locations = map
+            .place_payload_shards(ClusterEpoch::INITIAL, data_pg, ec_shape, &placement_key)
+            .unwrap();
+        let mut expected_connections_by_node = BTreeMap::<NodeId, usize>::new();
+        for location in &locations {
+            *expected_connections_by_node
+                .entry(location.node_id())
+                .or_default() += 1;
+        }
+        *expected_connections_by_node
+            .entry(wrong_ack_node)
+            .or_default() += 1;
+        *expected_connections_by_node
+            .entry(NodeId::new(0))
+            .or_default() += 1;
+
+        let mut server_configs = Vec::new();
+        let mut shard_client_configs = Vec::new();
+        for node_id in node_ids {
+            let socket_path = tmp
+                .path()
+                .join("sockets")
+                .join(format!("wrong-ack-node-{}.sock", node_id.as_u32()));
+            private_socket_dir(socket_path.parent().unwrap());
+            server_configs.push(StorageNodeProcessConfig {
+                node_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                data_dir: tmp
+                    .path()
+                    .join(format!("remote-node-wrong-ack-{}", node_id.as_u32())),
+                default_ec_shape: ec_shape,
+                pg_ids: vec![0],
+                socket_path: socket_path.clone(),
+                pg_routes: vec![StorageNodePgRoute {
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: PgState::Active,
+                    acting_set: node_ids.to_vec(),
+                }],
+            });
+            shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
+        }
+        let mut server_threads = Vec::new();
+        for config in server_configs.iter().cloned() {
+            let expected_connections = *expected_connections_by_node
+                .get(&config.node_id)
+                .unwrap_or(&0);
+            let server = StorageNodeServer::bind(config).unwrap();
+            server_threads.push(thread::spawn(move || {
+                for _ in 0..expected_connections {
+                    server.accept_one().unwrap();
+                }
+            }));
+        }
+        map.install_unix_shard_clients(shard_client_configs)
+            .unwrap();
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let direct_written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                b"remote shard ack row on wrong node",
+            )
+            .unwrap();
+        let shard_batch: Vec<(&ShardKey, WriteAck)> = direct_written
+            .written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        map.node(wrong_ack_node)
+            .unwrap()
+            .shard_ack_client()
+            .register_written_shard_acks(PgId::new(direct_written.data_pg_id), &shard_batch)
+            .unwrap();
+
+        let err = cluster
+            .validate_payload_shard_acks(
+                direct_written.data_pg_id,
+                direct_written.ec,
+                &segment_okh,
+                generation_id,
+                &shard_batch,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::StorageRpc {
+                    operation: "shard ack validate",
+                    ..
+                })
+            ),
+            "wrong-node remote ack rows should fail publish validation, got {err:?}"
+        );
+
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+        let wrong_config = server_configs
+            .iter()
+            .find(|config| config.node_id == wrong_ack_node)
+            .unwrap();
+        let wrong_node = SharedStorageNode::open_with_default_ec_shape(
+            &wrong_config.data_dir,
+            &wrong_config.pg_ids,
+            wrong_config.default_ec_shape,
+        )
+        .unwrap();
+        let wrong_pg = wrong_node.get_pg(direct_written.data_pg_id).unwrap();
+        for written in &direct_written.written_shards {
+            wrong_pg
+                .validate_written_shard_ack(&written.key, written.ack)
+                .unwrap();
+        }
+        let primary_config = server_configs
+            .iter()
+            .find(|config| config.node_id == NodeId::new(0))
+            .unwrap();
+        let primary = SharedStorageNode::open_with_default_ec_shape(
+            &primary_config.data_dir,
+            &primary_config.pg_ids,
+            primary_config.default_ec_shape,
+        )
+        .unwrap();
+        let primary_pg = primary.get_pg(direct_written.data_pg_id).unwrap();
+        for written in &direct_written.written_shards {
+            assert!(matches!(
+                primary_pg.validate_written_shard_ack(&written.key, written.ack),
+                Err(StoreError::NotFound)
+            ));
+        }
+    }
+
+    #[test]
     fn metadata_pg_primary_node_routes_by_pg_primary_and_fails_closed() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
