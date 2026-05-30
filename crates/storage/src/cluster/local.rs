@@ -5834,6 +5834,72 @@ mod tests {
     }
 
     #[test]
+    fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let socket_path = tmp.path().join("sockets").join("dead-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
+            NodeId::new(1),
+            socket_path,
+        )])
+        .unwrap();
+
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let key = ShardKey::new(&[0x63; 16], 101, 0);
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key.shard_index(),
+            NodeId::new(1),
+        );
+        let write_err = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, b"dead owner")
+            .unwrap_err();
+        assert!(matches!(
+            write_err,
+            ShardIoError::Store {
+                source: StoreError::Io {
+                    context: "connect storage-node RPC socket",
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let read_err = map
+            .read_payload_shard(
+                ClusterEpoch::INITIAL,
+                location,
+                &key,
+                WriteAck {
+                    stored_size: 10,
+                    crc64: 0x1234,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            read_err,
+            ShardIoError::Store {
+                source: StoreError::Io {
+                    context: "connect storage-node read-handle RPC socket",
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            map.node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .read_shard_file(0, &key),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
