@@ -65,6 +65,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandReplicaState = 15,
     MetadataCommandAcceptance = 16,
     MetadataCommandAbandonAcceptance = 17,
+    MetadataCommandPendingSlotInsert = 18,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +125,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandReplicaState => "metadata command replica state",
             Self::MetadataCommandAcceptance => "metadata command acceptance",
             Self::MetadataCommandAbandonAcceptance => "metadata command abandon acceptance",
+            Self::MetadataCommandPendingSlotInsert => "metadata command pending slot insert",
         }
     }
 
@@ -146,6 +148,7 @@ impl StorageRpcMessageKind {
             15 => Ok(Self::MetadataCommandReplicaState),
             16 => Ok(Self::MetadataCommandAcceptance),
             17 => Ok(Self::MetadataCommandAbandonAcceptance),
+            18 => Ok(Self::MetadataCommandPendingSlotInsert),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -211,6 +214,8 @@ pub(crate) enum StorageRpcPayloadError {
     MetadataCommandChecksumMismatch,
     #[error("metadata command route mismatch: {0}")]
     MetadataCommandRouteMismatch(&'static str),
+    #[error("invalid metadata command pending slot request: {0}")]
+    InvalidMetadataCommandPendingSlotRequest(&'static str),
     #[error("shard write size mismatch: expected {expected}, actual {actual}")]
     ShardWriteSizeMismatch { expected: u64, actual: u64 },
     #[error("shard write checksum mismatch")]
@@ -247,6 +252,31 @@ pub(crate) struct StorageRpcMetadataCommandRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandPendingSlotRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) scope_bucket: Option<BucketName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandPendingSlotInsertOutcome {
+    Inserted,
+    PendingConflict {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        existing_log_index: u64,
+        candidate_log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandPendingSlotInsertResponse {
+    pub(crate) outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -758,6 +788,115 @@ pub(crate) fn decode_metadata_command_request(
         pg_id,
         command,
     })
+}
+
+pub(crate) fn encode_metadata_command_pending_slot_request(
+    request: &StorageRpcMetadataCommandPendingSlotRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_metadata_command_route(request.cluster_epoch, request.pg_id, request.command.id())?;
+    let command_request = StorageRpcMetadataCommandRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        command: request.command.clone(),
+    };
+    let mut out = encode_metadata_command_request(&command_request)?;
+    match request.scope_bucket.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(bucket) => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, bucket.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_pending_slot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandPendingSlotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let command_checksum = decoder.read_u64()?;
+    let command_bytes = decoder.read_bytes()?.to_vec();
+    let item_bytes = {
+        let mut out = Vec::new();
+        put_u64(&mut out, command_checksum);
+        put_bytes(&mut out, &command_bytes);
+        out
+    };
+    let item = decode_metadata_command_item(&item_bytes)?;
+    let command = decode_metadata_command_envelope(&item.command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
+    let scope_bucket = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(decoder.read_bucket_name().map_err(|_| {
+            StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                "invalid scope bucket name",
+            )
+        })?),
+        _ => {
+            return Err(
+                StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                    "invalid optional scope bucket tag",
+                ),
+            )
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandPendingSlotRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        command,
+        scope_bucket,
+    })
+}
+
+pub(crate) fn encode_metadata_command_pending_slot_insert_response(
+    response: &StorageRpcMetadataCommandPendingSlotInsertResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.outcome {
+        StorageRpcMetadataCommandPendingSlotInsertOutcome::Inserted => put_u8(&mut out, 0),
+        StorageRpcMetadataCommandPendingSlotInsertOutcome::PendingConflict {
+            pg_id,
+            cluster_epoch,
+            existing_log_index,
+            candidate_log_index,
+        } => {
+            put_u8(&mut out, 1);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, existing_log_index);
+            put_u64(&mut out, candidate_log_index);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_pending_slot_insert_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandPendingSlotInsertResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMetadataCommandPendingSlotInsertOutcome::Inserted,
+        1 => StorageRpcMetadataCommandPendingSlotInsertOutcome::PendingConflict {
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            existing_log_index: decoder.read_u64()?,
+            candidate_log_index: decoder.read_u64()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command pending slot insert outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandPendingSlotInsertResponse { outcome })
 }
 
 pub(crate) fn encode_metadata_command_state_request(
@@ -2344,6 +2483,41 @@ mod tests {
             decode_metadata_command_request(&bytes),
             Err(StorageRpcPayloadError::MetadataCommandRouteMismatch(_))
         ));
+    }
+
+    #[test]
+    fn metadata_command_pending_slot_request_carries_scope_bucket() {
+        let command = test_metadata_command();
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            command: command.clone(),
+            scope_bucket: Some(BucketName::try_from("pending-scope").unwrap()),
+        };
+
+        let bytes = encode_metadata_command_pending_slot_request(&request).unwrap();
+        let decoded = decode_metadata_command_pending_slot_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.command.command_bytes(), command.command_bytes());
+    }
+
+    #[test]
+    fn metadata_command_pending_slot_insert_response_round_trips_conflict() {
+        let response = StorageRpcMetadataCommandPendingSlotInsertResponse {
+            outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::PendingConflict {
+                pg_id: 9,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                existing_log_index: 7,
+                candidate_log_index: 8,
+            },
+        };
+
+        let bytes = encode_metadata_command_pending_slot_insert_response(&response);
+        let decoded = decode_metadata_command_pending_slot_insert_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
     }
 
     #[test]
