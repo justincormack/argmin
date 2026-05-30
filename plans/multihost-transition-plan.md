@@ -5548,6 +5548,66 @@ Metadata reads and coordination operations get separate RPC messages rather
 than being encoded as metadata commands, because they are not durable metadata
 mutations.
 
+Implementation slices:
+
+1. add storage RPC payload codecs for metadata-command envelopes and metadata
+   command state queries. The command RPC payload should carry canonical
+   `MetadataCommandEnvelope` bytes plus route fields; decoding must reject
+   corrupted transport bytes, non-canonical command bytes, stale embedded
+   command checksums, mismatched route epoch, mismatched PG id, and invalid log
+   indexes before calling any store mutation.
+2. add storage-node server dispatch for metadata PG-primary and acting-set
+   replica operations, reusing Phase 10.3 route checks for node id, PG
+   configured locally, cluster epoch, active PG state, and acting-set
+   membership. The receiver must additionally validate that the embedded
+   command id matches the RPC route.
+3. split the current broad local metadata-command surface into a dedicated
+   node-client trait, for example `MetadataCommandNodeClient`, covering:
+   pending command slot insert/replace/read, metadata command acceptance,
+   abandon acceptance, apply-and-record, record-abandoned, replica state,
+   max-log-index, applied log-entry hash lookup, and matching-applied lookup.
+   `LocalStorageNodeClient` remains the local implementation; the Unix client
+   implements the same trait over RPC.
+4. replace process-local PG command serialization with a storage-node-owned
+   remote serialization boundary. The PG-primary storage node, not an
+   individual frontend process, must own the command install/reissue/fanout
+   critical section that Phase 9 previously protected with process-local
+   locks. Multiple frontend processes must be able to race on the same PG and
+   converge through the storage-node-owned pending slot, log index allocator,
+   primary-last fanout ordering, and reissue logic without observing each
+   other's half-complete in-process state.
+5. add separate RPC surfaces for non-command metadata reads and coordination
+   operations required before command construction. These include bucket/object
+   snapshot reads, object generation/version/order allocation, bucket-write
+   reservations and proof release, durable pending/drain/coordination checks,
+   lifecycle/object-read snapshot helpers used by command builders, and
+   operation-shaped command-builder calls that must execute against a
+   storage-node-owned snapshot rather than a frontend-owned raw PG handle.
+6. migrate command construction and convergence helpers in `StorageCluster` to
+   the new metadata-command client boundary. Start with bucket-PG command
+   install/apply for `CreateBucket`, then direct PUT object-generation
+   reserve/commit on object PGs, then broaden to stream PUT, multipart,
+   delete-marker/object-delete, bucket versioning/ACL/properties/subresources,
+   and completed-multipart bucket commands.
+7. preserve command-log and digest invariants across RPC by keeping the
+   existing `PgStore` apply/acceptance methods as the storage-node authority.
+   The RPC layer may route and validate envelopes, but must not bypass
+   `metadata_command_replica_state`, command-log hash-chain checks,
+   digest-revision checks, duplicate retry handling, or conflict detection.
+8. make side-effecting metadata RPCs exact-idempotent for lost replies. If the
+   server commits a pending-slot install/replace, apply-and-record,
+   abandoned-record insert, exact pending-slot removal, bucket reservation/proof
+   release, or other cleanup mutation but the response is lost, retrying the
+   same operation identity must observe success; retrying a different identity
+   for the same durable row must fail closed.
+9. after create-bucket, direct PUT metadata traffic, required non-command
+   metadata reads/coordination, and storage-node-owned PG serialization are
+   genuinely remote, replace the early `frontend`/`combined` unsupported-role
+   failure with frontend cluster construction from static node-id-to-socket
+   metadata and shard routing. Combined mode can then start both the
+   HTTP/coordinator server and the local storage-node listener in one process
+   while still using the same client boundary.
+
 Required tests:
 
 1. create bucket through remote PG-primary state
@@ -5558,6 +5618,18 @@ Required tests:
 5. corrupted command bytes in transport are rejected before apply
 6. command bytes with matching transport checksum but stale embedded command
    checksum are rejected
+7. two independent frontend handles converge/reissue the same PG while one
+   command is mid-fanout; the storage-node-owned serialization boundary must
+   preserve primary-last ordering and prevent duplicate or divergent command
+   application
+8. non-command metadata RPCs used by create-bucket/direct PUT run remotely:
+   bucket/object snapshot reads, generation/version/order allocation,
+   bucket-write reservation/proof release, durable pending/drain checks, and
+   operation-shaped command builders
+9. lost replies are retry-safe for pending-slot install/replace,
+   `apply_metadata_command_and_record`, abandoned-record insert, exact
+   pending-slot removal, bucket reservation/proof release, and cleanup
+   mutations; same identity succeeds and mismatched identity fails closed
 
 ### Phase 10.6: Background Workers Across RPC
 
