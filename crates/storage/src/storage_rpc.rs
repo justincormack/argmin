@@ -1,6 +1,9 @@
 use crate::{
     cluster::ShardLocation,
-    metadata_command::{decode_metadata_command_envelope, BucketWriteReservationProof},
+    metadata_command::{
+        decode_metadata_command_envelope, BucketWriteReservationProof, MetadataCommandAcceptance,
+        MetadataCommandReplicaState,
+    },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
         ChecksumBytes, ClusterEpoch, DataPgId, GenerationId, ObjectKey, ObjectPayloadReclaimKind,
@@ -241,6 +244,16 @@ pub(crate) struct StorageRpcMetadataCommandStateRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandStateResponse {
+    pub(crate) state: MetadataCommandReplicaState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandAcceptanceResponse {
+    pub(crate) acceptance: MetadataCommandAcceptance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,6 +770,67 @@ pub(crate) fn decode_metadata_command_state_request(
         cluster_epoch,
         pg_id,
     })
+}
+
+pub(crate) fn encode_metadata_command_state_response(
+    response: &StorageRpcMetadataCommandStateResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, response.state.cluster_epoch.get());
+    put_u64(&mut out, response.state.applied_log_index);
+    put_u64(&mut out, response.state.applied_log_hash);
+    put_u64(&mut out, response.state.state_digest);
+    out
+}
+
+pub(crate) fn decode_metadata_command_state_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandStateResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let applied_log_index = decoder.read_u64()?;
+    let applied_log_hash = decoder.read_u64()?;
+    let state_digest = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandStateResponse {
+        state: MetadataCommandReplicaState {
+            cluster_epoch,
+            applied_log_index,
+            applied_log_hash,
+            state_digest,
+        },
+    })
+}
+
+pub(crate) fn encode_metadata_command_acceptance_response(
+    response: &StorageRpcMetadataCommandAcceptanceResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(
+        &mut out,
+        match response.acceptance {
+            MetadataCommandAcceptance::Apply => 1,
+            MetadataCommandAcceptance::AlreadyApplied => 2,
+        },
+    );
+    out
+}
+
+pub(crate) fn decode_metadata_command_acceptance_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandAcceptanceResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let acceptance = match decoder.read_u8()? {
+        1 => MetadataCommandAcceptance::Apply,
+        2 => MetadataCommandAcceptance::AlreadyApplied,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command acceptance tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandAcceptanceResponse { acceptance })
 }
 
 fn validate_metadata_command_route(
@@ -2271,6 +2345,45 @@ mod tests {
         let decoded = decode_metadata_command_state_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn metadata_command_state_response_round_trips() {
+        let response = StorageRpcMetadataCommandStateResponse {
+            state: MetadataCommandReplicaState {
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                applied_log_index: 44,
+                applied_log_hash: 0x55,
+                state_digest: 0x66,
+            },
+        };
+
+        let bytes = encode_metadata_command_state_response(&response);
+        let decoded = decode_metadata_command_state_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn metadata_command_acceptance_response_round_trips() {
+        for acceptance in [
+            MetadataCommandAcceptance::Apply,
+            MetadataCommandAcceptance::AlreadyApplied,
+        ] {
+            let response = StorageRpcMetadataCommandAcceptanceResponse { acceptance };
+
+            let bytes = encode_metadata_command_acceptance_response(&response);
+            let decoded = decode_metadata_command_acceptance_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+
+        assert_eq!(
+            decode_metadata_command_acceptance_response(&[99]),
+            Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command acceptance tag"
+            ))
+        );
     }
 
     #[test]
