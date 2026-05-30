@@ -2048,6 +2048,57 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_rejects_corrupt_shard_write_without_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let location = test_location(1, 0, 7);
+        let shard_key = test_shard_key(0);
+        let payload = b"corrupt-before-write".to_vec();
+        let request = StorageRpcShardWriteRequest {
+            location,
+            shard_key: shard_key.clone(),
+            expected_size: payload.len() as u64,
+            expected_crc64: checksum::crc64::checksum(&payload),
+            payload,
+        };
+        let mut request_payload = encode_shard_write_request(&request).unwrap();
+        let last = request_payload
+            .last_mut()
+            .expect("test shard write payload must be nonempty");
+        *last ^= 0x01;
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardWrite,
+            request_payload,
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+        assert!(error.message.contains("checksum mismatch"));
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.read_shard_file(0, &shard_key),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn storage_node_server_retries_lost_shard_delete_as_terminal_success() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -2091,6 +2142,45 @@ mod tests {
             reopened.read_shard_file(0, &shard_key),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn storage_node_server_validates_shard_delete_route_before_missing_success() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let shard_key = test_shard_key(0);
+        let requests = [
+            (
+                test_location(2, 0, 7),
+                StorageRpcErrorCode::StaleShardLocation,
+            ),
+            (test_location(1, 0, 8), StorageRpcErrorCode::UnknownNode),
+            (test_location(1, 9, 7), StorageRpcErrorCode::UnknownPg),
+        ];
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        for (index, (location, expected_code)) in requests.into_iter().enumerate() {
+            let request = StorageRpcShardDeleteRequest {
+                location,
+                shard_key: shard_key.clone(),
+            };
+            let response = send_frame(
+                &mut client,
+                index as u64 + 1,
+                StorageRpcMessageKind::ShardDelete,
+                encode_shard_delete_request(&request).unwrap(),
+            );
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, expected_code);
+        }
+        drop(client);
+        join.join().unwrap();
     }
 
     #[test]
