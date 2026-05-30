@@ -4151,7 +4151,10 @@ impl StorageCluster {
                 let Some(node) = self.local_map.node(node_id) else {
                     continue;
                 };
-                match node.storage_client().list_scavenger_shard_files(data_pg) {
+                match node
+                    .shard_scavenger_client()
+                    .list_scavenger_shard_files(data_pg)
+                {
                     Ok(scan) if scan.errors.is_empty() => {
                         files_by_node.push((node_id.as_u32(), scan.files));
                     }

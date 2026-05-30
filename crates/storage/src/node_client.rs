@@ -26,15 +26,17 @@ use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
     decode_read_handle_acquire_response, decode_read_handle_release_response,
-    decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-    decode_storage_rpc_response_payload, encode_read_handle_acquire_request,
-    encode_read_handle_release_request, encode_shard_ack_batch_request,
+    decode_scavenger_list_files_response, decode_shard_read_range_response,
+    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    encode_read_handle_acquire_request, encode_read_handle_release_request,
+    encode_scavenger_list_files_request, encode_shard_ack_batch_request,
     encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
     encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -743,12 +745,14 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
     ) -> Result<(), StoreError>;
 }
 
-pub(crate) trait StorageNodeClient: PlacedShardNodeClient + ShardAckNodeClient {
+pub(crate) trait ShardScavengerNodeClient: Send + Sync {
     fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError>;
+}
 
+pub(crate) trait StorageNodeClient: ShardScavengerNodeClient {
     fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError>;
 
     fn list_shard_scavenger_payload_references(
@@ -1767,6 +1771,25 @@ impl UnixStorageNodeClient {
             .map(|_| ())
     }
 
+    pub(crate) fn list_scavenger_shard_files(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<ScavengerShardFileScan, StoreError> {
+        let request = StorageRpcScavengerListFilesRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            data_pg_id,
+        };
+        let payload = encode_scavenger_list_files_request(&request);
+        let response = self.rpc_request(StorageRpcMessageKind::ShardScavengerListFiles, payload)?;
+        decode_scavenger_list_files_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode shard scavenger list files response",
+                error.to_string(),
+            )
+        })
+    }
+
     fn encode_shard_ack_batch(
         &self,
         pg_id: PgId,
@@ -2046,6 +2069,15 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
     }
 }
 
+impl ShardScavengerNodeClient for UnixStorageNodeClient {
+    fn list_scavenger_shard_files(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<ScavengerShardFileScan, StoreError> {
+        UnixStorageNodeClient::list_scavenger_shard_files(self, data_pg_id)
+    }
+}
+
 impl LocalStorageNodeClient {
     pub(crate) fn new(node_id: NodeId, storage_node: Arc<SharedStorageNode>) -> Self {
         Self {
@@ -2205,7 +2237,7 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
     }
 }
 
-impl StorageNodeClient for LocalStorageNodeClient {
+impl ShardScavengerNodeClient for LocalStorageNodeClient {
     fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,
@@ -2213,7 +2245,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         self.storage_node
             .list_scavenger_shard_files(data_pg_id.get())
     }
+}
 
+impl StorageNodeClient for LocalStorageNodeClient {
     fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.list_scavenger_shard_rows()

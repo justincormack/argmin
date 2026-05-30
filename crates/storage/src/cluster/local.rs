@@ -15,7 +15,7 @@ use crate::metadata_command::{
 use crate::node::BucketLockGuard;
 use crate::node_client::{
     LocalStorageNodeClient, PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
-    StorageNodeClient, UnixStorageNodeClient,
+    ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -80,6 +80,7 @@ pub struct LocalNodeStore {
     shard_client: Arc<dyn PlacedShardNodeClient>,
     shard_ack_client: Arc<dyn ShardAckNodeClient>,
     shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient>,
+    shard_scavenger_client: Arc<dyn ShardScavengerNodeClient>,
 }
 
 impl LocalNodeStore {
@@ -91,7 +92,8 @@ impl LocalNodeStore {
         let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
         let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
         let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
-        let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = local_client;
+        let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = local_client.clone();
+        let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = local_client;
         Self {
             node_id,
             data_dir,
@@ -100,6 +102,7 @@ impl LocalNodeStore {
             shard_client,
             shard_ack_client,
             shard_read_handle_client,
+            shard_scavenger_client,
         }
     }
 
@@ -129,6 +132,10 @@ impl LocalNodeStore {
 
     pub(crate) fn shard_read_handle_client(&self) -> &Arc<dyn ShardReadHandleNodeClient> {
         &self.shard_read_handle_client
+    }
+
+    pub(crate) fn shard_scavenger_client(&self) -> &Arc<dyn ShardScavengerNodeClient> {
+        &self.shard_scavenger_client
     }
 }
 
@@ -618,10 +625,12 @@ impl LocalClusterMap {
             ));
             let shard_client: Arc<dyn PlacedShardNodeClient> = client.clone();
             let shard_ack_client: Arc<dyn ShardAckNodeClient> = client.clone();
-            let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = client;
+            let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = client.clone();
+            let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client;
             node.shard_client = shard_client;
             node.shard_ack_client = shard_ack_client;
             node.shard_read_handle_client = shard_read_handle_client;
+            node.shard_scavenger_client = shard_scavenger_client;
         }
         Ok(())
     }
@@ -5701,7 +5710,7 @@ mod tests {
             }],
         };
         let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..10)
+        let server_threads: Vec<_> = (0..11)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -5747,6 +5756,24 @@ mod tests {
             .unwrap();
         assert_eq!(read_into, payload);
         assert_eq!(server.read_handle_count(location), 0);
+        let scan = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .shard_scavenger_client()
+            .list_scavenger_shard_files(data_pg_id)
+            .unwrap();
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].key, key);
+        assert_eq!(scan.files[0].size, payload.len() as u64);
+        assert!(scan.errors.is_empty());
+        assert!(map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .list_scavenger_shard_files(0)
+            .unwrap()
+            .files
+            .is_empty());
         let missing_key = ShardKey::new(&[0x62; 16], 100, 0);
         let err = map
             .read_payload_shard(ClusterEpoch::INITIAL, location, &missing_key, ack)

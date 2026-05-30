@@ -1,6 +1,7 @@
 use crate::{
     cluster::ShardLocation,
     metadata_command::{decode_metadata_command_envelope, BucketWriteReservationProof},
+    pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
         ChecksumBytes, ClusterEpoch, DataPgId, GenerationId, ObjectKey, ObjectPayloadReclaimKind,
         PgId, ShardIndex, ShardKey, WriteAck, SHARD_KEY_LEN,
@@ -23,6 +24,10 @@ const STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK
     + 4
     + STORAGE_RPC_MAX_SHARD_ACK_ITEMS
         * (STORAGE_RPC_SHARD_KEY_FIELD_LEN + STORAGE_RPC_WRITE_ACK_LEN);
+const STORAGE_RPC_MAX_SCAVENGER_SCAN_ERRORS: usize = 4096;
+const STORAGE_RPC_MAX_SCAVENGER_SCAN_ERROR_LEN: usize = 4096;
+const STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK_ROUTE_LEN;
+const STORAGE_RPC_SCAVENGER_FILE_RESPONSE_LEN: usize = STORAGE_RPC_SHARD_KEY_FIELD_LEN + 8;
 const STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN: usize =
@@ -52,6 +57,7 @@ pub(crate) enum StorageRpcMessageKind {
     ProofRelease = 11,
     ShardAckRecord = 12,
     ShardAckValidate = 13,
+    ShardScavengerListFiles = 14,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +113,7 @@ impl StorageRpcMessageKind {
             Self::ProofRelease => "proof release",
             Self::ShardAckRecord => "shard ack record",
             Self::ShardAckValidate => "shard ack validate",
+            Self::ShardScavengerListFiles => "shard scavenger list files",
         }
     }
 
@@ -125,6 +132,7 @@ impl StorageRpcMessageKind {
             11 => Ok(Self::ProofRelease),
             12 => Ok(Self::ShardAckRecord),
             13 => Ok(Self::ShardAckValidate),
+            14 => Ok(Self::ShardScavengerListFiles),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -268,6 +276,13 @@ pub(crate) struct StorageRpcShardAckBatchRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) items: Vec<StorageRpcShardAckItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcScavengerListFilesRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) data_pg_id: DataPgId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,6 +548,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
             STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ShardScavengerListFiles => {
+            STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -945,6 +963,93 @@ pub(crate) fn decode_shard_ack_batch_request(
         pg_id,
         items,
     })
+}
+
+pub(crate) fn encode_scavenger_list_files_request(
+    request: &StorageRpcScavengerListFilesRequest,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.data_pg_id.get());
+    out
+}
+
+pub(crate) fn decode_scavenger_list_files_request(
+    bytes: &[u8],
+) -> Result<StorageRpcScavengerListFilesRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let data_pg_id = DataPgId::new(PgId::new(decoder.read_u32()?));
+    decoder.finish()?;
+    Ok(StorageRpcScavengerListFilesRequest {
+        node_id,
+        cluster_epoch,
+        data_pg_id,
+    })
+}
+
+pub(crate) fn encode_scavenger_list_files_response(scan: &ScavengerShardFileScan) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(scan.files.len()).expect("scavenger file count must fit in u32"),
+    );
+    for file in &scan.files {
+        put_bytes(&mut out, file.key.as_bytes());
+        put_u64(&mut out, file.size);
+    }
+    put_u32(
+        &mut out,
+        u32::try_from(scan.errors.len()).expect("scavenger scan error count must fit in u32"),
+    );
+    for error in &scan.errors {
+        put_string(&mut out, error);
+    }
+    out
+}
+
+pub(crate) fn decode_scavenger_list_files_response(
+    bytes: &[u8],
+) -> Result<ScavengerShardFileScan, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let file_count = decoder.read_u32()? as usize;
+    let file_bytes = file_count
+        .checked_mul(STORAGE_RPC_SCAVENGER_FILE_RESPONSE_LEN)
+        .ok_or(StorageRpcPayloadError::PayloadTooLarge {
+            len: file_count,
+            limit: usize::MAX / STORAGE_RPC_SCAVENGER_FILE_RESPONSE_LEN,
+        })?;
+    if file_bytes > decoder.remaining_len() {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut files = Vec::with_capacity(file_count);
+    for _ in 0..file_count {
+        files.push(ScavengerShardFile {
+            key: decoder.read_shard_key()?,
+            size: decoder.read_u64()?,
+        });
+    }
+    let error_count = decoder.read_u32()? as usize;
+    if error_count > STORAGE_RPC_MAX_SCAVENGER_SCAN_ERRORS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: error_count,
+            limit: STORAGE_RPC_MAX_SCAVENGER_SCAN_ERRORS,
+        });
+    }
+    let mut errors = Vec::with_capacity(error_count);
+    for _ in 0..error_count {
+        errors.push(decoder.read_string_with_limit(
+            STORAGE_RPC_MAX_SCAVENGER_SCAN_ERROR_LEN,
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: STORAGE_RPC_MAX_SCAVENGER_SCAN_ERROR_LEN + 1,
+                limit: STORAGE_RPC_MAX_SCAVENGER_SCAN_ERROR_LEN,
+            },
+        )?);
+    }
+    decoder.finish()?;
+    Ok(ScavengerShardFileScan { files, errors })
 }
 
 pub(crate) fn encode_read_handle_acquire_request(
@@ -2189,6 +2294,36 @@ mod tests {
             }),
             Err(StorageRpcPayloadError::InvalidShardAckBatchRequest(_))
         ));
+    }
+
+    #[test]
+    fn scavenger_list_files_request_and_response_round_trip() {
+        let request = StorageRpcScavengerListFilesRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            data_pg_id: DataPgId::new(PgId::new(3)),
+        };
+
+        let request_bytes = encode_scavenger_list_files_request(&request);
+        assert_eq!(
+            decode_scavenger_list_files_request(&request_bytes).unwrap(),
+            request
+        );
+
+        let scan = ScavengerShardFileScan {
+            files: vec![ScavengerShardFile {
+                key: test_shard_key(2),
+                size: 123,
+            }],
+            errors: vec!["bad prefix".to_string()],
+        };
+        let response_bytes = encode_scavenger_list_files_response(&scan);
+        let decoded = decode_scavenger_list_files_response(&response_bytes).unwrap();
+
+        assert_eq!(decoded.files.len(), 1);
+        assert_eq!(decoded.files[0].key, scan.files[0].key);
+        assert_eq!(decoded.files[0].size, scan.files[0].size);
+        assert_eq!(decoded.errors, scan.errors);
     }
 
     #[test]

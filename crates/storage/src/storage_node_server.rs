@@ -12,18 +12,19 @@ use crate::error::StoreError;
 use crate::node::SharedStorageNode;
 use crate::storage_rpc::{
     decode_read_handle_acquire_request, decode_read_handle_release_request,
-    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_write_request, encode_health_response,
-    encode_read_handle_acquire_response, encode_read_handle_release_response,
+    decode_scavenger_list_files_request, decode_shard_ack_batch_request,
+    decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
+    decode_shard_write_request, encode_health_response, encode_read_handle_acquire_response,
+    encode_read_handle_release_response, encode_scavenger_list_files_response,
     encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
     encode_storage_rpc_error_response, encode_storage_rpc_success_response,
     read_storage_rpc_request_frame_from, write_storage_rpc_frame_to, StorageRpcErrorCode,
     StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse, StorageRpcMessageKind,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
     StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
-    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
-    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
-    STORAGE_RPC_FRAME_ENCODING_VERSION,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, PgId, PgState, WriteAck};
 use crate::{EcShape, NodeId, ShardLocation};
@@ -404,6 +405,15 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::ShardScavengerListFiles => {
+                match decode_scavenger_list_files_request(&frame.payload) {
+                    Ok(request) => self.shard_scavenger_list_files_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             kind => self.unsupported_operation_response(kind),
         }
         .map_err(|error| StorageNodeServerError::ResponsePayload {
@@ -614,6 +624,30 @@ impl StorageNodeConnectionHandler {
             pg.validate_written_shard_ack(&item.shard_key, item.ack)?;
         }
         Ok(())
+    }
+
+    fn shard_scavenger_list_files_response(
+        &self,
+        request: StorageRpcScavengerListFilesRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.node_id,
+            request.cluster_epoch,
+            PgId::new(request.data_pg_id.get()),
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self
+            .node
+            .list_scavenger_shard_files(request.data_pg_id.get())
+        {
+            Ok(scan) => {
+                let payload = encode_scavenger_list_files_response(&scan);
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
     }
 
     fn validate_shard_locations(
@@ -1252,15 +1286,17 @@ mod tests {
 
     use crate::storage_rpc::{
         decode_health_response, decode_read_handle_acquire_response,
-        decode_read_handle_release_response, decode_shard_read_range_response,
-        decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
-        encode_read_handle_acquire_request, encode_read_handle_release_request,
+        decode_read_handle_release_response, decode_scavenger_list_files_response,
+        decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
+        decode_storage_rpc_response_payload, encode_read_handle_acquire_request,
+        encode_read_handle_release_request, encode_scavenger_list_files_request,
         encode_shard_ack_batch_request, encode_shard_delete_request,
         encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
         encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-        StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-        StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+        StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
+        StorageRpcShardAckItem, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
+        StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     };
     use crate::traits::ShardStore;
     use crate::types::{DataPgId, PgId, ShardIndex, ShardKey};
@@ -1882,6 +1918,51 @@ mod tests {
         let read_payload =
             decode_shard_read_range_response(&response_payload, request.length as usize).unwrap();
         assert_eq!(read_payload, payload[5..10]);
+    }
+
+    #[test]
+    fn storage_node_server_lists_scavenger_shard_files_over_rpc() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let key = test_shard_key(0);
+        let payload = b"remote shard scavenger file";
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            node.get_pg(0).unwrap().write_shard(&key, payload).unwrap();
+        }
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let request = StorageRpcScavengerListFilesRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            data_pg_id: DataPgId::new(PgId::new(0)),
+        };
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardScavengerListFiles,
+            encode_scavenger_list_files_request(&request),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let response_payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let scan = decode_scavenger_list_files_response(&response_payload).unwrap();
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].key, key);
+        assert_eq!(scan.files[0].size, payload.len() as u64);
+        assert!(scan.errors.is_empty());
     }
 
     #[test]
