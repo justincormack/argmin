@@ -469,8 +469,24 @@ impl StorageNodeConnectionHandler {
             .read_shard_file(request.location.data_pg_id().get(), &request.shard_key)
         {
             Ok(payload) => {
-                let payload = encode_shard_read_response(&payload, request.expected_ack)?;
-                encode_storage_rpc_success_response(&payload)
+                let actual_size = payload.len() as u64;
+                let actual_crc = checksum::crc64::checksum(&payload);
+                if actual_size != request.expected_ack.stored_size
+                    || actual_crc != request.expected_ack.crc64
+                {
+                    encode_storage_rpc_error_response(&store_error_response(
+                        StoreError::ShardAckMismatch {
+                            shard: request.shard_key,
+                            expected_size: request.expected_ack.stored_size,
+                            expected_crc: request.expected_ack.crc64,
+                            actual_size,
+                            actual_crc,
+                        },
+                    ))?
+                } else {
+                    let payload = encode_shard_read_response(&payload, request.expected_ack)?;
+                    encode_storage_rpc_success_response(&payload)
+                }
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
@@ -1726,7 +1742,7 @@ mod tests {
         drop(node);
         let request = StorageRpcShardReadRequest {
             location,
-            shard_key,
+            shard_key: shard_key.clone(),
             expected_ack,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1740,6 +1756,19 @@ mod tests {
             StorageRpcMessageKind::ShardRead,
             encode_shard_read_request(&request).unwrap(),
         );
+        let mismatched_request = StorageRpcShardReadRequest {
+            expected_ack: WriteAck {
+                stored_size: expected_ack.stored_size,
+                crc64: expected_ack.crc64 ^ 1,
+            },
+            ..request
+        };
+        let mismatch = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::ShardRead,
+            encode_shard_read_request(&mismatched_request).unwrap(),
+        );
         drop(client);
         join.join().unwrap();
 
@@ -1748,6 +1777,11 @@ mod tests {
             .unwrap();
         let read_payload = decode_shard_read_response(&response_payload, expected_ack).unwrap();
         assert_eq!(read_payload, payload);
+        let error = decode_storage_rpc_response_payload(&mismatch.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::Internal);
+        assert!(error.message.contains("ack mismatch"));
     }
 
     #[test]
