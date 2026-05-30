@@ -6109,6 +6109,71 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let remote_data_dir = tmp.path().join("remote-node-1-owned");
+        let socket_path = tmp.path().join("sockets").join("owned-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id: NodeId::new(1),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                acting_set: node_ids.to_vec(),
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+
+        let frontend_dir = tmp.path().join("frontend-only-shard-routing");
+        let mut map = LocalClusterMap::open(&frontend_dir, &node_ids, &[0], ec_shape).unwrap();
+        map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
+            NodeId::new(1),
+            socket_path,
+        )])
+        .unwrap();
+
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let key = ShardKey::new(&[0x64; 16], 102, 0);
+        let location = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key.shard_index(),
+            NodeId::new(1),
+        );
+        let payload = b"frontend writes to storage-node-owned shard dir";
+        let ack = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, payload)
+            .unwrap();
+        server_thread.join().unwrap();
+
+        assert!(matches!(
+            map.node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .read_shard_file(0, &key),
+            Err(StoreError::NotFound)
+        ));
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        assert_eq!(remote.read_shard_file(0, &key).unwrap(), payload);
+        assert_eq!(ack.stored_size, payload.len() as u64);
+    }
+
+    #[test]
     fn unix_shard_client_install_rejects_relative_socket_paths_before_mutation() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

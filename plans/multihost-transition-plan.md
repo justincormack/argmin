@@ -5506,6 +5506,26 @@ Required tests:
     release; the storage node releases the session-owned handles and physical
     cleanup can later proceed
 
+- Status: shard-remote scope complete. Phase 10.4 now has storage RPC codecs,
+  request payload caps, and storage-node dispatch for shard write/read/range
+  read/delete, read-handle acquire/release, data-PG ack record/validate, and
+  shard-scavenger file listing. Direct PUT writes shards through Unix
+  storage-node clients, records exact-idempotent ack rows on the authoritative
+  data-PG owner, validates those rows before metadata publication, and refuses
+  remote shard files without matching durable ack rows. Reads acquire
+  storage-node read handles over RPC, direct segment reads acquire the full
+  data-shard handle set before reading, partial multi-node handle acquisition
+  releases already-acquired handles, disconnect cleanup releases session-owned
+  handles, and physical delete fails closed while read handles are active.
+  Shard write/delete lost-response idempotency, corrupted shard payload
+  rejection, wrong-node/stale-route failures, stale/wrong ack rows, remote owner
+  unavailability, and shard-scavenger remote file scans are covered. The
+  10.4-specific frontend construction proof is shard-scoped: a frontend map can
+  install Unix shard clients and write to storage-node-owned data directories
+  while those storage-node processes already own their data-dir locks. Full
+  `frontend` and `combined` process roles remain explicitly unsupported until
+  Phase 10.5 routes metadata PG-primary and replica operations over RPC.
+
 ### Phase 10.5: Remote Metadata PG Operations
 
 Migrate metadata PG-primary and acting-set replica operations after shard IO.
