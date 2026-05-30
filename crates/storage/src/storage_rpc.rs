@@ -66,6 +66,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandAcceptance = 16,
     MetadataCommandAbandonAcceptance = 17,
     MetadataCommandPendingSlotInsert = 18,
+    MetadataCommandPendingSlotRemove = 19,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +127,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandAcceptance => "metadata command acceptance",
             Self::MetadataCommandAbandonAcceptance => "metadata command abandon acceptance",
             Self::MetadataCommandPendingSlotInsert => "metadata command pending slot insert",
+            Self::MetadataCommandPendingSlotRemove => "metadata command pending slot remove",
         }
     }
 
@@ -149,6 +151,7 @@ impl StorageRpcMessageKind {
             16 => Ok(Self::MetadataCommandAcceptance),
             17 => Ok(Self::MetadataCommandAbandonAcceptance),
             18 => Ok(Self::MetadataCommandPendingSlotInsert),
+            19 => Ok(Self::MetadataCommandPendingSlotRemove),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -277,6 +280,11 @@ pub(crate) enum StorageRpcMetadataCommandPendingSlotInsertOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingSlotInsertResponse {
     pub(crate) outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandPendingSlotRemoveResponse {
+    pub(crate) removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -897,6 +905,31 @@ pub(crate) fn decode_metadata_command_pending_slot_insert_response(
     };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandPendingSlotInsertResponse { outcome })
+}
+
+pub(crate) fn encode_metadata_command_pending_slot_remove_response(
+    response: &StorageRpcMetadataCommandPendingSlotRemoveResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(&mut out, u8::from(response.removed));
+    out
+}
+
+pub(crate) fn decode_metadata_command_pending_slot_remove_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandPendingSlotRemoveResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let removed = match decoder.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid metadata command pending slot remove outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandPendingSlotRemoveResponse { removed })
 }
 
 pub(crate) fn encode_metadata_command_state_request(
@@ -2518,6 +2551,18 @@ mod tests {
         let decoded = decode_metadata_command_pending_slot_insert_response(&bytes).unwrap();
 
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn metadata_command_pending_slot_remove_response_round_trips() {
+        for removed in [false, true] {
+            let response = StorageRpcMetadataCommandPendingSlotRemoveResponse { removed };
+
+            let bytes = encode_metadata_command_pending_slot_remove_response(&response);
+            let decoded = decode_metadata_command_pending_slot_remove_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
     }
 
     #[test]

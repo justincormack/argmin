@@ -17,7 +17,8 @@ use crate::storage_rpc::{
     decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
     decode_shard_read_request, decode_shard_write_request, encode_health_response,
     encode_metadata_command_acceptance_response,
-    encode_metadata_command_pending_slot_insert_response, encode_metadata_command_state_response,
+    encode_metadata_command_pending_slot_insert_response,
+    encode_metadata_command_pending_slot_remove_response, encode_metadata_command_state_response,
     encode_read_handle_acquire_response, encode_read_handle_release_response,
     encode_scavenger_list_files_response, encode_shard_read_range_response,
     encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
@@ -26,6 +27,7 @@ use crate::storage_rpc::{
     StorageRpcHealthResponse, StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
+    StorageRpcMetadataCommandPendingSlotRemoveResponse,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
@@ -458,6 +460,15 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
+                match decode_metadata_command_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_pending_slot_remove_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             kind => self.unsupported_operation_response(kind),
         }
         .map_err(|error| StorageNodeServerError::ResponsePayload {
@@ -816,6 +827,29 @@ impl StorageNodeConnectionHandler {
                                 candidate_log_index,
                             },
                     },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_pending_slot_remove_response(
+        &self,
+        request: StorageRpcMetadataCommandRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.remove_pending_metadata_command_slot(self.config.node_id.as_u32(), &request.command)
+        }) {
+            Ok(removed) => {
+                let payload = encode_metadata_command_pending_slot_remove_response(
+                    &StorageRpcMetadataCommandPendingSlotRemoveResponse { removed },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
@@ -1465,6 +1499,7 @@ mod tests {
     use crate::storage_rpc::{
         decode_health_response, decode_metadata_command_acceptance_response,
         decode_metadata_command_pending_slot_insert_response,
+        decode_metadata_command_pending_slot_remove_response,
         decode_metadata_command_state_response, decode_read_handle_acquire_response,
         decode_read_handle_release_response, decode_scavenger_list_files_response,
         decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
@@ -2721,6 +2756,59 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(reopened
+            .get_pg(0)
+            .unwrap()
+            .pending_metadata_command_envelope(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn storage_node_server_retries_lost_pending_slot_remove_as_not_found() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+        let pg = server._node.get_pg(0).unwrap();
+        pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+            .unwrap();
+        pg.record_metadata_command_abandoned(7, &command).unwrap();
+        drop(pg);
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+            command: command.clone(),
+        };
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        for (request_id, expected_removed) in [(1, true), (2, false)] {
+            let response = send_frame(
+                &mut client,
+                request_id,
+                StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+                encode_metadata_command_request(&request).unwrap(),
+            );
+            let payload = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap();
+            let decoded = decode_metadata_command_pending_slot_remove_response(&payload).unwrap();
+            assert_eq!(decoded.removed, expected_removed);
+        }
+        drop(client);
+        join.join().unwrap();
+
         let reopened = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,

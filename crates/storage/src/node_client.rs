@@ -26,7 +26,8 @@ use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
     decode_metadata_command_acceptance_response,
-    decode_metadata_command_pending_slot_insert_response, decode_metadata_command_state_response,
+    decode_metadata_command_pending_slot_insert_response,
+    decode_metadata_command_pending_slot_remove_response, decode_metadata_command_state_response,
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
@@ -1891,6 +1892,37 @@ impl UnixStorageNodeClient {
         }
     }
 
+    pub(crate) fn remove_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            command: command.clone(),
+        };
+        let payload = encode_metadata_command_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata command pending slot remove request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+            payload,
+        )?;
+        decode_metadata_command_pending_slot_remove_response(&response)
+            .map(|response| response.removed)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command pending slot remove response",
+                    error.to_string(),
+                )
+            })
+    }
+
     fn metadata_command_acceptance_request(
         &self,
         kind: StorageRpcMessageKind,
@@ -2262,10 +2294,10 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 
     fn remove_pending_metadata_command_slot(
         &self,
-        _pg_id: PgId,
-        _command: &MetadataCommandEnvelope,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
-        Err(self.unsupported_metadata_command_rpc("remove pending metadata command slot"))
+        UnixStorageNodeClient::remove_pending_metadata_command_slot(self, pg_id, command)
     }
 
     fn replace_pending_metadata_command_slot_for_reissue(
@@ -5268,6 +5300,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pending.command_bytes(), command.command_bytes());
+    }
+
+    #[test]
+    fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            pg.record_metadata_command_abandoned(7, &command).unwrap();
+        }
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+
+        assert!(
+            MetadataCommandNodeClient::remove_pending_metadata_command_slot(
+                &client,
+                PgId::new(0),
+                &command
+            )
+            .unwrap()
+        );
+        assert!(
+            !MetadataCommandNodeClient::remove_pending_metadata_command_slot(
+                &client,
+                PgId::new(0),
+                &command
+            )
+            .unwrap()
+        );
+        server_thread.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(reopened
+            .get_pg(0)
+            .unwrap()
+            .pending_metadata_command_envelope(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
