@@ -196,6 +196,8 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidMetadataCommandEnvelope,
     #[error("metadata command checksum mismatch")]
     MetadataCommandChecksumMismatch,
+    #[error("metadata command route mismatch: {0}")]
+    MetadataCommandRouteMismatch(&'static str),
     #[error("shard write size mismatch: expected {expected}, actual {actual}")]
     ShardWriteSizeMismatch { expected: u64, actual: u64 },
     #[error("shard write checksum mismatch")]
@@ -224,6 +226,21 @@ pub(crate) enum StorageRpcPayloadError {
 pub(crate) struct StorageRpcMetadataCommandItem {
     pub(crate) command_checksum: u64,
     pub(crate) command_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandStateRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -670,6 +687,94 @@ pub(crate) fn decode_metadata_command_item(
         command_checksum,
         command_bytes,
     })
+}
+
+pub(crate) fn encode_metadata_command_request(
+    request: &StorageRpcMetadataCommandRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_metadata_command_route(request.cluster_epoch, request.pg_id, request.command.id())?;
+    let item = StorageRpcMetadataCommandItem {
+        command_checksum: request.command.checksum_crc64(),
+        command_bytes: request.command.command_bytes(),
+    };
+    let command_payload = encode_metadata_command_item(&item)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    out.extend_from_slice(&command_payload);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let command_checksum = decoder.read_u64()?;
+    let command_bytes = decoder.read_bytes()?.to_vec();
+    decoder.finish()?;
+    let item_bytes = {
+        let mut out = Vec::new();
+        put_u64(&mut out, command_checksum);
+        put_bytes(&mut out, &command_bytes);
+        out
+    };
+    let item = decode_metadata_command_item(&item_bytes)?;
+    let command = decode_metadata_command_envelope(&item.command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
+    Ok(StorageRpcMetadataCommandRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        command,
+    })
+}
+
+pub(crate) fn encode_metadata_command_state_request(
+    request: &StorageRpcMetadataCommandStateRequest,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    out
+}
+
+pub(crate) fn decode_metadata_command_state_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandStateRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandStateRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+    })
+}
+
+fn validate_metadata_command_route(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    command_id: crate::metadata_command::MetadataCommandId,
+) -> Result<(), StorageRpcPayloadError> {
+    if command_id.cluster_epoch() != cluster_epoch {
+        return Err(StorageRpcPayloadError::MetadataCommandRouteMismatch(
+            "command epoch does not match RPC route",
+        ));
+    }
+    if command_id.pg_id() != pg_id {
+        return Err(StorageRpcPayloadError::MetadataCommandRouteMismatch(
+            "command PG does not match RPC route",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_shard_write_item(
@@ -2106,6 +2211,66 @@ mod tests {
             encode_metadata_command_item(&item),
             Err(StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
         );
+    }
+
+    #[test]
+    fn metadata_command_request_carries_route_and_command_identity() {
+        let command = test_metadata_command();
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            command: command.clone(),
+        };
+
+        let bytes = encode_metadata_command_request(&request).unwrap();
+        let decoded = decode_metadata_command_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.command.command_bytes(), command.command_bytes());
+    }
+
+    #[test]
+    fn metadata_command_request_rejects_route_command_mismatch() {
+        let command = test_metadata_command();
+        let wrong_pg = StorageRpcMetadataCommandRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: PgId::new(command.id().pg_id().get() + 1),
+            command: command.clone(),
+        };
+        assert!(matches!(
+            encode_metadata_command_request(&wrong_pg),
+            Err(StorageRpcPayloadError::MetadataCommandRouteMismatch(_))
+        ));
+
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            command,
+        };
+        let mut bytes = encode_metadata_command_request(&request).unwrap();
+        bytes[12..16].copy_from_slice(&(request.pg_id.get() + 1).to_le_bytes());
+
+        assert!(matches!(
+            decode_metadata_command_request(&bytes),
+            Err(StorageRpcPayloadError::MetadataCommandRouteMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn metadata_command_state_request_carries_route() {
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+        };
+
+        let bytes = encode_metadata_command_state_request(&request);
+        let decoded = decode_metadata_command_state_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
     }
 
     #[test]
