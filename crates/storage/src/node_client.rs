@@ -25,14 +25,17 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
+    decode_metadata_command_acceptance_response, decode_metadata_command_state_response,
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    encode_metadata_command_request, encode_metadata_command_state_request,
     encode_read_handle_acquire_request, encode_read_handle_release_request,
     encode_scavenger_list_files_request, encode_shard_ack_batch_request,
     encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
     encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
+    StorageRpcMetadataCommandRequest, StorageRpcMetadataCommandStateRequest,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
     StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
     StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
@@ -1794,6 +1797,78 @@ impl UnixStorageNodeClient {
         })
     }
 
+    pub(crate) fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_metadata_command_state_request(&request);
+        let response =
+            self.rpc_request(StorageRpcMessageKind::MetadataCommandReplicaState, payload)?;
+        decode_metadata_command_state_response(&response)
+            .map(|response| response.state)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command replica state response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    pub(crate) fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_acceptance_request(
+            StorageRpcMessageKind::MetadataCommandAcceptance,
+            pg_id,
+            command,
+        )
+    }
+
+    pub(crate) fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_acceptance_request(
+            StorageRpcMessageKind::MetadataCommandAbandonAcceptance,
+            pg_id,
+            command,
+        )
+    }
+
+    fn metadata_command_acceptance_request(
+        &self,
+        kind: StorageRpcMessageKind,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            command: command.clone(),
+        };
+        let payload = encode_metadata_command_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode metadata command request", error.to_string())
+        })?;
+        let response = self.rpc_request(kind, payload)?;
+        decode_metadata_command_acceptance_response(&response)
+            .map(|response| response.acceptance)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command acceptance response",
+                    error.to_string(),
+                )
+            })
+    }
+
     fn encode_shard_ack_batch(
         &self,
         pg_id: PgId,
@@ -1886,6 +1961,13 @@ impl UnixStorageNodeClient {
             operation,
             message,
         }
+    }
+
+    fn unsupported_metadata_command_rpc(&self, operation: &'static str) -> StoreError {
+        self.rpc_payload_error(
+            operation,
+            "metadata command RPC method is not implemented by this phase slice".to_string(),
+        )
     }
 }
 
@@ -2079,6 +2161,155 @@ impl ShardScavengerNodeClient for UnixStorageNodeClient {
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError> {
         UnixStorageNodeClient::list_scavenger_shard_files(self, data_pg_id)
+    }
+}
+
+impl MetadataCommandNodeClient for UnixStorageNodeClient {
+    fn max_metadata_command_log_index(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("max metadata command log index"))
+    }
+
+    fn next_metadata_command_id_at_least(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+        _min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("next metadata command id"))
+    }
+
+    fn pending_metadata_command_envelope(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("pending metadata command envelope"))
+    }
+
+    fn try_insert_pending_metadata_command_slot(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+        _bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError> {
+        Err(self.unsupported_metadata_command_rpc("insert pending metadata command slot"))
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+        _bucket: &BucketName,
+    ) -> Result<bool, StoreError> {
+        Err(self.unsupported_metadata_command_rpc(
+            "insert bucket-control pending metadata command slot",
+        ))
+    }
+
+    fn remove_pending_metadata_command_slot(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("remove pending metadata command slot"))
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        _pg_id: PgId,
+        _previous: &MetadataCommandEnvelope,
+        _replacement: &MetadataCommandEnvelope,
+        _bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("replace pending metadata command slot"))
+    }
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        UnixStorageNodeClient::metadata_command_replica_state(self, pg_id)
+    }
+
+    fn validate_metadata_command_replay_state(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("validate metadata command replay state"))
+    }
+
+    fn validate_metadata_command_replay_state_preserving_pending_slot(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        Err(self.unsupported_metadata_command_rpc(
+            "validate metadata command replay state preserving pending slot",
+        ))
+    }
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        UnixStorageNodeClient::metadata_command_acceptance(self, pg_id, command)
+    }
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        UnixStorageNodeClient::metadata_command_abandon_acceptance(self, pg_id, command)
+    }
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("applied metadata command log entry hashes"))
+    }
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+        _expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("matching applied metadata command log entry"))
+    }
+
+    fn apply_metadata_command_and_record(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        Err(self
+            .unsupported_metadata_command_rpc("apply metadata command and record")
+            .into())
+    }
+
+    fn record_metadata_command_abandoned(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("record metadata command abandoned"))
+    }
+
+    fn metadata_command_abandoned(
+        &self,
+        _pg_id: PgId,
+        _command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        Err(self.unsupported_metadata_command_rpc("metadata command abandoned"))
     }
 }
 
@@ -4825,6 +5056,25 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(pg_id),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    crate::tests::bucket_name("metadata-rpc-bucket"),
+                    crate::tests::object_key("object"),
+                    crate::tests::stream_session_id("metadata-rpc"),
+                    GenerationId::new(1).unwrap(),
+                    123,
+                ),
+            ),
+        )
+    }
+
     #[test]
     fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
         let tmp = test_util::tempdir();
@@ -4871,6 +5121,37 @@ mod tests {
         ));
         let pg = reopened.get_pg(0).unwrap();
         pg.validate_written_shard_ack(&key, ack).unwrap();
+    }
+
+    #[test]
+    fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let command = test_metadata_command(0, 1);
+
+        let state =
+            MetadataCommandNodeClient::metadata_command_replica_state(&client, PgId::new(0))
+                .unwrap();
+        let acceptance =
+            MetadataCommandNodeClient::metadata_command_acceptance(&client, PgId::new(0), &command)
+                .unwrap();
+
+        assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(state.applied_log_index, 0);
+        assert_eq!(acceptance, MetadataCommandAcceptance::Apply);
+        server_thread.join().unwrap();
     }
 
     #[test]

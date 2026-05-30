@@ -43,6 +43,7 @@ const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
     + STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS * STORAGE_RPC_SHARD_LOCATION_LEN;
 const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
     4 + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -61,6 +62,9 @@ pub(crate) enum StorageRpcMessageKind {
     ShardAckRecord = 12,
     ShardAckValidate = 13,
     ShardScavengerListFiles = 14,
+    MetadataCommandReplicaState = 15,
+    MetadataCommandAcceptance = 16,
+    MetadataCommandAbandonAcceptance = 17,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +121,9 @@ impl StorageRpcMessageKind {
             Self::ShardAckRecord => "shard ack record",
             Self::ShardAckValidate => "shard ack validate",
             Self::ShardScavengerListFiles => "shard scavenger list files",
+            Self::MetadataCommandReplicaState => "metadata command replica state",
+            Self::MetadataCommandAcceptance => "metadata command acceptance",
+            Self::MetadataCommandAbandonAcceptance => "metadata command abandon acceptance",
         }
     }
 
@@ -136,6 +143,9 @@ impl StorageRpcMessageKind {
             12 => Ok(Self::ShardAckRecord),
             13 => Ok(Self::ShardAckValidate),
             14 => Ok(Self::ShardScavengerListFiles),
+            15 => Ok(Self::MetadataCommandReplicaState),
+            16 => Ok(Self::MetadataCommandAcceptance),
+            17 => Ok(Self::MetadataCommandAbandonAcceptance),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -581,6 +591,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ShardScavengerListFiles => {
             STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandReplicaState => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -2735,6 +2748,11 @@ mod tests {
                 StorageRpcMessageKind::ShardRead,
                 STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandReplicaState,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
             ),
         ] {
             let mut bytes = Vec::new();
