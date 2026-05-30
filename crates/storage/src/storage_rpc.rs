@@ -44,6 +44,8 @@ const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
 const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
     4 + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN;
 const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
+const STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -67,6 +69,9 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandAbandonAcceptance = 17,
     MetadataCommandPendingSlotInsert = 18,
     MetadataCommandPendingSlotRemove = 19,
+    MetadataCommandMaxLogIndex = 20,
+    MetadataCommandNextId = 21,
+    MetadataCommandPendingEnvelope = 22,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +133,9 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandAbandonAcceptance => "metadata command abandon acceptance",
             Self::MetadataCommandPendingSlotInsert => "metadata command pending slot insert",
             Self::MetadataCommandPendingSlotRemove => "metadata command pending slot remove",
+            Self::MetadataCommandMaxLogIndex => "metadata command max log index",
+            Self::MetadataCommandNextId => "metadata command next id",
+            Self::MetadataCommandPendingEnvelope => "metadata command pending envelope",
         }
     }
 
@@ -152,6 +160,9 @@ impl StorageRpcMessageKind {
             17 => Ok(Self::MetadataCommandAbandonAcceptance),
             18 => Ok(Self::MetadataCommandPendingSlotInsert),
             19 => Ok(Self::MetadataCommandPendingSlotRemove),
+            20 => Ok(Self::MetadataCommandMaxLogIndex),
+            21 => Ok(Self::MetadataCommandNextId),
+            22 => Ok(Self::MetadataCommandPendingEnvelope),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -285,6 +296,44 @@ pub(crate) struct StorageRpcMetadataCommandPendingSlotInsertResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingSlotRemoveResponse {
     pub(crate) removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandNextIdRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) min_log_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandMaxLogIndexResponse {
+    pub(crate) max_log_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandNextIdOutcome {
+    Allocated {
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: u64,
+    },
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandNextIdResponse {
+    pub(crate) outcome: StorageRpcMetadataCommandNextIdOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandPendingEnvelopeResponse {
+    pub(crate) command: Option<crate::metadata_command::MetadataCommandEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +682,13 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::MetadataCommandReplicaState => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::MetadataCommandMaxLogIndex
+        | StorageRpcMessageKind::MetadataCommandPendingEnvelope => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandNextId => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN
+        }
         _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
@@ -930,6 +986,155 @@ pub(crate) fn decode_metadata_command_pending_slot_remove_response(
     };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandPendingSlotRemoveResponse { removed })
+}
+
+pub(crate) fn encode_metadata_command_next_id_request(
+    request: &StorageRpcMetadataCommandNextIdRequest,
+) -> Vec<u8> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    put_u64(&mut out, request.min_log_index);
+    out
+}
+
+pub(crate) fn decode_metadata_command_next_id_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandNextIdRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let min_log_index = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandNextIdRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        min_log_index,
+    })
+}
+
+pub(crate) fn encode_metadata_command_max_log_index_response(
+    response: &StorageRpcMetadataCommandMaxLogIndexResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, response.max_log_index);
+    out
+}
+
+pub(crate) fn decode_metadata_command_max_log_index_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let max_log_index = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandMaxLogIndexResponse { max_log_index })
+}
+
+pub(crate) fn encode_metadata_command_next_id_response(
+    response: &StorageRpcMetadataCommandNextIdResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.outcome {
+        StorageRpcMetadataCommandNextIdOutcome::Allocated {
+            cluster_epoch,
+            pg_id,
+            log_index,
+        } => {
+            put_u8(&mut out, 0);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u32(&mut out, pg_id.get());
+            put_u64(&mut out, log_index);
+        }
+        StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 1);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_next_id_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandNextIdResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMetadataCommandNextIdOutcome::Allocated {
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            pg_id: PgId::new(decoder.read_u32()?),
+            log_index: decoder.read_u64()?,
+        },
+        1 => StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command next id outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandNextIdResponse { outcome })
+}
+
+pub(crate) fn encode_metadata_command_pending_envelope_response(
+    response: &StorageRpcMetadataCommandPendingEnvelopeResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.command.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(command) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, command.checksum_crc64());
+            put_bytes(&mut out, &command.command_bytes());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_pending_envelope_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandPendingEnvelopeResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let command = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let command_checksum = decoder.read_u64()?;
+            let command_bytes = decoder.read_bytes()?.to_vec();
+            let item_bytes = {
+                let mut out = Vec::new();
+                put_u64(&mut out, command_checksum);
+                put_bytes(&mut out, &command_bytes);
+                out
+            };
+            let item = decode_metadata_command_item(&item_bytes)?;
+            Some(
+                decode_metadata_command_envelope(&item.command_bytes)
+                    .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?,
+            )
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid metadata command pending envelope tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandPendingEnvelopeResponse { command })
 }
 
 pub(crate) fn encode_metadata_command_state_request(
@@ -2560,6 +2765,74 @@ mod tests {
 
             let bytes = encode_metadata_command_pending_slot_remove_response(&response);
             let decoded = decode_metadata_command_pending_slot_remove_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn metadata_command_next_id_request_and_response_round_trip() {
+        let request = StorageRpcMetadataCommandNextIdRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+            min_log_index: 9,
+        };
+
+        let bytes = encode_metadata_command_next_id_request(&request);
+        let decoded = decode_metadata_command_next_id_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+
+        let response = StorageRpcMetadataCommandNextIdResponse {
+            outcome: StorageRpcMetadataCommandNextIdOutcome::Allocated {
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                pg_id: PgId::new(11),
+                log_index: 10,
+            },
+        };
+
+        let bytes = encode_metadata_command_next_id_response(&response);
+        let decoded = decode_metadata_command_next_id_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
+
+        let conflict = StorageRpcMetadataCommandNextIdResponse {
+            outcome: StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 11,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                log_index: 12,
+            },
+        };
+
+        let bytes = encode_metadata_command_next_id_response(&conflict);
+        let decoded = decode_metadata_command_next_id_response(&bytes).unwrap();
+
+        assert_eq!(decoded, conflict);
+    }
+
+    #[test]
+    fn metadata_command_max_log_index_response_round_trips() {
+        let response = StorageRpcMetadataCommandMaxLogIndexResponse { max_log_index: 42 };
+
+        let bytes = encode_metadata_command_max_log_index_response(&response);
+        let decoded = decode_metadata_command_max_log_index_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn metadata_command_pending_envelope_response_round_trips() {
+        let command = test_metadata_command();
+        for response in [
+            StorageRpcMetadataCommandPendingEnvelopeResponse { command: None },
+            StorageRpcMetadataCommandPendingEnvelopeResponse {
+                command: Some(command.clone()),
+            },
+        ] {
+            let bytes = encode_metadata_command_pending_envelope_response(&response);
+            let decoded = decode_metadata_command_pending_envelope_response(&bytes).unwrap();
 
             assert_eq!(decoded, response);
         }

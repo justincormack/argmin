@@ -9,14 +9,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::StoreError;
+use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::storage_rpc::{
-    decode_metadata_command_pending_slot_request, decode_metadata_command_request,
-    decode_metadata_command_state_request, decode_read_handle_acquire_request,
-    decode_read_handle_release_request, decode_scavenger_list_files_request,
-    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_write_request, encode_health_response,
-    encode_metadata_command_acceptance_response,
+    decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_request,
+    decode_metadata_command_request, decode_metadata_command_state_request,
+    decode_read_handle_acquire_request, decode_read_handle_release_request,
+    decode_scavenger_list_files_request, decode_shard_ack_batch_request,
+    decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
+    decode_shard_write_request, encode_health_response,
+    encode_metadata_command_acceptance_response, encode_metadata_command_max_log_index_response,
+    encode_metadata_command_next_id_response, encode_metadata_command_pending_envelope_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response, encode_metadata_command_state_response,
     encode_read_handle_acquire_response, encode_read_handle_release_response,
@@ -25,6 +28,9 @@ use crate::storage_rpc::{
     encode_storage_rpc_success_response, read_storage_rpc_request_frame_from,
     write_storage_rpc_frame_to, StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame,
     StorageRpcHealthResponse, StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceResponse,
+    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
+    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
+    StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -469,6 +475,33 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandMaxLogIndex => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_max_log_index_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandNextId => {
+                match decode_metadata_command_next_id_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_next_id_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_pending_envelope_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             kind => self.unsupported_operation_response(kind),
         }
         .map_err(|error| StorageNodeServerError::ResponsePayload {
@@ -722,6 +755,142 @@ impl StorageNodeConnectionHandler {
             Ok(state) => {
                 let payload = encode_metadata_command_state_response(
                     &StorageRpcMetadataCommandStateResponse { state },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_max_log_index_response(
+        &self,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self
+            .node
+            .get_pg(request.pg_id.get())
+            .and_then(|pg| pg.max_metadata_command_log_index(request.cluster_epoch))
+        {
+            Ok(max_log_index) => {
+                let payload = encode_metadata_command_max_log_index_response(
+                    &StorageRpcMetadataCommandMaxLogIndexResponse { max_log_index },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_next_id_response(
+        &self,
+        request: StorageRpcMetadataCommandNextIdRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let Some(min_log_index) = MetadataCommandLogIndex::new(request.min_log_index) else {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command min log index must not be zero".to_string(),
+            });
+        };
+        let response =
+            match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+                self.next_metadata_command_id_from_pg(request.pg_id, &pg, min_log_index)
+            }) {
+                Ok(id) => {
+                    let payload = encode_metadata_command_next_id_response(
+                        &StorageRpcMetadataCommandNextIdResponse {
+                            outcome: StorageRpcMetadataCommandNextIdOutcome::Allocated {
+                                cluster_epoch: id.cluster_epoch(),
+                                pg_id: id.pg_id(),
+                                log_index: id.log_index().get(),
+                            },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
+                Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                }) => {
+                    let payload = encode_metadata_command_next_id_response(
+                        &StorageRpcMetadataCommandNextIdResponse {
+                            outcome: StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+                                node_id,
+                                pg_id,
+                                cluster_epoch,
+                                log_index,
+                            },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
+                Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            };
+        Ok(response)
+    }
+
+    fn next_metadata_command_id_from_pg(
+        &self,
+        pg_id: PgId,
+        pg: &crate::PgStore,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let cluster_epoch = self.config.cluster_epoch;
+        let max_log_index = pg.max_metadata_command_log_index(cluster_epoch)?;
+        if let Some(slot) =
+            pg.pending_metadata_command_slot(self.config.node_id.as_u32(), cluster_epoch)?
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id: self.config.node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch,
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        let next_log_index = max_log_index
+            .checked_add(1)
+            .map(|next| next.max(min_log_index.get()))
+            .and_then(MetadataCommandLogIndex::new)
+            .ok_or(StoreError::MetadataCommandLogConflict {
+                node_id: self.config.node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch,
+                log_index: u64::MAX,
+            })?;
+        Ok(MetadataCommandId::new(cluster_epoch, pg_id, next_log_index))
+    }
+
+    fn metadata_command_pending_envelope_response(
+        &self,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.pending_metadata_command_envelope(
+                self.config.node_id.as_u32(),
+                request.cluster_epoch,
+            )
+        }) {
+            Ok(command) => {
+                let payload = encode_metadata_command_pending_envelope_response(
+                    &StorageRpcMetadataCommandPendingEnvelopeResponse { command },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
@@ -1498,18 +1667,21 @@ mod tests {
     };
     use crate::storage_rpc::{
         decode_health_response, decode_metadata_command_acceptance_response,
+        decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
+        decode_metadata_command_pending_envelope_response,
         decode_metadata_command_pending_slot_insert_response,
         decode_metadata_command_pending_slot_remove_response,
         decode_metadata_command_state_response, decode_read_handle_acquire_response,
         decode_read_handle_release_response, decode_scavenger_list_files_response,
         decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-        decode_storage_rpc_response_payload, encode_metadata_command_pending_slot_request,
-        encode_metadata_command_request, encode_metadata_command_state_request,
-        encode_read_handle_acquire_request, encode_read_handle_release_request,
-        encode_scavenger_list_files_request, encode_shard_ack_batch_request,
-        encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
-        encode_shard_write_request, encode_storage_rpc_frame, read_storage_rpc_frame_from,
-        write_storage_rpc_frame_to, StorageRpcMetadataCommandPendingSlotInsertOutcome,
+        decode_storage_rpc_response_payload, encode_metadata_command_next_id_request,
+        encode_metadata_command_pending_slot_request, encode_metadata_command_request,
+        encode_metadata_command_state_request, encode_read_handle_acquire_request,
+        encode_read_handle_release_request, encode_scavenger_list_files_request,
+        encode_shard_ack_batch_request, encode_shard_delete_request,
+        encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
+        encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
         StorageRpcMetadataCommandStateRequest, StorageRpcReadHandleAcquireRequest,
         StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
@@ -2585,6 +2757,130 @@ mod tests {
             .unwrap();
         let decoded = decode_metadata_command_state_response(&payload).unwrap();
         assert_eq!(decoded.state, expected);
+    }
+
+    #[test]
+    fn storage_node_server_returns_metadata_command_read_and_allocator_state() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let first = test_metadata_command(0, 1);
+        let pending = test_metadata_command(0, 3);
+        let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let pg = server._node.get_pg(0).unwrap();
+        pg.record_metadata_command_abandoned(7, &first).unwrap();
+        pg.try_insert_pending_metadata_command_slot(7, &pending, Some(&bucket))
+            .unwrap();
+        drop(pg);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+        let state_request = StorageRpcMetadataCommandStateRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+        };
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let max_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandMaxLogIndex,
+            encode_metadata_command_state_request(&state_request),
+        );
+        let max_payload = decode_storage_rpc_response_payload(&max_response.payload)
+            .unwrap()
+            .unwrap();
+        let max = decode_metadata_command_max_log_index_response(&max_payload).unwrap();
+        assert_eq!(max.max_log_index, 1);
+
+        let pending_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            encode_metadata_command_state_request(&state_request),
+        );
+        let pending_payload = decode_storage_rpc_response_payload(&pending_response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded_pending =
+            decode_metadata_command_pending_envelope_response(&pending_payload).unwrap();
+        assert_eq!(
+            decoded_pending.command.unwrap().command_bytes(),
+            pending.command_bytes()
+        );
+
+        let next_response = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::MetadataCommandNextId,
+            encode_metadata_command_next_id_request(&StorageRpcMetadataCommandNextIdRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                min_log_index: 1,
+            }),
+        );
+        let next_payload = decode_storage_rpc_response_payload(&next_response.payload)
+            .unwrap()
+            .unwrap();
+        let next = decode_metadata_command_next_id_response(&next_payload).unwrap();
+        assert_eq!(
+            next.outcome,
+            StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 3,
+            }
+        );
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_server_allocates_next_metadata_command_id() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let first = test_metadata_command(0, 1);
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .record_metadata_command_abandoned(7, &first)
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandNextId,
+            encode_metadata_command_next_id_request(&StorageRpcMetadataCommandNextIdRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                min_log_index: 5,
+            }),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let next = decode_metadata_command_next_id_response(&payload).unwrap();
+        assert_eq!(
+            next.outcome,
+            StorageRpcMetadataCommandNextIdOutcome::Allocated {
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                log_index: 5,
+            }
+        );
     }
 
     #[test]
