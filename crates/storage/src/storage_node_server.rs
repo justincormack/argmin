@@ -1992,6 +1992,59 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_rejects_stale_shard_ack_validate_before_rows() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.pg_routes[0].cluster_epoch = ClusterEpoch::new(2).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let shard_key = test_shard_key(0);
+        let ack = WriteAck {
+            stored_size: 12,
+            crc64: 0x1234,
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let pg = server._node.get_pg(0).unwrap();
+        pg.register_written_shards_batch_exact(&[(&shard_key, ack)])
+            .unwrap();
+        drop(pg);
+        let stale_request = StorageRpcShardAckBatchRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+            items: vec![StorageRpcShardAckItem {
+                shard_key: shard_key.clone(),
+                ack,
+            }],
+        };
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardAckValidate,
+            encode_shard_ack_batch_request(&stale_request).unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = reopened.get_pg(0).unwrap();
+        pg.validate_written_shard_ack(&shard_key, ack).unwrap();
+    }
+
+    #[test]
     fn storage_node_server_rejects_read_handle_acquire_for_wrong_node() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
