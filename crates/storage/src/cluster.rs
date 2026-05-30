@@ -2026,6 +2026,7 @@ impl StorageCluster {
             .read_payload_shard(self.operation_epoch(), location, key, expected)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_payload_shard_into(
         &self,
         location: ShardLocation,
@@ -4554,6 +4555,7 @@ impl StorageCluster {
         let padded = req.stored_size.div_ceil(k) * k;
         let shard_size = padded / k;
         dst.resize(padded, 0);
+        let mut direct_shards = Vec::with_capacity(k);
         for (shard_index, location) in locations.iter().take(k).enumerate() {
             let shard_key =
                 ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index as u8);
@@ -4565,16 +4567,42 @@ impl StorageCluster {
             if ack.stored_size != shard_size as u64 {
                 return Ok(false);
             }
+            direct_shards.push((*location, shard_key, ack));
+        }
+        let handle_entries: Vec<_> = direct_shards
+            .iter()
+            .map(|(location, shard_key, _)| (*location, shard_key.clone()))
+            .collect();
+        let mut read_handles = match self
+            .local_map
+            .acquire_payload_shard_read_handles(self.operation_epoch(), &handle_entries)
+        {
+            Ok(read_handles) => read_handles,
+            Err(error) => {
+                placed_segment_recoverable_shard_error(error)?;
+                return Ok(false);
+            }
+        };
+
+        for (shard_index, (location, shard_key, ack)) in direct_shards.iter().enumerate() {
             let start = shard_index * shard_size;
             let end = start + shard_size;
-            match self.read_payload_shard_into(*location, &shard_key, ack, &mut dst[start..end]) {
+            match self.local_map.read_payload_shard_into_without_handle(
+                self.operation_epoch(),
+                *location,
+                shard_key,
+                *ack,
+                &mut dst[start..end],
+            ) {
                 Ok(()) => {}
                 Err(error) => {
+                    read_handles.release().map_err(shard_io_error_to_store)?;
                     placed_segment_recoverable_shard_error(error)?;
                     return Ok(false);
                 }
             }
         }
+        read_handles.release().map_err(shard_io_error_to_store)?;
 
         dst.truncate(req.stored_size);
         let actual_crc64 = checksum::crc64::checksum(dst);

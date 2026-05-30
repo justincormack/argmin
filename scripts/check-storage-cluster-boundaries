@@ -1462,9 +1462,10 @@ payload_shard_read_callers=$(
     }
     {
         update_function_context()
-        if ($0 ~ /\.[[:space:]]*read_payload_shard(_into)?\(/ \
+        if ($0 ~ /\.[[:space:]]*read_payload_shard(_into(_without_handle)?)?\(/ \
             && current_fn != "read_payload_shard" \
             && current_fn != "read_payload_shard_into" \
+            && current_fn != "read_payload_shard_into_without_handle" \
             && !in_test_hook) {
             print FILENAME ":" current_fn
         }
@@ -1491,7 +1492,7 @@ fi
 
 public_payload_shard_read_apis=$(
     rg -n --color=never \
-        '^[[:space:]]*pub fn read_payload_shard(_into)?\(' \
+        '^[[:space:]]*pub fn read_payload_shard(_into(_without_handle)?)?\(' \
         crates/storage/src/cluster.rs \
         crates/storage/src/cluster/local.rs \
         || true

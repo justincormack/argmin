@@ -178,6 +178,7 @@ impl LocalShardNodeClient<'_> {
         Ok(data)
     }
 
+    #[cfg(test)]
     fn read_shard_into(
         &self,
         key: &ShardKey,
@@ -199,6 +200,24 @@ impl LocalShardNodeClient<'_> {
             return Err(self.store_error(error));
         }
         read_result?;
+        self.verify_read_ack(expected, dst)
+    }
+
+    fn read_shard_into_without_handle(
+        &self,
+        key: &ShardKey,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        if dst.len() as u64 != expected.stored_size {
+            return Err(self.store_error(StoreError::Io {
+                context: "read payload shard buffer size mismatch",
+                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+            }));
+        }
+        self.client
+            .read_placed_shard_into(self.data_pg_id, key, expected, dst)
+            .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, dst)
     }
 
@@ -229,6 +248,22 @@ impl LocalShardNodeClient<'_> {
         )
     }
 
+    fn read_operation_id_for_keys(&self, keys: &[ShardKey]) -> String {
+        let mut id = format!(
+            "read-batch:{}:{}:{}",
+            self.cluster_epoch.get(),
+            self.data_pg_id.get(),
+            self.node_id.as_u32()
+        );
+        for key in keys {
+            let hex_key = key.hex_bytes();
+            let hex_key = std::str::from_utf8(&hex_key).expect("shard key hex is valid ASCII");
+            id.push(':');
+            id.push_str(hex_key);
+        }
+        id
+    }
+
     fn store_error(&self, source: StoreError) -> ShardIoError {
         ShardIoError::Store {
             node_id: self.node_id.as_u32(),
@@ -253,6 +288,59 @@ impl LocalShardNodeClient<'_> {
             }));
         }
         Ok(())
+    }
+}
+
+pub(crate) struct LocalShardReadHandleSet {
+    leases: Vec<(
+        ShardLocation,
+        Box<dyn crate::node_client::ShardReadHandleLease>,
+    )>,
+    released: bool,
+}
+
+impl LocalShardReadHandleSet {
+    fn new() -> Self {
+        Self {
+            leases: Vec::new(),
+            released: false,
+        }
+    }
+
+    fn push(
+        &mut self,
+        location: ShardLocation,
+        lease: Box<dyn crate::node_client::ShardReadHandleLease>,
+    ) {
+        self.leases.push((location, lease));
+    }
+
+    pub(crate) fn release(&mut self) -> Result<(), ShardIoError> {
+        if self.released {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for (location, lease) in &mut self.leases {
+            if let Err(source) = lease.release() {
+                first_error.get_or_insert_with(|| ShardIoError::Store {
+                    node_id: location.node_id().as_u32(),
+                    pg_id: location.data_pg_id().get(),
+                    cluster_epoch: location.cluster_epoch(),
+                    source,
+                });
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for LocalShardReadHandleSet {
+    fn drop(&mut self) {
+        let _ = self.release();
     }
 }
 
@@ -659,6 +747,19 @@ impl LocalClusterMap {
             .get_mut(&node_id)
             .expect("test shard ack client node must exist");
         node.shard_ack_client = shard_ack_client;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_shard_read_handle_client_for_tests(
+        &mut self,
+        node_id: NodeId,
+        shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient>,
+    ) {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .expect("test shard read handle client node must exist");
+        node.shard_read_handle_client = shard_read_handle_client;
     }
 
     pub fn pg_route(&self, pg_id: PgId) -> Option<&LocalPgRoute> {
@@ -1348,6 +1449,7 @@ impl LocalClusterMap {
             .read_shard(key, expected)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_payload_shard_into(
         &self,
         operation_epoch: ClusterEpoch,
@@ -1358,6 +1460,64 @@ impl LocalClusterMap {
     ) -> Result<(), ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
             .read_shard_into(key, expected, dst)
+    }
+
+    pub(crate) fn acquire_payload_shard_read_handles(
+        &self,
+        operation_epoch: ClusterEpoch,
+        entries: &[(ShardLocation, ShardKey)],
+    ) -> Result<LocalShardReadHandleSet, ShardIoError> {
+        let mut groups: BTreeMap<NodeId, Vec<(ShardLocation, ShardKey)>> = BTreeMap::new();
+        for (location, key) in entries {
+            self.shard_node_client(operation_epoch, *location, key)?;
+            groups
+                .entry(location.node_id())
+                .or_default()
+                .push((*location, key.clone()));
+        }
+
+        let mut handle_set = LocalShardReadHandleSet::new();
+        for (node_id, entries) in groups {
+            let node = self
+                .node(node_id)
+                .expect("read handle group node was validated before grouping");
+            let locations: Vec<ShardLocation> =
+                entries.iter().map(|(location, _)| *location).collect();
+            let keys: Vec<ShardKey> = entries.iter().map(|(_, key)| key.clone()).collect();
+            let first = entries
+                .first()
+                .expect("read handle group must contain at least one location");
+            let client = self.shard_node_client(operation_epoch, first.0, &first.1)?;
+            let read_operation_id = client.read_operation_id_for_keys(&keys);
+            match node
+                .shard_read_handle_client()
+                .acquire_read_handles(&read_operation_id, locations.clone())
+            {
+                Ok(lease) => handle_set.push(first.0, lease),
+                Err(source) => {
+                    handle_set.release()?;
+                    return Err(ShardIoError::Store {
+                        node_id: node_id.as_u32(),
+                        pg_id: first.0.data_pg_id().get(),
+                        cluster_epoch: first.0.cluster_epoch(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(handle_set)
+    }
+
+    pub(crate) fn read_payload_shard_into_without_handle(
+        &self,
+        operation_epoch: ClusterEpoch,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        self.shard_node_client(operation_epoch, location, key)?
+            .read_shard_into_without_handle(key, expected, dst)
     }
 
     pub(crate) fn delete_payload_shard(
@@ -5677,6 +5837,138 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner()),
             vec![(pg_id, key, ack)]
         );
+    }
+
+    #[derive(Default)]
+    struct ReadHandleEvents {
+        acquires: Mutex<Vec<Vec<ShardLocation>>>,
+        releases: Mutex<Vec<Vec<ShardLocation>>>,
+    }
+
+    struct RecordingReadHandleClient {
+        fail_acquire: bool,
+        events: Arc<ReadHandleEvents>,
+    }
+
+    impl RecordingReadHandleClient {
+        fn new(fail_acquire: bool) -> Self {
+            Self {
+                fail_acquire,
+                events: Arc::new(ReadHandleEvents::default()),
+            }
+        }
+    }
+
+    struct RecordingReadHandleLease {
+        locations: Vec<ShardLocation>,
+        events: Arc<ReadHandleEvents>,
+        released: bool,
+    }
+
+    impl ShardReadHandleNodeClient for RecordingReadHandleClient {
+        fn acquire_read_handles(
+            &self,
+            _read_operation_id: &str,
+            locations: Vec<ShardLocation>,
+        ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, StoreError> {
+            self.events
+                .acquires
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(locations.clone());
+            if self.fail_acquire {
+                return Err(StoreError::Io {
+                    context: "recording read handle acquire",
+                    source: std::io::Error::from(std::io::ErrorKind::WouldBlock),
+                });
+            }
+            Ok(Box::new(RecordingReadHandleLease {
+                locations,
+                events: Arc::clone(&self.events),
+                released: false,
+            }))
+        }
+    }
+
+    impl crate::node_client::ShardReadHandleLease for RecordingReadHandleLease {
+        fn release(&mut self) -> Result<(), StoreError> {
+            if !self.released {
+                self.events
+                    .releases
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(self.locations.clone());
+                self.released = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn partial_multi_node_read_handle_acquire_failure_releases_prior_handles() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let ok_client = Arc::new(RecordingReadHandleClient::new(false));
+        let ok_events = Arc::clone(&ok_client.events);
+        let failing_client = Arc::new(RecordingReadHandleClient::new(true));
+        let failing_events = Arc::clone(&failing_client.events);
+        map.replace_shard_read_handle_client_for_tests(NodeId::new(1), ok_client);
+        map.replace_shard_read_handle_client_for_tests(NodeId::new(2), failing_client);
+
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        let key_0 = ShardKey::new(&[0x57; 16], 91, 0);
+        let key_1 = ShardKey::new(&[0x58; 16], 91, 1);
+        let location_0 = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key_0.shard_index(),
+            NodeId::new(1),
+        );
+        let location_1 = ShardLocation::new(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            key_1.shard_index(),
+            NodeId::new(2),
+        );
+
+        let err = match map.acquire_payload_shard_read_handles(
+            ClusterEpoch::INITIAL,
+            &[(location_0, key_0), (location_1, key_1)],
+        ) {
+            Ok(_) => panic!("expected later-node read handle acquire to fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            err,
+            ShardIoError::Store {
+                node_id: 2,
+                pg_id: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            *ok_events.acquires.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![vec![location_0]]
+        );
+        assert_eq!(
+            *ok_events.releases.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![vec![location_0]]
+        );
+        assert_eq!(
+            *failing_events
+                .acquires
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            vec![vec![location_1]]
+        );
+        assert!(failing_events
+            .releases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     fn private_socket_dir(path: &Path) {
