@@ -29,7 +29,8 @@ use crate::storage_rpc::{
     decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
     decode_metadata_command_next_id_response, decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,
-    decode_metadata_command_pending_slot_remove_response, decode_metadata_command_state_response,
+    decode_metadata_command_pending_slot_remove_response,
+    decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
@@ -43,11 +44,11 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
     StorageRpcMetadataCommandPendingSlotInsertOutcome, StorageRpcMetadataCommandPendingSlotRequest,
-    StorageRpcMetadataCommandRequest, StorageRpcMetadataCommandStateRequest,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest,
+    StorageRpcMetadataCommandRequest, StorageRpcMetadataCommandStateOutcome,
+    StorageRpcMetadataCommandStateRequest, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
+    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -2107,6 +2108,53 @@ impl UnixStorageNodeClient {
             })
     }
 
+    pub(crate) fn record_metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let payload = self.encode_metadata_command_request(pg_id, command)?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            payload,
+        )?;
+        let response =
+            decode_metadata_command_state_outcome_response(&response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    error.to_string(),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => {
+                if cluster_epoch != self.cluster_epoch || conflict_pg_id != pg_id.get() {
+                    return Err(self.rpc_payload_error(
+                        "decode metadata command record abandoned response",
+                        "metadata command log conflict route mismatch".to_string(),
+                    ));
+                }
+                if MetadataCommandLogIndex::new(log_index).is_none() {
+                    return Err(self.rpc_payload_error(
+                        "decode metadata command record abandoned response",
+                        "metadata command log conflict index must not be zero".to_string(),
+                    ));
+                }
+                Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                })
+            }
+        }
+    }
+
     pub(crate) fn try_insert_pending_metadata_command_slot(
         &self,
         pg_id: PgId,
@@ -2679,10 +2727,10 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 
     fn record_metadata_command_abandoned(
         &self,
-        _pg_id: PgId,
-        _command: &MetadataCommandEnvelope,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        Err(self.unsupported_metadata_command_rpc("record metadata command abandoned"))
+        UnixStorageNodeClient::record_metadata_command_abandoned(self, pg_id, command)
     }
 
     fn metadata_command_abandoned(
@@ -5411,9 +5459,10 @@ mod tests {
     };
     use crate::storage_rpc::{
         encode_metadata_command_applied_hashes_response, encode_metadata_command_next_id_response,
-        encode_read_handle_acquire_response, encode_storage_rpc_success_response,
-        read_storage_rpc_frame_from, write_storage_rpc_frame_to,
-        StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcMetadataCommandNextIdResponse,
+        encode_metadata_command_state_outcome_response, encode_read_handle_acquire_response,
+        encode_storage_rpc_success_response, read_storage_rpc_frame_from,
+        write_storage_rpc_frame_to, StorageRpcMetadataCommandAppliedHashesResponse,
+        StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandStateOutcomeResponse,
         StorageRpcReadHandleAcquireResponse,
     };
 
@@ -5745,6 +5794,52 @@ mod tests {
     }
 
     #[test]
+    fn unix_storage_node_client_records_abandoned_metadata_command_idempotently() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let command = test_metadata_command(0, 1);
+
+        let first = MetadataCommandNodeClient::record_metadata_command_abandoned(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap();
+        let second = MetadataCommandNodeClient::record_metadata_command_abandoned(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap();
+        server_thread.join().unwrap();
+
+        assert_eq!(first, second);
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(reopened
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_abandoned(7, &command)
+            .unwrap());
+    }
+
+    #[test]
     fn unix_storage_node_client_rejects_mismatched_next_id_conflict_response() {
         fn next_id_error_from_fake_response(
             outcome: StorageRpcMetadataCommandNextIdOutcome,
@@ -5899,6 +5994,95 @@ mod tests {
             zero_index,
             StoreError::StorageRpc {
                 operation: "decode metadata command applied hashes response",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_client_preserves_record_abandoned_log_conflict() {
+        fn record_abandoned_error_from_fake_response(
+            outcome: StorageRpcMetadataCommandStateOutcome,
+        ) -> StoreError {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("sock").join("storage.sock");
+            private_socket_dir(socket_path.parent().unwrap());
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let join = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+                let payload = encode_metadata_command_state_outcome_response(
+                    &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
+                );
+                let response = StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                };
+                write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+            });
+            let client = UnixStorageNodeClient::new(
+                NodeId::new(7),
+                ClusterEpoch::new(1).unwrap(),
+                socket_path,
+            );
+
+            let err = MetadataCommandNodeClient::record_metadata_command_abandoned(
+                &client,
+                PgId::new(0),
+                &test_metadata_command(0, 1),
+            )
+            .unwrap_err();
+
+            join.join().unwrap();
+            err
+        }
+
+        let conflict = record_abandoned_error_from_fake_response(
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        );
+        assert!(matches!(
+            conflict,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 0,
+                log_index: 1,
+                ..
+            }
+        ));
+
+        let wrong_route = record_abandoned_error_from_fake_response(
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        );
+        assert!(matches!(
+            wrong_route,
+            StoreError::StorageRpc {
+                operation: "decode metadata command record abandoned response",
+                ..
+            }
+        ));
+
+        let zero_index = record_abandoned_error_from_fake_response(
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 0,
+            },
+        );
+        assert!(matches!(
+            zero_index,
+            StoreError::StorageRpc {
+                operation: "decode metadata command record abandoned response",
                 ..
             }
         ));

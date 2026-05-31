@@ -77,6 +77,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
+    MetadataCommandRecordAbandoned = 28,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +149,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandAbandoned => "metadata command abandoned",
+            Self::MetadataCommandRecordAbandoned => "metadata command record abandoned",
         }
     }
 
@@ -180,6 +182,7 @@ impl StorageRpcMessageKind {
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
+            28 => Ok(Self::MetadataCommandRecordAbandoned),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -381,6 +384,22 @@ pub(crate) struct StorageRpcMetadataCommandAppliedHashesResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandBoolResponse {
     pub(crate) value: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandStateOutcome {
+    State(MetadataCommandReplicaState),
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandStateOutcomeResponse {
+    pub(crate) outcome: StorageRpcMetadataCommandStateOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1309,6 +1328,61 @@ pub(crate) fn decode_metadata_command_bool_response(
     };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandBoolResponse { value })
+}
+
+pub(crate) fn encode_metadata_command_state_outcome_response(
+    response: &StorageRpcMetadataCommandStateOutcomeResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.outcome {
+        StorageRpcMetadataCommandStateOutcome::State(state) => {
+            put_u8(&mut out, 0);
+            put_u64(&mut out, state.cluster_epoch.get());
+            put_u64(&mut out, state.applied_log_index);
+            put_u64(&mut out, state.applied_log_hash);
+            put_u64(&mut out, state.state_digest);
+        }
+        StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 1);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_state_outcome_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMetadataCommandStateOutcome::State(MetadataCommandReplicaState {
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            applied_log_index: decoder.read_u64()?,
+            applied_log_hash: decoder.read_u64()?,
+            state_digest: decoder.read_u64()?,
+        }),
+        1 => StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command state outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandStateOutcomeResponse { outcome })
 }
 
 pub(crate) fn encode_metadata_command_state_request(
@@ -3063,6 +3137,35 @@ mod tests {
         ] {
             let bytes = encode_metadata_command_bool_response(&response);
             let decoded = decode_metadata_command_bool_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn metadata_command_state_outcome_response_round_trips() {
+        for response in [
+            StorageRpcMetadataCommandStateOutcomeResponse {
+                outcome: StorageRpcMetadataCommandStateOutcome::State(
+                    MetadataCommandReplicaState {
+                        cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                        applied_log_index: 44,
+                        applied_log_hash: 0x55,
+                        state_digest: 0x66,
+                    },
+                ),
+            },
+            StorageRpcMetadataCommandStateOutcomeResponse {
+                outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 11,
+                    cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                    log_index: 12,
+                },
+            },
+        ] {
+            let bytes = encode_metadata_command_state_outcome_response(&response);
+            let decoded = decode_metadata_command_state_outcome_response(&bytes).unwrap();
 
             assert_eq!(decoded, response);
         }
