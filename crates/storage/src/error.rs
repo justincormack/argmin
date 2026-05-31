@@ -445,6 +445,15 @@ pub enum ClusterBuildError {
     #[error("remote bucket metadata client socket path {path:?} must be absolute")]
     RemoteBucketMetadataClientSocketPathNotAbsolute { path: PathBuf },
 
+    #[error("duplicate remote object-generation metadata client node id {id}")]
+    DuplicateRemoteObjectGenerationMetadataClientNodeId { id: u32 },
+
+    #[error("remote object-generation metadata client node {id} is not present in the local cluster map")]
+    RemoteObjectGenerationMetadataClientNodeNotFound { id: u32 },
+
+    #[error("remote object-generation metadata client socket path {path:?} must be absolute")]
+    RemoteObjectGenerationMetadataClientSocketPathNotAbsolute { path: PathBuf },
+
     #[error("metadata primary node {id} is not present in the local cluster map")]
     MetadataPrimaryNotFound { id: u32 },
 
@@ -591,6 +600,14 @@ pub enum MetadataError {
 
     #[error("object generation reservation not found: {reservation_id}")]
     ObjectGenerationReservationNotFound { reservation_id: String },
+
+    #[error(
+        "object generation reservation conflict: reservation {reservation_id} generation {generation_id}"
+    )]
+    ObjectGenerationReservationConflict {
+        reservation_id: String,
+        generation_id: u64,
+    },
 
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },

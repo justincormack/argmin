@@ -33,6 +33,7 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
+    decode_object_generation_reservation_response, decode_object_generation_response,
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
@@ -40,21 +41,23 @@ use crate::storage_rpc::{
     encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
     encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
-    encode_metadata_command_state_request, encode_proof_release_request,
-    encode_read_handle_acquire_request, encode_read_handle_release_request,
-    encode_scavenger_list_files_request, encode_shard_ack_batch_request,
-    encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
-    encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
-    StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
+    encode_metadata_command_state_request, encode_object_generation_reservation_request,
+    encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
+    encode_read_handle_release_request, encode_scavenger_list_files_request,
+    encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
+    encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
+    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandBoolOutcome,
-    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
+    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
+    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
-    StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
+    StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
+    StorageRpcObjectRequest, StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
     StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
     StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
@@ -616,6 +619,23 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         pg_id: PgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
+}
+
+pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
+    fn object_generation_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError>;
+
+    fn next_object_generation_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -2190,6 +2210,13 @@ impl UnixStorageNodeClient {
                     log_index,
                 })
             }
+            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+                ..
+            } => Err(self.rpc_payload_error(
+                "decode metadata command record abandoned response",
+                "record abandoned response cannot contain object generation reservation conflict"
+                    .to_string(),
+            )),
         }
     }
 
@@ -2244,6 +2271,15 @@ impl UnixStorageNodeClient {
                     },
                 ))
             }
+            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+                reservation_id,
+                generation_id,
+            } => Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict {
+                    reservation_id: reservation_id.into_string(),
+                    generation_id: generation_id.get(),
+                },
+            )),
         }
     }
 
@@ -2436,14 +2472,40 @@ impl UnixStorageNodeClient {
             self.rpc_payload_error("encode metadata command request", error.to_string())
         })?;
         let response = self.rpc_request(kind, payload)?;
-        decode_metadata_command_acceptance_response(&response)
-            .map(|response| response.acceptance)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command acceptance response",
-                    error.to_string(),
-                )
-            })
+        let response = decode_metadata_command_acceptance_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command acceptance response",
+                error.to_string(),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(acceptance) => Ok(acceptance),
+            StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => {
+                if cluster_epoch != self.cluster_epoch || conflict_pg_id != pg_id.get() {
+                    return Err(self.rpc_payload_error(
+                        "decode metadata command acceptance response",
+                        "metadata command log conflict route mismatch".to_string(),
+                    ));
+                }
+                if MetadataCommandLogIndex::new(log_index).is_none() {
+                    return Err(self.rpc_payload_error(
+                        "decode metadata command acceptance response",
+                        "metadata command log conflict index must not be zero".to_string(),
+                    ));
+                }
+                Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                })
+            }
+        }
     }
 
     fn encode_shard_ack_batch(
@@ -3173,6 +3235,33 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
+impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
+    fn object_generation_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        <Self as StorageNodeClient>::object_generation_reservation(
+            self,
+            pg_id,
+            bucket,
+            key,
+            reservation_id,
+        )
+    }
+
+    fn next_object_generation_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        <Self as StorageNodeClient>::next_object_generation_id(self, pg_id, bucket, key)
+    }
+}
+
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
     fn head_bucket_raw(
         &self,
@@ -3262,6 +3351,72 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             .map_err(BucketSnapshotLoadError::Store)?;
         self.validate_proof_release_response(&response)?;
         Ok(())
+    }
+}
+
+impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
+    fn object_generation_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let request = StorageRpcObjectGenerationReservationRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            reservation_id: reservation_id.clone(),
+        };
+        let payload = encode_object_generation_reservation_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectGenerationReservation, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_generation_reservation_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode object generation reservation response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectGenerationReservationOutcome::Found(generation_id) => Ok(generation_id),
+            StorageRpcObjectGenerationReservationOutcome::NotFound { reservation_id } => Err(
+                ObjectPgActionError::Metadata(MetadataError::ObjectGenerationReservationNotFound {
+                    reservation_id: reservation_id.into_string(),
+                }),
+            ),
+        }
+    }
+
+    fn next_object_generation_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let request = StorageRpcObjectRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+        let payload = encode_object_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectGenerationNext, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        decode_object_generation_response(&response)
+            .map(|response| response.generation_id)
+            .map_err(|error| {
+                ObjectPgActionError::Store(
+                    self.rpc_payload_error("decode object generation response", error.to_string()),
+                )
+            })
     }
 }
 
@@ -6304,6 +6459,55 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn unix_object_generation_metadata_client_routes_generation_reads() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("object-generation-rpc-bucket");
+        let key = crate::tests::object_key("object-generation-rpc-key");
+        let reservation_id = crate::tests::stream_session_id("obj-gen-rpc");
+        let reserved_generation = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                .unwrap()
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..2)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        assert_eq!(
+            client
+                .object_generation_reservation(PgId::new(0), &bucket, &key, &reservation_id)
+                .unwrap(),
+            reserved_generation
+        );
+        assert_eq!(
+            client
+                .next_object_generation_id(PgId::new(0), &bucket, &key)
+                .unwrap(),
+            GenerationId::new(reserved_generation.get() + 1).unwrap()
+        );
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]

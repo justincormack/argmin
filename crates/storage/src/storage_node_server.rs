@@ -11,17 +11,20 @@ use std::thread;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
-use crate::node_client::{CreateBucketCommandBuild, LocalStorageNodeClient, StorageNodeClient};
+use crate::node_client::{
+    CreateBucketCommandBuild, LocalStorageNodeClient, ObjectGenerationMetadataNodeClient,
+    StorageNodeClient,
+};
 use crate::storage_rpc::{
     decode_bucket_request, decode_create_bucket_command_build_request,
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
-    decode_metadata_command_state_request, decode_proof_release_request,
-    decode_read_handle_acquire_request, decode_read_handle_release_request,
-    decode_scavenger_list_files_request, decode_shard_ack_batch_request,
-    decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
-    decode_shard_write_request, encode_bucket_info_outcome_response,
+    decode_metadata_command_state_request, decode_object_generation_reservation_request,
+    decode_object_request, decode_proof_release_request, decode_read_handle_acquire_request,
+    decode_read_handle_release_request, decode_scavenger_list_files_request,
+    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
+    decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
     encode_create_bucket_command_build_response, encode_health_response,
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
     encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
@@ -30,6 +33,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
+    encode_object_generation_reservation_response, encode_object_generation_response,
     encode_read_handle_acquire_response, encode_read_handle_release_response,
     encode_scavenger_list_files_response, encode_shard_read_range_response,
     encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
@@ -38,13 +42,13 @@ use crate::storage_rpc::{
     StorageRpcBucketRequest, StorageRpcCreateBucketCommandBuildOutcome,
     StorageRpcCreateBucketCommandBuildRequest, StorageRpcCreateBucketCommandBuildResponse,
     StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
-    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceResponse,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
-    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
-    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
-    StorageRpcMetadataCommandPendingEnvelopeResponse,
+    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
+    StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesOutcome,
+    StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcMetadataCommandBoolOutcome,
+    StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandBoolResponse,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandMaxLogIndexResponse,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -52,15 +56,17 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
-    StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
+    StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
+    StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
+    StorageRpcObjectRequest, StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
     StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
     StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
     StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
     STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
-use crate::types::{ClusterEpoch, PgId, PgState, WriteAck};
-use crate::{EcShape, NodeId, ShardLocation};
+use crate::types::{ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
+use crate::{BucketName, EcShape, NodeId, ObjectPgActionError, ShardLocation};
 
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
 const LOCK_EX: i32 = 2;
@@ -400,6 +406,24 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::ObjectGenerationNext => {
+                match decode_object_request(&frame.payload) {
+                    Ok(request) => self.object_generation_next_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectGenerationReservation => {
+                match decode_object_generation_reservation_request(&frame.payload) {
+                    Ok(request) => self.object_generation_reservation_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ShardWrite => match decode_shard_write_request(&frame.payload) {
                 Ok(request) => self.shard_write_response(request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -729,6 +753,88 @@ impl StorageNodeConnectionHandler {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
         }
+    }
+
+    fn object_generation_next_response(
+        &self,
+        request: StorageRpcObjectRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.pg_id,
+            &request.bucket,
+            &request.key,
+            "object generation allocation",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectGenerationMetadataNodeClient::next_object_generation_id(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
+            &request.key,
+        ) {
+            Ok(generation_id) => {
+                let payload =
+                    encode_object_generation_response(&StorageRpcObjectGenerationResponse {
+                        generation_id,
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn object_generation_reservation_response(
+        &self,
+        request: StorageRpcObjectGenerationReservationRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "object generation reservation lookup",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let outcome = match ObjectGenerationMetadataNodeClient::object_generation_reservation(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.reservation_id,
+        ) {
+            Ok(generation_id) => StorageRpcObjectGenerationReservationOutcome::Found(generation_id),
+            Err(ObjectPgActionError::Metadata(
+                crate::MetadataError::ObjectGenerationReservationNotFound { reservation_id },
+            )) => StorageRpcObjectGenerationReservationOutcome::NotFound {
+                reservation_id: SessionId::try_from(reservation_id).map_err(|_| {
+                    crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "stored reservation id is invalid",
+                    )
+                })?,
+            },
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload = encode_object_generation_reservation_response(
+            &StorageRpcObjectGenerationReservationResponse { outcome },
+        );
+        Ok(encode_storage_rpc_success_response(&payload))
     }
 
     fn bucket_head_response(
@@ -1380,6 +1486,32 @@ impl StorageNodeConnectionHandler {
                 Err(BucketSnapshotLoadError::Store(error)) => {
                     encode_storage_rpc_error_response(&store_error_response(error))?
                 }
+                Err(BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::ObjectGenerationReservationConflict {
+                        reservation_id,
+                        generation_id,
+                    },
+                )) => {
+                    let reservation_id = SessionId::try_from(reservation_id).map_err(|_| {
+                        crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "stored reservation id is invalid",
+                        )
+                    })?;
+                    let generation_id = GenerationId::new(generation_id).ok_or(
+                        crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "stored generation id is invalid",
+                        ),
+                    )?;
+                    let payload = encode_metadata_command_state_outcome_response(
+                        &StorageRpcMetadataCommandStateOutcomeResponse {
+                            outcome: StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+                                reservation_id,
+                                generation_id,
+                            },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
                 Err(BucketSnapshotLoadError::Metadata(error)) => {
                     encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::Internal,
@@ -1406,7 +1538,27 @@ impl StorageNodeConnectionHandler {
         }) {
             Ok(acceptance) => {
                 let payload = encode_metadata_command_acceptance_response(
-                    &StorageRpcMetadataCommandAcceptanceResponse { acceptance },
+                    &StorageRpcMetadataCommandAcceptanceResponse {
+                        outcome: StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(acceptance),
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                let payload = encode_metadata_command_acceptance_response(
+                    &StorageRpcMetadataCommandAcceptanceResponse {
+                        outcome: StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
@@ -1429,7 +1581,27 @@ impl StorageNodeConnectionHandler {
         }) {
             Ok(acceptance) => {
                 let payload = encode_metadata_command_acceptance_response(
-                    &StorageRpcMetadataCommandAcceptanceResponse { acceptance },
+                    &StorageRpcMetadataCommandAcceptanceResponse {
+                        outcome: StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(acceptance),
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                let payload = encode_metadata_command_acceptance_response(
+                    &StorageRpcMetadataCommandAcceptanceResponse {
+                        outcome: StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
@@ -1741,6 +1913,45 @@ impl StorageNodeConnectionHandler {
         Ok(())
     }
 
+    fn validate_primary_pg_for_object(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &crate::ObjectKey,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        let route = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id.get())
+            .expect("validated object metadata PG route must exist");
+        if route.primary_node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not primary for {operation} on PG {}",
+                    self.config.node_id.as_u32(),
+                    pg_id.get()
+                ),
+            });
+        }
+        let expected_pg_id = PgId::new(self.node.pg_topology().object_pg_for(bucket, key));
+        if pg_id != expected_pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} PG {} does not match object {}/{} PG {}",
+                    pg_id.get(),
+                    bucket.as_str(),
+                    key.as_str(),
+                    expected_pg_id.get()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn unsupported_operation_response(
         &self,
         kind: StorageRpcMessageKind,
@@ -2039,6 +2250,13 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
     }
 }
 
+fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorResponse {
+    StorageRpcErrorResponse {
+        code: StorageRpcErrorCode::Internal,
+        message: error.to_string(),
+    }
+}
+
 impl Drop for StorageNodeServer {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.config.socket_path);
@@ -2308,8 +2526,9 @@ mod tests {
         encode_scavenger_list_files_request, encode_shard_ack_batch_request,
         encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
         encode_shard_write_request, encode_storage_rpc_frame, read_storage_rpc_frame_from,
-        write_storage_rpc_frame_to, StorageRpcMetadataCommandMatchingAppliedRequest,
-        StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
+        write_storage_rpc_frame_to, StorageRpcMetadataCommandAcceptanceOutcome,
+        StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdRequest,
+        StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
         StorageRpcMetadataCommandStateRequest, StorageRpcReadHandleAcquireRequest,
         StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
@@ -3642,8 +3861,10 @@ mod tests {
             .unwrap();
         let decoded = decode_metadata_command_acceptance_response(&payload).unwrap();
         assert_eq!(
-            decoded.acceptance,
-            crate::metadata_command::MetadataCommandAcceptance::Apply
+            decoded.outcome,
+            StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(
+                crate::metadata_command::MetadataCommandAcceptance::Apply
+            )
         );
     }
 

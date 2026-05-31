@@ -9,7 +9,8 @@ use crate::{
         BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketState, ChecksumBytes,
         ClusterEpoch, CreateBucketConfig, DataPgId, EffectiveBucketEncryptionConfig, GenerationId,
         ManagedEncryptionAlgorithm, ObjectKey, ObjectPayloadReclaimKind, PgId,
-        PublicAccessBlockConfig, ShardIndex, ShardKey, WriteAck, SHARD_KEY_LEN,
+        PublicAccessBlockConfig, SessionId, ShardIndex, ShardKey, WriteAck, SESSION_ID_LEN,
+        SHARD_KEY_LEN,
     },
     BucketName, NodeId,
 };
@@ -58,6 +59,11 @@ const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN: usize = 64 * 1024;
 const STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN: usize =
     4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+const STORAGE_RPC_MAX_OBJECT_KEY_LEN: usize = 1024;
+const STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN: usize =
+    4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN;
+const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
 const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 8
@@ -108,6 +114,8 @@ pub(crate) enum StorageRpcMessageKind {
     BucketHeadRaw = 32,
     BucketHeadInfo = 33,
     BucketCreateCommandBuild = 34,
+    ObjectGenerationNext = 35,
+    ObjectGenerationReservation = 36,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +196,8 @@ impl StorageRpcMessageKind {
             Self::BucketHeadRaw => "bucket head raw",
             Self::BucketHeadInfo => "bucket head info",
             Self::BucketCreateCommandBuild => "bucket create command build",
+            Self::ObjectGenerationNext => "object generation next",
+            Self::ObjectGenerationReservation => "object generation reservation",
         }
     }
 
@@ -227,6 +237,8 @@ impl StorageRpcMessageKind {
             32 => Ok(Self::BucketHeadRaw),
             33 => Ok(Self::BucketHeadInfo),
             34 => Ok(Self::BucketCreateCommandBuild),
+            35 => Ok(Self::ObjectGenerationNext),
+            36 => Ok(Self::ObjectGenerationReservation),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -296,6 +308,8 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidMetadataCommandPendingSlotRequest(&'static str),
     #[error("invalid bucket metadata request: {0}")]
     InvalidBucketMetadataRequest(&'static str),
+    #[error("invalid object metadata request: {0}")]
+    InvalidObjectMetadataRequest(&'static str),
     #[error("shard write size mismatch: expected {expected}, actual {actual}")]
     ShardWriteSizeMismatch { expected: u64, actual: u64 },
     #[error("shard write checksum mismatch")]
@@ -340,6 +354,37 @@ pub(crate) struct StorageRpcBucketRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) bucket: BucketName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectGenerationReservationRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) reservation_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectGenerationResponse {
+    pub(crate) generation_id: GenerationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcObjectGenerationReservationOutcome {
+    Found(GenerationId),
+    NotFound { reservation_id: SessionId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectGenerationReservationResponse {
+    pub(crate) outcome: StorageRpcObjectGenerationReservationOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,6 +579,10 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
         cluster_epoch: ClusterEpoch,
         log_index: u64,
     },
+    ObjectGenerationReservationConflict {
+        reservation_id: SessionId,
+        generation_id: GenerationId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,8 +603,19 @@ pub(crate) struct StorageRpcMetadataCommandStateResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandAcceptanceOutcome {
+    Acceptance(MetadataCommandAcceptance),
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandAcceptanceResponse {
-    pub(crate) acceptance: MetadataCommandAcceptance,
+    pub(crate) outcome: StorageRpcMetadataCommandAcceptanceOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,6 +965,12 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::BucketCreateCommandBuild => {
             STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectGenerationNext => {
+            STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectGenerationReservation => {
+            STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN
+        }
         _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
@@ -1094,6 +1160,119 @@ pub(crate) fn decode_bucket_request(
         pg_id,
         bucket,
     })
+}
+
+pub(crate) fn encode_object_request(request: &StorageRpcObjectRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_string(&mut out, request.bucket.as_str());
+    put_string(&mut out, request.key.as_str());
+    out
+}
+
+pub(crate) fn decode_object_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name()?;
+    let key = decoder.read_object_key()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        bucket,
+        key,
+    })
+}
+
+pub(crate) fn encode_object_generation_reservation_request(
+    request: &StorageRpcObjectGenerationReservationRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.reservation_id.as_str());
+    out
+}
+
+pub(crate) fn decode_object_generation_reservation_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectGenerationReservationRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name()?;
+    let key = decoder.read_object_key()?;
+    let reservation_id = decoder.read_session_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectGenerationReservationRequest {
+        object: StorageRpcObjectRequest {
+            node_id,
+            cluster_epoch,
+            pg_id,
+            bucket,
+            key,
+        },
+        reservation_id,
+    })
+}
+
+pub(crate) fn encode_object_generation_response(
+    response: &StorageRpcObjectGenerationResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, response.generation_id.get());
+    out
+}
+
+pub(crate) fn decode_object_generation_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectGenerationResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let generation_id = decoder.read_generation_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectGenerationResponse { generation_id })
+}
+
+pub(crate) fn encode_object_generation_reservation_response(
+    response: &StorageRpcObjectGenerationReservationResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcObjectGenerationReservationOutcome::Found(generation_id) => {
+            put_u8(&mut out, 0);
+            put_u64(&mut out, generation_id.get());
+        }
+        StorageRpcObjectGenerationReservationOutcome::NotFound { reservation_id } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, reservation_id.as_str());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_object_generation_reservation_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectGenerationReservationResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcObjectGenerationReservationOutcome::Found(decoder.read_generation_id()?),
+        1 => StorageRpcObjectGenerationReservationOutcome::NotFound {
+            reservation_id: decoder.read_session_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "unknown object generation reservation response tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcObjectGenerationReservationResponse { outcome })
 }
 
 pub(crate) fn encode_create_bucket_command_build_request(
@@ -1810,6 +1989,14 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_u64(&mut out, cluster_epoch.get());
             put_u64(&mut out, log_index);
         }
+        StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+            ref reservation_id,
+            generation_id,
+        } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, reservation_id.as_str());
+            put_u64(&mut out, generation_id.get());
+        }
     }
     out
 }
@@ -1830,6 +2017,10 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
             pg_id: decoder.read_u32()?,
             cluster_epoch: decoder.read_cluster_epoch()?,
             log_index: decoder.read_u64()?,
+        },
+        2 => StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+            reservation_id: decoder.read_session_id()?,
+            generation_id: decoder.read_generation_id()?,
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
@@ -1900,13 +2091,26 @@ pub(crate) fn encode_metadata_command_acceptance_response(
     response: &StorageRpcMetadataCommandAcceptanceResponse,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    put_u8(
-        &mut out,
-        match response.acceptance {
-            MetadataCommandAcceptance::Apply => 1,
-            MetadataCommandAcceptance::AlreadyApplied => 2,
-        },
-    );
+    match response.outcome {
+        StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(
+            MetadataCommandAcceptance::Apply,
+        ) => put_u8(&mut out, 1),
+        StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(
+            MetadataCommandAcceptance::AlreadyApplied,
+        ) => put_u8(&mut out, 2),
+        StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 3);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+    }
     out
 }
 
@@ -1914,9 +2118,19 @@ pub(crate) fn decode_metadata_command_acceptance_response(
     bytes: &[u8],
 ) -> Result<StorageRpcMetadataCommandAcceptanceResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let acceptance = match decoder.read_u8()? {
-        1 => MetadataCommandAcceptance::Apply,
-        2 => MetadataCommandAcceptance::AlreadyApplied,
+    let outcome = match decoder.read_u8()? {
+        1 => {
+            StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(MetadataCommandAcceptance::Apply)
+        }
+        2 => StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(
+            MetadataCommandAcceptance::AlreadyApplied,
+        ),
+        3 => StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown metadata command acceptance tag",
@@ -1924,7 +2138,7 @@ pub(crate) fn decode_metadata_command_acceptance_response(
         }
     };
     decoder.finish()?;
-    Ok(StorageRpcMetadataCommandAcceptanceResponse { acceptance })
+    Ok(StorageRpcMetadataCommandAcceptanceResponse { outcome })
 }
 
 fn validate_metadata_command_route(
@@ -2872,6 +3086,11 @@ impl<'a> StorageRpcDecoder<'a> {
             .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid object key"))
     }
 
+    fn read_session_id(&mut self) -> Result<SessionId, StorageRpcPayloadError> {
+        SessionId::try_from(self.read_string()?)
+            .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid session id"))
+    }
+
     fn read_generation_id(&mut self) -> Result<GenerationId, StorageRpcPayloadError> {
         GenerationId::new(self.read_u64()?).ok_or(StorageRpcPayloadError::InvalidDurableClaimToken(
             "generation id must not be zero",
@@ -3456,7 +3675,7 @@ mod tests {
         },
         types::{
             AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
-            ClusterEpoch, CreateBucketConfig, PgId,
+            ClusterEpoch, CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
         },
     };
 
@@ -4016,13 +4235,27 @@ mod tests {
             MetadataCommandAcceptance::Apply,
             MetadataCommandAcceptance::AlreadyApplied,
         ] {
-            let response = StorageRpcMetadataCommandAcceptanceResponse { acceptance };
+            let response = StorageRpcMetadataCommandAcceptanceResponse {
+                outcome: StorageRpcMetadataCommandAcceptanceOutcome::Acceptance(acceptance),
+            };
 
             let bytes = encode_metadata_command_acceptance_response(&response);
             let decoded = decode_metadata_command_acceptance_response(&bytes).unwrap();
 
             assert_eq!(decoded, response);
         }
+
+        let conflict = StorageRpcMetadataCommandAcceptanceResponse {
+            outcome: StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 11,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                log_index: 13,
+            },
+        };
+        let bytes = encode_metadata_command_acceptance_response(&conflict);
+        let decoded = decode_metadata_command_acceptance_response(&bytes).unwrap();
+        assert_eq!(decoded, conflict);
 
         assert_eq!(
             decode_metadata_command_acceptance_response(&[99]),
@@ -4387,6 +4620,16 @@ mod tests {
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
             ),
+            (
+                StorageRpcMessageKind::ObjectGenerationNext,
+                STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectGenerationReservation,
+                STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN,
+            ),
         ] {
             let mut bytes = Vec::new();
             put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
@@ -4538,6 +4781,42 @@ mod tests {
         let decoded = decode_proof_release_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn object_generation_reservation_request_and_response_round_trip() {
+        let request = StorageRpcObjectGenerationReservationRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: BucketName::try_from("bucket").unwrap(),
+                key: ObjectKey::try_from("key").unwrap(),
+            },
+            reservation_id: SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+        };
+
+        let bytes = encode_object_generation_reservation_request(&request);
+        let decoded = decode_object_generation_reservation_request(&bytes).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = StorageRpcObjectGenerationReservationResponse {
+            outcome: StorageRpcObjectGenerationReservationOutcome::Found(
+                GenerationId::new(42).unwrap(),
+            ),
+        };
+        let bytes = encode_object_generation_reservation_response(&response);
+        let decoded = decode_object_generation_reservation_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let response = StorageRpcObjectGenerationReservationResponse {
+            outcome: StorageRpcObjectGenerationReservationOutcome::NotFound {
+                reservation_id: request.reservation_id,
+            },
+        };
+        let bytes = encode_object_generation_reservation_response(&response);
+        let decoded = decode_object_generation_reservation_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

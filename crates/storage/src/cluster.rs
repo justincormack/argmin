@@ -10,7 +10,8 @@ use ring::rand::SecureRandom;
 use local::LocalClusterRuntimeState;
 pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
+    LocalUnixMetadataCommandNodeClientConfig, LocalUnixObjectGenerationMetadataNodeClientConfig,
+    LocalUnixShardNodeClientConfig,
 };
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
@@ -301,6 +302,9 @@ type MetadataCommandPendingInstallHook = Arc<dyn Fn() + Send + Sync>;
 type DirectPutCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type ObjectGenerationCommandIdHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 type StreamAppendCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -316,6 +320,7 @@ struct StorageClusterTestHooks {
     before_stream_abort_storage: Option<StreamAbortHook>,
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
+    before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
@@ -334,6 +339,11 @@ pub struct MetadataCommandPendingInstallHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct DirectPutCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ObjectGenerationCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -376,6 +386,16 @@ impl Drop for MetadataCommandPendingInstallHookGuard {
 impl Drop for DirectPutCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_direct_put_command_id = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ObjectGenerationCommandIdHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .before_object_generation_command_id = None;
     }
 }
 
@@ -724,6 +744,25 @@ impl StorageCluster {
             }) if *pg_id == command.id().pg_id().get()
                 && *cluster_epoch == command.id().cluster_epoch()
                 && *log_index == command.id().log_index().get()
+        )
+    }
+
+    fn reserve_object_generation_conflict_matches(
+        command: &MetadataCommandEnvelope,
+        error: &BucketSnapshotLoadError,
+    ) -> bool {
+        matches!(
+            (command.payload(), error),
+            (
+                MetadataCommandPayload::ReserveObjectGeneration(reservation),
+                BucketSnapshotLoadError::Metadata(
+                    MetadataError::ObjectGenerationReservationConflict {
+                        reservation_id,
+                        generation_id,
+                    },
+                ),
+            ) if reservation.reservation_id.as_str() == reservation_id
+                && reservation.generation_id.get() == *generation_id
         )
     }
 
@@ -1251,6 +1290,22 @@ impl StorageCluster {
 
     #[cfg(not(any(test, feature = "test-hooks")))]
     fn maybe_run_before_direct_put_command_id_hook(&self) {}
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_object_generation_command_id_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_object_generation_command_id
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_object_generation_command_id_hook(&self) {}
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_stream_append_command_id_hook(&self) {
@@ -1873,6 +1928,19 @@ impl StorageCluster {
         self.metadata_pg_primary_client(PgId::new(self.object_metadata_pg_id(bucket, key)))
     }
 
+    fn object_generation_metadata_primary_client(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<&Arc<dyn crate::node_client::ObjectGenerationMetadataNodeClient>, StoreError> {
+        self.local_map
+            .metadata_pg_primary_node(
+                self.operation_epoch(),
+                PgId::new(self.object_metadata_pg_id(bucket, key)),
+            )
+            .map(|node| node.object_generation_metadata_client())
+    }
+
     pub fn default_payload_ec_shape(&self) -> EcShape {
         self.local_map.default_ec_shape()
     }
@@ -1909,6 +1977,20 @@ impl StorageCluster {
     ) -> DirectPutCommandIdHookGuard {
         self.test_hooks.lock().unwrap().before_direct_put_command_id = Some(hook);
         DirectPutCommandIdHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_object_generation_command_id_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> ObjectGenerationCommandIdHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_object_generation_command_id = Some(hook);
+        ObjectGenerationCommandIdHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }
@@ -2160,7 +2242,7 @@ impl StorageCluster {
             }
 
             match self
-                .object_metadata_primary_client(bucket, key)?
+                .object_generation_metadata_primary_client(bucket, key)?
                 .object_generation_reservation(pg_id, bucket, key, reservation_id)
             {
                 Ok(generation_id) => return Ok(generation_id),
@@ -2170,8 +2252,27 @@ impl StorageCluster {
                 Err(error) => return Err(error),
             }
             let generation_id = self
-                .object_metadata_primary_client(bucket, key)?
+                .object_generation_metadata_primary_client(bucket, key)?
                 .next_object_generation_id(pg_id, bucket, key)?;
+            self.maybe_run_before_object_generation_command_id_hook();
+            // Drain any unresolved slot before the allocator recheck, then take
+            // the final command id immediately before publish. A contender that
+            // reserves this generation in between is handled by the typed apply
+            // conflict below.
+            if self
+                .next_object_metadata_command_id_or_drain(pg_id, bucket)?
+                .is_none()
+            {
+                continue;
+            }
+            if self
+                .object_generation_metadata_primary_client(bucket, key)?
+                .next_object_generation_id(pg_id, bucket, key)?
+                != generation_id
+            {
+                continue;
+            }
+            self.maybe_run_before_metadata_command_pending_install_hook();
             let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
             else {
                 continue;
@@ -2219,6 +2320,29 @@ impl StorageCluster {
                                 )
                                 .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
                     {
+                        continue;
+                    }
+                    Err(error)
+                        if error.applied_nodes == 0
+                            && Self::reserve_object_generation_conflict_matches(
+                                &command,
+                                &error.source,
+                            ) =>
+                    {
+                        if let Err(abandon_error) =
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                        {
+                            if !Self::metadata_command_log_conflict_matches(
+                                &command,
+                                &abandon_error.source,
+                            ) {
+                                return Err(bucket_snapshot_error_to_object_pg_action_error(
+                                    abandon_error.source,
+                                ));
+                            }
+                        }
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
                         continue;
                     }
                     Err(error)

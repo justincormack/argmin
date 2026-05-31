@@ -1929,7 +1929,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:reissue_pending_metadata_command:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
 2 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
-2 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
+3 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
 1 crates/storage/src/cluster.rs:try_set_object_pg_pending_command_or_drain:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:metadata-command-log-conflict

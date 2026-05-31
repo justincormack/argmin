@@ -5535,15 +5535,22 @@ boundary are in place. The first non-command metadata RPC surface is also in
 place for create-bucket: bucket raw/info reads and create-bucket command
 construction now route through a dedicated bucket metadata client, and a
 frontend map can create a bucket through a storage-node-owned Unix bucket
-metadata client plus the remote metadata-command client. Remaining non-command
-surfaces still need object snapshots/allocation/reservation and broader
+metadata client plus the remote metadata-command client. Object generation
+reservation lookup and next-generation allocation now route through a dedicated
+object-generation metadata client, so direct PUT generation reservation can be
+driven from a frontend through the storage-node-owned object PG. Generation
+reservation now rereads the storage-node-owned allocator before final command-id
+allocation and treats exact stale-generation apply conflicts as retryable, so
+two frontend handles racing on the same key converge to distinct generations
+instead of surfacing an internal uniqueness failure. Remaining non-command
+surfaces still need object snapshots, version allocation, and broader
 bucket-write reservation acquire/snapshot/release coordination. Proof-release
 cleanup for command-owned bucket write reservations has an RPC/client surface,
 but production cleanup should move only with the matching remote acquire/snapshot
 path so one reservation identity never spans local and remote stores. Direct PUT
-still needs the object snapshot/command-builder surface before its metadata path
-is remote end to end and before
-frontend/combined roles can be enabled.
+still needs the object snapshot/command-builder surface and version allocation
+before its metadata path is remote end to end and before frontend/combined roles
+can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5646,7 +5653,11 @@ Required tests:
    operation-shaped command builders. Proof release must reject the correct PG
    on a non-primary node even when that node appears first in the acting-set
    route list.
-9. lost replies are retry-safe for pending-slot install/replace,
+9. two independent frontend maps over one storage-node must handle stale
+   object-generation selection: the loser may read generation `N`, the winner
+   publishes `ReserveObjectGeneration(N)`, and the loser must retry to `N+1`
+   without returning an internal apply/uniqueness error.
+10. lost replies are retry-safe for pending-slot install/replace,
    `apply_metadata_command_and_record`, abandoned-record insert, exact
    pending-slot removal, bucket reservation/proof release, and cleanup
    mutations; same identity succeeds and mismatched identity fails closed

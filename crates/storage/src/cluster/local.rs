@@ -15,8 +15,8 @@ use crate::metadata_command::{
 use crate::node::BucketLockGuard;
 use crate::node_client::{
     BucketMetadataNodeClient, LocalStorageNodeClient, MetadataCommandNodeClient,
-    PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
-    StorageNodeClient, UnixStorageNodeClient,
+    ObjectGenerationMetadataNodeClient, PlacedShardNodeClient, ShardAckNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -85,6 +85,12 @@ pub struct LocalUnixBucketMetadataNodeClientConfig {
     socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalUnixObjectGenerationMetadataNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
 impl LocalUnixMetadataCommandNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -119,12 +125,30 @@ impl LocalUnixBucketMetadataNodeClientConfig {
     }
 }
 
+impl LocalUnixObjectGenerationMetadataNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
 pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
     storage_node: Arc<SharedStorageNode>,
     storage_client: Arc<dyn StorageNodeClient>,
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
+    object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient>,
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
     shard_ack_client: Arc<dyn ShardAckNodeClient>,
@@ -140,6 +164,8 @@ impl LocalNodeStore {
         ));
         let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
         let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = local_client.clone();
+        let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
+            local_client.clone();
         let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = local_client.clone();
         let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
         let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
@@ -151,6 +177,7 @@ impl LocalNodeStore {
             storage_node,
             storage_client,
             bucket_metadata_client,
+            object_generation_metadata_client,
             metadata_command_client,
             shard_client,
             shard_ack_client,
@@ -177,6 +204,12 @@ impl LocalNodeStore {
 
     pub(crate) fn bucket_metadata_client(&self) -> &Arc<dyn BucketMetadataNodeClient> {
         &self.bucket_metadata_client
+    }
+
+    pub(crate) fn object_generation_metadata_client(
+        &self,
+    ) -> &Arc<dyn ObjectGenerationMetadataNodeClient> {
+        &self.object_generation_metadata_client
     }
 
     pub(crate) fn metadata_command_client(&self) -> &Arc<dyn MetadataCommandNodeClient> {
@@ -866,6 +899,53 @@ impl LocalClusterMap {
             ));
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client;
             node.bucket_metadata_client = bucket_metadata_client;
+        }
+        Ok(())
+    }
+
+    pub fn install_unix_object_generation_metadata_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixObjectGenerationMetadataNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixObjectGenerationMetadataNodeClientConfig> =
+            configs.into_iter().collect();
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in &configs {
+            if !seen.insert(config.node_id) {
+                return Err(
+                    ClusterBuildError::DuplicateRemoteObjectGenerationMetadataClientNodeId {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(
+                    ClusterBuildError::RemoteObjectGenerationMetadataClientSocketPathNotAbsolute {
+                        path: config.socket_path.clone(),
+                    },
+                );
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(
+                    ClusterBuildError::RemoteObjectGenerationMetadataClientNodeNotFound {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+        }
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote object-generation metadata client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
+                client;
+            node.object_generation_metadata_client = object_generation_metadata_client;
         }
         Ok(())
     }
@@ -6484,6 +6564,357 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp
+            .path()
+            .join("remote-object-generation-metadata-node-1-owned");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("object-generation-metadata-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let frontend_data_dir = tmp
+            .path()
+            .join("frontend-only-object-generation-metadata-routing");
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                frontend_data_dir.join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        map.install_unix_metadata_command_clients([LocalUnixMetadataCommandNodeClientConfig::new(
+            node_id,
+            socket_path.clone(),
+        )])
+        .unwrap();
+        map.install_unix_object_generation_metadata_clients([
+            LocalUnixObjectGenerationMetadataNodeClientConfig::new(node_id, socket_path),
+        ])
+        .unwrap();
+        let map = Arc::new(map);
+        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let bucket = crate::tests::bucket_name("remote-object-generation-reserve");
+        let key = crate::tests::object_key("key");
+        let reservation_id = crate::tests::stream_session_id("remote-obj-gen");
+
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*frontend_pg,
+                &bucket,
+                &key,
+                &reservation_id
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*remote_pg,
+                &bucket,
+                &key,
+                &reservation_id
+            )
+            .unwrap(),
+            generation_id
+        );
+    }
+
+    #[test]
+    fn frontend_unix_object_generation_loser_retries_stale_generation() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp
+            .path()
+            .join("remote-object-generation-stale-loser-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("object-generation-stale-loser-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let build_frontend = |name: &str| {
+            let mut map = LocalClusterMap::open_with_configs(
+                node_id,
+                [LocalNodeStoreConfig::new(
+                    node_id,
+                    tmp.path().join(name).join("node-0001"),
+                )],
+                &[0],
+                ec_shape,
+            )
+            .unwrap();
+            map.install_unix_metadata_command_clients([
+                LocalUnixMetadataCommandNodeClientConfig::new(node_id, socket_path.clone()),
+            ])
+            .unwrap();
+            map.install_unix_object_generation_metadata_clients([
+                LocalUnixObjectGenerationMetadataNodeClientConfig::new(
+                    node_id,
+                    socket_path.clone(),
+                ),
+            ])
+            .unwrap();
+            let map = Arc::new(map);
+            let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            (map, cluster)
+        };
+        let (loser_map, loser) = build_frontend("frontend-loser");
+        let (_winner_map, winner) = build_frontend("frontend-winner");
+        let winner = Arc::new(winner);
+        let bucket = crate::tests::bucket_name("remote-object-generation-stale-loser");
+        let key = crate::tests::object_key("key");
+        let winner_reservation = crate::tests::stream_session_id("winner-gen");
+        let loser_reservation = crate::tests::stream_session_id("loser-gen");
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let _hook_guard = loser.test_install_before_object_generation_command_id_hook({
+            let winner = Arc::clone(&winner);
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let winner_reservation = winner_reservation.clone();
+            let hook_ran = Arc::clone(&hook_ran);
+            Arc::new(move || {
+                if !hook_ran.swap(true, Ordering::SeqCst) {
+                    let generation = winner
+                        .reserve_put_object_generation(&bucket, &key, &winner_reservation)
+                        .unwrap();
+                    assert_eq!(generation, GenerationId::new(1).unwrap());
+                }
+            })
+        });
+
+        let loser_generation = loser
+            .reserve_put_object_generation(&bucket, &key, &loser_reservation)
+            .unwrap();
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(loser_generation, GenerationId::new(2).unwrap());
+        let frontend_pg = loser_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*frontend_pg,
+                &bucket,
+                &key,
+                &loser_reservation
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*remote_pg,
+                &bucket,
+                &key,
+                &winner_reservation
+            )
+            .unwrap(),
+            GenerationId::new(1).unwrap()
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*remote_pg,
+                &bucket,
+                &key,
+                &loser_reservation
+            )
+            .unwrap(),
+            GenerationId::new(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp
+            .path()
+            .join("remote-object-generation-conflict-loser-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("object-generation-conflict-loser-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let build_frontend = |name: &str| {
+            let mut map = LocalClusterMap::open_with_configs(
+                node_id,
+                [LocalNodeStoreConfig::new(
+                    node_id,
+                    tmp.path().join(name).join("node-0001"),
+                )],
+                &[0],
+                ec_shape,
+            )
+            .unwrap();
+            map.install_unix_metadata_command_clients([
+                LocalUnixMetadataCommandNodeClientConfig::new(node_id, socket_path.clone()),
+            ])
+            .unwrap();
+            map.install_unix_object_generation_metadata_clients([
+                LocalUnixObjectGenerationMetadataNodeClientConfig::new(
+                    node_id,
+                    socket_path.clone(),
+                ),
+            ])
+            .unwrap();
+            let map = Arc::new(map);
+            let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            (map, cluster)
+        };
+        let (map, loser) = build_frontend("frontend-loser");
+        let (_winner_map, winner) = build_frontend("frontend-winner");
+        let winner = Arc::new(winner);
+        let bucket = crate::tests::bucket_name("remote-object-generation-rpc-conflict");
+        let key = crate::tests::object_key("key");
+        let winner_reservation = crate::tests::stream_session_id("winner-gen");
+        let loser_reservation = crate::tests::stream_session_id("loser-gen");
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let _hook_guard = loser.test_install_before_metadata_command_pending_install_hook({
+            let winner = Arc::clone(&winner);
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let winner_reservation = winner_reservation.clone();
+            let hook_ran = Arc::clone(&hook_ran);
+            Arc::new(move || {
+                if hook_ran.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let generation = winner
+                    .reserve_put_object_generation(&bucket, &key, &winner_reservation)
+                    .unwrap();
+                assert_eq!(generation, GenerationId::new(1).unwrap());
+            })
+        });
+
+        let loser_generation = loser
+            .reserve_put_object_generation(&bucket, &key, &loser_reservation)
+            .unwrap();
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(loser_generation, GenerationId::new(2).unwrap());
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*frontend_pg,
+                &bucket,
+                &key,
+                &loser_reservation
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*remote_pg,
+                &bucket,
+                &key,
+                &winner_reservation
+            )
+            .unwrap(),
+            GenerationId::new(1).unwrap()
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*remote_pg,
+                &bucket,
+                &key,
+                &loser_reservation
+            )
+            .unwrap(),
+            GenerationId::new(2).unwrap()
+        );
+    }
+
+    #[test]
     fn unix_metadata_command_client_install_rejects_relative_socket_path() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);
@@ -6538,6 +6969,37 @@ mod tests {
             err,
             ClusterBuildError::RemoteBucketMetadataClientSocketPathNotAbsolute { path }
                 if path == Path::new("relative-bucket-metadata-node-1.sock")
+        ));
+    }
+
+    #[test]
+    fn unix_object_generation_metadata_client_install_rejects_relative_socket_path() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+
+        let err = map
+            .install_unix_object_generation_metadata_clients([
+                LocalUnixObjectGenerationMetadataNodeClientConfig::new(
+                    node_id,
+                    PathBuf::from("relative-object-generation-node-1.sock"),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteObjectGenerationMetadataClientSocketPathNotAbsolute { path }
+                if path == Path::new("relative-object-generation-node-1.sock")
         ));
     }
 

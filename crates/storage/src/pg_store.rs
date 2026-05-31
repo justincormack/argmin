@@ -795,6 +795,19 @@ enum PendingMetadataCommandSlotCleanup {
     PreserveTerminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectGenerationReservationConstraint {
+    ReservationId,
+    Generation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectGenerationReservationIdentity {
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MetadataCommandRecordResult {
     state: MetadataCommandReplicaState,
@@ -9805,27 +9818,88 @@ impl PgStore {
             ],
         ) {
             Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(_, _)) => {
-                let existing = PgMetadataStore::get_object_generation_reservation(
-                    self,
-                    bucket,
-                    key,
-                    reservation_id,
-                );
-                if matches!(existing, Ok(existing_generation) if existing_generation == generation_id)
-                {
-                    Ok(())
-                } else {
-                    Err(MetadataError::Db {
-                        context: "reserve object generation explicit",
-                        source: rusqlite::Error::InvalidQuery,
+            Err(source) => match Self::object_generation_reservation_constraint_kind(&source) {
+                Some(ObjectGenerationReservationConstraint::ReservationId) => {
+                    match self.get_object_generation_reservation_by_id(reservation_id) {
+                        Ok(existing)
+                            if existing.bucket == *bucket
+                                && existing.key == *key
+                                && existing.generation_id == generation_id =>
+                        {
+                            Ok(())
+                        }
+                        Ok(_) | Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {
+                            Err(MetadataError::Db {
+                                context: "reserve object generation explicit",
+                                source,
+                            })
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Some(ObjectGenerationReservationConstraint::Generation) => {
+                    Err(MetadataError::ObjectGenerationReservationConflict {
+                        reservation_id: reservation_id.as_str().to_string(),
+                        generation_id: generation_id.get(),
                     })
                 }
+                None => Err(MetadataError::Db {
+                    context: "reserve object generation explicit",
+                    source,
+                }),
+            },
+        }
+    }
+
+    fn get_object_generation_reservation_by_id(
+        &self,
+        reservation_id: &SessionId,
+    ) -> Result<ObjectGenerationReservationIdentity, MetadataError> {
+        let raw = self
+            .query_row_cached_optional_metadata(
+                "SELECT bucket, key, generation_id FROM object_generation_reservations \
+                 WHERE reservation_id = ?1",
+                params![reservation_id.as_str()],
+                "get object generation reservation by id",
+                |row| {
+                    Ok((
+                        row.get::<_, BucketName>(0)?,
+                        row.get::<_, ObjectKey>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?
+            .ok_or_else(|| MetadataError::ObjectGenerationReservationNotFound {
+                reservation_id: reservation_id.as_str().to_owned(),
+            })?;
+        let generation_id =
+            Self::parse_generation_id(raw.2, 2, "generation_id").map_err(|source| {
+                MetadataError::Db {
+                    context: "parse object generation reservation by id",
+                    source,
+                }
+            })?;
+        Ok(ObjectGenerationReservationIdentity {
+            bucket: raw.0,
+            key: raw.1,
+            generation_id,
+        })
+    }
+
+    fn object_generation_reservation_constraint_kind(
+        source: &rusqlite::Error,
+    ) -> Option<ObjectGenerationReservationConstraint> {
+        let rusqlite::Error::SqliteFailure(err, _) = source else {
+            return None;
+        };
+        match err.extended_code {
+            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => {
+                Some(ObjectGenerationReservationConstraint::ReservationId)
             }
-            Err(source) => Err(MetadataError::Db {
-                context: "reserve object generation explicit",
-                source,
-            }),
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
+                Some(ObjectGenerationReservationConstraint::Generation)
+            }
+            _ => None,
         }
     }
 
@@ -21231,6 +21305,92 @@ mod tests {
         store
             .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
             .unwrap();
+    }
+
+    #[test]
+    fn object_generation_reservation_conflict_filter_only_accepts_uniqueness_constraints() {
+        fn sqlite_failure(code: rusqlite::ffi::ErrorCode, extended_code: i32) -> rusqlite::Error {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code,
+                },
+                None,
+            )
+        }
+
+        assert_eq!(
+            PgStore::object_generation_reservation_constraint_kind(&sqlite_failure(
+                rusqlite::ffi::ErrorCode::ConstraintViolation,
+                rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+            )),
+            Some(ObjectGenerationReservationConstraint::ReservationId)
+        );
+        assert_eq!(
+            PgStore::object_generation_reservation_constraint_kind(&sqlite_failure(
+                rusqlite::ffi::ErrorCode::ConstraintViolation,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            )),
+            Some(ObjectGenerationReservationConstraint::Generation)
+        );
+        assert_eq!(
+            PgStore::object_generation_reservation_constraint_kind(&sqlite_failure(
+                rusqlite::ffi::ErrorCode::ConstraintViolation,
+                rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+            )),
+            None
+        );
+        assert_eq!(
+            PgStore::object_generation_reservation_constraint_kind(&sqlite_failure(
+                rusqlite::ffi::ErrorCode::DatabaseBusy,
+                rusqlite::ffi::SQLITE_BUSY
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn reserve_object_generation_explicit_primary_key_conflict_must_match_identity() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let reservation_id = SessionId::try_from("85".repeat(16)).unwrap();
+        let existing_bucket = trusted_bucket_name("existing-reservation-bucket");
+        let existing_key = trusted_object_key("existing-key");
+        let requested_bucket = trusted_bucket_name("requested-reservation-bucket");
+        let requested_key = trusted_object_key("requested-key");
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_generation_reservations \
+                 (reservation_id, bucket, key, generation_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    reservation_id.as_str(),
+                    existing_bucket.as_str(),
+                    existing_key.as_str(),
+                    1_i64,
+                    1_i64,
+                ],
+            )
+            .unwrap();
+
+        let err = store
+            .reserve_object_generation_explicit(
+                &requested_bucket,
+                &requested_key,
+                &reservation_id,
+                GenerationId::new(1).unwrap(),
+                2,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MetadataError::Db {
+                context: "reserve object generation explicit",
+                ..
+            }
+        ));
     }
 
     fn direct_put_terminal_cleanup_command(
