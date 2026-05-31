@@ -79,6 +79,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandAbandoned = 27,
     MetadataCommandRecordAbandoned = 28,
     MetadataCommandPendingSlotReplace = 29,
+    MetadataCommandBucketControlPendingSlotInsert = 30,
+    MetadataCommandApplyAndRecord = 31,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +154,10 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandAbandoned => "metadata command abandoned",
             Self::MetadataCommandRecordAbandoned => "metadata command record abandoned",
             Self::MetadataCommandPendingSlotReplace => "metadata command pending slot replace",
+            Self::MetadataCommandBucketControlPendingSlotInsert => {
+                "metadata command bucket-control pending slot insert"
+            }
+            Self::MetadataCommandApplyAndRecord => "metadata command apply and record",
         }
     }
 
@@ -186,6 +192,8 @@ impl StorageRpcMessageKind {
             27 => Ok(Self::MetadataCommandAbandoned),
             28 => Ok(Self::MetadataCommandRecordAbandoned),
             29 => Ok(Self::MetadataCommandPendingSlotReplace),
+            30 => Ok(Self::MetadataCommandBucketControlPendingSlotInsert),
+            31 => Ok(Self::MetadataCommandApplyAndRecord),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -397,6 +405,22 @@ pub(crate) struct StorageRpcMetadataCommandAppliedHashesResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandBoolResponse {
     pub(crate) value: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandBoolOutcome {
+    Value(bool),
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandBoolOutcomeResponse {
+    pub(crate) outcome: StorageRpcMetadataCommandBoolOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1431,6 +1455,64 @@ pub(crate) fn decode_metadata_command_bool_response(
     };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandBoolResponse { value })
+}
+
+pub(crate) fn encode_metadata_command_bool_outcome_response(
+    response: &StorageRpcMetadataCommandBoolOutcomeResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.outcome {
+        StorageRpcMetadataCommandBoolOutcome::Value(value) => {
+            put_u8(&mut out, 0);
+            put_u8(&mut out, u8::from(value));
+        }
+        StorageRpcMetadataCommandBoolOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 1);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_bool_outcome_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => {
+            let value = match decoder.read_u8()? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                        "invalid metadata command bool outcome value tag",
+                    ))
+                }
+            };
+            StorageRpcMetadataCommandBoolOutcome::Value(value)
+        }
+        1 => StorageRpcMetadataCommandBoolOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command bool outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandBoolOutcomeResponse { outcome })
 }
 
 pub(crate) fn encode_metadata_command_state_outcome_response(
@@ -3271,6 +3353,31 @@ mod tests {
         ] {
             let bytes = encode_metadata_command_bool_response(&response);
             let decoded = decode_metadata_command_bool_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn metadata_command_bool_outcome_response_round_trips() {
+        for response in [
+            StorageRpcMetadataCommandBoolOutcomeResponse {
+                outcome: StorageRpcMetadataCommandBoolOutcome::Value(false),
+            },
+            StorageRpcMetadataCommandBoolOutcomeResponse {
+                outcome: StorageRpcMetadataCommandBoolOutcome::Value(true),
+            },
+            StorageRpcMetadataCommandBoolOutcomeResponse {
+                outcome: StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 11,
+                    cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                    log_index: 12,
+                },
+            },
+        ] {
+            let bytes = encode_metadata_command_bool_outcome_response(&response);
+            let decoded = decode_metadata_command_bool_outcome_response(&bytes).unwrap();
 
             assert_eq!(decoded, response);
         }

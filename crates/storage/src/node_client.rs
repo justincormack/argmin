@@ -26,8 +26,9 @@ use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
     decode_metadata_command_acceptance_response, decode_metadata_command_applied_hashes_response,
-    decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
-    decode_metadata_command_next_id_response, decode_metadata_command_pending_envelope_response,
+    decode_metadata_command_bool_outcome_response, decode_metadata_command_bool_response,
+    decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
+    decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -42,9 +43,9 @@ use crate::storage_rpc::{
     encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
     encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
     write_storage_rpc_frame_to, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
-    StorageRpcMetadataCommandPendingSlotInsertOutcome,
+    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandBoolOutcome,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdOutcome,
+    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
@@ -2158,6 +2159,60 @@ impl UnixStorageNodeClient {
         }
     }
 
+    pub(crate) fn apply_metadata_command_and_record(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let payload = self
+            .encode_metadata_command_request(pg_id, command)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_metadata_command_state_outcome_response(&response)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command apply and record response",
+                    error.to_string(),
+                )
+            })
+            .map_err(BucketSnapshotLoadError::Store)?;
+        match response.outcome {
+            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => {
+                if cluster_epoch != self.cluster_epoch || conflict_pg_id != pg_id.get() {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "decode metadata command apply and record response",
+                        "metadata command log conflict route mismatch".to_string(),
+                    )));
+                }
+                if MetadataCommandLogIndex::new(log_index).is_none() {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "decode metadata command apply and record response",
+                        "metadata command log conflict index must not be zero".to_string(),
+                    )));
+                }
+                Err(BucketSnapshotLoadError::Store(
+                    StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: conflict_pg_id,
+                        cluster_epoch,
+                        log_index,
+                    },
+                ))
+            }
+        }
+    }
+
     pub(crate) fn try_insert_pending_metadata_command_slot(
         &self,
         pg_id: PgId,
@@ -2201,6 +2256,66 @@ impl UnixStorageNodeClient {
                 existing_log_index,
                 candidate_log_index,
             }),
+        }
+    }
+
+    pub(crate) fn try_insert_bucket_control_pending_metadata_command_slot(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            command: command.clone(),
+            scope_bucket: Some(bucket.clone()),
+        };
+        let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata command bucket-control pending slot request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert,
+            payload,
+        )?;
+        let response =
+            decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command bucket-control pending slot insert response",
+                    error.to_string(),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandBoolOutcome::Value(value) => Ok(value),
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => {
+                if cluster_epoch != self.cluster_epoch || conflict_pg_id != pg_id.get() {
+                    return Err(self.rpc_payload_error(
+                        "decode metadata command bucket-control pending slot insert response",
+                        "metadata command log conflict route mismatch".to_string(),
+                    ));
+                }
+                if MetadataCommandLogIndex::new(log_index).is_none() {
+                    return Err(self.rpc_payload_error(
+                        "decode metadata command bucket-control pending slot insert response",
+                        "metadata command log conflict index must not be zero".to_string(),
+                    ));
+                }
+                Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                })
+            }
         }
     }
 
@@ -2389,13 +2504,6 @@ impl UnixStorageNodeClient {
             operation,
             message,
         }
-    }
-
-    fn unsupported_metadata_command_rpc(&self, operation: &'static str) -> StoreError {
-        self.rpc_payload_error(
-            operation,
-            "metadata command RPC method is not implemented by this phase slice".to_string(),
-        )
     }
 }
 
@@ -2652,13 +2760,13 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 
     fn try_insert_bucket_control_pending_metadata_command_slot(
         &self,
-        _pg_id: PgId,
-        _command: &MetadataCommandEnvelope,
-        _bucket: &BucketName,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
     ) -> Result<bool, StoreError> {
-        Err(self.unsupported_metadata_command_rpc(
-            "insert bucket-control pending metadata command slot",
-        ))
+        UnixStorageNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+            self, pg_id, command, bucket,
+        )
     }
 
     fn remove_pending_metadata_command_slot(
@@ -2762,12 +2870,10 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 
     fn apply_metadata_command_and_record(
         &self,
-        _pg_id: PgId,
-        _command: &MetadataCommandEnvelope,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        Err(self
-            .unsupported_metadata_command_rpc("apply metadata command and record")
-            .into())
+        UnixStorageNodeClient::apply_metadata_command_and_record(self, pg_id, command)
     }
 
     fn record_metadata_command_abandoned(
@@ -5503,12 +5609,13 @@ mod tests {
         StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
     };
     use crate::storage_rpc::{
-        encode_metadata_command_applied_hashes_response, encode_metadata_command_next_id_response,
+        encode_metadata_command_applied_hashes_response,
+        encode_metadata_command_bool_outcome_response, encode_metadata_command_next_id_response,
         encode_metadata_command_state_outcome_response, encode_read_handle_acquire_response,
         encode_storage_rpc_success_response, read_storage_rpc_frame_from,
         write_storage_rpc_frame_to, StorageRpcMetadataCommandAppliedHashesResponse,
-        StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandStateOutcomeResponse,
-        StorageRpcReadHandleAcquireResponse,
+        StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandNextIdResponse,
+        StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcReadHandleAcquireResponse,
     };
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
@@ -5710,6 +5817,54 @@ mod tests {
     }
 
     #[test]
+    fn unix_storage_node_client_applies_metadata_command_idempotently() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let command = test_metadata_command(0, 1);
+
+        let applied = MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap();
+        let retried = MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap();
+        server_thread.join().unwrap();
+
+        assert_eq!(applied.applied_log_index, 1);
+        assert_eq!(retried.applied_log_index, 1);
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let state = reopened
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap();
+        assert_eq!(state.applied_log_index, 1);
+    }
+
+    #[test]
     fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -5795,6 +5950,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pending.command_bytes(), replacement.command_bytes());
+    }
+
+    #[test]
+    fn unix_storage_node_client_inserts_bucket_control_pending_slot_idempotently() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let command = test_metadata_command(0, 1);
+        let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+
+        assert!(
+            MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+                &client,
+                PgId::new(0),
+                &command,
+                &bucket,
+            )
+            .unwrap()
+        );
+        assert!(
+            MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+                &client,
+                PgId::new(0),
+                &command,
+                &bucket,
+            )
+            .unwrap(),
+            "retrying after a lost response should observe the existing exact slot"
+        );
+        server_thread.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pending = reopened
+            .get_pg(0)
+            .unwrap()
+            .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.command_bytes, command.command_bytes());
+        assert_eq!(pending.scope_bucket.as_ref(), Some(&bucket));
     }
 
     #[test]
@@ -6150,6 +6361,183 @@ mod tests {
             zero_index,
             StoreError::StorageRpc {
                 operation: "decode metadata command record abandoned response",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_client_preserves_apply_metadata_command_log_conflict() {
+        fn apply_error_from_fake_response(
+            outcome: StorageRpcMetadataCommandStateOutcome,
+        ) -> BucketSnapshotLoadError {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("sock").join("storage.sock");
+            private_socket_dir(socket_path.parent().unwrap());
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let join = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+                let payload = encode_metadata_command_state_outcome_response(
+                    &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
+                );
+                let response = StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                };
+                write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+            });
+            let client = UnixStorageNodeClient::new(
+                NodeId::new(7),
+                ClusterEpoch::new(1).unwrap(),
+                socket_path,
+            );
+
+            let err = MetadataCommandNodeClient::apply_metadata_command_and_record(
+                &client,
+                PgId::new(0),
+                &test_metadata_command(0, 1),
+            )
+            .unwrap_err();
+
+            join.join().unwrap();
+            err
+        }
+
+        let conflict =
+            apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            });
+        assert!(matches!(
+            conflict,
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                pg_id: 0,
+                log_index: 1,
+                ..
+            })
+        ));
+
+        let wrong_route =
+            apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            });
+        assert!(matches!(
+            wrong_route,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode metadata command apply and record response",
+                ..
+            })
+        ));
+
+        let zero_index =
+            apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 0,
+            });
+        assert!(matches!(
+            zero_index,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode metadata command apply and record response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_client_preserves_bucket_control_pending_slot_log_conflict() {
+        fn bucket_control_error_from_fake_response(
+            outcome: StorageRpcMetadataCommandBoolOutcome,
+        ) -> StoreError {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("sock").join("storage.sock");
+            private_socket_dir(socket_path.parent().unwrap());
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let join = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+                let payload = encode_metadata_command_bool_outcome_response(
+                    &StorageRpcMetadataCommandBoolOutcomeResponse { outcome },
+                );
+                let response = StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                };
+                write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+            });
+            let client = UnixStorageNodeClient::new(
+                NodeId::new(7),
+                ClusterEpoch::new(1).unwrap(),
+                socket_path,
+            );
+
+            let err =
+                MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+                    &client,
+                    PgId::new(0),
+                    &test_metadata_command(0, 1),
+                    &crate::tests::bucket_name("metadata-rpc-bucket"),
+                )
+                .unwrap_err();
+
+            join.join().unwrap();
+            err
+        }
+
+        let conflict = bucket_control_error_from_fake_response(
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        );
+        assert!(matches!(
+            conflict,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 0,
+                log_index: 1,
+                ..
+            }
+        ));
+
+        let wrong_route = bucket_control_error_from_fake_response(
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        );
+        assert!(matches!(
+            wrong_route,
+            StoreError::StorageRpc {
+                operation: "decode metadata command bucket-control pending slot insert response",
+                ..
+            }
+        ));
+
+        let zero_index = bucket_control_error_from_fake_response(
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 0,
+            },
+        );
+        assert!(matches!(
+            zero_index,
+            StoreError::StorageRpc {
+                operation: "decode metadata command bucket-control pending slot insert response",
                 ..
             }
         ));
