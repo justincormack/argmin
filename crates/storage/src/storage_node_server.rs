@@ -13,6 +13,7 @@ use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::storage_rpc::{
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
+    decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_read_handle_acquire_request,
     decode_read_handle_release_request, decode_scavenger_list_files_request,
@@ -38,6 +39,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
+    StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
@@ -474,6 +476,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
                 match decode_metadata_command_request(&frame.payload) {
                     Ok(request) => self.metadata_command_pending_slot_remove_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
+                match decode_metadata_command_pending_slot_replace_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_pending_slot_replace_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1253,6 +1264,48 @@ impl StorageNodeConnectionHandler {
         }
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.remove_pending_metadata_command_slot(self.config.node_id.as_u32(), &request.command)
+        }) {
+            Ok(removed) => {
+                let payload = encode_metadata_command_pending_slot_remove_response(
+                    &StorageRpcMetadataCommandPendingSlotRemoveResponse { removed },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_pending_slot_replace_response(
+        &self,
+        request: StorageRpcMetadataCommandPendingSlotReplaceRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Some(scope_bucket) = request.scope_bucket.as_ref() {
+            if scope_bucket != request.replacement.bucket_name() {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "metadata command replacement scope bucket does not match command bucket"
+                            .to_string(),
+                });
+            }
+        }
+        let canonical_scope_bucket = request
+            .scope_bucket
+            .as_ref()
+            .map(|_| request.replacement.bucket_name().clone());
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.replace_pending_metadata_command_slot_for_reissue(
+                self.config.node_id.as_u32(),
+                &request.previous,
+                &request.replacement,
+                canonical_scope_bucket.as_ref(),
+            )
         }) {
             Ok(removed) => {
                 let payload = encode_metadata_command_pending_slot_remove_response(

@@ -35,6 +35,7 @@ use crate::storage_rpc::{
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
     encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+    encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_read_handle_acquire_request,
     encode_read_handle_release_request, encode_scavenger_list_files_request,
@@ -43,12 +44,14 @@ use crate::storage_rpc::{
     write_storage_rpc_frame_to, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
-    StorageRpcMetadataCommandPendingSlotInsertOutcome, StorageRpcMetadataCommandPendingSlotRequest,
-    StorageRpcMetadataCommandRequest, StorageRpcMetadataCommandStateOutcome,
-    StorageRpcMetadataCommandStateRequest, StorageRpcReadHandleAcquireRequest,
-    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcMetadataCommandPendingSlotInsertOutcome,
+    StorageRpcMetadataCommandPendingSlotReplaceRequest,
+    StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
+    StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -2232,6 +2235,42 @@ impl UnixStorageNodeClient {
             })
     }
 
+    pub(crate) fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandPendingSlotReplaceRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            previous: previous.clone(),
+            replacement: replacement.clone(),
+            scope_bucket: bucket.cloned(),
+        };
+        let payload =
+            encode_metadata_command_pending_slot_replace_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command pending slot replace request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandPendingSlotReplace,
+            payload,
+        )?;
+        decode_metadata_command_pending_slot_remove_response(&response)
+            .map(|response| response.removed)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command pending slot replace response",
+                    error.to_string(),
+                )
+            })
+    }
+
     fn metadata_command_acceptance_request(
         &self,
         kind: StorageRpcMessageKind,
@@ -2632,12 +2671,18 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 
     fn replace_pending_metadata_command_slot_for_reissue(
         &self,
-        _pg_id: PgId,
-        _previous: &MetadataCommandEnvelope,
-        _replacement: &MetadataCommandEnvelope,
-        _bucket: Option<&BucketName>,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
     ) -> Result<bool, StoreError> {
-        Err(self.unsupported_metadata_command_rpc("replace pending metadata command slot"))
+        UnixStorageNodeClient::replace_pending_metadata_command_slot_for_reissue(
+            self,
+            pg_id,
+            previous,
+            replacement,
+            bucket,
+        )
     }
 
     fn metadata_command_replica_state(
@@ -5671,7 +5716,7 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let server_thread = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..5 {
                 server.accept_one().unwrap();
             }
         });
@@ -5681,6 +5726,7 @@ mod tests {
             config.socket_path.clone(),
         );
         let command = test_metadata_command(0, 1);
+        let replacement = test_metadata_command(0, 2);
         let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
 
         MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
@@ -5697,10 +5743,31 @@ mod tests {
             Some(&bucket),
         )
         .unwrap();
+        assert!(
+            MetadataCommandNodeClient::replace_pending_metadata_command_slot_for_reissue(
+                &client,
+                PgId::new(0),
+                &command,
+                &replacement,
+                Some(&bucket),
+            )
+            .unwrap()
+        );
+        assert!(
+            MetadataCommandNodeClient::replace_pending_metadata_command_slot_for_reissue(
+                &client,
+                PgId::new(0),
+                &command,
+                &replacement,
+                Some(&bucket),
+            )
+            .unwrap(),
+            "replacing after a lost response should be idempotent"
+        );
         let conflict = MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
             &client,
             PgId::new(0),
-            &test_metadata_command(0, 2),
+            &test_metadata_command(0, 3),
             Some(&bucket),
         )
         .unwrap_err();
@@ -5708,8 +5775,8 @@ mod tests {
             conflict,
             StoreError::MetadataCommandPendingConflict {
                 pg_id: 0,
-                existing_log_index: 1,
-                candidate_log_index: 2,
+                existing_log_index: 2,
+                candidate_log_index: 3,
                 ..
             }
         ));
@@ -5727,7 +5794,7 @@ mod tests {
             .pending_metadata_command_envelope(7, ClusterEpoch::new(1).unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(pending.command_bytes(), command.command_bytes());
+        assert_eq!(pending.command_bytes(), replacement.command_bytes());
     }
 
     #[test]

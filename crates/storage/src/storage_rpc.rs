@@ -78,6 +78,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
     MetadataCommandRecordAbandoned = 28,
+    MetadataCommandPendingSlotReplace = 29,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +151,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandAbandoned => "metadata command abandoned",
             Self::MetadataCommandRecordAbandoned => "metadata command record abandoned",
+            Self::MetadataCommandPendingSlotReplace => "metadata command pending slot replace",
         }
     }
 
@@ -183,6 +185,7 @@ impl StorageRpcMessageKind {
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
             28 => Ok(Self::MetadataCommandRecordAbandoned),
+            29 => Ok(Self::MetadataCommandPendingSlotReplace),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -294,6 +297,16 @@ pub(crate) struct StorageRpcMetadataCommandPendingSlotRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) scope_bucket: Option<BucketName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandPendingSlotReplaceRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) previous: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) replacement: crate::metadata_command::MetadataCommandEnvelope,
     pub(crate) scope_bucket: Option<BucketName>,
 }
 
@@ -983,6 +996,96 @@ pub(crate) fn decode_metadata_command_pending_slot_request(
         cluster_epoch,
         pg_id,
         command,
+        scope_bucket,
+    })
+}
+
+pub(crate) fn encode_metadata_command_pending_slot_replace_request(
+    request: &StorageRpcMetadataCommandPendingSlotReplaceRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_metadata_command_route(request.cluster_epoch, request.pg_id, request.previous.id())?;
+    validate_metadata_command_route(
+        request.cluster_epoch,
+        request.pg_id,
+        request.replacement.id(),
+    )?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    let previous = StorageRpcMetadataCommandItem {
+        command_checksum: request.previous.checksum_crc64(),
+        command_bytes: request.previous.command_bytes(),
+    };
+    out.extend_from_slice(&encode_metadata_command_item(&previous)?);
+    let replacement = StorageRpcMetadataCommandItem {
+        command_checksum: request.replacement.checksum_crc64(),
+        command_bytes: request.replacement.command_bytes(),
+    };
+    out.extend_from_slice(&encode_metadata_command_item(&replacement)?);
+    match request.scope_bucket.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(bucket) => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, bucket.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_pending_slot_replace_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandPendingSlotReplaceRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let previous_checksum = decoder.read_u64()?;
+    let previous_bytes = decoder.read_bytes()?.to_vec();
+    let previous_item_bytes = {
+        let mut out = Vec::new();
+        put_u64(&mut out, previous_checksum);
+        put_bytes(&mut out, &previous_bytes);
+        out
+    };
+    let previous_item = decode_metadata_command_item(&previous_item_bytes)?;
+    let previous = decode_metadata_command_envelope(&previous_item.command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    validate_metadata_command_route(cluster_epoch, pg_id, previous.id())?;
+    let replacement_checksum = decoder.read_u64()?;
+    let replacement_bytes = decoder.read_bytes()?.to_vec();
+    let replacement_item_bytes = {
+        let mut out = Vec::new();
+        put_u64(&mut out, replacement_checksum);
+        put_bytes(&mut out, &replacement_bytes);
+        out
+    };
+    let replacement_item = decode_metadata_command_item(&replacement_item_bytes)?;
+    let replacement = decode_metadata_command_envelope(&replacement_item.command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    validate_metadata_command_route(cluster_epoch, pg_id, replacement.id())?;
+    let scope_bucket = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(decoder.read_bucket_name().map_err(|_| {
+            StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                "invalid scope bucket name",
+            )
+        })?),
+        _ => {
+            return Err(
+                StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                    "invalid optional scope bucket tag",
+                ),
+            )
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandPendingSlotReplaceRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        previous,
+        replacement,
         scope_bucket,
     })
 }
@@ -2987,6 +3090,37 @@ mod tests {
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.command.command_bytes(), command.command_bytes());
+    }
+
+    #[test]
+    fn metadata_command_pending_slot_replace_request_round_trips() {
+        let previous = test_metadata_command();
+        let replacement = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                previous.id().cluster_epoch(),
+                previous.id().pg_id(),
+                MetadataCommandLogIndex::new(previous.id().log_index().get() + 1).unwrap(),
+            ),
+            previous.payload().clone(),
+        );
+        let request = StorageRpcMetadataCommandPendingSlotReplaceRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: previous.id().cluster_epoch(),
+            pg_id: previous.id().pg_id(),
+            previous: previous.clone(),
+            replacement: replacement.clone(),
+            scope_bucket: Some(previous.bucket_name().clone()),
+        };
+
+        let bytes = encode_metadata_command_pending_slot_replace_request(&request).unwrap();
+        let decoded = decode_metadata_command_pending_slot_replace_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.previous.command_bytes(), previous.command_bytes());
+        assert_eq!(
+            decoded.replacement.command_bytes(),
+            replacement.command_bytes()
+        );
     }
 
     #[test]
