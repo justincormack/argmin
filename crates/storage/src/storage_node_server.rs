@@ -12,13 +12,14 @@ use crate::error::StoreError;
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::storage_rpc::{
-    decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_request,
-    decode_metadata_command_request, decode_metadata_command_state_request,
-    decode_read_handle_acquire_request, decode_read_handle_release_request,
-    decode_scavenger_list_files_request, decode_shard_ack_batch_request,
-    decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
-    decode_shard_write_request, encode_health_response,
-    encode_metadata_command_acceptance_response, encode_metadata_command_max_log_index_response,
+    decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
+    decode_metadata_command_pending_slot_request, decode_metadata_command_request,
+    decode_metadata_command_state_request, decode_read_handle_acquire_request,
+    decode_read_handle_release_request, decode_scavenger_list_files_request,
+    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
+    decode_shard_read_request, decode_shard_write_request, encode_health_response,
+    encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
+    encode_metadata_command_bool_response, encode_metadata_command_max_log_index_response,
     encode_metadata_command_next_id_response, encode_metadata_command_pending_envelope_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response, encode_metadata_command_state_response,
@@ -28,6 +29,8 @@ use crate::storage_rpc::{
     encode_storage_rpc_success_response, read_storage_rpc_request_frame_from,
     write_storage_rpc_frame_to, StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame,
     StorageRpcHealthResponse, StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceResponse,
+    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
+    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
     StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
     StorageRpcMetadataCommandPendingEnvelopeResponse,
@@ -502,6 +505,55 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandValidateReplayState => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_command_validate_replay_state_response(request, false)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_command_validate_replay_state_response(request, true)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandAppliedLogHashes => {
+                match decode_metadata_command_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_applied_hashes_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
+                match decode_metadata_command_matching_applied_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_matching_applied_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandAbandoned => {
+                match decode_metadata_command_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_abandoned_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             kind => self.unsupported_operation_response(kind),
         }
         .map_err(|error| StorageNodeServerError::ResponsePayload {
@@ -892,6 +944,138 @@ impl StorageNodeConnectionHandler {
                 let payload = encode_metadata_command_pending_envelope_response(
                     &StorageRpcMetadataCommandPendingEnvelopeResponse { command },
                 );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_validate_replay_state_response(
+        &self,
+        request: StorageRpcMetadataCommandStateRequest,
+        preserve_pending_slot: bool,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            if preserve_pending_slot {
+                pg.validate_metadata_command_replay_state_preserving_pending_slot(
+                    self.config.node_id.as_u32(),
+                    request.cluster_epoch,
+                )
+            } else {
+                pg.validate_metadata_command_replay_state(
+                    self.config.node_id.as_u32(),
+                    request.cluster_epoch,
+                )
+            }
+        }) {
+            Ok(state) => {
+                let payload = encode_metadata_command_state_response(
+                    &StorageRpcMetadataCommandStateResponse { state },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_applied_hashes_response(
+        &self,
+        request: StorageRpcMetadataCommandRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.applied_metadata_command_log_entry_hashes(
+                self.config.node_id.as_u32(),
+                &request.command,
+            )
+        }) {
+            Ok(hashes) => {
+                let payload = encode_metadata_command_applied_hashes_response(
+                    &StorageRpcMetadataCommandAppliedHashesResponse {
+                        outcome: StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(hashes),
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                let payload = encode_metadata_command_applied_hashes_response(
+                    &StorageRpcMetadataCommandAppliedHashesResponse {
+                        outcome: StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_matching_applied_response(
+        &self,
+        request: StorageRpcMetadataCommandMatchingAppliedRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.has_matching_applied_metadata_command_log_entry(
+                self.config.node_id.as_u32(),
+                &request.command,
+                request.expected_previous_log_hash,
+            )
+        }) {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_abandoned_response(
+        &self,
+        request: StorageRpcMetadataCommandRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
+        }) {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
                 encode_storage_rpc_success_response(&payload)
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
@@ -1667,6 +1851,7 @@ mod tests {
     };
     use crate::storage_rpc::{
         decode_health_response, decode_metadata_command_acceptance_response,
+        decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_response,
         decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
         decode_metadata_command_pending_envelope_response,
         decode_metadata_command_pending_slot_insert_response,
@@ -1674,13 +1859,14 @@ mod tests {
         decode_metadata_command_state_response, decode_read_handle_acquire_response,
         decode_read_handle_release_response, decode_scavenger_list_files_response,
         decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-        decode_storage_rpc_response_payload, encode_metadata_command_next_id_request,
-        encode_metadata_command_pending_slot_request, encode_metadata_command_request,
-        encode_metadata_command_state_request, encode_read_handle_acquire_request,
-        encode_read_handle_release_request, encode_scavenger_list_files_request,
-        encode_shard_ack_batch_request, encode_shard_delete_request,
-        encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
-        encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        decode_storage_rpc_response_payload, encode_metadata_command_matching_applied_request,
+        encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_request,
+        encode_metadata_command_request, encode_metadata_command_state_request,
+        encode_read_handle_acquire_request, encode_read_handle_release_request,
+        encode_scavenger_list_files_request, encode_shard_ack_batch_request,
+        encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
+        encode_shard_write_request, encode_storage_rpc_frame, read_storage_rpc_frame_from,
+        write_storage_rpc_frame_to, StorageRpcMetadataCommandMatchingAppliedRequest,
         StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
         StorageRpcMetadataCommandStateRequest, StorageRpcReadHandleAcquireRequest,
@@ -2765,11 +2951,17 @@ mod tests {
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
         let first = test_metadata_command(0, 1);
+        let applied = test_metadata_command(0, 2);
         let pending = test_metadata_command(0, 3);
         let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let pg = server._node.get_pg(0).unwrap();
         pg.record_metadata_command_abandoned(7, &first).unwrap();
+        pg.apply_metadata_command_and_record(7, &applied).unwrap();
+        let applied_hashes = pg
+            .applied_metadata_command_log_entry_hashes(7, &applied)
+            .unwrap()
+            .unwrap();
         pg.try_insert_pending_metadata_command_slot(7, &pending, Some(&bucket))
             .unwrap();
         drop(pg);
@@ -2792,7 +2984,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let max = decode_metadata_command_max_log_index_response(&max_payload).unwrap();
-        assert_eq!(max.max_log_index, 1);
+        assert_eq!(max.max_log_index, 2);
 
         let pending_response = send_frame(
             &mut client,
@@ -2810,9 +3002,83 @@ mod tests {
             pending.command_bytes()
         );
 
-        let next_response = send_frame(
+        let replay_response = send_frame(
             &mut client,
             3,
+            StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending,
+            encode_metadata_command_state_request(&state_request),
+        );
+        let replay_payload = decode_storage_rpc_response_payload(&replay_response.payload)
+            .unwrap()
+            .unwrap();
+        let replay_state = decode_metadata_command_state_response(&replay_payload).unwrap();
+        assert_eq!(replay_state.state.applied_log_index, 2);
+
+        let applied_hashes_response = send_frame(
+            &mut client,
+            4,
+            StorageRpcMessageKind::MetadataCommandAppliedLogHashes,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command: applied.clone(),
+            })
+            .unwrap(),
+        );
+        let applied_hashes_payload =
+            decode_storage_rpc_response_payload(&applied_hashes_response.payload)
+                .unwrap()
+                .unwrap();
+        let decoded_hashes =
+            decode_metadata_command_applied_hashes_response(&applied_hashes_payload).unwrap();
+        assert_eq!(
+            decoded_hashes.outcome,
+            StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(Some(applied_hashes))
+        );
+
+        let matching_response = send_frame(
+            &mut client,
+            5,
+            StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
+            encode_metadata_command_matching_applied_request(
+                &StorageRpcMetadataCommandMatchingAppliedRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    pg_id: PgId::new(0),
+                    command: applied.clone(),
+                    expected_previous_log_hash: applied_hashes.0,
+                },
+            )
+            .unwrap(),
+        );
+        let matching_payload = decode_storage_rpc_response_payload(&matching_response.payload)
+            .unwrap()
+            .unwrap();
+        let matching = decode_metadata_command_bool_response(&matching_payload).unwrap();
+        assert!(matching.value);
+
+        let abandoned_response = send_frame(
+            &mut client,
+            6,
+            StorageRpcMessageKind::MetadataCommandAbandoned,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command: first,
+            })
+            .unwrap(),
+        );
+        let abandoned_payload = decode_storage_rpc_response_payload(&abandoned_response.payload)
+            .unwrap()
+            .unwrap();
+        let abandoned = decode_metadata_command_bool_response(&abandoned_payload).unwrap();
+        assert!(abandoned.value);
+
+        let next_response = send_frame(
+            &mut client,
+            7,
             StorageRpcMessageKind::MetadataCommandNextId,
             encode_metadata_command_next_id_request(&StorageRpcMetadataCommandNextIdRequest {
                 node_id: NodeId::new(7),

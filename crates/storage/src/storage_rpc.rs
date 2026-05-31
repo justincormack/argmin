@@ -72,6 +72,11 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandMaxLogIndex = 20,
     MetadataCommandNextId = 21,
     MetadataCommandPendingEnvelope = 22,
+    MetadataCommandValidateReplayState = 23,
+    MetadataCommandValidateReplayStatePreservingPending = 24,
+    MetadataCommandAppliedLogHashes = 25,
+    MetadataCommandMatchingAppliedLog = 26,
+    MetadataCommandAbandoned = 27,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +141,13 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandMaxLogIndex => "metadata command max log index",
             Self::MetadataCommandNextId => "metadata command next id",
             Self::MetadataCommandPendingEnvelope => "metadata command pending envelope",
+            Self::MetadataCommandValidateReplayState => "metadata command validate replay state",
+            Self::MetadataCommandValidateReplayStatePreservingPending => {
+                "metadata command validate replay state preserving pending"
+            }
+            Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
+            Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
+            Self::MetadataCommandAbandoned => "metadata command abandoned",
         }
     }
 
@@ -163,6 +175,11 @@ impl StorageRpcMessageKind {
             20 => Ok(Self::MetadataCommandMaxLogIndex),
             21 => Ok(Self::MetadataCommandNextId),
             22 => Ok(Self::MetadataCommandPendingEnvelope),
+            23 => Ok(Self::MetadataCommandValidateReplayState),
+            24 => Ok(Self::MetadataCommandValidateReplayStatePreservingPending),
+            25 => Ok(Self::MetadataCommandAppliedLogHashes),
+            26 => Ok(Self::MetadataCommandMatchingAppliedLog),
+            27 => Ok(Self::MetadataCommandAbandoned),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -334,6 +351,36 @@ pub(crate) struct StorageRpcMetadataCommandNextIdResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingEnvelopeResponse {
     pub(crate) command: Option<crate::metadata_command::MetadataCommandEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandMatchingAppliedRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) expected_previous_log_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandAppliedHashesOutcome {
+    Hashes(Option<(u64, u64)>),
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandAppliedHashesResponse {
+    pub(crate) outcome: StorageRpcMetadataCommandAppliedHashesOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandBoolResponse {
+    pub(crate) value: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,7 +730,9 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandMaxLogIndex
-        | StorageRpcMessageKind::MetadataCommandPendingEnvelope => {
+        | StorageRpcMessageKind::MetadataCommandPendingEnvelope
+        | StorageRpcMessageKind::MetadataCommandValidateReplayState
+        | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandNextId => {
@@ -1135,6 +1184,131 @@ pub(crate) fn decode_metadata_command_pending_envelope_response(
     };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandPendingEnvelopeResponse { command })
+}
+
+pub(crate) fn encode_metadata_command_matching_applied_request(
+    request: &StorageRpcMetadataCommandMatchingAppliedRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let command_request = StorageRpcMetadataCommandRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        command: request.command.clone(),
+    };
+    let mut out = encode_metadata_command_request(&command_request)?;
+    put_u64(&mut out, request.expected_previous_log_hash);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_matching_applied_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let command_checksum = decoder.read_u64()?;
+    let command_bytes = decoder.read_bytes()?.to_vec();
+    let item_bytes = {
+        let mut out = Vec::new();
+        put_u64(&mut out, command_checksum);
+        put_bytes(&mut out, &command_bytes);
+        out
+    };
+    let item = decode_metadata_command_item(&item_bytes)?;
+    let command = decode_metadata_command_envelope(&item.command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
+    let expected_previous_log_hash = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandMatchingAppliedRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        command,
+        expected_previous_log_hash,
+    })
+}
+
+pub(crate) fn encode_metadata_command_applied_hashes_response(
+    response: &StorageRpcMetadataCommandAppliedHashesResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.outcome {
+        StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(None) => put_u8(&mut out, 0),
+        StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(Some((
+            previous_log_hash,
+            log_hash,
+        ))) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, previous_log_hash);
+            put_u64(&mut out, log_hash);
+        }
+        StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 2);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_applied_hashes_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(None),
+        1 => StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(Some((
+            decoder.read_u64()?,
+            decoder.read_u64()?,
+        ))),
+        2 => StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command applied hashes outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandAppliedHashesResponse { outcome })
+}
+
+pub(crate) fn encode_metadata_command_bool_response(
+    response: &StorageRpcMetadataCommandBoolResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(&mut out, u8::from(response.value));
+    out
+}
+
+pub(crate) fn decode_metadata_command_bool_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandBoolResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let value = match decoder.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid metadata command bool response tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandBoolResponse { value })
 }
 
 pub(crate) fn encode_metadata_command_state_request(
@@ -2833,6 +3007,62 @@ mod tests {
         ] {
             let bytes = encode_metadata_command_pending_envelope_response(&response);
             let decoded = decode_metadata_command_pending_envelope_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn metadata_command_matching_applied_request_round_trips() {
+        let command = test_metadata_command();
+        let request = StorageRpcMetadataCommandMatchingAppliedRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            command: command.clone(),
+            expected_previous_log_hash: 0xabc,
+        };
+
+        let bytes = encode_metadata_command_matching_applied_request(&request).unwrap();
+        let decoded = decode_metadata_command_matching_applied_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.command.command_bytes(), command.command_bytes());
+    }
+
+    #[test]
+    fn metadata_command_applied_hashes_response_round_trips_outcomes() {
+        for response in [
+            StorageRpcMetadataCommandAppliedHashesResponse {
+                outcome: StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(None),
+            },
+            StorageRpcMetadataCommandAppliedHashesResponse {
+                outcome: StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(Some((0x12, 0x34))),
+            },
+            StorageRpcMetadataCommandAppliedHashesResponse {
+                outcome: StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 11,
+                    cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                    log_index: 12,
+                },
+            },
+        ] {
+            let bytes = encode_metadata_command_applied_hashes_response(&response);
+            let decoded = decode_metadata_command_applied_hashes_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn metadata_command_bool_response_round_trips() {
+        for response in [
+            StorageRpcMetadataCommandBoolResponse { value: false },
+            StorageRpcMetadataCommandBoolResponse { value: true },
+        ] {
+            let bytes = encode_metadata_command_bool_response(&response);
+            let decoded = decode_metadata_command_bool_response(&bytes).unwrap();
 
             assert_eq!(decoded, response);
         }
