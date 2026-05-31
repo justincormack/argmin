@@ -680,6 +680,9 @@ pub(crate) struct StorageRpcClaimReleaseRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcProofReleaseRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
 }
 
@@ -2527,8 +2530,16 @@ pub(crate) fn decode_claim_release_request(
 pub(crate) fn encode_proof_release_request(
     request: &StorageRpcProofReleaseRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.proof.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match proof epoch",
+        ));
+    }
     validate_bucket_write_reservation_proof(&request.proof)?;
     let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
     put_bucket_write_reservation_proof(&mut out, &request.proof);
     Ok(out)
 }
@@ -2537,10 +2548,23 @@ pub(crate) fn decode_proof_release_request(
     bytes: &[u8],
 ) -> Result<StorageRpcProofReleaseRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
     let proof = decoder.read_bucket_write_reservation_proof()?;
     decoder.finish()?;
+    if cluster_epoch != proof.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match proof epoch",
+        ));
+    }
     validate_bucket_write_reservation_proof(&proof)?;
-    Ok(StorageRpcProofReleaseRequest { proof })
+    Ok(StorageRpcProofReleaseRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        proof,
+    })
 }
 
 pub(crate) fn encode_optional_checksum_metadata(checksum: Option<&ChecksumBytes>) -> Vec<u8> {
@@ -4504,6 +4528,9 @@ mod tests {
     #[test]
     fn proof_release_request_carries_full_reservation_identity() {
         let request = StorageRpcProofReleaseRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
             proof: test_bucket_write_reservation_proof(),
         };
 

@@ -17,10 +17,11 @@ use crate::storage_rpc::{
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
-    decode_metadata_command_state_request, decode_read_handle_acquire_request,
-    decode_read_handle_release_request, decode_scavenger_list_files_request,
-    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
+    decode_metadata_command_state_request, decode_proof_release_request,
+    decode_read_handle_acquire_request, decode_read_handle_release_request,
+    decode_scavenger_list_files_request, decode_shard_ack_batch_request,
+    decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
+    decode_shard_write_request, encode_bucket_info_outcome_response,
     encode_create_bucket_command_build_response, encode_health_response,
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
     encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
@@ -51,11 +52,12 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
-    StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest, StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
+    StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
+    StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
+    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
+    STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, PgId, PgState, WriteAck};
 use crate::{EcShape, NodeId, ShardLocation};
@@ -88,6 +90,7 @@ pub struct StorageNodePgRoute {
     pub pg_id: u32,
     pub cluster_epoch: ClusterEpoch,
     pub state: PgState,
+    pub primary_node_id: NodeId,
     pub acting_set: Vec<NodeId>,
 }
 
@@ -105,6 +108,8 @@ pub enum StorageNodeServerError {
     RoutePgNotConfigured { pg_id: u32 },
     #[error("storage-node PG route {pg_id} is inconsistent across static config")]
     InconsistentPgRoute { pg_id: u32 },
+    #[error("storage-node PG route {pg_id} primary node {primary_node_id} is not in acting set")]
+    RoutePrimaryNotInActingSet { pg_id: u32, primary_node_id: u32 },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
@@ -380,6 +385,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ReadHandlesRelease => {
                 match decode_read_handle_release_request(&frame.payload) {
                     Ok(request) => self.read_handles_release_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ProofRelease => {
+                match decode_proof_release_request(&frame.payload) {
+                    Ok(request) => self.proof_release_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -668,6 +682,53 @@ impl StorageNodeConnectionHandler {
         session.release_read_handles(&request.read_operation_id);
         let payload = encode_read_handle_release_response(&StorageRpcReadHandleReleaseResponse);
         Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn proof_release_response(
+        &self,
+        request: StorageRpcProofReleaseRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let route = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == request.pg_id.get())
+            .expect("validated proof-release PG route must exist");
+        if route.primary_node_id != self.config.node_id {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not primary for proof release on PG {}",
+                    self.config.node_id.as_u32(),
+                    request.pg_id.get()
+                ),
+            });
+        }
+        let expected_pg_id =
+            PgId::new(self.node.pg_topology().bucket_pg_for(&request.proof.bucket));
+        if request.pg_id != expected_pg_id {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "proof release PG {} does not match bucket {} PG {}",
+                    request.pg_id.get(),
+                    request.proof.bucket.as_str(),
+                    expected_pg_id.get()
+                ),
+            });
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client
+            .release_metadata_command_bucket_write_reservation(request.pg_id, &request.proof)
+        {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
     }
 
     fn bucket_head_response(
@@ -2065,6 +2126,12 @@ fn validate_pg_routes(
         if !configured.contains_key(&route.pg_id) {
             return Err(StorageNodeServerError::RoutePgNotConfigured { pg_id: route.pg_id });
         }
+        if !route.acting_set.contains(&route.primary_node_id) {
+            return Err(StorageNodeServerError::RoutePrimaryNotInActingSet {
+                pg_id: route.pg_id,
+                primary_node_id: route.primary_node_id.as_u32(),
+            });
+        }
     }
     for &pg_id in pg_ids {
         if !seen.contains_key(&pg_id) {
@@ -2264,6 +2331,7 @@ mod tests {
                 pg_id: 0,
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 state: PgState::Active,
+                primary_node_id: NodeId::new(7),
                 acting_set: vec![NodeId::new(7)],
             }],
         }
@@ -2274,6 +2342,7 @@ mod tests {
             pg_id,
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: PgState::Active,
+            primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }
     }
@@ -2597,6 +2666,23 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_static_config_rejects_primary_outside_acting_set() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+
+        let err = validate_storage_node_process_configs(&[config]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::RoutePrimaryNotInActingSet {
+                pg_id: 0,
+                primary_node_id: 8
+            }
+        ));
+    }
+
+    #[test]
     fn storage_node_static_config_rejects_missing_pg_route() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -2649,6 +2735,7 @@ mod tests {
         second.node_id = NodeId::new(8);
         second.data_dir = tmp.path().join("node-2");
         second.socket_path = tmp.path().join("sock").join("storage-2.sock");
+        second.pg_routes[0].primary_node_id = NodeId::new(8);
         second.pg_routes[0].acting_set = vec![NodeId::new(8)];
 
         let err = validate_storage_node_process_configs(&[first, second]).unwrap_err();
@@ -3816,6 +3903,7 @@ mod tests {
     fn storage_node_server_rejects_read_handle_acquire_for_non_acting_set() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
         config.pg_routes[0].acting_set = vec![NodeId::new(8)];
 
         let error = send_read_handle_acquire(config, test_location(1, 0, 7));

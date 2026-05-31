@@ -6146,6 +6146,7 @@ mod tests {
                 pg_id: 0,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
+                primary_node_id: NodeId::new(1),
                 acting_set: node_ids.to_vec(),
             }],
         };
@@ -6275,6 +6276,7 @@ mod tests {
                 pg_id: 0,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
+                primary_node_id: NodeId::new(1),
                 acting_set: node_ids.to_vec(),
             }],
         };
@@ -6340,6 +6342,7 @@ mod tests {
                 pg_id: 0,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
+                primary_node_id: node_id,
                 acting_set: vec![node_id],
             }],
         };
@@ -6414,6 +6417,7 @@ mod tests {
                 pg_id: 0,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
+                primary_node_id: node_id,
                 acting_set: vec![node_id],
             }],
         };
@@ -6673,6 +6677,7 @@ mod tests {
                     pg_id: 0,
                     cluster_epoch: ClusterEpoch::INITIAL,
                     state: PgState::Active,
+                    primary_node_id: NodeId::new(0),
                     acting_set: node_ids.to_vec(),
                 }],
             });
@@ -6801,6 +6806,7 @@ mod tests {
                     pg_id: 0,
                     cluster_epoch: ClusterEpoch::INITIAL,
                     state: PgState::Active,
+                    primary_node_id: NodeId::new(0),
                     acting_set: node_ids.to_vec(),
                 }],
             });
@@ -6953,6 +6959,7 @@ mod tests {
                     pg_id: 0,
                     cluster_epoch: ClusterEpoch::INITIAL,
                     state: PgState::Active,
+                    primary_node_id: NodeId::new(0),
                     acting_set: node_ids.to_vec(),
                 }],
             });

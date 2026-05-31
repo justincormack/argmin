@@ -197,6 +197,7 @@ fn build_storage_node_process_config(
             pg_id,
             cluster_epoch,
             state: PgState::Active,
+            primary_node_id: NodeId::new(0),
             acting_set: acting_set.clone(),
         })
         .collect();

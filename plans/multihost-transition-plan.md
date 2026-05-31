@@ -5536,9 +5536,14 @@ place for create-bucket: bucket raw/info reads and create-bucket command
 construction now route through a dedicated bucket metadata client, and a
 frontend map can create a bucket through a storage-node-owned Unix bucket
 metadata client plus the remote metadata-command client. Remaining non-command
-surfaces still need object snapshots/allocation/reservation/proof-release and
-the direct PUT command-builder path before frontend/combined roles can be
-enabled.
+surfaces still need object snapshots/allocation/reservation and broader
+bucket-write reservation acquire/snapshot/release coordination. Proof-release
+cleanup for command-owned bucket write reservations has an RPC/client surface,
+but production cleanup should move only with the matching remote acquire/snapshot
+path so one reservation identity never spans local and remote stores. Direct PUT
+still needs the object snapshot/command-builder surface before its metadata path
+is remote end to end and before
+frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5570,7 +5575,10 @@ Implementation slices:
    replica operations, reusing Phase 10.3 route checks for node id, PG
    configured locally, cluster epoch, active PG state, and acting-set
    membership. The receiver must additionally validate that the embedded
-   command id matches the RPC route.
+   command id matches the RPC route. `StorageNodePgRoute` carries an explicit
+   primary node id separate from acting-set order; PG-primary-only operations
+   such as bucket write proof release must validate against that field, not
+   `acting_set[0]`.
 3. split the current broad local metadata-command surface into a dedicated
    node-client trait, for example `MetadataCommandNodeClient`, covering:
    pending command slot insert/replace/read, metadata command acceptance,
@@ -5635,7 +5643,9 @@ Required tests:
 8. non-command metadata RPCs used by create-bucket/direct PUT run remotely:
    bucket/object snapshot reads, generation/version/order allocation,
    bucket-write reservation/proof release, durable pending/drain checks, and
-   operation-shaped command builders
+   operation-shaped command builders. Proof release must reject the correct PG
+   on a non-primary node even when that node appears first in the acting-set
+   route list.
 9. lost replies are retry-safe for pending-slot install/replace,
    `apply_metadata_command_and_record`, abandoned-record insert, exact
    pending-slot removal, bucket reservation/proof release, and cleanup

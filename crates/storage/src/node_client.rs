@@ -40,11 +40,12 @@ use crate::storage_rpc::{
     encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
     encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
-    encode_metadata_command_state_request, encode_read_handle_acquire_request,
-    encode_read_handle_release_request, encode_scavenger_list_files_request,
-    encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
-    encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
-    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
+    encode_metadata_command_state_request, encode_proof_release_request,
+    encode_read_handle_acquire_request, encode_read_handle_release_request,
+    encode_scavenger_list_files_request, encode_shard_ack_batch_request,
+    encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
+    encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandBoolOutcome,
@@ -53,10 +54,10 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest,
+    StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
+    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -608,6 +609,13 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
+
+    #[allow(dead_code)]
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -3153,6 +3161,16 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
             self, pg_id, bucket, command_id, config,
         )
     }
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::release_metadata_command_bucket_write_reservation(
+            self, pg_id, proof,
+        )
+    }
 }
 
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
@@ -3222,9 +3240,46 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             config,
         )
     }
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcProofReleaseRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            proof: proof.clone(),
+        };
+        let payload = encode_proof_release_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode proof release request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ProofRelease, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_proof_release_response(&response)?;
+        Ok(())
+    }
 }
 
 impl UnixStorageNodeClient {
+    fn validate_proof_release_response(
+        &self,
+        response: &[u8],
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode proof release response",
+                "proof release response payload must be empty".to_string(),
+            )))
+        }
+    }
+
     fn validate_create_bucket_command_build_outcome(
         &self,
         outcome: StorageRpcCreateBucketCommandBuildOutcome,
@@ -5833,6 +5888,7 @@ mod tests {
                 pg_id: 0,
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 state: crate::types::PgState::Active,
+                primary_node_id: NodeId::new(7),
                 acting_set: vec![NodeId::new(7)],
             }],
         }
@@ -5973,6 +6029,281 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn unix_proof_release_response_rejects_non_empty_payload() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+
+        client.validate_proof_release_response(&[]).unwrap();
+        let err = client
+            .validate_proof_release_response(b"unexpected")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode proof release response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_releases_bucket_write_proof() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("proof-release-rpc-bucket");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let reservation = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "reservation-1",
+                "owner-token-1",
+                ClusterEpoch::new(1).unwrap(),
+                "put-object",
+                10,
+                Some(20),
+                Some("key=a"),
+            )
+            .unwrap()
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        client
+            .release_metadata_command_bucket_write_reservation(
+                PgId::new(0),
+                &BucketWriteReservationProof::from(&reservation),
+            )
+            .unwrap();
+        server_thread.join().unwrap();
+
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![0, 1];
+        config.pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: crate::types::PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            },
+            StorageNodePgRoute {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: crate::types::PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            },
+        ];
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let (bucket, correct_pg_id, wrong_pg_id, reservation) = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let (bucket, correct_pg_id, wrong_pg_id) = (0..100)
+                .map(|index| crate::tests::bucket_name(format!("proof-release-wrong-pg-{index}")))
+                .find_map(|bucket| {
+                    let correct_pg_id = node.pg_topology().bucket_pg_for(&bucket);
+                    (correct_pg_id < 2).then(|| {
+                        let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
+                        (bucket, correct_pg_id, wrong_pg_id)
+                    })
+                })
+                .expect("two-PG topology must place a test bucket");
+            let pg = node.get_pg(correct_pg_id).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "reservation-1",
+                "owner-token-1",
+                ClusterEpoch::new(1).unwrap(),
+                "put-object",
+                10,
+                Some(20),
+                Some("key=a"),
+            )
+            .unwrap();
+            (bucket, correct_pg_id, wrong_pg_id, reservation)
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let err = client
+            .release_metadata_command_bucket_write_reservation(
+                PgId::new(wrong_pg_id),
+                &BucketWriteReservationProof::from(&reservation),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "proof release",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(correct_pg_id).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_rejects_proof_release_on_non_primary() {
+        let tmp = test_util::tempdir();
+        let mut primary_config = test_config(&tmp);
+        primary_config.node_id = NodeId::new(7);
+        primary_config.data_dir = tmp.path().join("primary-node");
+        primary_config.pg_routes[0].primary_node_id = NodeId::new(7);
+        primary_config.pg_routes[0].acting_set = vec![NodeId::new(8), NodeId::new(7)];
+        let mut replica_config = primary_config.clone();
+        replica_config.node_id = NodeId::new(8);
+        replica_config.data_dir = tmp.path().join("replica-node");
+        replica_config.socket_path = tmp.path().join("sock").join("replica-storage.sock");
+        let bucket = crate::tests::bucket_name("proof-release-replica-bucket");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let reservation = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &primary_config.data_dir,
+                &primary_config.pg_ids,
+                primary_config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "reservation-1",
+                "owner-token-1",
+                ClusterEpoch::new(1).unwrap(),
+                "put-object",
+                10,
+                Some(20),
+                Some("key=a"),
+            )
+            .unwrap()
+        };
+        private_socket_dir(replica_config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(replica_config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(8),
+            ClusterEpoch::new(1).unwrap(),
+            replica_config.socket_path.clone(),
+        );
+
+        let err = client
+            .release_metadata_command_bucket_write_reservation(
+                PgId::new(0),
+                &BucketWriteReservationProof::from(&reservation),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "proof release",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &primary_config.data_dir,
+            &primary_config.pg_ids,
+            primary_config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
