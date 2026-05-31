@@ -566,7 +566,7 @@ migrated_metadata_pg_bypasses=$(
     FNR == 1 {
         current_fn = ""
         pending_test_cfg = 0
-        pending_storage_client = 0
+        pending_metadata_command_client = 0
         in_test_hook = 0
         in_test_module = 0
     }
@@ -600,23 +600,22 @@ migrated_metadata_pg_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if ($0 ~ /\.storage_client\(\)/ \
-            || $0 ~ /object_metadata_primary_client\(/ \
-            || $0 ~ /storage_client[[:space:]]*$/) {
-            pending_storage_client = 1
+        if ($0 ~ /\.metadata_command_client\(\)/ \
+            || $0 ~ /metadata_command_client[[:space:]]*$/) {
+            pending_metadata_command_client = 1
         }
         if ($0 ~ /\.(max_metadata_command_log_index|pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|validate_metadata_command_replay_state|validate_metadata_command_replay_state_preserving_pending_slot|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
-            if (pending_storage_client || $0 ~ /\.storage_client\(\)/) {
-                pending_storage_client = 0
+            if (pending_metadata_command_client || $0 ~ /\.metadata_command_client\(\)/) {
+                pending_metadata_command_client = 0
                 next
             }
-            if ($0 ~ /storage_client\./) {
+            if ($0 ~ /metadata_command_client\./) {
                 next
             }
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /;/) {
-            pending_storage_client = 0
+            pending_metadata_command_client = 0
         }
     }
     ' crates/storage/src/cluster.rs \

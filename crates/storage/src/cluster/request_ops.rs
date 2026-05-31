@@ -966,7 +966,7 @@ impl super::StorageCluster {
                     source: source.into(),
                 })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                node.storage_client()
+                node.metadata_command_client()
                     .apply_metadata_command_and_record(pg_id, command)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
@@ -988,7 +988,7 @@ impl super::StorageCluster {
                 applied_nodes,
                 source: source.into(),
             })?;
-            node.storage_client()
+            node.metadata_command_client()
                 .apply_metadata_command_and_record(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
@@ -1040,7 +1040,7 @@ impl super::StorageCluster {
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 continue;
             }
-            node.storage_client()
+            node.metadata_command_client()
                 .record_metadata_command_abandoned(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
@@ -1064,7 +1064,7 @@ impl super::StorageCluster {
             })?;
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node
-                .storage_client()
+                .metadata_command_client()
                 .metadata_command_abandoned(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
@@ -1302,7 +1302,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         match primary
-            .storage_client()
+            .metadata_command_client()
             .try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket)
         {
             Ok(true) => Ok(true),

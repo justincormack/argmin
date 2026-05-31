@@ -427,6 +427,15 @@ pub enum ClusterBuildError {
     #[error("remote shard client socket path {path:?} must be absolute")]
     RemoteShardClientSocketPathNotAbsolute { path: PathBuf },
 
+    #[error("duplicate remote metadata-command client node id {id}")]
+    DuplicateRemoteMetadataCommandClientNodeId { id: u32 },
+
+    #[error("remote metadata-command client node {id} is not present in the local cluster map")]
+    RemoteMetadataCommandClientNodeNotFound { id: u32 },
+
+    #[error("remote metadata-command client socket path {path:?} must be absolute")]
+    RemoteMetadataCommandClientSocketPathNotAbsolute { path: PathBuf },
+
     #[error("metadata primary node {id} is not present in the local cluster map")]
     MetadataPrimaryNotFound { id: u32 },
 

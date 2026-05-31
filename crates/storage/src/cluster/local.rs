@@ -14,8 +14,8 @@ use crate::metadata_command::{
 };
 use crate::node::BucketLockGuard;
 use crate::node_client::{
-    LocalStorageNodeClient, PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
-    ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
+    LocalStorageNodeClient, MetadataCommandNodeClient, PlacedShardNodeClient, ShardAckNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -72,11 +72,35 @@ impl LocalUnixShardNodeClientConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUnixMetadataCommandNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
+impl LocalUnixMetadataCommandNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
 pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
     storage_node: Arc<SharedStorageNode>,
     storage_client: Arc<dyn StorageNodeClient>,
+    metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
     shard_ack_client: Arc<dyn ShardAckNodeClient>,
     shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient>,
@@ -90,6 +114,7 @@ impl LocalNodeStore {
             Arc::clone(&storage_node),
         ));
         let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
+        let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = local_client.clone();
         let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
         let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
         let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = local_client.clone();
@@ -99,6 +124,7 @@ impl LocalNodeStore {
             data_dir,
             storage_node,
             storage_client,
+            metadata_command_client,
             shard_client,
             shard_ack_client,
             shard_read_handle_client,
@@ -120,6 +146,10 @@ impl LocalNodeStore {
 
     pub(crate) fn storage_client(&self) -> &Arc<dyn StorageNodeClient> {
         &self.storage_client
+    }
+
+    pub(crate) fn metadata_command_client(&self) -> &Arc<dyn MetadataCommandNodeClient> {
+        &self.metadata_command_client
     }
 
     pub(crate) fn shard_client(&self) -> &Arc<dyn PlacedShardNodeClient> {
@@ -723,6 +753,49 @@ impl LocalClusterMap {
         Ok(())
     }
 
+    pub fn install_unix_metadata_command_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixMetadataCommandNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixMetadataCommandNodeClientConfig> = configs.into_iter().collect();
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in &configs {
+            if !seen.insert(config.node_id) {
+                return Err(
+                    ClusterBuildError::DuplicateRemoteMetadataCommandClientNodeId {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(
+                    ClusterBuildError::RemoteMetadataCommandClientSocketPathNotAbsolute {
+                        path: config.socket_path.clone(),
+                    },
+                );
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(ClusterBuildError::RemoteMetadataCommandClientNodeNotFound {
+                    id: config.node_id.as_u32(),
+                });
+            }
+        }
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote metadata-command client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = client;
+            node.metadata_command_client = metadata_command_client;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_shard_client_for_tests(
         &mut self,
@@ -1286,7 +1359,7 @@ impl LocalClusterMap {
             })?;
 
         target_node
-            .storage_client()
+            .metadata_command_client()
             .metadata_command_acceptance(target_pg_id, command)
     }
 
@@ -1371,7 +1444,7 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             })?;
         target_node
-            .storage_client()
+            .metadata_command_client()
             .metadata_command_abandon_acceptance(target_pg_id, command)
     }
 
@@ -1683,13 +1756,13 @@ fn validate_metadata_command_replay_state(
         for node in nodes.values() {
             let node_id = node.node_id();
             let state = if node_id == primary_node_id {
-                node.storage_client()
+                node.metadata_command_client()
                     .validate_metadata_command_replay_state_preserving_pending_slot(
                         pg_id,
                         cluster_epoch,
                     )
             } else {
-                node.storage_client()
+                node.metadata_command_client()
                     .validate_metadata_command_replay_state(pg_id, cluster_epoch)
             }
             .map_err(|source| ClusterBuildError::OpenLocalNode {
@@ -1697,7 +1770,7 @@ fn validate_metadata_command_replay_state(
                 source,
             })?;
             let pending_command = node
-                .storage_client()
+                .metadata_command_client()
                 .pending_metadata_command_envelope(pg_id, cluster_epoch)
                 .map_err(|source| ClusterBuildError::OpenLocalNode {
                     node_id: node_id.as_u32(),
@@ -1771,14 +1844,14 @@ fn clean_terminal_primary_pending_slot_on_open(
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
     primary
-        .storage_client()
+        .metadata_command_client()
         .remove_pending_metadata_command_slot(pg_id, command)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
             source,
         })?;
     if primary
-        .storage_client()
+        .metadata_command_client()
         .pending_metadata_command_envelope(pg_id, cluster_epoch)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
@@ -1847,7 +1920,7 @@ fn converge_in_flight_metadata_command_on_open(
     nodes_primary_last.sort_by_key(|(node_id, _node)| **node_id == primary_node_id);
     for (node_id, node) in nodes_primary_last {
         validate_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
-        node.storage_client()
+        node.metadata_command_client()
             .apply_metadata_command_and_record(pg_id, command)
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
@@ -1868,7 +1941,7 @@ fn converge_in_flight_metadata_command_on_open(
     for node in nodes.values() {
         let node_id = node.node_id();
         let state = node
-            .storage_client()
+            .metadata_command_client()
             .validate_metadata_command_replay_state(pg_id, cluster_epoch)
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
@@ -2097,7 +2170,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
                 .get(node_id)
                 .expect("replica state node must exist in local node set");
             let matches_pending = node
-                .storage_client()
+                .metadata_command_client()
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     command,
@@ -2161,7 +2234,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
             .get(node_id)
             .expect("replica state node must exist in local node set");
         let matches_pending = node
-            .storage_client()
+            .metadata_command_client()
             .has_matching_applied_metadata_command_log_entry(
                 pg_id,
                 command,
@@ -2372,6 +2445,7 @@ mod tests {
     use crate::storage_node_server::{
         StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
     };
+    use crate::StorageCluster;
     use proptest::prelude::*;
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use std::collections::BTreeSet;
@@ -6171,6 +6245,106 @@ mod tests {
         .unwrap();
         assert_eq!(remote.read_shard_file(0, &key).unwrap(), payload);
         assert_eq!(ack.stored_size, payload.len() as u64);
+    }
+
+    #[test]
+    fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-metadata-node-1-owned");
+        let socket_path = tmp.path().join("sockets").join("metadata-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let server_threads: Vec<_> = (0..2)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+
+        let frontend_data_dir = tmp.path().join("frontend-only-metadata-routing");
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                frontend_data_dir.join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        map.install_unix_metadata_command_clients([LocalUnixMetadataCommandNodeClientConfig::new(
+            node_id,
+            socket_path,
+        )])
+        .unwrap();
+        let map = Arc::new(map);
+        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let bucket = crate::tests::bucket_name("remote-metadata-command-bucket");
+        let command = create_bucket_metadata_command(PgId::new(0), 1, bucket.clone());
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(node_id, &command)
+            .unwrap();
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        crate::PgMetadataStore::head_bucket_raw(&*remote_pg, &bucket).unwrap();
+    }
+
+    #[test]
+    fn unix_metadata_command_client_install_rejects_relative_socket_path() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+
+        let err = map
+            .install_unix_metadata_command_clients([LocalUnixMetadataCommandNodeClientConfig::new(
+                node_id,
+                PathBuf::from("relative-metadata-node-1.sock"),
+            )])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteMetadataCommandClientSocketPathNotAbsolute { path }
+                if path == Path::new("relative-metadata-node-1.sock")
+        ));
     }
 
     #[test]

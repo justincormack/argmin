@@ -10,7 +10,7 @@ use ring::rand::SecureRandom;
 use local::LocalClusterRuntimeState;
 pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixShardNodeClientConfig,
+    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
 };
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
@@ -28,7 +28,8 @@ use crate::node::BucketLockGuard;
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
-    CreateStreamUploadPrecondition, ShardAckNodeClient, StorageNodeClient,
+    CreateStreamUploadPrecondition, MetadataCommandNodeClient, ShardAckNodeClient,
+    StorageNodeClient,
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
@@ -748,11 +749,12 @@ impl StorageCluster {
         source: &BucketSnapshotLoadError,
     ) -> Result<bool, BucketSnapshotLoadError> {
         fn entry_hashes_or_not_retryable(
-            storage_client: &dyn StorageNodeClient,
+            metadata_command_client: &dyn MetadataCommandNodeClient,
             pg_id: PgId,
             command: &MetadataCommandEnvelope,
         ) -> Result<Option<(u64, u64)>, BucketSnapshotLoadError> {
-            match storage_client.applied_metadata_command_log_entry_hashes(pg_id, command) {
+            match metadata_command_client.applied_metadata_command_log_entry_hashes(pg_id, command)
+            {
                 Ok(hashes) => Ok(hashes),
                 Err(StoreError::MetadataCommandLogConflict { .. }) => Ok(None),
                 Err(error) => Err(error.into()),
@@ -798,31 +800,36 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id)?;
         let primary_state = primary
-            .storage_client()
+            .metadata_command_client()
             .metadata_command_replica_state(pg_id)?;
         let command_log_index = command.id().log_index().get();
-        let expected_previous_log_hash = if command_log_index
-            == primary_state.applied_log_index.saturating_add(1)
-        {
-            primary_state.applied_log_hash
-        } else if command_log_index == primary_state.applied_log_index {
-            let Some((previous_log_hash, log_hash)) =
-                entry_hashes_or_not_retryable(primary.storage_client().as_ref(), pg_id, command)?
-            else {
+        let expected_previous_log_hash =
+            if command_log_index == primary_state.applied_log_index.saturating_add(1) {
+                primary_state.applied_log_hash
+            } else if command_log_index == primary_state.applied_log_index {
+                let Some((previous_log_hash, log_hash)) = entry_hashes_or_not_retryable(
+                    primary.metadata_command_client().as_ref(),
+                    pg_id,
+                    command,
+                )?
+                else {
+                    return Ok(false);
+                };
+                if log_hash != primary_state.applied_log_hash {
+                    return Ok(false);
+                }
+                previous_log_hash
+            } else {
                 return Ok(false);
             };
-            if log_hash != primary_state.applied_log_hash {
-                return Ok(false);
-            }
-            previous_log_hash
-        } else {
-            return Ok(false);
-        };
 
         let mut expected_hashes = None;
         for (index, node) in nodes.into_iter().enumerate() {
-            let hashes =
-                entry_hashes_or_not_retryable(node.storage_client().as_ref(), pg_id, command)?;
+            let hashes = entry_hashes_or_not_retryable(
+                node.metadata_command_client().as_ref(),
+                pg_id,
+                command,
+            )?;
             match (index <= conflict_index, hashes, expected_hashes) {
                 (true, Some(hashes), None) if hashes.0 == expected_previous_log_hash => {
                     expected_hashes = Some(hashes)
@@ -854,11 +861,11 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let primary_state = primary
-            .storage_client()
+            .metadata_command_client()
             .metadata_command_replica_state(pg_id)?;
         if current_log_index == primary_state.applied_log_index {
             let Some((_, log_hash)) = primary
-                .storage_client()
+                .metadata_command_client()
                 .applied_metadata_command_log_entry_hashes(pg_id, &current)?
             else {
                 return Err(self.metadata_command_conflict(
@@ -926,15 +933,15 @@ impl StorageCluster {
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             let node_max_log_index = node
-                .storage_client()
+                .metadata_command_client()
                 .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
             let node_state = node
-                .storage_client()
+                .metadata_command_client()
                 .metadata_command_replica_state(pg_id)?;
             let replacement_match = if node_max_log_index < current_log_index {
                 ReissuedPendingCommandReplicaMatch::BelowReplacement
             } else if node
-                .storage_client()
+                .metadata_command_client()
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     &current,
@@ -1007,7 +1014,7 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let Some((previous_log_hash, terminal_log_hash)) = primary
-            .storage_client()
+            .metadata_command_client()
             .applied_metadata_command_log_entry_hashes(pg_id, &current)?
         else {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
@@ -1021,10 +1028,10 @@ impl StorageCluster {
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             let node_max_log_index = node
-                .storage_client()
+                .metadata_command_client()
                 .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
             let node_state = node
-                .storage_client()
+                .metadata_command_client()
                 .metadata_command_replica_state(pg_id)?;
             if node_max_log_index > current_log_index {
                 return Err(self.metadata_command_conflict(
@@ -1047,7 +1054,7 @@ impl StorageCluster {
                 continue;
             }
             if !node
-                .storage_client()
+                .metadata_command_client()
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     &current,
@@ -1079,11 +1086,11 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let primary_max_log_index = primary
-            .storage_client()
+            .metadata_command_client()
             .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
         let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
         if let Some(current) = primary
-            .storage_client()
+            .metadata_command_client()
             .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
         {
             if current != *command {
@@ -1103,7 +1110,7 @@ impl StorageCluster {
         }
         if acting_set_max_log_index > primary_max_log_index {
             if let Some(current) = primary
-                .storage_client()
+                .metadata_command_client()
                 .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
             {
                 if current != *command {
@@ -1147,7 +1154,7 @@ impl StorageCluster {
             command.payload().clone(),
         );
         if !primary
-            .storage_client()
+            .metadata_command_client()
             .replace_pending_metadata_command_slot_for_reissue(
                 pg_id,
                 command,
@@ -1156,10 +1163,10 @@ impl StorageCluster {
             )?
         {
             let current = primary
-                .storage_client()
+                .metadata_command_client()
                 .pending_metadata_command_envelope(pg_id, self.operation_epoch())?;
             let primary_max_log_index = primary
-                .storage_client()
+                .metadata_command_client()
                 .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
             let Some(current) = current else {
                 return Ok(None);
@@ -1196,7 +1203,7 @@ impl StorageCluster {
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             max_log_index = max_log_index.max(
-                node.storage_client()
+                node.metadata_command_client()
                     .max_metadata_command_log_index(pg_id, self.operation_epoch())?,
             );
         }
@@ -1442,7 +1449,7 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         match primary
-            .storage_client()
+            .metadata_command_client()
             .try_insert_pending_metadata_command_slot(pg_id, command, Some(bucket))
         {
             Ok(()) => Ok(Some(())),
@@ -1504,7 +1511,7 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         primary
-            .storage_client()
+            .metadata_command_client()
             .pending_metadata_command_envelope(pg_id, self.operation_epoch())
     }
 
@@ -1519,7 +1526,7 @@ impl StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let _ = bucket;
         primary
-            .storage_client()
+            .metadata_command_client()
             .remove_pending_metadata_command_slot(pg_id, command)
     }
 
@@ -1538,11 +1545,9 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        primary.storage_client().next_metadata_command_id_at_least(
-            pg_id,
-            self.operation_epoch(),
-            min_log_index,
-        )
+        primary
+            .metadata_command_client()
+            .next_metadata_command_id_at_least(pg_id, self.operation_epoch(), min_log_index)
     }
 
     #[cfg(test)]
