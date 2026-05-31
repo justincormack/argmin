@@ -6,12 +6,19 @@ use crate::{
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
-        ChecksumBytes, ClusterEpoch, DataPgId, GenerationId, ObjectKey, ObjectPayloadReclaimKind,
-        PgId, ShardIndex, ShardKey, WriteAck, SHARD_KEY_LEN,
+        BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketState, ChecksumBytes,
+        ClusterEpoch, CreateBucketConfig, DataPgId, EffectiveBucketEncryptionConfig, GenerationId,
+        ManagedEncryptionAlgorithm, ObjectKey, ObjectPayloadReclaimKind, PgId,
+        PublicAccessBlockConfig, ShardIndex, ShardKey, WriteAck, SHARD_KEY_LEN,
     },
     BucketName, NodeId,
 };
+use s3_types::{
+    AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
+    ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod,
+};
 use std::io::{Read, Write};
+use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
@@ -46,6 +53,23 @@ const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
 const STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_BUCKET_NAME_LEN: usize = 63;
+const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
+const STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN: usize = 64 * 1024;
+const STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN: usize =
+    4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_NAME_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN
+        + 4
+        + s3_types::CANONICAL_USER_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN
+        + 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -81,6 +105,9 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPendingSlotReplace = 29,
     MetadataCommandBucketControlPendingSlotInsert = 30,
     MetadataCommandApplyAndRecord = 31,
+    BucketHeadRaw = 32,
+    BucketHeadInfo = 33,
+    BucketCreateCommandBuild = 34,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +185,9 @@ impl StorageRpcMessageKind {
                 "metadata command bucket-control pending slot insert"
             }
             Self::MetadataCommandApplyAndRecord => "metadata command apply and record",
+            Self::BucketHeadRaw => "bucket head raw",
+            Self::BucketHeadInfo => "bucket head info",
+            Self::BucketCreateCommandBuild => "bucket create command build",
         }
     }
 
@@ -194,6 +224,9 @@ impl StorageRpcMessageKind {
             29 => Ok(Self::MetadataCommandPendingSlotReplace),
             30 => Ok(Self::MetadataCommandBucketControlPendingSlotInsert),
             31 => Ok(Self::MetadataCommandApplyAndRecord),
+            32 => Ok(Self::BucketHeadRaw),
+            33 => Ok(Self::BucketHeadInfo),
+            34 => Ok(Self::BucketCreateCommandBuild),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -261,6 +294,8 @@ pub(crate) enum StorageRpcPayloadError {
     MetadataCommandRouteMismatch(&'static str),
     #[error("invalid metadata command pending slot request: {0}")]
     InvalidMetadataCommandPendingSlotRequest(&'static str),
+    #[error("invalid bucket metadata request: {0}")]
+    InvalidBucketMetadataRequest(&'static str),
     #[error("shard write size mismatch: expected {expected}, actual {actual}")]
     ShardWriteSizeMismatch { expected: u64, actual: u64 },
     #[error("shard write checksum mismatch")]
@@ -297,6 +332,73 @@ pub(crate) struct StorageRpcMetadataCommandRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) bucket: BucketName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCreateBucketConfig {
+    pub(crate) name: BucketName,
+    pub(crate) owner_principal: String,
+    pub(crate) owner_canonical_id: CanonicalUserId,
+    pub(crate) acl_grants: AclGrants,
+    pub(crate) public_read: bool,
+    pub(crate) public_write: bool,
+    pub(crate) versioning: BucketVersioningState,
+    pub(crate) object_lock: BucketObjectLockConfig,
+}
+
+impl StorageRpcCreateBucketConfig {
+    pub(crate) fn as_create_bucket_config(&self) -> CreateBucketConfig<'_> {
+        CreateBucketConfig {
+            name: self.name.as_str(),
+            owner_principal: &self.owner_principal,
+            owner_canonical_id: &self.owner_canonical_id,
+            acl_grants: &self.acl_grants,
+            public_read: self.public_read,
+            public_write: self.public_write,
+            versioning: self.versioning,
+            object_lock: self.object_lock,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCreateBucketCommandBuildRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) bucket: BucketName,
+    pub(crate) command_id: crate::metadata_command::MetadataCommandId,
+    pub(crate) config: StorageRpcCreateBucketConfig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum StorageRpcBucketInfoOutcome {
+    Info(BucketInfo),
+    BucketNotFound { name: BucketName },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcBucketInfoOutcomeResponse {
+    pub(crate) outcome: StorageRpcBucketInfoOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum StorageRpcCreateBucketCommandBuildOutcome {
+    Exists(BucketInfo),
+    Command(Box<crate::metadata_command::MetadataCommandEnvelope>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcCreateBucketCommandBuildResponse {
+    pub(crate) outcome: StorageRpcCreateBucketCommandBuildOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -794,6 +896,12 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::MetadataCommandNextId => {
             STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::BucketHeadRaw | StorageRpcMessageKind::BucketHeadInfo => {
+            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketCreateCommandBuild => {
+            STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN
+        }
         _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
@@ -957,6 +1065,166 @@ pub(crate) fn decode_metadata_command_request(
         pg_id,
         command,
     })
+}
+
+pub(crate) fn encode_bucket_request(request: &StorageRpcBucketRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_string(&mut out, request.bucket.as_str());
+    out
+}
+
+pub(crate) fn decode_bucket_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        bucket,
+    })
+}
+
+pub(crate) fn encode_create_bucket_command_build_request(
+    request: &StorageRpcCreateBucketCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.bucket != request.config.name {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "request bucket must match create-bucket config name",
+        ));
+    }
+    if request.command_id.cluster_epoch() != request.cluster_epoch
+        || request.command_id.pg_id() != request.pg_id
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "command id route must match request route",
+        ));
+    }
+    let mut out = encode_bucket_request(&StorageRpcBucketRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        bucket: request.bucket.clone(),
+    });
+    put_u64(&mut out, request.command_id.log_index().get());
+    put_create_bucket_config(&mut out, &request.config);
+    Ok(out)
+}
+
+pub(crate) fn decode_create_bucket_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcCreateBucketCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name()?;
+    let log_index = crate::metadata_command::MetadataCommandLogIndex::new(decoder.read_u64()?)
+        .ok_or(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "metadata command log index must not be zero",
+        ))?;
+    let config = decoder.read_create_bucket_config()?;
+    decoder.finish()?;
+    if bucket != config.name {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "request bucket must match create-bucket config name",
+        ));
+    }
+    Ok(StorageRpcCreateBucketCommandBuildRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        bucket,
+        command_id: crate::metadata_command::MetadataCommandId::new(
+            cluster_epoch,
+            pg_id,
+            log_index,
+        ),
+        config,
+    })
+}
+
+pub(crate) fn encode_bucket_info_outcome_response(
+    response: &StorageRpcBucketInfoOutcomeResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcBucketInfoOutcome::Info(info) => {
+            put_u8(&mut out, 0);
+            put_bucket_info(&mut out, info);
+        }
+        StorageRpcBucketInfoOutcome::BucketNotFound { name } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, name.as_str());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_bucket_info_outcome_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketInfoOutcomeResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcBucketInfoOutcome::Info(decoder.read_bucket_info()?),
+        1 => StorageRpcBucketInfoOutcome::BucketNotFound {
+            name: decoder.read_bucket_name()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid bucket info outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketInfoOutcomeResponse { outcome })
+}
+
+pub(crate) fn encode_create_bucket_command_build_response(
+    response: &StorageRpcCreateBucketCommandBuildResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcCreateBucketCommandBuildOutcome::Exists(info) => {
+            put_u8(&mut out, 0);
+            put_bucket_info(&mut out, info);
+        }
+        StorageRpcCreateBucketCommandBuildOutcome::Command(command) => {
+            put_u8(&mut out, 1);
+            put_bytes(&mut out, &command.command_bytes());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_create_bucket_command_build_response(
+    bytes: &[u8],
+) -> Result<StorageRpcCreateBucketCommandBuildResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcCreateBucketCommandBuildOutcome::Exists(decoder.read_bucket_info()?),
+        1 => {
+            let command_bytes = decoder.read_bytes()?.to_vec();
+            let command = decode_metadata_command_envelope(&command_bytes)
+                .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+            StorageRpcCreateBucketCommandBuildOutcome::Command(Box::new(command))
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid create-bucket command build outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcCreateBucketCommandBuildResponse { outcome })
 }
 
 pub(crate) fn encode_metadata_command_pending_slot_request(
@@ -2732,6 +3000,190 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_create_bucket_config(
+        &mut self,
+    ) -> Result<StorageRpcCreateBucketConfig, StorageRpcPayloadError> {
+        Ok(StorageRpcCreateBucketConfig {
+            name: self.read_bucket_name()?,
+            owner_principal: self.read_string_with_limit(
+                STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN,
+                StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "owner principal is too large",
+                ),
+            )?,
+            owner_canonical_id: self.read_canonical_user_id()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            public_write: self.read_bool()?,
+            versioning: self.read_bucket_versioning_state()?,
+            object_lock: self.read_bucket_object_lock_config()?,
+        })
+    }
+
+    fn read_bucket_info(&mut self) -> Result<BucketInfo, StorageRpcPayloadError> {
+        Ok(BucketInfo {
+            name: self.read_bucket_name()?,
+            owner_principal: self.read_string_with_limit(
+                STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN,
+                StorageRpcPayloadError::InvalidResponseEnvelope("owner principal is too large"),
+            )?,
+            owner_canonical_id: self.read_canonical_user_id()?,
+            created_at: self.read_u64()?,
+            region: self.read_u16()?,
+            state: self.read_bucket_state()?,
+            versioning: self.read_bucket_versioning_state()?,
+            object_lock: self.read_bucket_object_lock_config()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            public_write: self.read_bool()?,
+            public_access_block: self.read_optional_public_access_block_config()?,
+            ownership_controls: self.read_optional_bucket_ownership_controls()?,
+            bucket_policy_present: self.read_bool()?,
+            bucket_policy_public: self.read_bool()?,
+            bucket_policy_generation: self.read_u64()?,
+            bucket_lifecycle_present: self.read_bool()?,
+            bucket_lifecycle_generation: self.read_u64()?,
+            bucket_execution_generation: self.read_u64()?,
+            bucket_incarnation_generation: self.read_u64()?,
+            bucket_abac_enabled: self.read_bool()?,
+            encryption: self.read_effective_bucket_encryption_config()?,
+        })
+    }
+
+    fn read_canonical_user_id(&mut self) -> Result<CanonicalUserId, StorageRpcPayloadError> {
+        let value = self.read_string_with_limit(
+            s3_types::CANONICAL_USER_ID_LEN,
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("canonical user id is too large"),
+        )?;
+        CanonicalUserId::parse_stored(&value).ok_or(
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid canonical user id"),
+        )
+    }
+
+    fn read_acl_grants(&mut self) -> Result<AclGrants, StorageRpcPayloadError> {
+        let value = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN,
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("ACL grants are too large"),
+        )?;
+        AclGrants::parse(&value)
+            .map_err(|_| StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid ACL grants"))
+    }
+
+    fn read_bool(&mut self) -> Result<bool, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid bool tag",
+            )),
+        }
+    }
+
+    fn read_bucket_state(&mut self) -> Result<BucketState, StorageRpcPayloadError> {
+        BucketState::from_u8(self.read_u8()?).ok_or(
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid bucket state"),
+        )
+    }
+
+    fn read_bucket_versioning_state(
+        &mut self,
+    ) -> Result<BucketVersioningState, StorageRpcPayloadError> {
+        BucketVersioningState::from_u8(self.read_u8()?).ok_or(
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid bucket versioning state"),
+        )
+    }
+
+    fn read_bucket_object_lock_config(
+        &mut self,
+    ) -> Result<BucketObjectLockConfig, StorageRpcPayloadError> {
+        let enabled = self.read_bool()?;
+        let default_retention = match self.read_u8()? {
+            0 => None,
+            1 => Some(ObjectLockDefaultRetention {
+                mode: self.read_object_lock_mode()?,
+                period: self.read_retention_period()?,
+            }),
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "invalid object-lock default-retention tag",
+                ));
+            }
+        };
+        Ok(BucketObjectLockConfig {
+            enabled,
+            default_retention,
+        })
+    }
+
+    fn read_object_lock_mode(&mut self) -> Result<ObjectLockMode, StorageRpcPayloadError> {
+        ObjectLockMode::from_u8(self.read_u8()?).ok_or(
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid object-lock mode"),
+        )
+    }
+
+    fn read_retention_period(&mut self) -> Result<RetentionPeriod, StorageRpcPayloadError> {
+        let value = self.read_u32()?;
+        let value =
+            NonZeroU32::new(value).ok_or(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "retention period must not be zero",
+            ))?;
+        match self.read_u8()? {
+            0 => Ok(RetentionPeriod::Days(value)),
+            1 => Ok(RetentionPeriod::Years(value)),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid retention period tag",
+            )),
+        }
+    }
+
+    fn read_optional_public_access_block_config(
+        &mut self,
+    ) -> Result<Option<PublicAccessBlockConfig>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(PublicAccessBlockConfig {
+                block_public_acls: self.read_bool()?,
+                ignore_public_acls: self.read_bool()?,
+                block_public_policy: self.read_bool()?,
+                restrict_public_buckets: self.read_bool()?,
+            })),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid public-access-block tag",
+            )),
+        }
+    }
+
+    fn read_optional_bucket_ownership_controls(
+        &mut self,
+    ) -> Result<Option<BucketOwnershipControls>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::from_u8(self.read_u8()?).ok_or(
+                    StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                        "invalid object ownership",
+                    ),
+                )?,
+            })),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid ownership-controls tag",
+            )),
+        }
+    }
+
+    fn read_effective_bucket_encryption_config(
+        &mut self,
+    ) -> Result<EffectiveBucketEncryptionConfig, StorageRpcPayloadError> {
+        Ok(EffectiveBucketEncryptionConfig {
+            default_encryption: ManagedEncryptionAlgorithm::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "invalid managed encryption algorithm",
+                ),
+            )?,
+            sse_c_blocked: self.read_bool()?,
+        })
+    }
+
     fn remaining_len(&self) -> usize {
         self.bytes.len() - self.cursor
     }
@@ -2821,6 +3273,97 @@ fn put_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteRese
     put_u64(out, proof.created_at);
     put_optional_u64(out, proof.lease_deadline);
     put_optional_string(out, proof.target_context.as_deref());
+}
+
+fn put_create_bucket_config(out: &mut Vec<u8>, config: &StorageRpcCreateBucketConfig) {
+    put_string(out, config.name.as_str());
+    put_string(out, &config.owner_principal);
+    put_string(out, config.owner_canonical_id.as_str());
+    put_string(out, &config.acl_grants.serialized());
+    put_bool(out, config.public_read);
+    put_bool(out, config.public_write);
+    put_u8(out, config.versioning as u8);
+    put_bucket_object_lock_config(out, &config.object_lock);
+}
+
+fn put_bucket_info(out: &mut Vec<u8>, info: &BucketInfo) {
+    put_string(out, info.name.as_str());
+    put_string(out, &info.owner_principal);
+    put_string(out, info.owner_canonical_id.as_str());
+    put_u64(out, info.created_at);
+    put_u16(out, info.region);
+    put_u8(out, info.state as u8);
+    put_u8(out, info.versioning as u8);
+    put_bucket_object_lock_config(out, &info.object_lock);
+    put_string(out, &info.acl_grants.serialized());
+    put_bool(out, info.public_read);
+    put_bool(out, info.public_write);
+    put_optional_public_access_block_config(out, info.public_access_block);
+    put_optional_bucket_ownership_controls(out, info.ownership_controls);
+    put_bool(out, info.bucket_policy_present);
+    put_bool(out, info.bucket_policy_public);
+    put_u64(out, info.bucket_policy_generation);
+    put_bool(out, info.bucket_lifecycle_present);
+    put_u64(out, info.bucket_lifecycle_generation);
+    put_u64(out, info.bucket_execution_generation);
+    put_u64(out, info.bucket_incarnation_generation);
+    put_bool(out, info.bucket_abac_enabled);
+    put_u8(out, info.encryption.default_encryption as u8);
+    put_bool(out, info.encryption.sse_c_blocked);
+}
+
+fn put_bucket_object_lock_config(out: &mut Vec<u8>, config: &BucketObjectLockConfig) {
+    put_bool(out, config.enabled);
+    match config.default_retention {
+        None => put_u8(out, 0),
+        Some(retention) => {
+            put_u8(out, 1);
+            put_u8(out, retention.mode as u8);
+            match retention.period {
+                RetentionPeriod::Days(days) => {
+                    put_u32(out, days.get());
+                    put_u8(out, 0);
+                }
+                RetentionPeriod::Years(years) => {
+                    put_u32(out, years.get());
+                    put_u8(out, 1);
+                }
+            }
+        }
+    }
+}
+
+fn put_optional_public_access_block_config(
+    out: &mut Vec<u8>,
+    config: Option<PublicAccessBlockConfig>,
+) {
+    match config {
+        None => put_u8(out, 0),
+        Some(config) => {
+            put_u8(out, 1);
+            put_bool(out, config.block_public_acls);
+            put_bool(out, config.ignore_public_acls);
+            put_bool(out, config.block_public_policy);
+            put_bool(out, config.restrict_public_buckets);
+        }
+    }
+}
+
+fn put_optional_bucket_ownership_controls(
+    out: &mut Vec<u8>,
+    controls: Option<BucketOwnershipControls>,
+) {
+    match controls {
+        None => put_u8(out, 0),
+        Some(controls) => {
+            put_u8(out, 1);
+            put_u8(out, controls.object_ownership as u8);
+        }
+    }
+}
+
+fn put_bool(out: &mut Vec<u8>, value: bool) {
+    put_u8(out, u8::from(value));
 }
 
 fn put_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {

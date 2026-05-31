@@ -25,6 +25,7 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
+    decode_bucket_info_outcome_response, decode_create_bucket_command_build_response,
     decode_metadata_command_acceptance_response, decode_metadata_command_applied_hashes_response,
     decode_metadata_command_bool_outcome_response, decode_metadata_command_bool_response,
     decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
@@ -35,6 +36,7 @@ use crate::storage_rpc::{
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    encode_bucket_request, encode_create_bucket_command_build_request,
     encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
     encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
@@ -42,7 +44,9 @@ use crate::storage_rpc::{
     encode_read_handle_release_request, encode_scavenger_list_files_request,
     encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
     encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
-    write_storage_rpc_frame_to, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
+    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
+    StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
+    StorageRpcCreateBucketConfig, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandBoolOutcome,
     StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdOutcome,
     StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
@@ -582,6 +586,28 @@ pub(crate) enum MarkBucketDeletingCommandBuild {
 pub(crate) enum CreateBucketCommandBuild {
     Exists(BucketInfo),
     Command(Box<MetadataCommandEnvelope>),
+}
+
+pub(crate) trait BucketMetadataNodeClient: Send + Sync {
+    fn head_bucket_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
+    fn head_bucket_info(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
+    fn build_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -2434,6 +2460,43 @@ impl UnixStorageNodeClient {
         })
     }
 
+    fn head_bucket_with_kind(
+        &self,
+        kind: StorageRpcMessageKind,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(kind, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_info_outcome_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode bucket info response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcBucketInfoOutcome::Info(info) => {
+                if info.name != *bucket {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket info response",
+                        "response bucket name does not match request".to_string(),
+                    )));
+                }
+                Ok(info)
+            }
+            StorageRpcBucketInfoOutcome::BucketNotFound { name } => Err(
+                BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name }),
+            ),
+        }
+    }
+
     fn rpc_request(
         &self,
         kind: StorageRpcMessageKind,
@@ -3059,6 +3122,146 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
     ) -> Result<ScavengerShardFileScan, StoreError> {
         self.storage_node
             .list_scavenger_shard_files(data_pg_id.get())
+    }
+}
+
+impl BucketMetadataNodeClient for LocalStorageNodeClient {
+    fn head_bucket_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::head_bucket_raw(self, pg_id, bucket)
+    }
+
+    fn head_bucket_info(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::head_bucket_info(self, pg_id, bucket)
+    }
+
+    fn build_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::build_create_bucket_command(
+            self, pg_id, bucket, command_id, config,
+        )
+    }
+}
+
+impl BucketMetadataNodeClient for UnixStorageNodeClient {
+    fn head_bucket_raw(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadRaw, pg_id, bucket)
+    }
+
+    fn head_bucket_info(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadInfo, pg_id, bucket)
+    }
+
+    fn build_create_bucket_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
+        let request = StorageRpcCreateBucketCommandBuildRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            command_id,
+            config: StorageRpcCreateBucketConfig {
+                name: BucketName::try_from(config.name).map_err(|reason| {
+                    BucketSnapshotLoadError::Metadata(MetadataError::InvalidBucketName {
+                        reason: reason.to_string(),
+                    })
+                })?,
+                owner_principal: config.owner_principal.to_string(),
+                owner_canonical_id: config.owner_canonical_id.clone(),
+                acl_grants: config.acl_grants.clone(),
+                public_read: config.public_read,
+                public_write: config.public_write,
+                versioning: config.versioning,
+                object_lock: config.object_lock,
+            },
+        };
+        let payload = encode_create_bucket_command_build_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode create-bucket command build request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketCreateCommandBuild, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_create_bucket_command_build_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode create-bucket command build response",
+                error.to_string(),
+            ))
+        })?;
+        self.validate_create_bucket_command_build_outcome(
+            response.outcome,
+            bucket,
+            command_id,
+            config,
+        )
+    }
+}
+
+impl UnixStorageNodeClient {
+    fn validate_create_bucket_command_build_outcome(
+        &self,
+        outcome: StorageRpcCreateBucketCommandBuildOutcome,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
+        match outcome {
+            StorageRpcCreateBucketCommandBuildOutcome::Exists(info) => {
+                if info.name != *bucket {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate create-bucket command build response",
+                        "exists response bucket name does not match request".to_string(),
+                    )));
+                }
+                Ok(CreateBucketCommandBuild::Exists(info))
+            }
+            StorageRpcCreateBucketCommandBuildOutcome::Command(command) => {
+                if command.id() != command_id {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate create-bucket command build response",
+                        "response command id does not match request".to_string(),
+                    )));
+                }
+                match command.payload() {
+                    MetadataCommandPayload::CreateBucket(create)
+                        if create.matches_create_config(config) => {}
+                    _ => {
+                        return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                            "validate create-bucket command build response",
+                            "response command payload does not match request".to_string(),
+                        )));
+                    }
+                }
+                Ok(CreateBucketCommandBuild::Command(command))
+            }
+        }
     }
 }
 
@@ -5657,6 +5860,119 @@ mod tests {
                 ),
             ),
         )
+    }
+
+    fn test_bucket_info(
+        name: BucketName,
+        owner: &crate::CanonicalUserId,
+        acl_grants: &crate::AclGrants,
+    ) -> BucketInfo {
+        BucketInfo {
+            name,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: owner.clone(),
+            created_at: 123,
+            region: 0,
+            state: BucketState::Active,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            acl_grants: acl_grants.clone(),
+            public_read: false,
+            public_write: false,
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            bucket_abac_enabled: false,
+            encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
+    #[test]
+    fn unix_create_bucket_build_response_rejects_mismatched_identity() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("create-bucket-rpc-expected");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+        let command_id = MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        );
+
+        let wrong_bucket = crate::tests::bucket_name("create-bucket-rpc-wrong");
+        let err = client
+            .validate_create_bucket_command_build_outcome(
+                StorageRpcCreateBucketCommandBuildOutcome::Exists(test_bucket_info(
+                    wrong_bucket,
+                    &owner,
+                    &acl_grants,
+                )),
+                &bucket,
+                command_id,
+                &config,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate create-bucket command build response",
+                ..
+            })
+        ));
+
+        let other_owner = crate::CanonicalUserId::from_principal("other-owner");
+        let bad_config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "other-owner",
+            owner_canonical_id: &other_owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+        let bad_command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&bad_config, 123, 1).unwrap(),
+            ),
+        );
+        let err = client
+            .validate_create_bucket_command_build_outcome(
+                StorageRpcCreateBucketCommandBuildOutcome::Command(Box::new(bad_command)),
+                &bucket,
+                command_id,
+                &config,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate create-bucket command build response",
+                ..
+            })
+        ));
     }
 
     #[test]

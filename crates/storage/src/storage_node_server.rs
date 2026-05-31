@@ -8,17 +8,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::error::{BucketSnapshotLoadError, StoreError};
+use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
+use crate::node_client::{CreateBucketCommandBuild, LocalStorageNodeClient, StorageNodeClient};
 use crate::storage_rpc::{
+    decode_bucket_request, decode_create_bucket_command_build_request,
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_read_handle_acquire_request,
     decode_read_handle_release_request, decode_scavenger_list_files_request,
     decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_write_request, encode_health_response,
+    decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
+    encode_create_bucket_command_build_response, encode_health_response,
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
     encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
     encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
@@ -30,8 +33,11 @@ use crate::storage_rpc::{
     encode_scavenger_list_files_response, encode_shard_read_range_response,
     encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
     encode_storage_rpc_success_response, read_storage_rpc_request_frame_from,
-    write_storage_rpc_frame_to, StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame,
-    StorageRpcHealthResponse, StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceResponse,
+    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse,
+    StorageRpcBucketRequest, StorageRpcCreateBucketCommandBuildOutcome,
+    StorageRpcCreateBucketCommandBuildRequest, StorageRpcCreateBucketCommandBuildResponse,
+    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
+    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceResponse,
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
     StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
@@ -598,6 +604,29 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::BucketHeadRaw => match decode_bucket_request(&frame.payload) {
+                Ok(request) => self.bucket_head_response(request, false),
+                Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: error.to_string(),
+                }),
+            },
+            StorageRpcMessageKind::BucketHeadInfo => match decode_bucket_request(&frame.payload) {
+                Ok(request) => self.bucket_head_response(request, true),
+                Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: error.to_string(),
+                }),
+            },
+            StorageRpcMessageKind::BucketCreateCommandBuild => {
+                match decode_create_bucket_command_build_request(&frame.payload) {
+                    Ok(request) => self.bucket_create_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             kind => self.unsupported_operation_response(kind),
         }
         .map_err(|error| StorageNodeServerError::ResponsePayload {
@@ -639,6 +668,84 @@ impl StorageNodeConnectionHandler {
         session.release_read_handles(&request.read_operation_id);
         let payload = encode_read_handle_release_response(&StorageRpcReadHandleReleaseResponse);
         Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn bucket_head_response(
+        &self,
+        request: StorageRpcBucketRequest,
+        filtered: bool,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let result = if filtered {
+            local_client.head_bucket_info(request.pg_id, &request.bucket)
+        } else {
+            local_client.head_bucket_raw(request.pg_id, &request.bucket)
+        };
+        match result {
+            Ok(info) => {
+                let payload =
+                    encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
+                        outcome: StorageRpcBucketInfoOutcome::Info(info),
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })) => {
+                let payload =
+                    encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
+                        outcome: StorageRpcBucketInfoOutcome::BucketNotFound { name },
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_create_command_build_response(
+        &self,
+        request: StorageRpcCreateBucketCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if request.bucket != request.config.name {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "request bucket must match create-bucket config name".to_string(),
+            });
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let config = request.config.as_create_bucket_config();
+        match local_client.build_create_bucket_command(
+            request.pg_id,
+            &request.bucket,
+            request.command_id,
+            &config,
+        ) {
+            Ok(CreateBucketCommandBuild::Exists(info)) => {
+                let payload = encode_create_bucket_command_build_response(
+                    &StorageRpcCreateBucketCommandBuildResponse {
+                        outcome: StorageRpcCreateBucketCommandBuildOutcome::Exists(info),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Ok(CreateBucketCommandBuild::Command(command)) => {
+                let payload = encode_create_bucket_command_build_response(
+                    &StorageRpcCreateBucketCommandBuildResponse {
+                        outcome: StorageRpcCreateBucketCommandBuildOutcome::Command(command),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
     }
 
     fn shard_write_response(
@@ -1858,6 +1965,13 @@ fn resource_exhausted_response(message: String) -> StorageRpcErrorResponse {
 }
 
 fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
+    StorageRpcErrorResponse {
+        code: StorageRpcErrorCode::Internal,
+        message: error.to_string(),
+    }
+}
+
+fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcErrorResponse {
     StorageRpcErrorResponse {
         code: StorageRpcErrorCode::Internal,
         message: error.to_string(),

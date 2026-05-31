@@ -5530,6 +5530,16 @@ Required tests:
 
 Migrate metadata PG-primary and acting-set replica operations after shard IO.
 
+Status: metadata-command RPCs and the dedicated `MetadataCommandNodeClient`
+boundary are in place. The first non-command metadata RPC surface is also in
+place for create-bucket: bucket raw/info reads and create-bucket command
+construction now route through a dedicated bucket metadata client, and a
+frontend map can create a bucket through a storage-node-owned Unix bucket
+metadata client plus the remote metadata-command client. Remaining non-command
+surfaces still need object snapshots/allocation/reservation/proof-release and
+the direct PUT command-builder path before frontend/combined roles can be
+enabled.
+
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
 request; the embedded `MetadataCommandEnvelope` remains the durable mutation

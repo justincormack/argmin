@@ -836,7 +836,7 @@ impl super::StorageCluster {
         let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(&bucket)?;
         {
             match primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(PgId::new(pg_id), &bucket)
             {
                 Ok(info) => {
@@ -879,7 +879,7 @@ impl super::StorageCluster {
                         continue;
                     };
                     let command = match primary_store
-                        .storage_client()
+                        .bucket_metadata_client()
                         .build_create_bucket_command(pg_id, &bucket, command_id, config)?
                     {
                         CreateBucketCommandBuild::Exists(info) => {
@@ -906,7 +906,7 @@ impl super::StorageCluster {
             }
 
             let info = primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_info(pg_id, &bucket)?;
             return Ok(BucketCreateAttemptOutcome::Created(info));
         }
@@ -2522,7 +2522,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+            .bucket_metadata_client()
             .head_bucket_info(pg_id, bucket)
     }
 
