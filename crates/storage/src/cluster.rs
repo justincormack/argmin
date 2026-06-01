@@ -3178,13 +3178,6 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        let storage_client = match self.object_metadata_primary_client(&req.bucket, &req.key) {
-            Ok(client) => client,
-            Err(error) => {
-                cleanup_direct_put_attempt_before_command_ownership!();
-                return Err(error.into());
-            }
-        };
         let direct_put_metadata_client =
             match self.direct_put_metadata_primary_client(&req.bucket, &req.key) {
                 Ok(client) => client,
@@ -3243,7 +3236,7 @@ impl StorageCluster {
                         VersionId::Null
                     };
                     self.maybe_run_before_direct_put_command_id_hook();
-                    let command = match storage_client.build_direct_put_commit_command(
+                    let command = match direct_put_metadata_client.build_direct_put_commit_command(
                         BuildDirectPutCommitCommandReq {
                             pg_id,
                             cluster_epoch: self.operation_epoch(),

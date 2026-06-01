@@ -5559,10 +5559,12 @@ distinct buckets; frontend maps can load requested bucket subresources from the
 storage-node-owned bucket PG without reading the frontend-local PG. Direct PUT
 commit snapshot loads now route through a dedicated direct PUT metadata
 client/RPC surface, so the precondition/auth snapshot is read from the
-storage-node-owned object PG. Remaining non-command surfaces still need the
-direct PUT command-builder operation, other object snapshot reads, and the
-operation-shaped builders for the rest of the metadata mutation paths before
-frontend/combined roles can be enabled.
+storage-node-owned object PG. Direct PUT commit command construction also now
+routes through that dedicated RPC surface, preserving typed stale-snapshot
+retries and validating the returned command identity before the frontend
+publishes it. Remaining non-command surfaces still need other object snapshot
+reads and the operation-shaped builders for the rest of the metadata mutation
+paths before frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5616,9 +5618,9 @@ Implementation slices:
 5. add separate RPC surfaces for non-command metadata reads and coordination
    operations required before command construction. Bucket raw/info reads,
    bucket snapshot reads, object generation/version allocation, bucket-write
-   reservations, proof release, and direct PUT commit snapshot loads now have
-   dedicated node-client/RPC surfaces. Remaining work includes the direct PUT
-   command-builder operation, other object snapshot reads, order allocation,
+   reservations, proof release, direct PUT commit snapshot loads, and direct
+   PUT commit command construction now have dedicated node-client/RPC surfaces.
+   Remaining work includes other object snapshot reads, order allocation,
    durable pending/drain/coordination checks, lifecycle/object-read snapshot
    helpers used by command builders, and operation-shaped command-builder calls
    that must execute against a storage-node-owned snapshot rather than a

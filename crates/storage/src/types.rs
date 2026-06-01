@@ -2887,6 +2887,7 @@ pub struct DirectPutCommitSnapshot {
 pub struct DirectPutCommitStorageSnapshot {
     pub auth_snapshot: DirectPutCommitSnapshot,
     pub current: Option<StoredObject>,
+    pub(crate) stale_payload: Option<crate::metadata_command::ObjectPayloadReclaimCommand>,
 }
 
 #[derive(Debug, Clone)]

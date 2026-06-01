@@ -27,11 +27,11 @@ use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
     decode_bucket_info_outcome_response, decode_bucket_snapshot_pair_response,
     decode_bucket_snapshot_response, decode_bucket_write_reservation_record_response,
-    decode_create_bucket_command_build_response, decode_direct_put_commit_snapshot_response,
-    decode_metadata_command_acceptance_response, decode_metadata_command_applied_hashes_response,
-    decode_metadata_command_bool_outcome_response, decode_metadata_command_bool_response,
-    decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
-    decode_metadata_command_pending_envelope_response,
+    decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
+    decode_direct_put_commit_snapshot_response, decode_metadata_command_acceptance_response,
+    decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
+    decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
+    decode_metadata_command_next_id_response, decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -43,8 +43,9 @@ use crate::storage_rpc::{
     encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
     encode_bucket_write_reservation_record_request, encode_create_bucket_command_build_request,
-    encode_direct_put_commit_snapshot_request, encode_metadata_command_matching_applied_request,
-    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
+    encode_direct_put_command_build_request, encode_direct_put_commit_snapshot_request,
+    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+    encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_object_generation_reservation_request,
     encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
@@ -57,7 +58,8 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
-    StorageRpcCreateBucketConfig, StorageRpcDirectPutCommitSnapshotRequest,
+    StorageRpcCreateBucketConfig, StorageRpcDirectPutCommandBuildOutcome,
+    StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommitSnapshotRequest,
     StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
@@ -329,6 +331,7 @@ fn load_direct_put_commit_snapshot_from_pg(
     Ok(DirectPutCommitStorageSnapshot {
         auth_snapshot: DirectPutCommitSnapshot { existing_etag },
         current,
+        stale_payload: snapshot_direct_put_stale_payload_command(pg, bucket, key, 0)?,
     })
 }
 
@@ -392,6 +395,52 @@ fn snapshot_direct_put_stale_payload_command(
     Ok(Some(snapshot_live_object_payload_reclaim_command(
         pg, bucket, key, &record, created_at,
     )?))
+}
+
+fn normalize_reclaim_created_at(reclaim: &mut Option<ObjectPayloadReclaimCommand>) {
+    match reclaim {
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => reclaim.created_at = 0,
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => reclaim.created_at = 0,
+        None => {}
+    }
+}
+
+fn reclaim_matches_bucket_key(
+    reclaim: Option<&ObjectPayloadReclaimCommand>,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> bool {
+    match reclaim {
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => {
+            reclaim.bucket == *bucket && reclaim.key == *key
+        }
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
+            reclaim.bucket == *bucket && reclaim.key == *key
+        }
+        None => true,
+    }
+}
+
+fn reclaim_matches_snapshot_live_object(
+    reclaim: Option<&ObjectPayloadReclaimCommand>,
+    current: &Option<StoredObject>,
+) -> bool {
+    let Some(reclaim) = reclaim else {
+        return true;
+    };
+    let Some(StoredObject::Live(live)) = current else {
+        return false;
+    };
+    match (reclaim, live.layout) {
+        (ObjectPayloadReclaimCommand::Segments(reclaim), ObjectLayout::Standard) => {
+            reclaim.generation_id == live.generation_id
+        }
+        (
+            ObjectPayloadReclaimCommand::Multipart(reclaim),
+            ObjectLayout::MultipartManifest { .. },
+        ) => reclaim.generation_id == live.generation_id,
+        _ => false,
+    }
 }
 
 fn snapshot_live_object_payload_reclaim_command(
@@ -708,6 +757,11 @@ pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
         reservation_id: &SessionId,
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError>;
+
+    fn build_direct_put_commit_command(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -3432,6 +3486,13 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
             generation_id,
         )
     }
+
+    fn build_direct_put_commit_command(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_direct_put_commit_command(self, request)
+    }
 }
 
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
@@ -3870,9 +3931,145 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
         self.validate_direct_put_commit_snapshot_response(&response.snapshot, bucket, key)?;
         Ok(response.snapshot)
     }
+
+    fn build_direct_put_commit_command(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let rpc_request = StorageRpcDirectPutCommandBuildRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch: request.cluster_epoch,
+                pg_id: request.pg_id,
+                bucket: request.request.bucket.clone(),
+                key: request.request.key.clone(),
+            },
+            request: request.request.clone(),
+            version_id: request.version_id,
+            expected_snapshot: request.expected_snapshot.clone(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload = encode_direct_put_command_build_request(&rpc_request).map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(
+                "encode direct PUT commit command build request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::DirectPutCommitCommandBuild, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_direct_put_command_build_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(
+                "decode direct PUT commit command build response",
+                error.to_string(),
+            ))
+        })?;
+        match response.outcome {
+            StorageRpcDirectPutCommandBuildOutcome::Command(command) => {
+                self.validate_direct_put_command_build_response(&command, &request)?;
+                Ok(*command)
+            }
+            StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleDirectPutCommitSnapshot)
+            }
+        }
+    }
 }
 
 impl UnixStorageNodeClient {
+    fn validate_direct_put_command_build_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        if command.id().cluster_epoch() != request.cluster_epoch
+            || command.id().pg_id() != request.pg_id
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "command id route does not match request".to_string(),
+            )));
+        }
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "response command payload is not direct PUT commit".to_string(),
+            )));
+        };
+        if !commit.matches_request(
+            &request.request.bucket,
+            &request.request.key,
+            &request.request.generation_reservation_id,
+            request.request.generation_id,
+        ) || commit.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "response command identity does not match request".to_string(),
+            )));
+        }
+        let object = &commit.object;
+        let expected_etag = ObjectEtag::single_part(request.request.etag_crc64);
+        if object.version_id != request.version_id
+            || object.owner != request.request.owner
+            || object.acl_grants != request.request.acl_grants
+            || object.public_read != request.request.public_read
+            || object.size != request.request.size
+            || object.etag != expected_etag
+            || object.ec != request.request.ec
+            || object.layout != ObjectLayout::Standard
+            || object.tags != request.request.tags
+            || object.metadata_blob.as_ref() != Some(&request.request.metadata_blob)
+            || object.system_metadata_blob.as_ref() != Some(&request.request.system_metadata_blob)
+            || object.object_lock != request.request.object_lock
+            || object.encryption != request.request.encryption
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "response command object does not match request".to_string(),
+            )));
+        }
+        let [segment] = commit.segments.as_slice() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "response command must contain one segment".to_string(),
+            )));
+        };
+        if segment.bucket != request.request.bucket
+            || segment.key != request.request.key
+            || segment.version_id != request.version_id
+            || segment.segment_index != request.request.segment_index
+            || segment.size != request.request.size
+            || segment.segment_crc64 != request.request.segment_crc64
+            || segment.segment_okh != request.request.segment_okh
+            || segment.segment_vid != request.request.segment_vid
+            || segment.data_pg_id != request.request.data_pg_id
+            || segment.ec_k != request.request.ec.k
+            || segment.ec_m != request.request.ec.m
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "response command segment does not match request".to_string(),
+            )));
+        }
+        if request.version_id.is_null() {
+            let mut actual_stale_payload = commit.stale_payload.clone();
+            normalize_reclaim_created_at(&mut actual_stale_payload);
+            if actual_stale_payload != request.expected_snapshot.stale_payload {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate direct PUT commit command build response",
+                    "response command stale payload does not match expected snapshot".to_string(),
+                )));
+            }
+        } else if commit.stale_payload.is_some() {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit command build response",
+                "versioned direct PUT response must not reclaim stale null payload".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_direct_put_commit_snapshot_response(
         &self,
         snapshot: &DirectPutCommitStorageSnapshot,
@@ -3895,6 +4092,19 @@ impl UnixStorageNodeClient {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate direct PUT commit snapshot response",
                 "auth snapshot etag does not match current object".to_string(),
+            )));
+        }
+        if !reclaim_matches_bucket_key(snapshot.stale_payload.as_ref(), bucket, key) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit snapshot response",
+                "stale payload identity does not match request".to_string(),
+            )));
+        }
+        if !reclaim_matches_snapshot_live_object(snapshot.stale_payload.as_ref(), &snapshot.current)
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit snapshot response",
+                "stale payload shape does not match current live object".to_string(),
             )));
         }
         Ok(())
@@ -6742,6 +6952,83 @@ mod tests {
                 existing_etag: Some("unexpected-etag".to_string()),
             },
             current: None,
+            stale_payload: None,
+        };
+
+        let err = client
+            .validate_direct_put_commit_snapshot_response(&snapshot, &bucket, &key)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate direct PUT commit snapshot response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_mismatched_stale_payload_identity() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-stale");
+        let key = crate::tests::object_key("direct-put-snapshot-stale-key");
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
+                ObjectSegmentsReclaimRecord {
+                    bucket: crate::tests::bucket_name("wrong-direct-put-snapshot-stale"),
+                    key: key.clone(),
+                    generation_id: GenerationId::new(9).unwrap(),
+                    created_at: 0,
+                    segments: Vec::new(),
+                },
+            )),
+        };
+
+        let err = client
+            .validate_direct_put_commit_snapshot_response(&snapshot, &bucket, &key)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate direct PUT commit snapshot response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_stale_payload_without_live_current() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-stale-shape");
+        let key = crate::tests::object_key("direct-put-snapshot-stale-shape-key");
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
+                ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id: GenerationId::new(9).unwrap(),
+                    created_at: 0,
+                    segments: Vec::new(),
+                },
+            )),
         };
 
         let err = client
@@ -7464,6 +7751,149 @@ mod tests {
         assert_eq!(snapshot.auth_snapshot.existing_etag, None);
         assert_eq!(snapshot.current, None);
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_direct_put_metadata_client_builds_commit_command() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("direct-put-build-rpc-bucket");
+        let key = crate::tests::object_key("direct-put-build-rpc-key");
+        let reservation_id = crate::tests::stream_session_id("dp-build-rpc");
+        let reserved_generation = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                .unwrap()
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_thread = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        };
+        let build_server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "reservation-1".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "direct-put".to_string(),
+            created_at: 123,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let request = CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id: reservation_id.clone(),
+            versioning: BucketVersioningState::Suspended,
+            owner: OwnerIdentity {
+                principal: "owner".to_string(),
+                canonical_id: crate::CanonicalUserId::from_principal("owner"),
+            },
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            generation_id: reserved_generation,
+            size: 12,
+            etag_crc64: 99,
+            ec: EcShape { k: 4, m: 2 },
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: Some(99),
+            segment_okh: [7; 16],
+            segment_vid: GenerationId::new(10).unwrap(),
+            data_pg_id: 0,
+            bucket_write_reservation: proof.clone(),
+        };
+        let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            &reservation_id,
+            reserved_generation,
+        )
+        .unwrap();
+
+        let command = DirectPutMetadataNodeClient::build_direct_put_commit_command(
+            &client,
+            BuildDirectPutCommitCommandReq {
+                pg_id: PgId::new(0),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &request,
+                version_id: VersionId::Null,
+                expected_snapshot: &snapshot,
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(command.id().pg_id(), PgId::new(0));
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+            panic!("expected direct PUT commit command");
+        };
+        assert!(commit.matches_request(&bucket, &key, &reservation_id, reserved_generation));
+        assert_eq!(commit.bucket_write_reservation, proof);
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(bad_commit) = &mut bad_payload else {
+            panic!("expected direct PUT commit command");
+        };
+        bad_commit.stale_payload = Some(ObjectPayloadReclaimCommand::Segments(
+            ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id: reserved_generation,
+                created_at: 0,
+                segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: 99,
+                    segment_okh: [9; 16],
+                    segment_vid: GenerationId::new(11).unwrap(),
+                    data_pg_id: 0,
+                    ec: EcShape { k: 4, m: 2 },
+                }],
+            },
+        ));
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_direct_put_command_build_response(
+                &bad_command,
+                &BuildDirectPutCommitCommandReq {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    request: &request,
+                    version_id: VersionId::Null,
+                    expected_snapshot: &snapshot,
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate direct PUT commit command build response",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+        build_server_thread.join().unwrap();
     }
 
     #[test]

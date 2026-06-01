@@ -12,16 +12,17 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
-    BucketMetadataNodeClient, BucketWriteReservationNodeClient, CreateBucketCommandBuild,
-    DirectPutMetadataNodeClient, LocalStorageNodeClient, ObjectGenerationMetadataNodeClient,
-    ObjectVersionMetadataNodeClient,
+    BucketMetadataNodeClient, BucketWriteReservationNodeClient, BuildDirectPutCommitCommandReq,
+    CreateBucketCommandBuild, DirectPutMetadataNodeClient, LocalStorageNodeClient,
+    ObjectGenerationMetadataNodeClient, ObjectVersionMetadataNodeClient,
 };
 use crate::storage_rpc::{
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
     decode_bucket_write_reservation_acquire_request, decode_bucket_write_reservation_proof_request,
     decode_bucket_write_reservation_record_request, decode_create_bucket_command_build_request,
-    decode_direct_put_commit_snapshot_request, decode_metadata_command_matching_applied_request,
-    decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_replace_request,
+    decode_direct_put_command_build_request, decode_direct_put_commit_snapshot_request,
+    decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
+    decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_object_generation_reservation_request,
     decode_object_request, decode_proof_release_request, decode_read_handle_acquire_request,
@@ -30,11 +31,11 @@ use crate::storage_rpc::{
     decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
     encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
     encode_bucket_write_reservation_record_response, encode_create_bucket_command_build_response,
-    encode_direct_put_commit_snapshot_response, encode_health_response,
-    encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
-    encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
-    encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
-    encode_metadata_command_pending_envelope_response,
+    encode_direct_put_command_build_response, encode_direct_put_commit_snapshot_response,
+    encode_health_response, encode_metadata_command_acceptance_response,
+    encode_metadata_command_applied_hashes_response, encode_metadata_command_bool_outcome_response,
+    encode_metadata_command_bool_response, encode_metadata_command_max_log_index_response,
+    encode_metadata_command_next_id_response, encode_metadata_command_pending_envelope_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
@@ -51,16 +52,17 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
     StorageRpcBucketWriteReservationRecordRequest, StorageRpcBucketWriteReservationRecordResponse,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
-    StorageRpcCreateBucketCommandBuildResponse, StorageRpcDirectPutCommitSnapshotRequest,
-    StorageRpcDirectPutCommitSnapshotResponse, StorageRpcErrorCode, StorageRpcErrorResponse,
-    StorageRpcFrame, StorageRpcHealthResponse, StorageRpcMessageKind,
-    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAcceptanceResponse,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
-    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
-    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
-    StorageRpcMetadataCommandPendingEnvelopeResponse,
+    StorageRpcCreateBucketCommandBuildResponse, StorageRpcDirectPutCommandBuildOutcome,
+    StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommandBuildResponse,
+    StorageRpcDirectPutCommitSnapshotRequest, StorageRpcDirectPutCommitSnapshotResponse,
+    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
+    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
+    StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesOutcome,
+    StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcMetadataCommandBoolOutcome,
+    StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandBoolResponse,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandMaxLogIndexResponse,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -466,6 +468,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::DirectPutCommitSnapshotLoad => {
                 match decode_direct_put_commit_snapshot_request(&frame.payload) {
                     Ok(request) => self.direct_put_commit_snapshot_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::DirectPutCommitCommandBuild => {
+                match decode_direct_put_command_build_request(&frame.payload) {
+                    Ok(request) => self.direct_put_commit_command_build_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1080,6 +1091,68 @@ impl StorageNodeConnectionHandler {
             Ok(snapshot) => {
                 let payload = encode_direct_put_commit_snapshot_response(
                     &StorageRpcDirectPutCommitSnapshotResponse { snapshot },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn direct_put_commit_command_build_response(
+        &self,
+        request: StorageRpcDirectPutCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if request.object.bucket != request.request.bucket
+            || request.object.bucket != request.request.bucket_write_reservation.bucket
+            || request.object.bucket != request.bucket_write_reservation.bucket
+            || request.request.bucket_write_reservation != request.bucket_write_reservation
+        {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "direct PUT bucket write reservation proof does not match object bucket"
+                    .to_string(),
+            });
+        }
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "direct PUT commit command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match DirectPutMetadataNodeClient::build_direct_put_commit_command(
+            &local_client,
+            BuildDirectPutCommitCommandReq {
+                pg_id: request.object.pg_id,
+                cluster_epoch: request.object.cluster_epoch,
+                request: &request.request,
+                version_id: request.version_id,
+                expected_snapshot: &request.expected_snapshot,
+                bucket_write_reservation: &request.bucket_write_reservation,
+            },
+        ) {
+            Ok(command) => {
+                let payload = encode_direct_put_command_build_response(
+                    &StorageRpcDirectPutCommandBuildResponse {
+                        outcome: StorageRpcDirectPutCommandBuildOutcome::Command(Box::new(command)),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
+                let payload = encode_direct_put_command_build_response(
+                    &StorageRpcDirectPutCommandBuildResponse {
+                        outcome: StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
+                    },
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }

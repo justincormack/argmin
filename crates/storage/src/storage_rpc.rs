@@ -2,18 +2,20 @@ use crate::{
     cluster::ShardLocation,
     metadata_command::{
         decode_metadata_command_envelope, BucketWriteReservationProof, MetadataCommandAcceptance,
-        MetadataCommandReplicaState,
+        MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
         BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
         BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-        BucketWriteReservationRecord, ChecksumBytes, ClusterEpoch, CreateBucketConfig, DataPgId,
-        DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
+        BucketWriteReservationRecord, ChecksumBytes, ClusterEpoch, CommitDirectPutObjectReq,
+        CreateBucketConfig, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
         EffectiveBucketEncryptionConfig, GenerationId, LiveObjectRecord, LoadedBucketSubresource,
-        ManagedEncryptionAlgorithm, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
-        ObjectLayout, ObjectLockState, ObjectPayloadReclaimKind, ObjectRetention, OwnerIdentity,
-        PgId, PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+        ManagedEncryptionAlgorithm, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+        MultipartReclaimRecord, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
+        ObjectLayout, ObjectLockState, ObjectPayloadReclaimKind, ObjectRetention,
+        ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
+        PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
         SerializedTagSet, SessionId, ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus,
         StoredObject, VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN,
     },
@@ -98,6 +100,7 @@ const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 4
@@ -175,6 +178,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketSnapshotLoad = 41,
     BucketSnapshotPairLoad = 42,
     DirectPutCommitSnapshotLoad = 43,
+    DirectPutCommitCommandBuild = 44,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +268,7 @@ impl StorageRpcMessageKind {
             Self::BucketSnapshotLoad => "bucket snapshot load",
             Self::BucketSnapshotPairLoad => "bucket snapshot pair load",
             Self::DirectPutCommitSnapshotLoad => "direct PUT commit snapshot load",
+            Self::DirectPutCommitCommandBuild => "direct PUT commit command build",
         }
     }
 
@@ -312,6 +317,7 @@ impl StorageRpcMessageKind {
             41 => Ok(Self::BucketSnapshotLoad),
             42 => Ok(Self::BucketSnapshotPairLoad),
             43 => Ok(Self::DirectPutCommitSnapshotLoad),
+            44 => Ok(Self::DirectPutCommitCommandBuild),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -451,6 +457,15 @@ pub(crate) struct StorageRpcDirectPutCommitSnapshotRequest {
     pub(crate) generation_id: GenerationId,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcDirectPutCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) request: CommitDirectPutObjectReq,
+    pub(crate) version_id: VersionId,
+    pub(crate) expected_snapshot: DirectPutCommitStorageSnapshot,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcObjectGenerationResponse {
     pub(crate) generation_id: GenerationId,
@@ -475,6 +490,17 @@ pub(crate) struct StorageRpcObjectGenerationReservationResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcDirectPutCommitSnapshotResponse {
     pub(crate) snapshot: DirectPutCommitStorageSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcDirectPutCommandBuildOutcome {
+    Command(Box<crate::metadata_command::MetadataCommandEnvelope>),
+    StaleSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcDirectPutCommandBuildResponse {
+    pub(crate) outcome: StorageRpcDirectPutCommandBuildOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1145,6 +1171,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::DirectPutCommitSnapshotLoad => {
             STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::DirectPutCommitCommandBuild => {
+            STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectVersionNext => {
             STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN
         }
@@ -1478,6 +1507,61 @@ pub(crate) fn decode_direct_put_commit_snapshot_request(
     })
 }
 
+pub(crate) fn encode_direct_put_command_build_request(
+    request: &StorageRpcDirectPutCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.object.bucket != request.request.bucket || request.object.key != request.request.key
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "object route must match direct PUT request",
+        ));
+    }
+    if request.request.bucket_write_reservation != request.bucket_write_reservation
+        || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "bucket write reservation proof must match direct PUT bucket",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_commit_direct_put_object_req(&mut out, &request.request);
+    put_u64(&mut out, request.version_id.to_u64());
+    put_direct_put_commit_storage_snapshot(&mut out, &request.expected_snapshot);
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_direct_put_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcDirectPutCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let request = decoder.read_commit_direct_put_object_req()?;
+    let version_id = VersionId::from_u64(decoder.read_u64()?);
+    let expected_snapshot = decoder.read_direct_put_commit_storage_snapshot()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    if object.bucket != request.bucket || object.key != request.key {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "object route must match direct PUT request",
+        ));
+    }
+    if request.bucket_write_reservation != bucket_write_reservation
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "bucket write reservation proof must match direct PUT bucket",
+        ));
+    }
+    Ok(StorageRpcDirectPutCommandBuildRequest {
+        object,
+        request,
+        version_id,
+        expected_snapshot,
+        bucket_write_reservation,
+    })
+}
+
 pub(crate) fn encode_object_generation_response(
     response: &StorageRpcObjectGenerationResponse,
 ) -> Vec<u8> {
@@ -1569,6 +1653,52 @@ pub(crate) fn decode_direct_put_commit_snapshot_response(
     let snapshot = decoder.read_direct_put_commit_storage_snapshot()?;
     decoder.finish()?;
     Ok(StorageRpcDirectPutCommitSnapshotResponse { snapshot })
+}
+
+pub(crate) fn encode_direct_put_command_build_response(
+    response: &StorageRpcDirectPutCommandBuildResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcDirectPutCommandBuildOutcome::Command(command) => {
+            put_u8(&mut out, 0);
+            put_u64(&mut out, command.checksum_crc64());
+            put_bytes(&mut out, &command.command_bytes());
+        }
+        StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot => put_u8(&mut out, 1),
+    }
+    out
+}
+
+pub(crate) fn decode_direct_put_command_build_response(
+    bytes: &[u8],
+) -> Result<StorageRpcDirectPutCommandBuildResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => {
+            let command_checksum = decoder.read_u64()?;
+            let command_bytes = decoder.read_bytes()?.to_vec();
+            let item_bytes = {
+                let mut out = Vec::new();
+                put_u64(&mut out, command_checksum);
+                put_bytes(&mut out, &command_bytes);
+                out
+            };
+            let item = decode_metadata_command_item(&item_bytes)?;
+            StorageRpcDirectPutCommandBuildOutcome::Command(Box::new(
+                decode_metadata_command_envelope(&item.command_bytes)
+                    .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?,
+            ))
+        }
+        1 => StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid direct PUT command build outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcDirectPutCommandBuildResponse { outcome })
 }
 
 pub(crate) fn encode_create_bucket_command_build_request(
@@ -3684,6 +3814,23 @@ impl<'a> StorageRpcDecoder<'a> {
             .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid object key"))
     }
 
+    fn read_rpc_object_request(
+        &mut self,
+    ) -> Result<StorageRpcObjectRequest, StorageRpcPayloadError> {
+        let node_id = NodeId::new(self.read_u32()?);
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let pg_id = PgId::new(self.read_u32()?);
+        let bucket = self.read_bucket_name()?;
+        let key = self.read_object_key()?;
+        Ok(StorageRpcObjectRequest {
+            node_id,
+            cluster_epoch,
+            pg_id,
+            bucket,
+            key,
+        })
+    }
+
     fn read_session_id(&mut self) -> Result<SessionId, StorageRpcPayloadError> {
         SessionId::try_from(self.read_string()?)
             .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid session id"))
@@ -4026,9 +4173,223 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<DirectPutCommitStorageSnapshot, StorageRpcPayloadError> {
         let existing_etag = self.read_optional_string()?;
         let current = self.read_optional_stored_object()?;
+        let stale_payload = self.read_optional_object_payload_reclaim()?;
         Ok(DirectPutCommitStorageSnapshot {
             auth_snapshot: crate::DirectPutCommitSnapshot { existing_etag },
             current,
+            stale_payload,
+        })
+    }
+
+    fn read_optional_object_payload_reclaim(
+        &mut self,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_object_payload_reclaim()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional object payload reclaim tag",
+            )),
+        }
+    }
+
+    fn read_object_payload_reclaim(
+        &mut self,
+    ) -> Result<ObjectPayloadReclaimCommand, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(ObjectPayloadReclaimCommand::Segments(
+                self.read_object_segments_reclaim_record()?,
+            )),
+            1 => Ok(ObjectPayloadReclaimCommand::Multipart(
+                self.read_multipart_reclaim_record()?,
+            )),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid object payload reclaim tag",
+            )),
+        }
+    }
+
+    fn read_object_segments_reclaim_record(
+        &mut self,
+    ) -> Result<ObjectSegmentsReclaimRecord, StorageRpcPayloadError> {
+        const MIN_SEGMENT_LEN: usize = 4 + 4 + 16 + 8 + 4 + 2;
+
+        let bucket = self.read_bucket_name()?;
+        let key = self.read_object_key()?;
+        let generation_id = self.read_generation_id()?;
+        let created_at = self.read_u64()?;
+        let segment_count = self.read_bounded_remaining_count(
+            MIN_SEGMENT_LEN,
+            "object segment reclaim count exceeds payload",
+        )?;
+        let mut segments = Vec::new();
+        for _ in 0..segment_count {
+            segments.push(ObjectSegmentsReclaimSegmentRecord {
+                segment_index: self.read_u32()?,
+                segment_okh: self.read_fixed_16_bytes("object segment reclaim OKH")?,
+                segment_vid: self.read_generation_id()?,
+                data_pg_id: self.read_u32()?,
+                ec: self.read_ec_shape()?,
+            });
+        }
+        Ok(ObjectSegmentsReclaimRecord {
+            bucket,
+            key,
+            generation_id,
+            created_at,
+            segments,
+        })
+    }
+
+    fn read_multipart_reclaim_record(
+        &mut self,
+    ) -> Result<MultipartReclaimRecord, StorageRpcPayloadError> {
+        const MIN_PART_LEN: usize = 1 + 4;
+        const MIN_SEGMENT_LEN: usize = 4 + 4 + 16 + 8 + 4 + 2;
+
+        let bucket = self.read_bucket_name()?;
+        let key = self.read_object_key()?;
+        let generation_id = self.read_generation_id()?;
+        let created_at = self.read_u64()?;
+        let part_count = self.read_bounded_remaining_count(
+            MIN_PART_LEN,
+            "multipart reclaim count exceeds payload",
+        )?;
+        let mut parts = Vec::new();
+        for _ in 0..part_count {
+            parts.push(match self.read_u8()? {
+                0 => MultipartReclaimPartRecord::ShardSet {
+                    part_number: self.read_u32()?,
+                    part_okh: self.read_fixed_16_bytes("multipart reclaim part OKH")?,
+                    part_vid: self.read_generation_id()?,
+                    data_pg_id: self.read_u32()?,
+                    ec: self.read_ec_shape()?,
+                },
+                1 => {
+                    let part_number = self.read_u32()?;
+                    let segment_count = self.read_bounded_remaining_count(
+                        MIN_SEGMENT_LEN,
+                        "multipart reclaim segment count exceeds payload",
+                    )?;
+                    let mut segments = Vec::new();
+                    for _ in 0..segment_count {
+                        segments.push(MultipartReclaimPartSegmentRecord {
+                            part_number,
+                            segment_index: self.read_u32()?,
+                            segment_okh: self
+                                .read_fixed_16_bytes("multipart reclaim segment OKH")?,
+                            segment_vid: self.read_generation_id()?,
+                            data_pg_id: self.read_u32()?,
+                            ec: self.read_ec_shape()?,
+                        });
+                    }
+                    MultipartReclaimPartRecord::Segments {
+                        part_number,
+                        segments,
+                    }
+                }
+                _ => {
+                    return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid multipart reclaim part tag",
+                    ));
+                }
+            });
+        }
+        Ok(MultipartReclaimRecord {
+            bucket,
+            key,
+            generation_id,
+            created_at,
+            parts,
+        })
+    }
+
+    fn read_bounded_remaining_count(
+        &mut self,
+        min_item_len: usize,
+        message: &'static str,
+    ) -> Result<usize, StorageRpcPayloadError> {
+        let count = self.read_u32()? as usize;
+        let remaining = self.bytes.len().saturating_sub(self.cursor);
+        if count > remaining / min_item_len {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                message,
+            ));
+        }
+        Ok(count)
+    }
+
+    fn read_fixed_16_bytes(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; 16], StorageRpcPayloadError> {
+        self.read_bytes()?
+            .try_into()
+            .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest(field))
+    }
+
+    fn read_commit_direct_put_object_req(
+        &mut self,
+    ) -> Result<CommitDirectPutObjectReq, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let key = self.read_object_key()?;
+        let generation_reservation_id = self.read_session_id()?;
+        let versioning = match self.read_u8()? {
+            0 => BucketVersioningState::Disabled,
+            1 => BucketVersioningState::Enabled,
+            2 => BucketVersioningState::Suspended,
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid bucket versioning state",
+                ));
+            }
+        };
+        let owner = self.read_owner_identity()?;
+        let acl_grants = self.read_acl_grants()?;
+        let public_read = self.read_bool()?;
+        let generation_id = self.read_generation_id()?;
+        let size = self.read_u64()?;
+        let etag_crc64 = self.read_u64()?;
+        let ec = self.read_ec_shape()?;
+        let tags = self.read_optional_serialized_tag_set()?;
+        let metadata_blob = SerializedMetadataBlob::new(self.read_bytes()?.to_vec());
+        let system_metadata_blob = SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec());
+        let object_lock = self.read_object_lock_state()?;
+        let encryption = self.read_object_encryption()?;
+        let segment_index = self.read_u32()?;
+        let segment_crc64 = self.read_optional_u64()?;
+        let segment_okh_bytes = self.read_bytes()?;
+        let segment_okh: [u8; 16] = segment_okh_bytes.try_into().map_err(|_| {
+            StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "direct PUT segment object key hash must be 16 bytes",
+            )
+        })?;
+        let segment_vid = self.read_generation_id()?;
+        let data_pg_id = self.read_u32()?;
+        let bucket_write_reservation = self.read_bucket_write_reservation_proof()?;
+        Ok(CommitDirectPutObjectReq {
+            bucket,
+            key,
+            generation_reservation_id,
+            versioning,
+            owner,
+            acl_grants,
+            public_read,
+            generation_id,
+            size,
+            etag_crc64,
+            ec,
+            tags,
+            metadata_blob,
+            system_metadata_blob,
+            object_lock,
+            encryption,
+            segment_index,
+            segment_crc64,
+            segment_okh,
+            segment_vid,
+            data_pg_id,
+            bucket_write_reservation,
         })
     }
 
@@ -4553,6 +4914,114 @@ fn put_direct_put_commit_storage_snapshot(
 ) {
     put_optional_string(out, snapshot.auth_snapshot.existing_etag.as_deref());
     put_optional_stored_object(out, snapshot.current.as_ref());
+    put_optional_object_payload_reclaim(out, snapshot.stale_payload.as_ref());
+}
+
+fn put_optional_object_payload_reclaim(
+    out: &mut Vec<u8>,
+    reclaim: Option<&ObjectPayloadReclaimCommand>,
+) {
+    match reclaim {
+        None => put_u8(out, 0),
+        Some(reclaim) => {
+            put_u8(out, 1);
+            put_object_payload_reclaim(out, reclaim);
+        }
+    }
+}
+
+fn put_object_payload_reclaim(out: &mut Vec<u8>, reclaim: &ObjectPayloadReclaimCommand) {
+    match reclaim {
+        ObjectPayloadReclaimCommand::Segments(reclaim) => {
+            put_u8(out, 0);
+            put_object_segments_reclaim_record(out, reclaim);
+        }
+        ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+            put_u8(out, 1);
+            put_multipart_reclaim_record(out, reclaim);
+        }
+    }
+}
+
+fn put_object_segments_reclaim_record(out: &mut Vec<u8>, reclaim: &ObjectSegmentsReclaimRecord) {
+    put_string(out, reclaim.bucket.as_str());
+    put_string(out, reclaim.key.as_str());
+    put_u64(out, reclaim.generation_id.get());
+    put_u64(out, reclaim.created_at);
+    put_u32(out, reclaim.segments.len() as u32);
+    for segment in &reclaim.segments {
+        put_u32(out, segment.segment_index);
+        put_bytes(out, &segment.segment_okh);
+        put_u64(out, segment.segment_vid.get());
+        put_u32(out, segment.data_pg_id);
+        put_ec_shape(out, segment.ec);
+    }
+}
+
+fn put_multipart_reclaim_record(out: &mut Vec<u8>, reclaim: &MultipartReclaimRecord) {
+    put_string(out, reclaim.bucket.as_str());
+    put_string(out, reclaim.key.as_str());
+    put_u64(out, reclaim.generation_id.get());
+    put_u64(out, reclaim.created_at);
+    put_u32(out, reclaim.parts.len() as u32);
+    for part in &reclaim.parts {
+        match part {
+            MultipartReclaimPartRecord::ShardSet {
+                part_number,
+                part_okh,
+                part_vid,
+                data_pg_id,
+                ec,
+            } => {
+                put_u8(out, 0);
+                put_u32(out, *part_number);
+                put_bytes(out, part_okh);
+                put_u64(out, part_vid.get());
+                put_u32(out, *data_pg_id);
+                put_ec_shape(out, *ec);
+            }
+            MultipartReclaimPartRecord::Segments {
+                part_number,
+                segments,
+            } => {
+                put_u8(out, 1);
+                put_u32(out, *part_number);
+                put_u32(out, segments.len() as u32);
+                for segment in segments {
+                    put_u32(out, segment.segment_index);
+                    put_bytes(out, &segment.segment_okh);
+                    put_u64(out, segment.segment_vid.get());
+                    put_u32(out, segment.data_pg_id);
+                    put_ec_shape(out, segment.ec);
+                }
+            }
+        }
+    }
+}
+
+fn put_commit_direct_put_object_req(out: &mut Vec<u8>, request: &CommitDirectPutObjectReq) {
+    put_string(out, request.bucket.as_str());
+    put_string(out, request.key.as_str());
+    put_string(out, request.generation_reservation_id.as_str());
+    put_u8(out, request.versioning as u8);
+    put_owner_identity(out, &request.owner);
+    put_string(out, &request.acl_grants.serialized());
+    put_bool(out, request.public_read);
+    put_u64(out, request.generation_id.get());
+    put_u64(out, request.size);
+    put_u64(out, request.etag_crc64);
+    put_ec_shape(out, request.ec);
+    put_optional_string(out, request.tags.as_ref().map(|tags| tags.as_str()));
+    put_bytes(out, request.metadata_blob.as_slice());
+    put_bytes(out, request.system_metadata_blob.as_slice());
+    put_object_lock_state(out, request.object_lock);
+    put_object_encryption(out, &request.encryption);
+    put_u32(out, request.segment_index);
+    put_optional_u64(out, request.segment_crc64);
+    put_bytes(out, &request.segment_okh);
+    put_u64(out, request.segment_vid.get());
+    put_u32(out, request.data_pg_id);
+    put_bucket_write_reservation_proof(out, &request.bucket_write_reservation);
 }
 
 fn put_optional_stored_object(out: &mut Vec<u8>, stored: Option<&StoredObject>) {
@@ -5764,6 +6233,11 @@ mod tests {
                 STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::DirectPutCommitCommandBuild,
+                STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::BucketWriteReservationAcquire,
                 STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN,
@@ -6231,10 +6705,106 @@ mod tests {
                     existing_etag: Some("\"0123456789abcdef\"".to_string()),
                 },
                 current: None,
+                stale_payload: None,
             },
         };
         let bytes = encode_direct_put_commit_snapshot_response(&response);
         let decoded = decode_direct_put_commit_snapshot_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn direct_put_command_build_request_and_stale_response_round_trip() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let reservation_id = SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
+        let owner = OwnerIdentity {
+            principal: "owner".to_string(),
+            canonical_id: CanonicalUserId::from_principal("owner"),
+        };
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "reservation-1".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "direct-put".to_string(),
+            created_at: 123,
+            lease_deadline: None,
+            target_context: Some("key".to_string()),
+        };
+        let commit = CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id: reservation_id,
+            versioning: BucketVersioningState::Suspended,
+            owner,
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(9).unwrap(),
+            size: 12,
+            etag_crc64: 99,
+            ec: EcShape { k: 4, m: 2 },
+            tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
+            metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
+            system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: Some(99),
+            segment_okh: [7; 16],
+            segment_vid: GenerationId::new(10).unwrap(),
+            data_pg_id: 3,
+            bucket_write_reservation: proof.clone(),
+        };
+        let request = StorageRpcDirectPutCommandBuildRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            request: commit,
+            version_id: VersionId::Null,
+            expected_snapshot: DirectPutCommitStorageSnapshot {
+                auth_snapshot: crate::DirectPutCommitSnapshot {
+                    existing_etag: None,
+                },
+                current: None,
+                stale_payload: None,
+            },
+            bucket_write_reservation: proof,
+        };
+
+        let bytes = encode_direct_put_command_build_request(&request).unwrap();
+        let decoded = decode_direct_put_command_build_request(&bytes).unwrap();
+        assert_eq!(decoded.object, request.object);
+        assert_eq!(decoded.request.bucket, bucket);
+        assert_eq!(decoded.request.key, key);
+        assert_eq!(decoded.request.generation_id, request.request.generation_id);
+        assert_eq!(decoded.request.segment_okh, request.request.segment_okh);
+        assert_eq!(
+            decoded.bucket_write_reservation,
+            request.bucket_write_reservation
+        );
+
+        let mut wrong_proof_request = request.clone();
+        wrong_proof_request.bucket_write_reservation.bucket =
+            BucketName::try_from("other-bucket").unwrap();
+        assert_eq!(
+            encode_direct_put_command_build_request(&wrong_proof_request),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "bucket write reservation proof must match direct PUT bucket"
+            ))
+        );
+
+        let response = StorageRpcDirectPutCommandBuildResponse {
+            outcome: StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
+        };
+        let bytes = encode_direct_put_command_build_response(&response);
+        let decoded = decode_direct_put_command_build_response(&bytes).unwrap();
         assert_eq!(decoded, response);
     }
 
