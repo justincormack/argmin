@@ -36,15 +36,6 @@ impl SharedStorageNode {
         })
     }
 
-    pub(crate) fn load_object_tag_read_auth_subject_from_object_pg(
-        pg: &PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        Self::load_object_read_auth_subject_from_object_pg(pg, bucket, key, version_id)
-    }
-
     pub(crate) fn get_object_tags_for_subject_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
@@ -78,24 +69,6 @@ impl SharedStorageNode {
             key,
             authorized_version_id,
         )?)
-    }
-
-    pub(crate) fn load_object_legal_hold_read_subject_from_object_pg(
-        pg: &PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        Self::load_object_read_auth_subject_from_object_pg(pg, bucket, key, version_id)
-    }
-
-    pub(crate) fn load_object_retention_read_subject_from_object_pg(
-        pg: &PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        Self::load_object_read_auth_subject_from_object_pg(pg, bucket, key, version_id)
     }
 
     #[cfg(test)]

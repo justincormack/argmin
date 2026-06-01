@@ -5568,10 +5568,13 @@ RPC boundary as well, validating returned command id, bucket, and order
 identity before publishing. Object read auth-subject loads and subject-checked
 snapshot reloads now route through a dedicated object-read metadata client/RPC
 surface, preserving typed not-found and stale-subject outcomes for the existing
-bounded retry loop. Remaining non-command surfaces still need lifecycle/object
-snapshot reads used by command builders and the operation-shaped builders for
-the rest of the metadata mutation paths before frontend/combined roles can be
-enabled.
+bounded retry loop. Object tag reads now use the same dedicated object-read
+metadata RPC boundary for the subject load and subject-checked tag reload, and
+legal-hold/retention reads use the shared object-read auth-subject RPC instead
+of the broad storage-client surface. Remaining non-command surfaces still need
+lifecycle/object snapshot reads used by command builders and the
+operation-shaped builders for the rest of the metadata mutation paths before
+frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5629,11 +5632,12 @@ Implementation slices:
    PUT commit command construction now have dedicated node-client/RPC surfaces.
    Completed-multipart order allocation also now routes through the bucket
    metadata RPC boundary. Object-read auth-subject/snapshot helpers now route
-   through a dedicated object-read metadata RPC surface. Remaining work includes
-   lifecycle/object snapshot helpers used by command builders, durable
-   pending/drain/coordination checks, and operation-shaped command-builder
-   calls that must execute against a storage-node-owned snapshot rather than a
-   frontend-owned raw PG handle.
+   through a dedicated object-read metadata RPC surface, including
+   subject-checked object tag reads and legal-hold/retention auth-subject
+   loads. Remaining work includes lifecycle/object snapshot helpers used by
+   command builders, durable pending/drain/coordination checks, and
+   operation-shaped command-builder calls that must execute against a
+   storage-node-owned snapshot rather than a frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
    install/apply for `CreateBucket`, then direct PUT object-generation
@@ -5674,11 +5678,12 @@ Required tests:
    preserve primary-last ordering and prevent duplicate or divergent command
    application
 8. non-command metadata RPCs used by create-bucket/direct PUT run remotely:
-   bucket raw/info and bucket snapshot reads, object snapshot reads,
-   generation/version/order allocation, bucket-write reservation/proof release,
-   durable pending/drain checks, and operation-shaped command builders. Proof
-   release must reject the correct PG on a non-primary node even when that node
-   appears first in the acting-set route list.
+   bucket raw/info and bucket snapshot reads, object read snapshot and
+   tag/legal-hold/retention subject reads, generation/version/order allocation,
+   bucket-write reservation/proof release, durable pending/drain checks, and
+   operation-shaped command builders. Proof release must reject the correct PG
+   on a non-primary node even when that node appears first in the acting-set
+   route list.
 9. two independent frontend maps over one storage-node must handle stale
    object-generation selection: the loser may read generation `N`, the winner
    publishes `ReserveObjectGeneration(N)`, and the loser must retry to `N+1`

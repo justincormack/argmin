@@ -28,10 +28,11 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_object_generation_reservation_request,
     decode_object_read_auth_subject_request, decode_object_read_snapshot_request,
-    decode_object_request, decode_proof_release_request, decode_read_handle_acquire_request,
-    decode_read_handle_release_request, decode_scavenger_list_files_request,
-    decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
+    decode_object_request, decode_object_tags_for_subject_request, decode_proof_release_request,
+    decode_read_handle_acquire_request, decode_read_handle_release_request,
+    decode_scavenger_list_files_request, decode_shard_ack_batch_request,
+    decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
+    decode_shard_write_request, encode_bucket_info_outcome_response,
     encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
     encode_bucket_write_reservation_record_response,
     encode_completed_multipart_order_command_build_response,
@@ -46,17 +47,18 @@ use crate::storage_rpc::{
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
     encode_object_generation_reservation_response, encode_object_generation_response,
     encode_object_read_auth_subject_response, encode_object_read_snapshot_response,
-    encode_object_version_response, encode_read_handle_acquire_response,
-    encode_read_handle_release_response, encode_scavenger_list_files_response,
-    encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
-    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
-    read_storage_rpc_request_frame_from, write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome,
-    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
-    StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
-    StorageRpcBucketSnapshotPairResponse, StorageRpcBucketSnapshotRequest,
-    StorageRpcBucketSnapshotResponse, StorageRpcBucketWriteReservationAcquireOutcome,
-    StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
-    StorageRpcBucketWriteReservationRecordRequest, StorageRpcBucketWriteReservationRecordResponse,
+    encode_object_tags_for_subject_response, encode_object_version_response,
+    encode_read_handle_acquire_response, encode_read_handle_release_response,
+    encode_scavenger_list_files_response, encode_shard_read_range_response,
+    encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
+    encode_storage_rpc_success_response, read_storage_rpc_request_frame_from,
+    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse,
+    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotPairResponse,
+    StorageRpcBucketSnapshotRequest, StorageRpcBucketSnapshotResponse,
+    StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
+    StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
+    StorageRpcBucketWriteReservationRecordResponse,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildResponse,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
@@ -83,7 +85,9 @@ use crate::storage_rpc::{
     StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
     StorageRpcObjectReadAuthSubjectResponse, StorageRpcObjectReadSnapshotOutcome,
     StorageRpcObjectReadSnapshotRequest, StorageRpcObjectReadSnapshotResponse,
-    StorageRpcObjectRequest, StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
+    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
+    StorageRpcObjectTagsForSubjectRequest, StorageRpcObjectTagsForSubjectResponse,
+    StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
     StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
     StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
@@ -506,6 +510,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectReadSnapshotLoad => {
                 match decode_object_read_snapshot_request(&frame.payload) {
                     Ok(request) => self.object_read_snapshot_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectTagsForSubjectLoad => {
+                match decode_object_tags_for_subject_request(&frame.payload) {
+                    Ok(request) => self.object_tags_for_subject_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1286,6 +1299,55 @@ impl StorageNodeConnectionHandler {
                     encode_object_read_snapshot_response(&StorageRpcObjectReadSnapshotResponse {
                         outcome: StorageRpcObjectReadSnapshotOutcome::StaleSubject,
                     });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn object_tags_for_subject_response(
+        &self,
+        request: StorageRpcObjectTagsForSubjectRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "object tags for subject load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectReadMetadataNodeClient::get_object_tags_for_subject(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            request.version_id,
+            &request.expected_identity,
+            request.authorized_version_id,
+        ) {
+            Ok(tags) => {
+                let payload = encode_object_tags_for_subject_response(
+                    &StorageRpcObjectTagsForSubjectResponse {
+                        outcome: StorageRpcObjectTagsForSubjectOutcome::Loaded(tags),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                let payload = encode_object_tags_for_subject_response(
+                    &StorageRpcObjectTagsForSubjectResponse {
+                        outcome: StorageRpcObjectTagsForSubjectOutcome::StaleSubject,
+                    },
+                );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),

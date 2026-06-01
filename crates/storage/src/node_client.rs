@@ -38,11 +38,11 @@ use crate::storage_rpc::{
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
     decode_object_generation_reservation_response, decode_object_generation_response,
     decode_object_read_auth_subject_response, decode_object_read_snapshot_response,
-    decode_object_version_response, decode_read_handle_acquire_response,
-    decode_read_handle_release_response, decode_scavenger_list_files_response,
-    decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-    decode_storage_rpc_response_payload, encode_bucket_request,
-    encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
+    decode_object_tags_for_subject_response, decode_object_version_response,
+    decode_read_handle_acquire_response, decode_read_handle_release_response,
+    decode_scavenger_list_files_response, decode_shard_read_range_response,
+    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
     encode_bucket_write_reservation_record_request,
     encode_completed_multipart_order_command_build_request,
@@ -52,15 +52,16 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_object_generation_reservation_request,
     encode_object_read_auth_subject_request, encode_object_read_snapshot_request,
-    encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
-    encode_read_handle_release_request, encode_scavenger_list_files_request,
-    encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
-    encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
-    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
-    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
-    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
-    StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
-    StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
+    encode_object_request, encode_object_tags_for_subject_request, encode_proof_release_request,
+    encode_read_handle_acquire_request, encode_read_handle_release_request,
+    encode_scavenger_list_files_request, encode_shard_ack_batch_request,
+    encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
+    encode_shard_write_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    StorageRpcBucketInfoOutcome, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
+    StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
+    StorageRpcBucketSnapshotRequest, StorageRpcBucketWriteReservationAcquireOutcome,
+    StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
+    StorageRpcBucketWriteReservationRecordRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcDirectPutCommandBuildOutcome,
@@ -76,10 +77,12 @@ use crate::storage_rpc::{
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
     StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
-    StorageRpcObjectRequest, StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
-    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
+    StorageRpcObjectTagsForSubjectRequest, StorageRpcProofReleaseRequest,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -818,6 +821,16 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
         expected_identity: &ObjectReadAuthSubjectIdentity,
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
+
+    fn get_object_tags_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: VersionId,
+    ) -> Result<Option<String>, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -1401,14 +1414,6 @@ pub(crate) trait StorageNodeClient:
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
 
-    fn load_object_tag_read_auth_subject(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
-
     fn get_object_tags_for_subject(
         &self,
         pg_id: PgId,
@@ -1418,22 +1423,6 @@ pub(crate) trait StorageNodeClient:
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: s3_types::VersionId,
     ) -> Result<Option<String>, ObjectPgActionError>;
-
-    fn load_object_legal_hold_read_subject(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
-
-    fn load_object_retention_read_subject(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
 
     fn load_multipart_upload(
         &self,
@@ -3594,6 +3583,26 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
             snapshot_mode,
         )
     }
+
+    fn get_object_tags_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: VersionId,
+    ) -> Result<Option<String>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::get_object_tags_for_subject(
+            self,
+            pg_id,
+            bucket,
+            key,
+            version_id,
+            expected_identity,
+            authorized_version_id,
+        )
+    }
 }
 
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
@@ -4201,6 +4210,46 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
                 Ok(*snapshot)
             }
             StorageRpcObjectReadSnapshotOutcome::StaleSubject => {
+                Err(ObjectPgActionError::StaleObjectReadSubject)
+            }
+        }
+    }
+
+    fn get_object_tags_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: VersionId,
+    ) -> Result<Option<String>, ObjectPgActionError> {
+        let request = StorageRpcObjectTagsForSubjectRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            version_id,
+            expected_identity: expected_identity.clone(),
+            authorized_version_id,
+        };
+        let payload = encode_object_tags_for_subject_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectTagsForSubjectLoad, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_tags_for_subject_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode object tags for subject response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectTagsForSubjectOutcome::Loaded(tags) => Ok(tags),
+            StorageRpcObjectTagsForSubjectOutcome::StaleSubject => {
                 Err(ObjectPgActionError::StaleObjectReadSubject)
             }
         }
@@ -5704,19 +5753,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )
     }
 
-    fn load_object_tag_read_auth_subject(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::load_object_tag_read_auth_subject_from_object_pg(
-            &pg, bucket, key, version_id,
-        )
-    }
-
     fn get_object_tags_for_subject(
         &self,
         pg_id: PgId,
@@ -5734,32 +5770,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
             version_id,
             expected_identity,
             authorized_version_id,
-        )
-    }
-
-    fn load_object_legal_hold_read_subject(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::load_object_legal_hold_read_subject_from_object_pg(
-            &pg, bucket, key, version_id,
-        )
-    }
-
-    fn load_object_retention_read_subject(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::load_object_retention_read_subject_from_object_pg(
-            &pg, bucket, key, version_id,
         )
     }
 
@@ -7267,7 +7277,8 @@ mod tests {
         StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcReadHandleAcquireResponse,
     };
     use crate::types::{
-        DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, StorageClass,
+        DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedTagSet,
+        StorageClass,
     };
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
@@ -8757,7 +8768,10 @@ mod tests {
                     etag: ObjectEtag::single_part(99),
                     ec: EcShape { k: 4, m: 2 },
                     layout: ObjectLayout::Standard,
-                    tags: None,
+                    tags: Some(SerializedTagSet::new(
+                        "<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"
+                            .to_string(),
+                    )),
                     metadata_blob: None,
                     system_metadata_blob: None,
                     object_lock: ObjectLockState::default(),
@@ -8769,7 +8783,7 @@ mod tests {
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..2)
+        let server_threads: Vec<_> = (0..3)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -8806,6 +8820,21 @@ mod tests {
         assert_eq!(snapshot.object_segments, vec![segment]);
         assert!(snapshot.multipart_parts.is_empty());
         assert!(snapshot.multipart_part_segments.is_empty());
+
+        let tags = ObjectReadMetadataNodeClient::get_object_tags_for_subject(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            None,
+            &subject.identity,
+            VersionId::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            tags.as_deref(),
+            Some("<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>")
+        );
 
         for thread in server_threads {
             thread.join().unwrap();

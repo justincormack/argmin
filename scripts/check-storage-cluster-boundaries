@@ -972,7 +972,7 @@ migrated_simple_object_read_bypasses=$(
             || $0 ~ /object_read_metadata_client[[:space:]]*$/) {
             pending_object_read_metadata_client = 1
         }
-        if ($0 ~ /\.(load_object_read_auth_subject|load_object_read_snapshot_for_subject)\(/) {
+        if ($0 ~ /\.(load_object_read_auth_subject|load_object_read_snapshot_for_subject|get_object_tags_for_subject)\(/) {
             if (pending_object_read_metadata_client \
                 || $0 ~ /\.object_read_metadata_client\(\)/ \
                 || $0 ~ /object_read_client\./) {
