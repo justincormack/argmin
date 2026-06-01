@@ -5565,9 +5565,13 @@ retries and validating the returned command identity before the frontend
 publishes it. Completed-multipart order allocation now builds
 `AdvanceCompletedMultipartUploadSequence` commands through the bucket metadata
 RPC boundary as well, validating returned command id, bucket, and order
-identity before publishing. Remaining non-command surfaces still need other
-object snapshot reads and the operation-shaped builders for the rest of the
-metadata mutation paths before frontend/combined roles can be enabled.
+identity before publishing. Object read auth-subject loads and subject-checked
+snapshot reloads now route through a dedicated object-read metadata client/RPC
+surface, preserving typed not-found and stale-subject outcomes for the existing
+bounded retry loop. Remaining non-command surfaces still need lifecycle/object
+snapshot reads used by command builders and the operation-shaped builders for
+the rest of the metadata mutation paths before frontend/combined roles can be
+enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5624,10 +5628,11 @@ Implementation slices:
    reservations, proof release, direct PUT commit snapshot loads, and direct
    PUT commit command construction now have dedicated node-client/RPC surfaces.
    Completed-multipart order allocation also now routes through the bucket
-   metadata RPC boundary. Remaining work includes other object snapshot reads,
-   durable pending/drain/coordination checks, lifecycle/object-read snapshot
-   helpers used by command builders, and operation-shaped command-builder calls
-   that must execute against a storage-node-owned snapshot rather than a
+   metadata RPC boundary. Object-read auth-subject/snapshot helpers now route
+   through a dedicated object-read metadata RPC surface. Remaining work includes
+   lifecycle/object snapshot helpers used by command builders, durable
+   pending/drain/coordination checks, and operation-shaped command-builder
+   calls that must execute against a storage-node-owned snapshot rather than a
    frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
@@ -5734,6 +5739,11 @@ Required test coverage:
 3. killing a non-critical node fails closed with clear errors
 4. no test depends on process-local cache invalidation, mutexes, or condition
    variables for correctness
+5. full-harness parallel S3 test runs are rechecked under the multi-process
+   framework, including the high-pressure multipart/SSE-C cases that have
+   previously shown intermittent operation-attempt timeouts; any recurrence is
+   treated as a server-side admission/backpressure bug to investigate, not as a
+   reason to reduce test request concurrency or disable production workers
 
 ### Phase 10.8: Closeout Audit
 

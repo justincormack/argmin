@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +37,7 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
     decode_object_generation_reservation_response, decode_object_generation_response,
+    decode_object_read_auth_subject_response, decode_object_read_snapshot_response,
     decode_object_version_response, decode_read_handle_acquire_response,
     decode_read_handle_release_response, decode_scavenger_list_files_response,
     decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
@@ -50,6 +51,7 @@ use crate::storage_rpc::{
     encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_object_generation_reservation_request,
+    encode_object_read_auth_subject_request, encode_object_read_snapshot_request,
     encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
     encode_read_handle_release_request, encode_scavenger_list_files_request,
     encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
@@ -72,6 +74,8 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
+    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
+    StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
     StorageRpcObjectRequest, StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
     StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
@@ -794,6 +798,26 @@ pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
+    fn load_object_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -3538,6 +3562,40 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
+impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
+    fn load_object_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_object_read_auth_subject(
+            self, pg_id, bucket, key, version_id,
+        )
+    }
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_object_read_snapshot_for_subject(
+            self,
+            pg_id,
+            bucket,
+            key,
+            version_id,
+            expected_identity,
+            snapshot_mode,
+        )
+    }
+}
+
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
     fn head_bucket_raw(
         &self,
@@ -4061,7 +4119,307 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
     }
 }
 
+impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
+    fn load_object_read_auth_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        let request = StorageRpcObjectReadAuthSubjectRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            version_id,
+        };
+        let payload = encode_object_read_auth_subject_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectReadAuthSubjectLoad, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_object_read_auth_subject_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(
+                "decode object read auth subject response",
+                error.to_string(),
+            ))
+        })?;
+        match response.outcome {
+            StorageRpcObjectReadAuthSubjectOutcome::Loaded(subject) => {
+                self.validate_object_read_subject_response(&subject, bucket, key, version_id)?;
+                Ok(*subject)
+            }
+            StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound => {
+                Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound))
+            }
+        }
+    }
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
+        let request = StorageRpcObjectReadSnapshotRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            version_id,
+            expected_identity: expected_identity.clone(),
+            snapshot_mode,
+        };
+        let payload = encode_object_read_snapshot_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectReadSnapshotLoad, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_object_read_snapshot_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode object read snapshot response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcObjectReadSnapshotOutcome::Loaded(snapshot) => {
+                self.validate_object_read_snapshot_response(
+                    &snapshot,
+                    bucket,
+                    key,
+                    version_id,
+                    expected_identity,
+                    snapshot_mode,
+                )?;
+                Ok(*snapshot)
+            }
+            StorageRpcObjectReadSnapshotOutcome::StaleSubject => {
+                Err(ObjectPgActionError::StaleObjectReadSubject)
+            }
+        }
+    }
+}
+
 impl UnixStorageNodeClient {
+    fn validate_object_read_subject_response(
+        &self,
+        subject: &ObjectReadAuthSubject,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<(), ObjectPgActionError> {
+        if subject.stored.bucket() != bucket
+            || subject.stored.key() != key
+            || version_id.is_some_and(|version_id| subject.stored.version_id() != version_id)
+            || !subject.identity.matches_stored(&subject.stored)
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate object read auth subject response",
+                "subject identity does not match request".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_object_read_snapshot_response(
+        &self,
+        snapshot: &ObjectReadSnapshot,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<(), ObjectPgActionError> {
+        if snapshot.stored.bucket() != bucket
+            || snapshot.stored.key() != key
+            || version_id.is_some_and(|version_id| snapshot.stored.version_id() != version_id)
+            || !expected_identity.matches_stored(&snapshot.stored)
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate object read snapshot response",
+                "snapshot identity does not match request".to_string(),
+            )));
+        }
+
+        let stored_version_id = snapshot.stored.version_id();
+        for segment in &snapshot.object_segments {
+            if &segment.bucket != bucket
+                || &segment.key != key
+                || segment.version_id != stored_version_id
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "object segment identity does not match snapshot".to_string(),
+                )));
+            }
+        }
+        for part in &snapshot.multipart_parts {
+            if &part.bucket != bucket || &part.key != key || part.version_id != stored_version_id {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "multipart part identity does not match snapshot".to_string(),
+                )));
+            }
+        }
+        for segment in &snapshot.multipart_part_segments {
+            if &segment.bucket != bucket
+                || &segment.key != key
+                || segment.version_id != stored_version_id.to_u64()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "multipart segment identity does not match snapshot".to_string(),
+                )));
+            }
+        }
+
+        match &snapshot.stored {
+            StoredObject::DeleteMarker(_) => {
+                if !snapshot.object_segments.is_empty()
+                    || !snapshot.multipart_parts.is_empty()
+                    || !snapshot.multipart_part_segments.is_empty()
+                {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate object read snapshot response",
+                        "delete-marker snapshot must not include payload layout".to_string(),
+                    )));
+                }
+            }
+            StoredObject::Live(record) => match (record.layout, snapshot_mode) {
+                (_, ObjectReadSnapshotMode::MetadataOnly)
+                | (ObjectLayout::Standard, ObjectReadSnapshotMode::MultipartParts)
+                | (
+                    ObjectLayout::MultipartManifest { .. },
+                    ObjectReadSnapshotMode::StandardSegments,
+                ) => {
+                    if !snapshot.object_segments.is_empty()
+                        || !snapshot.multipart_parts.is_empty()
+                        || !snapshot.multipart_part_segments.is_empty()
+                    {
+                        return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                            "validate object read snapshot response",
+                            "snapshot mode must not include payload layout".to_string(),
+                        )));
+                    }
+                }
+                (ObjectLayout::Standard, ObjectReadSnapshotMode::StandardSegments)
+                | (ObjectLayout::Standard, ObjectReadSnapshotMode::FullPayloadLayout) => {
+                    if !snapshot.multipart_parts.is_empty()
+                        || !snapshot.multipart_part_segments.is_empty()
+                    {
+                        return Err(ObjectPgActionError::Store(
+                            self.rpc_payload_error(
+                                "validate object read snapshot response",
+                                "standard object snapshot must not include multipart layout"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                }
+                (
+                    ObjectLayout::MultipartManifest { parts_count },
+                    ObjectReadSnapshotMode::MultipartParts,
+                ) => {
+                    if !snapshot.object_segments.is_empty()
+                        || !snapshot.multipart_part_segments.is_empty()
+                    {
+                        return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                            "validate object read snapshot response",
+                            "multipart-parts snapshot must not include segment layout".to_string(),
+                        )));
+                    }
+                    self.validate_object_read_multipart_manifest_snapshot(
+                        snapshot,
+                        parts_count,
+                        false,
+                    )?;
+                }
+                (
+                    ObjectLayout::MultipartManifest { parts_count },
+                    ObjectReadSnapshotMode::FullPayloadLayout,
+                ) => {
+                    if !snapshot.object_segments.is_empty() {
+                        return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                            "validate object read snapshot response",
+                            "multipart snapshot must not include standard segments".to_string(),
+                        )));
+                    }
+                    self.validate_object_read_multipart_manifest_snapshot(
+                        snapshot,
+                        parts_count,
+                        true,
+                    )?;
+                }
+            },
+        }
+        Ok(())
+    }
+
+    fn validate_object_read_multipart_manifest_snapshot(
+        &self,
+        snapshot: &ObjectReadSnapshot,
+        parts_count: std::num::NonZeroU32,
+        require_segment_layout: bool,
+    ) -> Result<(), ObjectPgActionError> {
+        if snapshot.multipart_parts.len() != parts_count.get() as usize {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate object read snapshot response",
+                "multipart snapshot part count does not match manifest".to_string(),
+            )));
+        }
+
+        let mut parts_by_number = BTreeMap::new();
+        for part in &snapshot.multipart_parts {
+            if parts_by_number.insert(part.part_number, part).is_some() {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "multipart snapshot contains duplicate part numbers".to_string(),
+                )));
+            }
+        }
+
+        let mut segment_counts_by_part = BTreeMap::<u32, usize>::new();
+        for segment in &snapshot.multipart_part_segments {
+            let Some(part) = parts_by_number.get(&segment.part_number) else {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "multipart segment has no matching part row".to_string(),
+                )));
+            };
+            if part.part_okh != [0u8; 16] {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "multipart segment belongs to shard-set part row".to_string(),
+                )));
+            }
+            *segment_counts_by_part
+                .entry(segment.part_number)
+                .or_default() += 1;
+        }
+
+        if require_segment_layout {
+            for part in &snapshot.multipart_parts {
+                if part.part_okh == [0u8; 16]
+                    && !segment_counts_by_part.contains_key(&part.part_number)
+                {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate object read snapshot response",
+                        "segmented multipart part has no segment rows".to_string(),
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_direct_put_command_build_response(
         &self,
         command: &MetadataCommandEnvelope,
@@ -6908,7 +7266,9 @@ mod tests {
         StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandNextIdResponse,
         StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcReadHandleAcquireResponse,
     };
-    use crate::types::{DeleteMarkerRecord, ObjectEncryption, ObjectLockState, StorageClass};
+    use crate::types::{
+        DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, StorageClass,
+    };
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
         StorageNodeProcessConfig {
@@ -6990,6 +7350,81 @@ mod tests {
         ObjectLayout::MultipartManifest {
             parts_count: std::num::NonZeroU32::new(1).unwrap(),
         }
+    }
+
+    fn test_object_read_multipart_part(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        part_number: u32,
+        part_okh: [u8; 16],
+    ) -> ObjectPartRecord {
+        ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            part_number,
+            size: 12,
+            etag: vec![part_number as u8; 16],
+            etag_kind: EtagKind::Crc64,
+            part_okh,
+            part_vid: GenerationId::new(20 + u64::from(part_number)).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            data_pg_id: 0,
+            checksum: None,
+        }
+    }
+
+    fn test_object_read_multipart_segment(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        part_number: u32,
+    ) -> MultipartPartSegmentRecord {
+        MultipartPartSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: UploadId::try_from("u".repeat(128)).unwrap(),
+            version_id: VersionId::Null.to_u64(),
+            part_number,
+            segment_index: 0,
+            size: 12,
+            segment_crc64: Some(99),
+            segment_okh: [7; 16],
+            segment_vid: GenerationId::new(30 + u64::from(part_number)).unwrap(),
+            data_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        }
+    }
+
+    fn assert_object_read_snapshot_rejected(
+        snapshot: &ObjectReadSnapshot,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let identity = ObjectReadAuthSubjectIdentity::for_stored(&snapshot.stored);
+        let err = client
+            .validate_object_read_snapshot_response(
+                snapshot,
+                snapshot.stored.bucket(),
+                snapshot.stored.key(),
+                Some(snapshot.stored.version_id()),
+                &identity,
+                snapshot_mode,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate object read snapshot response",
+                ..
+            })
+        ));
     }
 
     fn assert_direct_put_snapshot_rejected(
@@ -7244,6 +7679,68 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn unix_object_read_snapshot_response_rejects_missing_multipart_parts() {
+        let bucket = crate::tests::bucket_name("object-read-missing-part-rpc");
+        let key = crate::tests::object_key("object-read-missing-part-rpc-key");
+        let stored = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(10).unwrap(),
+            ObjectLayout::MultipartManifest {
+                parts_count: std::num::NonZeroU32::new(2).unwrap(),
+            },
+        );
+        let snapshot = ObjectReadSnapshot {
+            stored,
+            object_segments: Vec::new(),
+            multipart_parts: vec![test_object_read_multipart_part(&bucket, &key, 1, [5; 16])],
+            multipart_part_segments: Vec::new(),
+        };
+
+        assert_object_read_snapshot_rejected(&snapshot, ObjectReadSnapshotMode::MultipartParts);
+    }
+
+    #[test]
+    fn unix_object_read_snapshot_response_rejects_orphan_multipart_segments() {
+        let bucket = crate::tests::bucket_name("object-read-orphan-seg-rpc");
+        let key = crate::tests::object_key("object-read-orphan-seg-rpc-key");
+        let stored = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(10).unwrap(),
+            test_multipart_layout(),
+        );
+        let snapshot = ObjectReadSnapshot {
+            stored,
+            object_segments: Vec::new(),
+            multipart_parts: vec![test_object_read_multipart_part(&bucket, &key, 1, [0; 16])],
+            multipart_part_segments: vec![test_object_read_multipart_segment(&bucket, &key, 2)],
+        };
+
+        assert_object_read_snapshot_rejected(&snapshot, ObjectReadSnapshotMode::FullPayloadLayout);
+    }
+
+    #[test]
+    fn unix_object_read_snapshot_response_rejects_segments_for_shard_set_parts() {
+        let bucket = crate::tests::bucket_name("object-read-shard-set-seg-rpc");
+        let key = crate::tests::object_key("object-read-shard-set-seg-rpc-key");
+        let stored = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(10).unwrap(),
+            test_multipart_layout(),
+        );
+        let snapshot = ObjectReadSnapshot {
+            stored,
+            object_segments: Vec::new(),
+            multipart_parts: vec![test_object_read_multipart_part(&bucket, &key, 1, [5; 16])],
+            multipart_part_segments: vec![test_object_read_multipart_segment(&bucket, &key, 1)],
+        };
+
+        assert_object_read_snapshot_rejected(&snapshot, ObjectReadSnapshotMode::FullPayloadLayout);
     }
 
     #[test]
@@ -8205,6 +8702,114 @@ mod tests {
             VersionId::from_u64(1)
         );
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("object-read-rpc-bucket");
+        let key = crate::tests::object_key("object-read-rpc-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let segment_vid = GenerationId::new(10).unwrap();
+        let segment = ObjectSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size: 12,
+            segment_crc64: Some(99),
+            segment_okh: [3; 16],
+            segment_vid,
+            data_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        };
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &crate::CanonicalUserId::from_principal("owner"),
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::put_object_with_segments(
+                &*pg,
+                &PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id,
+                    size: 12,
+                    etag: ObjectEtag::single_part(99),
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                std::slice::from_ref(&segment),
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..2)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let subject = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            None,
+        )
+        .unwrap();
+        assert_eq!(subject.stored.bucket(), &bucket);
+        assert_eq!(subject.stored.key(), &key);
+
+        let snapshot = ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            None,
+            &subject.identity,
+            ObjectReadSnapshotMode::StandardSegments,
+        )
+        .unwrap();
+        assert_eq!(snapshot.stored, subject.stored);
+        assert_eq!(snapshot.object_segments, vec![segment]);
+        assert!(snapshot.multipart_parts.is_empty());
+        assert!(snapshot.multipart_part_segments.is_empty());
+
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]

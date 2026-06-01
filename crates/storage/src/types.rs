@@ -2912,7 +2912,7 @@ pub struct FinalizeStreamPutOutcome<T> {
     pub stale_generation_id: Option<GenerationId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectReadSnapshot {
     pub stored: StoredObject,
     pub object_segments: Vec<ObjectSegmentRecord>,
@@ -2920,7 +2920,7 @@ pub struct ObjectReadSnapshot {
     pub multipart_part_segments: Vec<MultipartPartSegmentRecord>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectReadAuthSubject {
     pub stored: StoredObject,
     pub identity: ObjectReadAuthSubjectIdentity,
@@ -2936,6 +2936,10 @@ impl ObjectReadAuthSubjectIdentity {
         Self {
             stored: stored.clone(),
         }
+    }
+
+    pub(crate) fn stored(&self) -> &StoredObject {
+        &self.stored
     }
 
     pub fn matches_stored(&self, stored: &StoredObject) -> bool {

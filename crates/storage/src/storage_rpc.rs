@@ -10,14 +10,17 @@ use crate::{
         BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
         BucketWriteReservationRecord, ChecksumBytes, ClusterEpoch, CommitDirectPutObjectReq,
         CreateBucketConfig, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
-        EffectiveBucketEncryptionConfig, GenerationId, LiveObjectRecord, LoadedBucketSubresource,
-        ManagedEncryptionAlgorithm, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-        MultipartReclaimRecord, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
-        ObjectLayout, ObjectLockState, ObjectPayloadReclaimKind, ObjectRetention,
-        ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
-        PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-        SerializedTagSet, SessionId, ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus,
-        StoredObject, VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN,
+        EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LiveObjectRecord,
+        LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartPartSegmentRecord,
+        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
+        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+        ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
+        ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+        OwnerIdentity, PgId, PublicAccessBlockConfig, SerializedMetadataBlob,
+        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+        StorageClass, StoredLegalHoldStatus, StoredObject, UploadId, VersionId, WriteAck,
+        SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -101,6 +104,14 @@ const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 1 + 8;
+const STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
+const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
+    4 + 4 + 8 + 4 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
+const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
+    4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 4
@@ -182,6 +193,8 @@ pub(crate) enum StorageRpcMessageKind {
     DirectPutCommitSnapshotLoad = 43,
     DirectPutCommitCommandBuild = 44,
     CompletedMultipartOrderCommandBuild = 45,
+    ObjectReadAuthSubjectLoad = 46,
+    ObjectReadSnapshotLoad = 47,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +286,8 @@ impl StorageRpcMessageKind {
             Self::DirectPutCommitSnapshotLoad => "direct PUT commit snapshot load",
             Self::DirectPutCommitCommandBuild => "direct PUT commit command build",
             Self::CompletedMultipartOrderCommandBuild => "completed multipart order command build",
+            Self::ObjectReadAuthSubjectLoad => "object read auth subject load",
+            Self::ObjectReadSnapshotLoad => "object read snapshot load",
         }
     }
 
@@ -323,6 +338,8 @@ impl StorageRpcMessageKind {
             43 => Ok(Self::DirectPutCommitSnapshotLoad),
             44 => Ok(Self::DirectPutCommitCommandBuild),
             45 => Ok(Self::CompletedMultipartOrderCommandBuild),
+            46 => Ok(Self::ObjectReadAuthSubjectLoad),
+            47 => Ok(Self::ObjectReadSnapshotLoad),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -495,6 +512,42 @@ pub(crate) struct StorageRpcObjectGenerationReservationResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcDirectPutCommitSnapshotResponse {
     pub(crate) snapshot: DirectPutCommitStorageSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectReadAuthSubjectRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) version_id: Option<VersionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcObjectReadAuthSubjectOutcome {
+    Loaded(Box<ObjectReadAuthSubject>),
+    ObjectNotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectReadAuthSubjectResponse {
+    pub(crate) outcome: StorageRpcObjectReadAuthSubjectOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectReadSnapshotRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) version_id: Option<VersionId>,
+    pub(crate) expected_identity: ObjectReadAuthSubjectIdentity,
+    pub(crate) snapshot_mode: ObjectReadSnapshotMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcObjectReadSnapshotOutcome {
+    Loaded(Box<ObjectReadSnapshot>),
+    StaleSubject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectReadSnapshotResponse {
+    pub(crate) outcome: StorageRpcObjectReadSnapshotOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1185,6 +1238,12 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::CompletedMultipartOrderCommandBuild => {
             STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectReadAuthSubjectLoad => {
+            STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectReadSnapshotLoad => {
+            STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectGenerationNext => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
         }
@@ -1530,6 +1589,51 @@ pub(crate) fn decode_direct_put_commit_snapshot_request(
     })
 }
 
+pub(crate) fn encode_object_read_auth_subject_request(
+    request: &StorageRpcObjectReadAuthSubjectRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_optional_version_id(&mut out, request.version_id);
+    out
+}
+
+pub(crate) fn decode_object_read_auth_subject_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectReadAuthSubjectRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let version_id = decoder.read_optional_version_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectReadAuthSubjectRequest { object, version_id })
+}
+
+pub(crate) fn encode_object_read_snapshot_request(
+    request: &StorageRpcObjectReadSnapshotRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_optional_version_id(&mut out, request.version_id);
+    put_stored_object(&mut out, request.expected_identity.stored());
+    put_object_read_snapshot_mode(&mut out, request.snapshot_mode);
+    out
+}
+
+pub(crate) fn decode_object_read_snapshot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectReadSnapshotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let version_id = decoder.read_optional_version_id()?;
+    let expected_stored = decoder.read_stored_object()?;
+    let snapshot_mode = decoder.read_object_read_snapshot_mode()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectReadSnapshotRequest {
+        object,
+        version_id,
+        expected_identity: ObjectReadAuthSubjectIdentity::for_stored(&expected_stored),
+        snapshot_mode,
+    })
+}
+
 pub(crate) fn encode_direct_put_command_build_request(
     request: &StorageRpcDirectPutCommandBuildRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -1623,6 +1727,72 @@ pub(crate) fn decode_object_version_response(
         ));
     }
     Ok(StorageRpcObjectVersionResponse { version_id })
+}
+
+pub(crate) fn encode_object_read_auth_subject_response(
+    response: &StorageRpcObjectReadAuthSubjectResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcObjectReadAuthSubjectOutcome::Loaded(subject) => {
+            put_u8(&mut out, 0);
+            put_object_read_auth_subject(&mut out, subject);
+        }
+        StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound => put_u8(&mut out, 1),
+    }
+    out
+}
+
+pub(crate) fn decode_object_read_auth_subject_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectReadAuthSubjectResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcObjectReadAuthSubjectOutcome::Loaded(Box::new(
+            decoder.read_object_read_auth_subject()?,
+        )),
+        1 => StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid object read auth subject outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcObjectReadAuthSubjectResponse { outcome })
+}
+
+pub(crate) fn encode_object_read_snapshot_response(
+    response: &StorageRpcObjectReadSnapshotResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcObjectReadSnapshotOutcome::Loaded(snapshot) => {
+            put_u8(&mut out, 0);
+            put_object_read_snapshot(&mut out, snapshot);
+        }
+        StorageRpcObjectReadSnapshotOutcome::StaleSubject => put_u8(&mut out, 1),
+    }
+    out
+}
+
+pub(crate) fn decode_object_read_snapshot_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectReadSnapshotResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcObjectReadSnapshotOutcome::Loaded(Box::new(
+            decoder.read_object_read_snapshot()?,
+        )),
+        1 => StorageRpcObjectReadSnapshotOutcome::StaleSubject,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid object read snapshot outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcObjectReadSnapshotResponse { outcome })
 }
 
 pub(crate) fn encode_object_generation_reservation_response(
@@ -4109,6 +4279,16 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_optional_version_id(&mut self) -> Result<Option<VersionId>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(VersionId::from_u64(self.read_u64()?))),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional version id tag",
+            )),
+        }
+    }
+
     fn read_optional_string(&mut self) -> Result<Option<String>, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => Ok(None),
@@ -4534,6 +4714,146 @@ impl<'a> StorageRpcDecoder<'a> {
             object_lock: self.read_object_lock_state()?,
             encryption: self.read_object_encryption()?,
         })
+    }
+
+    fn read_upload_id(&mut self) -> Result<UploadId, StorageRpcPayloadError> {
+        UploadId::try_from(self.read_string_with_limit(
+            UPLOAD_ID_LEN,
+            StorageRpcPayloadError::InvalidObjectMetadataRequest("upload id is too large"),
+        )?)
+        .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid upload id"))
+    }
+
+    fn read_object_read_auth_subject(
+        &mut self,
+    ) -> Result<ObjectReadAuthSubject, StorageRpcPayloadError> {
+        let stored = self.read_stored_object()?;
+        Ok(ObjectReadAuthSubject {
+            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
+            stored,
+        })
+    }
+
+    fn read_object_read_snapshot(&mut self) -> Result<ObjectReadSnapshot, StorageRpcPayloadError> {
+        let stored = self.read_stored_object()?;
+        let object_segment_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN,
+            "object read segment count exceeds payload",
+        )?;
+        let mut object_segments = Vec::new();
+        for _ in 0..object_segment_count {
+            object_segments.push(self.read_object_segment_record()?);
+        }
+        let multipart_part_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN,
+            "object read part count exceeds payload",
+        )?;
+        let mut multipart_parts = Vec::new();
+        for _ in 0..multipart_part_count {
+            multipart_parts.push(self.read_object_part_record()?);
+        }
+        let multipart_part_segment_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
+            "object read multipart segment count exceeds payload",
+        )?;
+        let mut multipart_part_segments = Vec::new();
+        for _ in 0..multipart_part_segment_count {
+            multipart_part_segments.push(self.read_multipart_part_segment_record()?);
+        }
+        Ok(ObjectReadSnapshot {
+            stored,
+            object_segments,
+            multipart_parts,
+            multipart_part_segments,
+        })
+    }
+
+    fn read_object_segment_record(
+        &mut self,
+    ) -> Result<ObjectSegmentRecord, StorageRpcPayloadError> {
+        Ok(ObjectSegmentRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            version_id: VersionId::from_u64(self.read_u64()?),
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64()?,
+            segment_okh: self.read_fixed_16_bytes("object segment OKH")?,
+            segment_vid: self.read_generation_id()?,
+            data_pg_id: self.read_u32()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+        })
+    }
+
+    fn read_object_part_record(&mut self) -> Result<ObjectPartRecord, StorageRpcPayloadError> {
+        Ok(ObjectPartRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            version_id: VersionId::from_u64(self.read_u64()?),
+            part_number: self.read_u32()?,
+            size: self.read_u64()?,
+            etag: self.read_bytes()?.to_vec(),
+            etag_kind: EtagKind::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid etag kind"),
+            )?,
+            part_okh: self.read_fixed_16_bytes("object part OKH")?,
+            part_vid: self.read_generation_id()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+            data_pg_id: self.read_u32()?,
+            checksum: self.read_optional_checksum_bytes()?,
+        })
+    }
+
+    fn read_multipart_part_segment_record(
+        &mut self,
+    ) -> Result<MultipartPartSegmentRecord, StorageRpcPayloadError> {
+        Ok(MultipartPartSegmentRecord {
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            upload_id: self.read_upload_id()?,
+            version_id: self.read_u64()?,
+            part_number: self.read_u32()?,
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64()?,
+            segment_okh: self.read_fixed_16_bytes("multipart part segment OKH")?,
+            segment_vid: self.read_generation_id()?,
+            data_pg_id: self.read_u32()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+        })
+    }
+
+    fn read_optional_checksum_bytes(
+        &mut self,
+    ) -> Result<Option<ChecksumBytes>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Some(
+                ChecksumBytes::new(self.read_bytes()?)
+                    .map_err(StorageRpcPayloadError::InvalidChecksumMetadata),
+            )
+            .transpose(),
+            _ => Err(StorageRpcPayloadError::InvalidChecksumMetadata(
+                "invalid optional checksum tag",
+            )),
+        }
+    }
+
+    fn read_object_read_snapshot_mode(
+        &mut self,
+    ) -> Result<ObjectReadSnapshotMode, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(ObjectReadSnapshotMode::MetadataOnly),
+            1 => Ok(ObjectReadSnapshotMode::StandardSegments),
+            2 => Ok(ObjectReadSnapshotMode::MultipartParts),
+            3 => Ok(ObjectReadSnapshotMode::FullPayloadLayout),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid object read snapshot mode",
+            )),
+        }
     }
 
     fn read_delete_marker_record(&mut self) -> Result<DeleteMarkerRecord, StorageRpcPayloadError> {
@@ -5141,6 +5461,108 @@ fn put_stored_object(out: &mut Vec<u8>, stored: &StoredObject) {
             put_delete_marker_record(out, record);
         }
     }
+}
+
+fn put_object_read_auth_subject(out: &mut Vec<u8>, subject: &ObjectReadAuthSubject) {
+    put_stored_object(out, &subject.stored);
+}
+
+fn put_object_read_snapshot(out: &mut Vec<u8>, snapshot: &ObjectReadSnapshot) {
+    put_stored_object(out, &snapshot.stored);
+    put_u32(
+        out,
+        u32::try_from(snapshot.object_segments.len())
+            .expect("object segment count must fit in u32"),
+    );
+    for segment in &snapshot.object_segments {
+        put_object_segment_record(out, segment);
+    }
+    put_u32(
+        out,
+        u32::try_from(snapshot.multipart_parts.len()).expect("object part count must fit in u32"),
+    );
+    for part in &snapshot.multipart_parts {
+        put_object_part_record(out, part);
+    }
+    put_u32(
+        out,
+        u32::try_from(snapshot.multipart_part_segments.len())
+            .expect("multipart part segment count must fit in u32"),
+    );
+    for segment in &snapshot.multipart_part_segments {
+        put_multipart_part_segment_record(out, segment);
+    }
+}
+
+fn put_object_segment_record(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
+    put_string(out, segment.bucket.as_str());
+    put_string(out, segment.key.as_str());
+    put_u64(out, segment.version_id.to_u64());
+    put_u32(out, segment.segment_index);
+    put_u64(out, segment.size);
+    put_optional_u64(out, segment.segment_crc64);
+    put_bytes(out, &segment.segment_okh);
+    put_u64(out, segment.segment_vid.get());
+    put_u32(out, segment.data_pg_id);
+    put_u8(out, segment.ec_k);
+    put_u8(out, segment.ec_m);
+}
+
+fn put_object_part_record(out: &mut Vec<u8>, part: &ObjectPartRecord) {
+    put_string(out, part.bucket.as_str());
+    put_string(out, part.key.as_str());
+    put_u64(out, part.version_id.to_u64());
+    put_u32(out, part.part_number);
+    put_u64(out, part.size);
+    put_bytes(out, &part.etag);
+    put_u8(out, part.etag_kind as u8);
+    put_bytes(out, &part.part_okh);
+    put_u64(out, part.part_vid.get());
+    put_u8(out, part.ec_k);
+    put_u8(out, part.ec_m);
+    put_u32(out, part.data_pg_id);
+    put_optional_bytes(
+        out,
+        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
+    );
+}
+
+fn put_multipart_part_segment_record(out: &mut Vec<u8>, segment: &MultipartPartSegmentRecord) {
+    put_string(out, segment.bucket.as_str());
+    put_string(out, segment.key.as_str());
+    put_string(out, segment.upload_id.as_str());
+    put_u64(out, segment.version_id);
+    put_u32(out, segment.part_number);
+    put_u32(out, segment.segment_index);
+    put_u64(out, segment.size);
+    put_optional_u64(out, segment.segment_crc64);
+    put_bytes(out, &segment.segment_okh);
+    put_u64(out, segment.segment_vid.get());
+    put_u32(out, segment.data_pg_id);
+    put_u8(out, segment.ec_k);
+    put_u8(out, segment.ec_m);
+}
+
+fn put_optional_version_id(out: &mut Vec<u8>, version_id: Option<VersionId>) {
+    match version_id {
+        None => put_u8(out, 0),
+        Some(version_id) => {
+            put_u8(out, 1);
+            put_u64(out, version_id.to_u64());
+        }
+    }
+}
+
+fn put_object_read_snapshot_mode(out: &mut Vec<u8>, mode: ObjectReadSnapshotMode) {
+    put_u8(
+        out,
+        match mode {
+            ObjectReadSnapshotMode::MetadataOnly => 0,
+            ObjectReadSnapshotMode::StandardSegments => 1,
+            ObjectReadSnapshotMode::MultipartParts => 2,
+            ObjectReadSnapshotMode::FullPayloadLayout => 3,
+        },
+    );
 }
 
 fn put_live_object_record(out: &mut Vec<u8>, record: &LiveObjectRecord) {
@@ -6775,6 +7197,131 @@ mod tests {
         };
         let bytes = encode_object_generation_reservation_response(&response);
         let decoded = decode_object_generation_reservation_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn object_read_auth_subject_and_snapshot_round_trip() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let owner = OwnerIdentity {
+            principal: "owner".to_string(),
+            canonical_id: CanonicalUserId::from_principal("owner"),
+        };
+        let stored = StoredObject::Live(LiveObjectRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::from_u64(7),
+            owner: owner.clone(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(9).unwrap(),
+            size: 12,
+            etag: ObjectEtag::single_part(55),
+            last_modified: 10,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::MultipartManifest {
+                parts_count: NonZeroU32::new(1).unwrap(),
+            },
+            tags: None,
+            metadata_blob: Some(SerializedMetadataBlob::new(vec![1, 2, 3])),
+            system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![4, 5, 6])),
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        });
+        let request = StorageRpcObjectReadAuthSubjectRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            version_id: Some(VersionId::from_u64(7)),
+        };
+
+        let bytes = encode_object_read_auth_subject_request(&request);
+        let decoded = decode_object_read_auth_subject_request(&bytes).unwrap();
+        assert_eq!(decoded, request);
+
+        let subject = ObjectReadAuthSubject {
+            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
+            stored: stored.clone(),
+        };
+        let response = StorageRpcObjectReadAuthSubjectResponse {
+            outcome: StorageRpcObjectReadAuthSubjectOutcome::Loaded(Box::new(subject.clone())),
+        };
+        let bytes = encode_object_read_auth_subject_response(&response);
+        let decoded = decode_object_read_auth_subject_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let response = StorageRpcObjectReadAuthSubjectResponse {
+            outcome: StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound,
+        };
+        let bytes = encode_object_read_auth_subject_response(&response);
+        let decoded = decode_object_read_auth_subject_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let snapshot_request = StorageRpcObjectReadSnapshotRequest {
+            object: request.object,
+            version_id: request.version_id,
+            expected_identity: subject.identity,
+            snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
+        };
+        let bytes = encode_object_read_snapshot_request(&snapshot_request);
+        let decoded = decode_object_read_snapshot_request(&bytes).unwrap();
+        assert_eq!(decoded, snapshot_request);
+
+        let checksum = ChecksumBytes::new([1, 2, 3, 4]).unwrap();
+        let part = ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::from_u64(7),
+            part_number: 1,
+            size: 12,
+            etag: vec![8; 16],
+            etag_kind: EtagKind::MultipartComposite,
+            part_okh: [3; 16],
+            part_vid: GenerationId::new(11).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            data_pg_id: 5,
+            checksum: Some(checksum),
+        };
+        let segment = MultipartPartSegmentRecord {
+            bucket,
+            key,
+            upload_id: UploadId::try_from("u".repeat(128)).unwrap(),
+            version_id: 7,
+            part_number: 1,
+            segment_index: 0,
+            size: 12,
+            segment_crc64: Some(99),
+            segment_okh: [4; 16],
+            segment_vid: GenerationId::new(12).unwrap(),
+            data_pg_id: 5,
+            ec_k: 4,
+            ec_m: 2,
+        };
+        let response = StorageRpcObjectReadSnapshotResponse {
+            outcome: StorageRpcObjectReadSnapshotOutcome::Loaded(Box::new(ObjectReadSnapshot {
+                stored,
+                object_segments: Vec::new(),
+                multipart_parts: vec![part],
+                multipart_part_segments: vec![segment],
+            })),
+        };
+        let bytes = encode_object_read_snapshot_response(&response);
+        let decoded = decode_object_read_snapshot_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let response = StorageRpcObjectReadSnapshotResponse {
+            outcome: StorageRpcObjectReadSnapshotOutcome::StaleSubject,
+        };
+        let bytes = encode_object_read_snapshot_response(&response);
+        let decoded = decode_object_read_snapshot_response(&bytes).unwrap();
         assert_eq!(decoded, response);
     }
 

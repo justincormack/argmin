@@ -14,7 +14,8 @@ use crate::node::SharedStorageNode;
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, BuildDirectPutCommitCommandReq,
     CreateBucketCommandBuild, DirectPutMetadataNodeClient, LocalStorageNodeClient,
-    ObjectGenerationMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    ObjectGenerationMetadataNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient,
 };
 use crate::storage_rpc::{
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
@@ -26,6 +27,7 @@ use crate::storage_rpc::{
     decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_object_generation_reservation_request,
+    decode_object_read_auth_subject_request, decode_object_read_snapshot_request,
     decode_object_request, decode_proof_release_request, decode_read_handle_acquire_request,
     decode_read_handle_release_request, decode_scavenger_list_files_request,
     decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
@@ -43,6 +45,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
     encode_object_generation_reservation_response, encode_object_generation_response,
+    encode_object_read_auth_subject_response, encode_object_read_snapshot_response,
     encode_object_version_response, encode_read_handle_acquire_response,
     encode_read_handle_release_response, encode_scavenger_list_files_response,
     encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
@@ -77,6 +80,9 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
     StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
+    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
+    StorageRpcObjectReadAuthSubjectResponse, StorageRpcObjectReadSnapshotOutcome,
+    StorageRpcObjectReadSnapshotRequest, StorageRpcObjectReadSnapshotResponse,
     StorageRpcObjectRequest, StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
     StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
@@ -482,6 +488,24 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::DirectPutCommitCommandBuild => {
                 match decode_direct_put_command_build_request(&frame.payload) {
                     Ok(request) => self.direct_put_commit_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectReadAuthSubjectLoad => {
+                match decode_object_read_auth_subject_request(&frame.payload) {
+                    Ok(request) => self.object_read_auth_subject_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectReadSnapshotLoad => {
+                match decode_object_read_snapshot_request(&frame.payload) {
+                    Ok(request) => self.object_read_snapshot_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1168,6 +1192,100 @@ impl StorageNodeConnectionHandler {
                         outcome: StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
                     },
                 );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn object_read_auth_subject_response(
+        &self,
+        request: StorageRpcObjectReadAuthSubjectRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "object read auth subject load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            request.version_id,
+        ) {
+            Ok(subject) => {
+                let payload = encode_object_read_auth_subject_response(
+                    &StorageRpcObjectReadAuthSubjectResponse {
+                        outcome: StorageRpcObjectReadAuthSubjectOutcome::Loaded(Box::new(subject)),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => {
+                let payload = encode_object_read_auth_subject_response(
+                    &StorageRpcObjectReadAuthSubjectResponse {
+                        outcome: StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound,
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn object_read_snapshot_response(
+        &self,
+        request: StorageRpcObjectReadSnapshotRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "object read snapshot load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            request.version_id,
+            &request.expected_identity,
+            request.snapshot_mode,
+        ) {
+            Ok(snapshot) => {
+                let payload =
+                    encode_object_read_snapshot_response(&StorageRpcObjectReadSnapshotResponse {
+                        outcome: StorageRpcObjectReadSnapshotOutcome::Loaded(Box::new(snapshot)),
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                let payload =
+                    encode_object_read_snapshot_response(&StorageRpcObjectReadSnapshotResponse {
+                        outcome: StorageRpcObjectReadSnapshotOutcome::StaleSubject,
+                    });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),

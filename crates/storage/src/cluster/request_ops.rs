@@ -3770,7 +3770,7 @@ impl super::StorageCluster {
         let subject = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+            .object_read_metadata_client()
             .load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
         Ok(action(&subject.stored))
     }
@@ -3796,19 +3796,19 @@ impl super::StorageCluster {
         mut action: impl FnMut(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self
+        let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client();
+            .object_read_metadata_client();
 
         for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
             let subject =
-                storage_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+                object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
             let value = match action(&subject.stored) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
-            match storage_client.load_object_read_snapshot_for_subject(
+            match object_read_client.load_object_read_snapshot_for_subject(
                 pg_id,
                 bucket,
                 key,
