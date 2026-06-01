@@ -1942,6 +1942,19 @@ impl StorageCluster {
             .map(|node| node.object_generation_metadata_client())
     }
 
+    fn direct_put_metadata_primary_client(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<&Arc<dyn crate::node_client::DirectPutMetadataNodeClient>, StoreError> {
+        self.local_map
+            .metadata_pg_primary_node(
+                self.operation_epoch(),
+                PgId::new(self.object_metadata_pg_id(bucket, key)),
+            )
+            .map(|node| node.direct_put_metadata_client())
+    }
+
     pub fn default_payload_ec_shape(&self) -> EcShape {
         self.local_map.default_ec_shape()
     }
@@ -3172,6 +3185,14 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
+        let direct_put_metadata_client =
+            match self.direct_put_metadata_primary_client(&req.bucket, &req.key) {
+                Ok(client) => client,
+                Err(error) => {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(error.into());
+                }
+            };
 
         let mut stale_commit_snapshot_retries = 0;
         let (command, new_pending_command) = loop {
@@ -3186,7 +3207,7 @@ impl StorageCluster {
                         }
                     })
                 else {
-                    let snapshot = match storage_client.load_direct_put_commit_snapshot(
+                    let snapshot = match direct_put_metadata_client.load_direct_put_commit_snapshot(
                         pg_id,
                         &req.bucket,
                         &req.key,

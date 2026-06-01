@@ -5556,10 +5556,12 @@ when DeleteBucket has installed a drain. Bucket snapshot loads now route
 through the same dedicated bucket metadata client/RPC surface, including
 reserved bucket-write snapshot loads and same-node pair snapshot loads for
 distinct buckets; frontend maps can load requested bucket subresources from the
-storage-node-owned bucket PG without reading the frontend-local PG. Remaining
-non-command surfaces still need object snapshots and operation-shaped direct PUT
-command builders. Direct PUT still needs the object snapshot/command-builder
-surface before its metadata path is remote end to end and before
+storage-node-owned bucket PG without reading the frontend-local PG. Direct PUT
+commit snapshot loads now route through a dedicated direct PUT metadata
+client/RPC surface, so the precondition/auth snapshot is read from the
+storage-node-owned object PG. Remaining non-command surfaces still need the
+direct PUT command-builder operation, other object snapshot reads, and the
+operation-shaped builders for the rest of the metadata mutation paths before
 frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
@@ -5614,11 +5616,12 @@ Implementation slices:
 5. add separate RPC surfaces for non-command metadata reads and coordination
    operations required before command construction. Bucket raw/info reads,
    bucket snapshot reads, object generation/version allocation, bucket-write
-   reservations, and proof release now have dedicated node-client/RPC surfaces.
-   Remaining work includes object snapshot reads, order allocation, durable
-   pending/drain/coordination checks, lifecycle/object-read snapshot helpers
-   used by command builders, and operation-shaped command-builder calls that
-   must execute against a storage-node-owned snapshot rather than a
+   reservations, proof release, and direct PUT commit snapshot loads now have
+   dedicated node-client/RPC surfaces. Remaining work includes the direct PUT
+   command-builder operation, other object snapshot reads, order allocation,
+   durable pending/drain/coordination checks, lifecycle/object-read snapshot
+   helpers used by command builders, and operation-shaped command-builder calls
+   that must execute against a storage-node-owned snapshot rather than a
    frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
