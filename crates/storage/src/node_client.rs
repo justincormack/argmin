@@ -25,11 +25,11 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
-    decode_bucket_info_outcome_response, decode_create_bucket_command_build_response,
-    decode_metadata_command_acceptance_response, decode_metadata_command_applied_hashes_response,
-    decode_metadata_command_bool_outcome_response, decode_metadata_command_bool_response,
-    decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
-    decode_metadata_command_pending_envelope_response,
+    decode_bucket_info_outcome_response, decode_bucket_write_reservation_record_response,
+    decode_create_bucket_command_build_response, decode_metadata_command_acceptance_response,
+    decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
+    decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
+    decode_metadata_command_next_id_response, decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -38,8 +38,10 @@ use crate::storage_rpc::{
     decode_read_handle_release_response, decode_scavenger_list_files_response,
     decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
     decode_storage_rpc_response_payload, encode_bucket_request,
-    encode_create_bucket_command_build_request, encode_metadata_command_matching_applied_request,
-    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
+    encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
+    encode_bucket_write_reservation_record_request, encode_create_bucket_command_build_request,
+    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+    encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_object_generation_reservation_request,
     encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
@@ -47,6 +49,8 @@ use crate::storage_rpc::{
     encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
     encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
     write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
+    StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
+    StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
@@ -612,8 +616,35 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
+}
 
-    #[allow(dead_code)]
+pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+
+    fn validate_bucket_write_reservation_proof(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn release_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
     fn release_metadata_command_bucket_write_reservation(
         &self,
         pg_id: PgId,
@@ -3232,6 +3263,50 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
             self, pg_id, bucket, command_id, config,
         )
     }
+}
+
+impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::acquire_durable_bucket_write_reservation(
+            self,
+            pg_id,
+            bucket,
+            reservation_id,
+            owner_token,
+            cluster_epoch,
+            operation_kind,
+            created_at,
+            lease_deadline,
+            target_context,
+        )
+    }
+
+    fn validate_bucket_write_reservation_proof(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(self, pg_id, proof)
+    }
+
+    fn release_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::release_durable_bucket_write_reservation(self, pg_id, record)
+    }
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
@@ -3347,6 +3422,136 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             bucket,
             command_id,
             config,
+        )
+    }
+}
+
+impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteReservationAcquireRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            reservation_id: reservation_id.to_string(),
+            owner_token: owner_token.to_string(),
+            operation_kind: operation_kind.to_string(),
+            created_at,
+            lease_deadline,
+            target_context: target_context.map(str::to_string),
+        };
+        let payload =
+            encode_bucket_write_reservation_acquire_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write reservation acquire request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketWriteReservationAcquire,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_write_reservation_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket write reservation acquire response",
+                    error.to_string(),
+                ))
+            })?;
+        let record = match response.outcome {
+            StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) => record,
+            StorageRpcBucketWriteReservationAcquireOutcome::Draining => {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketWriteDraining,
+                ));
+            }
+        };
+        if record.bucket != *bucket
+            || record.reservation_id != reservation_id
+            || record.owner_token != owner_token
+            || record.cluster_epoch != cluster_epoch
+            || record.operation_kind != operation_kind
+            || record.created_at != created_at
+            || record.lease_deadline != lease_deadline
+            || record.target_context.as_deref() != target_context
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket write reservation acquire response",
+                "reservation response identity does not match request".to_string(),
+            )));
+        }
+        Ok(record)
+    }
+
+    fn validate_bucket_write_reservation_proof(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteReservationProofRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            proof: proof.clone(),
+        };
+        let payload = encode_bucket_write_reservation_proof_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode bucket write reservation proof request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketWriteReservationValidate,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket write reservation validate response",
+            &response,
+        )
+    }
+
+    fn release_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: record.clone(),
+        };
+        let payload =
+            encode_bucket_write_reservation_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write reservation release request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketWriteReservationRelease,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket write reservation release response",
+            &response,
         )
     }
 
@@ -3469,6 +3674,21 @@ impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
 }
 
 impl UnixStorageNodeClient {
+    fn validate_empty_bucket_write_reservation_response(
+        &self,
+        context: &'static str,
+        response: &[u8],
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                context,
+                "bucket write reservation response payload must be empty".to_string(),
+            )))
+        }
+    }
+
     fn validate_proof_release_response(
         &self,
         response: &[u8],
@@ -6254,6 +6474,157 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bucket-write-reservation-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..3)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let record = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
+            &client,
+            PgId::new(0),
+            &bucket,
+            "reservation-remote-1",
+            "owner-token-remote-1",
+            ClusterEpoch::new(1).unwrap(),
+            "put-object",
+            10,
+            Some(20),
+            Some("key=a"),
+        )
+        .unwrap();
+        assert_eq!(record.bucket, bucket);
+        assert_eq!(record.reservation_id, "reservation-remote-1");
+
+        BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
+            &client,
+            PgId::new(0),
+            &BucketWriteReservationProof::from(&record),
+        )
+        .unwrap();
+        BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+            &client,
+            PgId::new(0),
+            &record,
+        )
+        .unwrap();
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        assert!(PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            "reservation-remote-1",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn unix_bucket_write_reservation_client_preserves_draining_signal() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bucket-write-reservation-draining-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::begin_durable_bucket_write_drain(
+                &*pg,
+                &bucket,
+                "drain-remote-1",
+                "drain-owner-remote-1",
+                ClusterEpoch::new(1).unwrap(),
+                10,
+                Some(20),
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
+            &client,
+            PgId::new(0),
+            &bucket,
+            "reservation-remote-1",
+            "owner-token-remote-1",
+            ClusterEpoch::new(1).unwrap(),
+            "put-object",
+            30,
+            Some(40),
+            Some("key=a"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)
+        ));
+        server_thread.join().unwrap();
     }
 
     #[test]

@@ -6,11 +6,11 @@ use crate::{
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
-        BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketState, ChecksumBytes,
-        ClusterEpoch, CreateBucketConfig, DataPgId, EffectiveBucketEncryptionConfig, GenerationId,
-        ManagedEncryptionAlgorithm, ObjectKey, ObjectPayloadReclaimKind, PgId,
-        PublicAccessBlockConfig, SessionId, ShardIndex, ShardKey, VersionId, WriteAck,
-        SESSION_ID_LEN, SHARD_KEY_LEN,
+        BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketState,
+        BucketWriteReservationRecord, ChecksumBytes, ClusterEpoch, CreateBucketConfig, DataPgId,
+        EffectiveBucketEncryptionConfig, GenerationId, ManagedEncryptionAlgorithm, ObjectKey,
+        ObjectPayloadReclaimKind, PgId, PublicAccessBlockConfig, SessionId, ShardIndex, ShardKey,
+        VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN,
     },
     BucketName, NodeId,
 };
@@ -55,6 +55,27 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
 const STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_NAME_LEN: usize = 63;
+const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN: usize = 256;
+const STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN: usize = 1024;
+const STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN: usize = 128;
+const STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN: usize = 1024;
+const STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN: usize = 4
+    + STORAGE_RPC_MAX_BUCKET_NAME_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+    + 8
+    + 8
+    + 8
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN
+    + 8
+    + 1
+    + 8
+    + 1
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
 const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN: usize = 64 * 1024;
 const STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN: usize =
@@ -66,6 +87,24 @@ const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
 const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN
+        + 8
+        + 1
+        + 8
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
+const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
+const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 8
@@ -119,6 +158,9 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectGenerationNext = 35,
     ObjectGenerationReservation = 36,
     ObjectVersionNext = 37,
+    BucketWriteReservationAcquire = 38,
+    BucketWriteReservationValidate = 39,
+    BucketWriteReservationRelease = 40,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +244,9 @@ impl StorageRpcMessageKind {
             Self::ObjectGenerationNext => "object generation next",
             Self::ObjectGenerationReservation => "object generation reservation",
             Self::ObjectVersionNext => "object version next",
+            Self::BucketWriteReservationAcquire => "bucket write reservation acquire",
+            Self::BucketWriteReservationValidate => "bucket write reservation validate",
+            Self::BucketWriteReservationRelease => "bucket write reservation release",
         }
     }
 
@@ -244,6 +289,9 @@ impl StorageRpcMessageKind {
             35 => Ok(Self::ObjectGenerationNext),
             36 => Ok(Self::ObjectGenerationReservation),
             37 => Ok(Self::ObjectVersionNext),
+            38 => Ok(Self::BucketWriteReservationAcquire),
+            39 => Ok(Self::BucketWriteReservationValidate),
+            40 => Ok(Self::BucketWriteReservationRelease),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -756,6 +804,47 @@ pub(crate) struct StorageRpcProofReleaseRequest {
     pub(crate) proof: BucketWriteReservationProof,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteReservationAcquireRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) bucket: BucketName,
+    pub(crate) reservation_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) operation_kind: String,
+    pub(crate) created_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) target_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteReservationProofRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) proof: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteReservationRecordRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) record: BucketWriteReservationRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcBucketWriteReservationAcquireOutcome {
+    Acquired(BucketWriteReservationRecord),
+    Draining,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteReservationRecordResponse {
+    pub(crate) outcome: StorageRpcBucketWriteReservationAcquireOutcome,
+}
+
 pub(crate) fn encode_storage_rpc_frame(
     request_id: u64,
     kind: StorageRpcMessageKind,
@@ -983,6 +1072,15 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectVersionNext => {
             STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteReservationAcquire => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteReservationValidate => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteReservationRelease => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -2817,6 +2915,187 @@ pub(crate) fn decode_proof_release_request(
     })
 }
 
+pub(crate) fn encode_bucket_write_reservation_acquire_request(
+    request: &StorageRpcBucketWriteReservationAcquireRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_reservation_identity(
+        &request.reservation_id,
+        &request.owner_token,
+        &request.operation_kind,
+        request.target_context.as_deref(),
+    )?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_string(&mut out, request.bucket.as_str());
+    put_string(&mut out, &request.reservation_id);
+    put_string(&mut out, &request.owner_token);
+    put_string(&mut out, &request.operation_kind);
+    put_u64(&mut out, request.created_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    put_optional_string(&mut out, request.target_context.as_deref());
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_reservation_acquire_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteReservationAcquireRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name().map_err(|_| {
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof("invalid bucket name")
+    })?;
+    let reservation_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "reservation id exceeds maximum length",
+        ),
+    )?;
+    let owner_token = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token exceeds maximum length",
+        ),
+    )?;
+    let operation_kind = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "operation kind exceeds maximum length",
+        ),
+    )?;
+    let created_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    let target_context = decoder.read_optional_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "target context exceeds maximum length",
+        ),
+    )?;
+    decoder.finish()?;
+    validate_bucket_write_reservation_identity(
+        &reservation_id,
+        &owner_token,
+        &operation_kind,
+        target_context.as_deref(),
+    )?;
+    Ok(StorageRpcBucketWriteReservationAcquireRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        bucket,
+        reservation_id,
+        owner_token,
+        operation_kind,
+        created_at,
+        lease_deadline,
+        target_context,
+    })
+}
+
+pub(crate) fn encode_bucket_write_reservation_proof_request(
+    request: &StorageRpcBucketWriteReservationProofRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    encode_proof_release_request(&StorageRpcProofReleaseRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        proof: request.proof.clone(),
+    })
+}
+
+pub(crate) fn decode_bucket_write_reservation_proof_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteReservationProofRequest, StorageRpcPayloadError> {
+    let request = decode_proof_release_request(bytes)?;
+    Ok(StorageRpcBucketWriteReservationProofRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        proof: request.proof,
+    })
+}
+
+pub(crate) fn encode_bucket_write_reservation_record_request(
+    request: &StorageRpcBucketWriteReservationRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match reservation epoch",
+        ));
+    }
+    validate_bucket_write_reservation_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_write_reservation_record(&mut out, &request.record);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_reservation_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteReservationRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let record = decoder.read_bucket_write_reservation_record()?;
+    decoder.finish()?;
+    if cluster_epoch != record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match reservation epoch",
+        ));
+    }
+    validate_bucket_write_reservation_record(&record)?;
+    Ok(StorageRpcBucketWriteReservationRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        record,
+    })
+}
+
+pub(crate) fn encode_bucket_write_reservation_record_response(
+    response: &StorageRpcBucketWriteReservationRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) => {
+            validate_bucket_write_reservation_record(record)?;
+            put_u8(&mut out, 0);
+            put_bucket_write_reservation_record(&mut out, record);
+        }
+        StorageRpcBucketWriteReservationAcquireOutcome::Draining => {
+            put_u8(&mut out, 1);
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_reservation_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteReservationRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => {
+            let record = decoder.read_bucket_write_reservation_record()?;
+            validate_bucket_write_reservation_record(&record)?;
+            StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record)
+        }
+        1 => StorageRpcBucketWriteReservationAcquireOutcome::Draining,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown bucket write reservation acquire outcome tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketWriteReservationRecordResponse { outcome })
+}
+
 pub(crate) fn encode_optional_checksum_metadata(checksum: Option<&ChecksumBytes>) -> Vec<u8> {
     let mut out = Vec::new();
     match checksum {
@@ -3013,19 +3292,66 @@ fn validate_claim_token(token: &StorageRpcDurableClaimToken) -> Result<(), Stora
 fn validate_bucket_write_reservation_proof(
     proof: &BucketWriteReservationProof,
 ) -> Result<(), StorageRpcPayloadError> {
-    if proof.reservation_id.is_empty() {
+    validate_bucket_write_reservation_identity(
+        &proof.reservation_id,
+        &proof.owner_token,
+        &proof.operation_kind,
+        proof.target_context.as_deref(),
+    )
+}
+
+fn validate_bucket_write_reservation_record(
+    record: &BucketWriteReservationRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_bucket_write_reservation_identity(
+        &record.reservation_id,
+        &record.owner_token,
+        &record.operation_kind,
+        record.target_context.as_deref(),
+    )
+}
+
+fn validate_bucket_write_reservation_identity(
+    reservation_id: &str,
+    owner_token: &str,
+    operation_kind: &str,
+    target_context: Option<&str>,
+) -> Result<(), StorageRpcPayloadError> {
+    if reservation_id.is_empty() {
         return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
             "reservation id must not be empty",
         ));
     }
-    if proof.owner_token.is_empty() {
+    if reservation_id.len() > STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "reservation id exceeds maximum length",
+        ));
+    }
+    if owner_token.is_empty() {
         return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
             "owner token must not be empty",
         ));
     }
-    if proof.operation_kind.is_empty() {
+    if owner_token.len() > STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token exceeds maximum length",
+        ));
+    }
+    if operation_kind.is_empty() {
         return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
             "operation kind must not be empty",
+        ));
+    }
+    if operation_kind.len() > STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "operation kind exceeds maximum length",
+        ));
+    }
+    if target_context
+        .is_some_and(|context| context.len() > STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN)
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "target context exceeds maximum length",
         ));
     }
     Ok(())
@@ -3230,15 +3556,35 @@ impl<'a> StorageRpcDecoder<'a> {
         let bucket = self.read_bucket_name().map_err(|_| {
             StorageRpcPayloadError::InvalidBucketWriteReservationProof("invalid bucket name")
         })?;
-        let reservation_id = self.read_string()?;
-        let owner_token = self.read_string()?;
+        let reservation_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "reservation id exceeds maximum length",
+            ),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "owner token exceeds maximum length",
+            ),
+        )?;
         let cluster_epoch = self.read_cluster_epoch()?;
         let bucket_execution_generation = self.read_u64()?;
         let bucket_incarnation_generation = self.read_u64()?;
-        let operation_kind = self.read_string()?;
+        let operation_kind = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "operation kind exceeds maximum length",
+            ),
+        )?;
         let created_at = self.read_u64()?;
         let lease_deadline = self.read_optional_u64()?;
-        let target_context = self.read_optional_string()?;
+        let target_context = self.read_optional_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "target context exceeds maximum length",
+            ),
+        )?;
         Ok(BucketWriteReservationProof {
             bucket,
             reservation_id,
@@ -3250,6 +3596,24 @@ impl<'a> StorageRpcDecoder<'a> {
             created_at,
             lease_deadline,
             target_context,
+        })
+    }
+
+    fn read_bucket_write_reservation_record(
+        &mut self,
+    ) -> Result<BucketWriteReservationRecord, StorageRpcPayloadError> {
+        let proof = self.read_bucket_write_reservation_proof()?;
+        Ok(BucketWriteReservationRecord {
+            bucket: proof.bucket,
+            reservation_id: proof.reservation_id,
+            owner_token: proof.owner_token,
+            cluster_epoch: proof.cluster_epoch,
+            bucket_execution_generation: proof.bucket_execution_generation,
+            bucket_incarnation_generation: proof.bucket_incarnation_generation,
+            operation_kind: proof.operation_kind,
+            created_at: proof.created_at,
+            lease_deadline: proof.lease_deadline,
+            target_context: proof.target_context,
         })
     }
 
@@ -3273,6 +3637,20 @@ impl<'a> StorageRpcDecoder<'a> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => Ok(Some(self.read_string()?)),
+            _ => Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional string tag",
+            )),
+        }
+    }
+
+    fn read_optional_string_with_limit(
+        &mut self,
+        limit: usize,
+        too_large_error: StorageRpcPayloadError,
+    ) -> Result<Option<String>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_string_with_limit(limit, too_large_error)?)),
             _ => Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
                 "invalid optional string tag",
             )),
@@ -3552,6 +3930,19 @@ fn put_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteRese
     put_u64(out, proof.created_at);
     put_optional_u64(out, proof.lease_deadline);
     put_optional_string(out, proof.target_context.as_deref());
+}
+
+fn put_bucket_write_reservation_record(out: &mut Vec<u8>, record: &BucketWriteReservationRecord) {
+    put_string(out, record.bucket.as_str());
+    put_string(out, &record.reservation_id);
+    put_string(out, &record.owner_token);
+    put_u64(out, record.cluster_epoch.get());
+    put_u64(out, record.bucket_execution_generation);
+    put_u64(out, record.bucket_incarnation_generation);
+    put_string(out, &record.operation_kind);
+    put_u64(out, record.created_at);
+    put_optional_u64(out, record.lease_deadline);
+    put_optional_string(out, record.target_context.as_deref());
 }
 
 fn put_create_bucket_config(out: &mut Vec<u8>, config: &StorageRpcCreateBucketConfig) {
@@ -4671,6 +5062,21 @@ mod tests {
                 STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN,
             ),
+            (
+                StorageRpcMessageKind::BucketWriteReservationAcquire,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketWriteReservationValidate,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketWriteReservationRelease,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN,
+            ),
         ] {
             let mut bytes = Vec::new();
             put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
@@ -4822,6 +5228,71 @@ mod tests {
         let decoded = decode_proof_release_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn bucket_write_reservation_requests_round_trip() {
+        let acquire = StorageRpcBucketWriteReservationAcquireRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            bucket: BucketName::try_from("bucket").unwrap(),
+            reservation_id: "reservation-1".to_string(),
+            owner_token: "owner-token-1".to_string(),
+            operation_kind: "put-object".to_string(),
+            created_at: 10,
+            lease_deadline: Some(20),
+            target_context: Some("key=a".to_string()),
+        };
+        let bytes = encode_bucket_write_reservation_acquire_request(&acquire).unwrap();
+        let decoded = decode_bucket_write_reservation_acquire_request(&bytes).unwrap();
+        assert_eq!(decoded, acquire);
+
+        let record = BucketWriteReservationRecord {
+            bucket: acquire.bucket.clone(),
+            reservation_id: acquire.reservation_id.clone(),
+            owner_token: acquire.owner_token.clone(),
+            cluster_epoch: acquire.cluster_epoch,
+            bucket_execution_generation: 2,
+            bucket_incarnation_generation: 3,
+            operation_kind: acquire.operation_kind.clone(),
+            created_at: acquire.created_at,
+            lease_deadline: acquire.lease_deadline,
+            target_context: acquire.target_context.clone(),
+        };
+        let response = StorageRpcBucketWriteReservationRecordResponse {
+            outcome: StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record.clone()),
+        };
+        let bytes = encode_bucket_write_reservation_record_response(&response).unwrap();
+        let decoded = decode_bucket_write_reservation_record_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let response = StorageRpcBucketWriteReservationRecordResponse {
+            outcome: StorageRpcBucketWriteReservationAcquireOutcome::Draining,
+        };
+        let bytes = encode_bucket_write_reservation_record_response(&response).unwrap();
+        let decoded = decode_bucket_write_reservation_record_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let release = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            record: record.clone(),
+        };
+        let bytes = encode_bucket_write_reservation_record_request(&release).unwrap();
+        let decoded = decode_bucket_write_reservation_record_request(&bytes).unwrap();
+        assert_eq!(decoded, release);
+
+        let proof = StorageRpcBucketWriteReservationProofRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            proof: BucketWriteReservationProof::from(&record),
+        };
+        let bytes = encode_bucket_write_reservation_proof_request(&proof).unwrap();
+        let decoded = decode_bucket_write_reservation_proof_request(&bytes).unwrap();
+        assert_eq!(decoded, proof);
     }
 
     #[test]

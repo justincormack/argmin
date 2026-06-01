@@ -12,24 +12,25 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
-    CreateBucketCommandBuild, LocalStorageNodeClient, ObjectGenerationMetadataNodeClient,
-    ObjectVersionMetadataNodeClient, StorageNodeClient,
+    BucketWriteReservationNodeClient, CreateBucketCommandBuild, LocalStorageNodeClient,
+    ObjectGenerationMetadataNodeClient, ObjectVersionMetadataNodeClient, StorageNodeClient,
 };
 use crate::storage_rpc::{
-    decode_bucket_request, decode_create_bucket_command_build_request,
-    decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
-    decode_metadata_command_pending_slot_replace_request,
+    decode_bucket_request, decode_bucket_write_reservation_acquire_request,
+    decode_bucket_write_reservation_proof_request, decode_bucket_write_reservation_record_request,
+    decode_create_bucket_command_build_request, decode_metadata_command_matching_applied_request,
+    decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_object_generation_reservation_request,
     decode_object_request, decode_proof_release_request, decode_read_handle_acquire_request,
     decode_read_handle_release_request, decode_scavenger_list_files_request,
     decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
     decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
-    encode_create_bucket_command_build_response, encode_health_response,
-    encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
-    encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
-    encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
-    encode_metadata_command_pending_envelope_response,
+    encode_bucket_write_reservation_record_response, encode_create_bucket_command_build_response,
+    encode_health_response, encode_metadata_command_acceptance_response,
+    encode_metadata_command_applied_hashes_response, encode_metadata_command_bool_outcome_response,
+    encode_metadata_command_bool_response, encode_metadata_command_max_log_index_response,
+    encode_metadata_command_next_id_response, encode_metadata_command_pending_envelope_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
@@ -40,16 +41,18 @@ use crate::storage_rpc::{
     encode_storage_rpc_error_response, encode_storage_rpc_success_response,
     read_storage_rpc_request_frame_from, write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketRequest,
-    StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
-    StorageRpcCreateBucketCommandBuildResponse, StorageRpcErrorCode, StorageRpcErrorResponse,
-    StorageRpcFrame, StorageRpcHealthResponse, StorageRpcMessageKind,
-    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAcceptanceResponse,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
-    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
-    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
-    StorageRpcMetadataCommandPendingEnvelopeResponse,
+    StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
+    StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
+    StorageRpcBucketWriteReservationRecordResponse, StorageRpcCreateBucketCommandBuildOutcome,
+    StorageRpcCreateBucketCommandBuildRequest, StorageRpcCreateBucketCommandBuildResponse,
+    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
+    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
+    StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesOutcome,
+    StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcMetadataCommandBoolOutcome,
+    StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandBoolResponse,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandMaxLogIndexResponse,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -407,6 +410,33 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::BucketWriteReservationAcquire => {
+                match decode_bucket_write_reservation_acquire_request(&frame.payload) {
+                    Ok(request) => self.bucket_write_reservation_acquire_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketWriteReservationValidate => {
+                match decode_bucket_write_reservation_proof_request(&frame.payload) {
+                    Ok(request) => self.bucket_write_reservation_validate_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketWriteReservationRelease => {
+                match decode_bucket_write_reservation_record_request(&frame.payload) {
+                    Ok(request) => self.bucket_write_reservation_release_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ObjectGenerationNext => {
                 match decode_object_request(&frame.payload) {
                     Ok(request) => self.object_generation_next_response(request),
@@ -756,9 +786,11 @@ impl StorageNodeConnectionHandler {
             });
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client
-            .release_metadata_command_bucket_write_reservation(request.pg_id, &request.proof)
-        {
+        match BucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
+            &local_client,
+            request.pg_id,
+            &request.proof,
+        ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
         }
@@ -796,6 +828,109 @@ impl StorageNodeConnectionHandler {
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn bucket_write_reservation_acquire_response(
+        &self,
+        request: StorageRpcBucketWriteReservationAcquireRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.bucket,
+            "bucket write reservation acquire",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
+            &request.reservation_id,
+            &request.owner_token,
+            request.cluster_epoch,
+            &request.operation_kind,
+            request.created_at,
+            request.lease_deadline,
+            request.target_context.as_deref(),
+        ) {
+            Ok(record) => {
+                let payload = encode_bucket_write_reservation_record_response(
+                    &StorageRpcBucketWriteReservationRecordResponse {
+                        outcome: StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record),
+                    },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                let payload = encode_bucket_write_reservation_record_response(
+                    &StorageRpcBucketWriteReservationRecordResponse {
+                        outcome: StorageRpcBucketWriteReservationAcquireOutcome::Draining,
+                    },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_write_reservation_validate_response(
+        &self,
+        request: StorageRpcBucketWriteReservationProofRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.proof.bucket,
+            "bucket write reservation validate",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
+            &local_client,
+            request.pg_id,
+            &request.proof,
+        ) {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_write_reservation_release_response(
+        &self,
+        request: StorageRpcBucketWriteReservationRecordRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.record.bucket,
+            "bucket write reservation release",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+            &local_client,
+            request.pg_id,
+            &request.record,
+        ) {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
         }
     }
 
@@ -1997,6 +2132,43 @@ impl StorageNodeConnectionHandler {
                     pg_id.get(),
                     bucket.as_str(),
                     key.as_str(),
+                    expected_pg_id.get()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_primary_pg_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        let route = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id.get())
+            .expect("validated bucket metadata PG route must exist");
+        if route.primary_node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not primary for {operation} on PG {}",
+                    self.config.node_id.as_u32(),
+                    pg_id.get()
+                ),
+            });
+        }
+        let expected_pg_id = PgId::new(self.node.pg_topology().bucket_pg_for(bucket));
+        if pg_id != expected_pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} PG {} does not match bucket {} PG {}",
+                    pg_id.get(),
+                    bucket.as_str(),
                     expected_pg_id.get()
                 ),
             });

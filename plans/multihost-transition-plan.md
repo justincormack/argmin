@@ -5546,14 +5546,17 @@ instead of surfacing an internal uniqueness failure. Object version allocation
 now routes through a dedicated object-version metadata client, so
 `ReserveObjectVersion` command construction no longer reads the broad storage
 client surface and frontend maps can reserve version ids on the storage-node
-object PG. Remaining non-command
-surfaces still need object snapshots and broader
-bucket-write reservation acquire/snapshot/release coordination. Proof-release
-cleanup for command-owned bucket write reservations has an RPC/client surface,
-but production cleanup should move only with the matching remote acquire/snapshot
-path so one reservation identity never spans local and remote stores. Direct PUT
-still needs the object snapshot/command-builder surface before its metadata path
-is remote end to end and before frontend/combined roles can be enabled.
+object PG. Durable bucket-write reservation acquire, proof validation, exact
+record release, and command-owned proof release now route through a dedicated
+bucket-write reservation client/RPC surface; frontend maps can acquire and
+release reservation rows on the storage-node-owned bucket PG without writing the
+frontend-local PG. Remote reservation acquire preserves the typed
+`BucketWriteDraining` outcome, so callers keep the existing wait/retry behavior
+when DeleteBucket has installed a drain. Remaining non-command surfaces still
+need bucket snapshot loads to run through a remote bucket metadata snapshot API,
+plus object snapshots and operation-shaped direct PUT command builders. Direct
+PUT still needs the object snapshot/command-builder surface before its metadata
+path is remote end to end and before frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the

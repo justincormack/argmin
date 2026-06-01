@@ -10,7 +10,8 @@ use ring::rand::SecureRandom;
 use local::LocalClusterRuntimeState;
 pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixMetadataCommandNodeClientConfig, LocalUnixObjectGenerationMetadataNodeClientConfig,
+    LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
+    LocalUnixObjectGenerationMetadataNodeClientConfig,
     LocalUnixObjectVersionMetadataNodeClientConfig, LocalUnixShardNodeClientConfig,
 };
 
@@ -1804,7 +1805,7 @@ impl StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .validate_bucket_write_reservation_proof(PgId::new(pg_id), proof)
     }
 
@@ -1826,7 +1827,7 @@ impl StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
         self.notify_bucket_coordination_change_on_bucket_metadata_primary(&proof.bucket)?;
         Ok(())

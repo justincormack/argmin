@@ -1621,7 +1621,7 @@ impl super::StorageCluster {
         let reservation_id = self.next_bucket_write_reservation_id()?;
         let owner_token = self.bucket_write_owner_token();
         let record = node
-            .storage_client()
+            .bucket_write_reservation_client()
             .acquire_durable_bucket_write_reservation(
                 PgId::new(pg_id),
                 bucket,
@@ -1647,7 +1647,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(reservation.pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .release_durable_bucket_write_reservation(
                 PgId::new(reservation.pg_id),
                 &reservation.record,

@@ -445,6 +445,17 @@ pub enum ClusterBuildError {
     #[error("remote bucket metadata client socket path {path:?} must be absolute")]
     RemoteBucketMetadataClientSocketPathNotAbsolute { path: PathBuf },
 
+    #[error("duplicate remote bucket write reservation client node id {id}")]
+    DuplicateRemoteBucketWriteReservationClientNodeId { id: u32 },
+
+    #[error(
+        "remote bucket write reservation client node {id} is not present in the local cluster map"
+    )]
+    RemoteBucketWriteReservationClientNodeNotFound { id: u32 },
+
+    #[error("remote bucket write reservation client socket path {path:?} must be absolute")]
+    RemoteBucketWriteReservationClientSocketPathNotAbsolute { path: PathBuf },
+
     #[error("duplicate remote object-generation metadata client node id {id}")]
     DuplicateRemoteObjectGenerationMetadataClientNodeId { id: u32 },
 

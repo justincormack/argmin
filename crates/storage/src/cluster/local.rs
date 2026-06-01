@@ -14,10 +14,10 @@ use crate::metadata_command::{
 };
 use crate::node::BucketLockGuard;
 use crate::node_client::{
-    BucketMetadataNodeClient, LocalStorageNodeClient, MetadataCommandNodeClient,
-    ObjectGenerationMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
-    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
-    UnixStorageNodeClient,
+    BucketMetadataNodeClient, BucketWriteReservationNodeClient, LocalStorageNodeClient,
+    MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
+    StorageNodeClient, UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -87,6 +87,12 @@ pub struct LocalUnixBucketMetadataNodeClientConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct LocalUnixBucketWriteReservationNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalUnixObjectGenerationMetadataNodeClientConfig {
     node_id: NodeId,
     socket_path: PathBuf,
@@ -116,6 +122,23 @@ impl LocalUnixMetadataCommandNodeClientConfig {
 }
 
 impl LocalUnixBucketMetadataNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+impl LocalUnixBucketWriteReservationNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             node_id,
@@ -172,6 +195,7 @@ pub struct LocalNodeStore {
     storage_node: Arc<SharedStorageNode>,
     storage_client: Arc<dyn StorageNodeClient>,
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
+    bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient>,
     object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient>,
     object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient>,
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
@@ -189,6 +213,8 @@ impl LocalNodeStore {
         ));
         let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
         let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = local_client.clone();
+        let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
+            local_client.clone();
         let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
             local_client.clone();
         let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> =
@@ -204,6 +230,7 @@ impl LocalNodeStore {
             storage_node,
             storage_client,
             bucket_metadata_client,
+            bucket_write_reservation_client,
             object_generation_metadata_client,
             object_version_metadata_client,
             metadata_command_client,
@@ -232,6 +259,12 @@ impl LocalNodeStore {
 
     pub(crate) fn bucket_metadata_client(&self) -> &Arc<dyn BucketMetadataNodeClient> {
         &self.bucket_metadata_client
+    }
+
+    pub(crate) fn bucket_write_reservation_client(
+        &self,
+    ) -> &Arc<dyn BucketWriteReservationNodeClient> {
+        &self.bucket_write_reservation_client
     }
 
     pub(crate) fn object_generation_metadata_client(
@@ -933,6 +966,52 @@ impl LocalClusterMap {
             ));
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client;
             node.bucket_metadata_client = bucket_metadata_client;
+        }
+        Ok(())
+    }
+
+    pub fn install_unix_bucket_write_reservation_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixBucketWriteReservationNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixBucketWriteReservationNodeClientConfig> =
+            configs.into_iter().collect();
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in &configs {
+            if !seen.insert(config.node_id) {
+                return Err(
+                    ClusterBuildError::DuplicateRemoteBucketWriteReservationClientNodeId {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(
+                    ClusterBuildError::RemoteBucketWriteReservationClientSocketPathNotAbsolute {
+                        path: config.socket_path.clone(),
+                    },
+                );
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(
+                    ClusterBuildError::RemoteBucketWriteReservationClientNodeNotFound {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+        }
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote bucket write reservation client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> = client;
+            node.bucket_write_reservation_client = bucket_write_reservation_client;
         }
         Ok(())
     }
@@ -2128,7 +2207,7 @@ fn release_open_metadata_command_bucket_write_reservation(
     let node = nodes
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
-    node.storage_client()
+    node.bucket_write_reservation_client()
         .release_metadata_command_bucket_write_reservation(bucket_pg_id, proof)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
@@ -2227,7 +2306,7 @@ fn validate_open_metadata_command_bucket_write_reservation(
     let node = nodes
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
-    node.storage_client()
+    node.bucket_write_reservation_client()
         .validate_bucket_write_reservation_proof(bucket_pg_id, proof)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
@@ -6819,6 +6898,114 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp
+            .path()
+            .join("remote-bucket-write-reservation-node-1-owned");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("bucket-write-reservation-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let bucket = crate::tests::bucket_name("remote-bucket-write-reservation");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let remote = SharedStorageNode::open_with_default_ec_shape(
+                &server_config.data_dir,
+                &server_config.pg_ids,
+                server_config.default_ec_shape,
+            )
+            .unwrap();
+            let remote_pg = remote.get_pg(0).unwrap();
+            crate::PgMetadataStore::create_bucket(
+                &*remote_pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let frontend_data_dir = tmp
+            .path()
+            .join("frontend-only-bucket-write-reservation-routing");
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                frontend_data_dir.join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        map.install_unix_bucket_write_reservation_clients([
+            LocalUnixBucketWriteReservationNodeClientConfig::new(node_id, socket_path),
+        ])
+        .unwrap();
+        let map = Arc::new(map);
+        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let reservation = cluster
+            .acquire_durable_bucket_write_reservation(&bucket, "bucket-write-snapshot", None)
+            .unwrap();
+        assert_eq!(reservation.record.bucket, bucket);
+        assert_eq!(reservation.record.cluster_epoch, ClusterEpoch::INITIAL);
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*frontend_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*remote_pg, &bucket)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        cluster
+            .release_durable_bucket_write_reservation(reservation)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*remote_pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn frontend_unix_object_generation_loser_retries_stale_generation() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);
@@ -7131,6 +7318,37 @@ mod tests {
             err,
             ClusterBuildError::RemoteBucketMetadataClientSocketPathNotAbsolute { path }
                 if path == Path::new("relative-bucket-metadata-node-1.sock")
+        ));
+    }
+
+    #[test]
+    fn unix_bucket_write_reservation_client_install_rejects_relative_socket_path() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+
+        let err = map
+            .install_unix_bucket_write_reservation_clients([
+                LocalUnixBucketWriteReservationNodeClientConfig::new(
+                    node_id,
+                    PathBuf::from("relative-bucket-write-node-1.sock"),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteBucketWriteReservationClientSocketPathNotAbsolute { path }
+                if path == Path::new("relative-bucket-write-node-1.sock")
         ));
     }
 
