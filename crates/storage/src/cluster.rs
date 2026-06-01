@@ -584,7 +584,7 @@ pub struct StorageCluster {
 }
 
 pub(super) struct DurableBucketWriteReservation {
-    node: Arc<dyn StorageNodeClient>,
+    node: Arc<dyn crate::node_client::BucketMetadataNodeClient>,
     pg_id: u32,
     record: BucketWriteReservationRecord,
 }

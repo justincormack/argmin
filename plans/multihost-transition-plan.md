@@ -5552,11 +5552,15 @@ bucket-write reservation client/RPC surface; frontend maps can acquire and
 release reservation rows on the storage-node-owned bucket PG without writing the
 frontend-local PG. Remote reservation acquire preserves the typed
 `BucketWriteDraining` outcome, so callers keep the existing wait/retry behavior
-when DeleteBucket has installed a drain. Remaining non-command surfaces still
-need bucket snapshot loads to run through a remote bucket metadata snapshot API,
-plus object snapshots and operation-shaped direct PUT command builders. Direct
-PUT still needs the object snapshot/command-builder surface before its metadata
-path is remote end to end and before frontend/combined roles can be enabled.
+when DeleteBucket has installed a drain. Bucket snapshot loads now route
+through the same dedicated bucket metadata client/RPC surface, including
+reserved bucket-write snapshot loads and same-node pair snapshot loads for
+distinct buckets; frontend maps can load requested bucket subresources from the
+storage-node-owned bucket PG without reading the frontend-local PG. Remaining
+non-command surfaces still need object snapshots and operation-shaped direct PUT
+command builders. Direct PUT still needs the object snapshot/command-builder
+surface before its metadata path is remote end to end and before
+frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5608,12 +5612,14 @@ Implementation slices:
    primary-last fanout ordering, and reissue logic without observing each
    other's half-complete in-process state.
 5. add separate RPC surfaces for non-command metadata reads and coordination
-   operations required before command construction. These include bucket/object
-   snapshot reads, object generation/version/order allocation, bucket-write
-   reservations and proof release, durable pending/drain/coordination checks,
-   lifecycle/object-read snapshot helpers used by command builders, and
-   operation-shaped command-builder calls that must execute against a
-   storage-node-owned snapshot rather than a frontend-owned raw PG handle.
+   operations required before command construction. Bucket raw/info reads,
+   bucket snapshot reads, object generation/version allocation, bucket-write
+   reservations, and proof release now have dedicated node-client/RPC surfaces.
+   Remaining work includes object snapshot reads, order allocation, durable
+   pending/drain/coordination checks, lifecycle/object-read snapshot helpers
+   used by command builders, and operation-shaped command-builder calls that
+   must execute against a storage-node-owned snapshot rather than a
+   frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
    install/apply for `CreateBucket`, then direct PUT object-generation
@@ -5654,11 +5660,11 @@ Required tests:
    preserve primary-last ordering and prevent duplicate or divergent command
    application
 8. non-command metadata RPCs used by create-bucket/direct PUT run remotely:
-   bucket/object snapshot reads, generation/version/order allocation,
-   bucket-write reservation/proof release, durable pending/drain checks, and
-   operation-shaped command builders. Proof release must reject the correct PG
-   on a non-primary node even when that node appears first in the acting-set
-   route list.
+   bucket raw/info and bucket snapshot reads, object snapshot reads,
+   generation/version/order allocation, bucket-write reservation/proof release,
+   durable pending/drain checks, and operation-shaped command builders. Proof
+   release must reject the correct PG on a non-primary node even when that node
+   appears first in the acting-set route list.
 9. two independent frontend maps over one storage-node must handle stale
    object-generation selection: the loser may read generation `N`, the winner
    publishes `ReserveObjectGeneration(N)`, and the loser must retry to `N+1`

@@ -721,18 +721,34 @@ migrated_bucket_snapshot_read_bypasses=$(
             || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
+        if ($0 ~ /\.bucket_metadata_client\(\)/ \
+            || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
+            pending_bucket_metadata_client = 1
+        }
         if ($0 ~ /\.(load_bucket_execution_generations_for_pg|load_bucket_fast_path_identities_for_pg)\(/) {
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /SharedStorageNode::load_bucket_snapshot_from_pg\(/) {
             print FILENAME ":" FNR ":" $0
         }
+        if ($0 ~ /\.load_bucket_snapshot_pair\(/) {
+            if (pending_bucket_metadata_client \
+                || $0 ~ /\.bucket_metadata_client\(\)/ \
+                || $0 ~ /bucket_metadata_client\./ \
+                || $0 ~ /self\.load_bucket_snapshot_pair\(/) {
+                pending_storage_client = 0
+                pending_bucket_metadata_client = 0
+                next
+            }
+            print FILENAME ":" FNR ":" $0
+        }
         if ($0 ~ /\.load_bucket_snapshot\(/) {
-            if (pending_storage_client \
-                || $0 ~ /\.storage_client\(\)/ \
-                || $0 ~ /storage_client\./ \
+            if (pending_bucket_metadata_client \
+                || $0 ~ /\.bucket_metadata_client\(\)/ \
+                || $0 ~ /bucket_metadata_client\./ \
                 || $0 ~ /reservation\.node\.load_bucket_snapshot\(/) {
                 pending_storage_client = 0
+                pending_bucket_metadata_client = 0
                 next
             }
             if ($0 ~ /self\.load_bucket_snapshot\(/) {
@@ -742,6 +758,7 @@ migrated_bucket_snapshot_read_bypasses=$(
         }
         if ($0 ~ /;/) {
             pending_storage_client = 0
+            pending_bucket_metadata_client = 0
         }
     }
     ' crates/storage/src/cluster.rs \

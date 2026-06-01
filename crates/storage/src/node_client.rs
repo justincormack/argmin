@@ -25,7 +25,8 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
-    decode_bucket_info_outcome_response, decode_bucket_write_reservation_record_response,
+    decode_bucket_info_outcome_response, decode_bucket_snapshot_pair_response,
+    decode_bucket_snapshot_response, decode_bucket_write_reservation_record_response,
     decode_create_bucket_command_build_response, decode_metadata_command_acceptance_response,
     decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
     decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
@@ -38,6 +39,7 @@ use crate::storage_rpc::{
     decode_read_handle_release_response, decode_scavenger_list_files_response,
     decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
     decode_storage_rpc_response_payload, encode_bucket_request,
+    encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
     encode_bucket_write_reservation_record_request, encode_create_bucket_command_build_request,
     encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
@@ -49,6 +51,8 @@ use crate::storage_rpc::{
     encode_shard_ack_batch_request, encode_shard_delete_request, encode_shard_read_range_request,
     encode_shard_read_request, encode_shard_write_request, read_storage_rpc_frame_from,
     write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
+    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
@@ -608,6 +612,21 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
+    fn load_bucket_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
+
+    fn load_bucket_snapshot_pair(
+        &self,
+        source_pg_id: PgId,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination_pg_id: PgId,
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
 
     fn build_create_bucket_command(
         &self,
@@ -3252,6 +3271,31 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::head_bucket_info(self, pg_id, bucket)
     }
 
+    fn load_bucket_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::load_bucket_snapshot(self, pg_id, bucket, request)
+    }
+
+    fn load_bucket_snapshot_pair(
+        &self,
+        source_pg_id: PgId,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination_pg_id: PgId,
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::load_bucket_snapshot_pair(
+            self,
+            source_pg_id,
+            source,
+            destination_pg_id,
+            destination,
+        )
+    }
+
     fn build_create_bucket_command(
         &self,
         pg_id: PgId,
@@ -3372,6 +3416,93 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadInfo, pg_id, bucket)
+    }
+
+    fn load_bucket_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketSnapshotRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            request,
+        };
+        let payload = encode_bucket_snapshot_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketSnapshotLoad, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_snapshot_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode bucket snapshot response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcBucketSnapshotOutcome::Loaded(snapshot) => {
+                if snapshot.bucket.name != *bucket || snapshot.request != request.request {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket snapshot response",
+                        "bucket snapshot response identity does not match request".to_string(),
+                    )));
+                }
+                Ok(*snapshot)
+            }
+            StorageRpcBucketSnapshotOutcome::BucketNotFound { name } => Err(
+                BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name }),
+            ),
+        }
+    }
+
+    fn load_bucket_snapshot_pair(
+        &self,
+        source_pg_id: PgId,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination_pg_id: PgId,
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketSnapshotPairRequest {
+            source: StorageRpcBucketSnapshotRequest {
+                bucket: StorageRpcBucketRequest {
+                    node_id: self.node_id,
+                    cluster_epoch: self.cluster_epoch,
+                    pg_id: source_pg_id,
+                    bucket: source.0.clone(),
+                },
+                request: source.1,
+            },
+            destination: StorageRpcBucketSnapshotRequest {
+                bucket: StorageRpcBucketRequest {
+                    node_id: self.node_id,
+                    cluster_epoch: self.cluster_epoch,
+                    pg_id: destination_pg_id,
+                    bucket: destination.0.clone(),
+                },
+                request: destination.1,
+            },
+        };
+        let payload = encode_bucket_snapshot_pair_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketSnapshotPairLoad, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_snapshot_pair_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode bucket snapshot pair response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcBucketSnapshotPairOutcome::Loaded(pair) => {
+                self.validate_bucket_snapshot_pair_response(&pair, source, destination)?;
+                Ok(*pair)
+            }
+            StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name } => Err(
+                BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name }),
+            ),
+        }
     }
 
     fn build_create_bucket_command(
@@ -3740,6 +3871,53 @@ impl UnixStorageNodeClient {
                 Ok(CreateBucketCommandBuild::Command(command))
             }
         }
+    }
+
+    fn validate_bucket_snapshot_pair_response(
+        &self,
+        pair: &BucketSnapshotPair,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination: (&BucketName, BucketSnapshotRequest),
+    ) -> Result<(), BucketSnapshotLoadError> {
+        match pair {
+            BucketSnapshotPair::Same { bucket } => {
+                if source.0 != destination.0 {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket snapshot pair response",
+                        "same-bucket response for distinct bucket request".to_string(),
+                    )));
+                }
+                let expected_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
+                if bucket.bucket.name != *source.0 || bucket.request != expected_request {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket snapshot pair response",
+                        "same-bucket snapshot identity does not match request".to_string(),
+                    )));
+                }
+            }
+            BucketSnapshotPair::Distinct {
+                source: source_snapshot,
+                destination: destination_snapshot,
+            } => {
+                if source.0 == destination.0 {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket snapshot pair response",
+                        "distinct-bucket response for same bucket request".to_string(),
+                    )));
+                }
+                if source_snapshot.bucket.name != *source.0
+                    || source_snapshot.request != source.1
+                    || destination_snapshot.bucket.name != *destination.0
+                    || destination_snapshot.request != destination.1
+                {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket snapshot pair response",
+                        "distinct-bucket snapshot identity does not match request".to_string(),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -6624,6 +6802,172 @@ mod tests {
             err,
             BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)
         ));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_loads_bucket_snapshot() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bucket-snapshot-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Policy,
+                    body: "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+                    aux: crate::types::BucketSubresourceAux::policy(false),
+                },
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let request = BucketSnapshotRequest {
+            policy: true,
+            tags: BucketSnapshotTagsRequest::Always,
+            lifecycle: false,
+            cors: true,
+        };
+        let snapshot =
+            BucketMetadataNodeClient::load_bucket_snapshot(&client, PgId::new(0), &bucket, request)
+                .unwrap();
+        assert_eq!(snapshot.bucket.name, bucket);
+        assert_eq!(snapshot.request, request);
+        assert_eq!(
+            snapshot.policy,
+            crate::types::LoadedBucketSubresource::Loaded(
+                "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()
+            )
+        );
+        assert_eq!(
+            snapshot.tags,
+            crate::types::LoadedBucketSubresource::Missing
+        );
+        assert_eq!(
+            snapshot.lifecycle,
+            crate::types::LoadedBucketSubresource::NotRequested
+        );
+        assert_eq!(
+            snapshot.cors,
+            crate::types::LoadedBucketSubresource::Missing
+        );
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let source_bucket = crate::tests::bucket_name("bucket-snapshot-pair-source-rpc");
+        let destination_bucket = crate::tests::bucket_name("bucket-snapshot-pair-dest-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            for bucket in [&source_bucket, &destination_bucket] {
+                PgMetadataStore::create_bucket(
+                    &*pg,
+                    bucket,
+                    "owner",
+                    &owner,
+                    &crate::AclGrants::default(),
+                    false,
+                    false,
+                )
+                .unwrap();
+            }
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &source_bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Tagging,
+                    body: "<Tagging/>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &destination_bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Cors,
+                    body: "<CORSConfiguration/>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let pair = BucketMetadataNodeClient::load_bucket_snapshot_pair(
+            &client,
+            PgId::new(0),
+            (
+                &source_bucket,
+                BucketSnapshotRequest {
+                    tags: BucketSnapshotTagsRequest::Always,
+                    ..Default::default()
+                },
+            ),
+            PgId::new(0),
+            (
+                &destination_bucket,
+                BucketSnapshotRequest {
+                    cors: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(pair.source().bucket.name, source_bucket);
+        assert_eq!(pair.destination().bucket.name, destination_bucket);
+        assert_eq!(
+            pair.source().tags,
+            crate::types::LoadedBucketSubresource::Loaded("<Tagging/>".to_string())
+        );
+        assert_eq!(
+            pair.destination().cors,
+            crate::types::LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string())
+        );
         server_thread.join().unwrap();
     }
 

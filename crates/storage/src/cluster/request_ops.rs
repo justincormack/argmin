@@ -1464,7 +1464,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+            .bucket_metadata_client()
             .load_bucket_snapshot(pg_id, bucket, request)
     }
 
@@ -1634,7 +1634,7 @@ impl super::StorageCluster {
                 target_context,
             )?;
         Ok(super::DurableBucketWriteReservation {
-            node: Arc::clone(node.storage_client()),
+            node: Arc::clone(node.bucket_metadata_client()),
             pg_id,
             record,
         })
@@ -1856,35 +1856,28 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), destination_pg_id)?;
         if source_node.node_id() == destination_node.node_id() {
-            return source_node.storage_client().load_bucket_snapshot_pair(
-                source_pg_id,
-                source,
-                destination_pg_id,
-                destination,
-            );
+            return source_node
+                .bucket_metadata_client()
+                .load_bucket_snapshot_pair(source_pg_id, source, destination_pg_id, destination);
         }
 
         let (source_snapshot, destination_snapshot) =
             if source_pg_id.get() < destination_pg_id.get() {
                 (
-                    source_node.storage_client().load_bucket_snapshot(
+                    source_node.bucket_metadata_client().load_bucket_snapshot(
                         source_pg_id,
                         source.0,
                         source.1,
                     )?,
-                    destination_node.storage_client().load_bucket_snapshot(
-                        destination_pg_id,
-                        destination.0,
-                        destination.1,
-                    )?,
+                    destination_node
+                        .bucket_metadata_client()
+                        .load_bucket_snapshot(destination_pg_id, destination.0, destination.1)?,
                 )
             } else {
-                let destination_snapshot = destination_node.storage_client().load_bucket_snapshot(
-                    destination_pg_id,
-                    destination.0,
-                    destination.1,
-                )?;
-                let source_snapshot = source_node.storage_client().load_bucket_snapshot(
+                let destination_snapshot = destination_node
+                    .bucket_metadata_client()
+                    .load_bucket_snapshot(destination_pg_id, destination.0, destination.1)?;
+                let source_snapshot = source_node.bucket_metadata_client().load_bucket_snapshot(
                     source_pg_id,
                     source.0,
                     source.1,
