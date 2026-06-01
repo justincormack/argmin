@@ -4173,10 +4173,12 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<DirectPutCommitStorageSnapshot, StorageRpcPayloadError> {
         let existing_etag = self.read_optional_string()?;
         let current = self.read_optional_stored_object()?;
+        let stale_payload_source = self.read_optional_stored_object()?;
         let stale_payload = self.read_optional_object_payload_reclaim()?;
         Ok(DirectPutCommitStorageSnapshot {
             auth_snapshot: crate::DirectPutCommitSnapshot { existing_etag },
             current,
+            stale_payload_source,
             stale_payload,
         })
     }
@@ -4914,6 +4916,7 @@ fn put_direct_put_commit_storage_snapshot(
 ) {
     put_optional_string(out, snapshot.auth_snapshot.existing_etag.as_deref());
     put_optional_stored_object(out, snapshot.current.as_ref());
+    put_optional_stored_object(out, snapshot.stale_payload_source.as_ref());
     put_optional_object_payload_reclaim(out, snapshot.stale_payload.as_ref());
 }
 
@@ -6705,6 +6708,7 @@ mod tests {
                     existing_etag: Some("\"0123456789abcdef\"".to_string()),
                 },
                 current: None,
+                stale_payload_source: None,
                 stale_payload: None,
             },
         };
@@ -6773,6 +6777,7 @@ mod tests {
                     existing_etag: None,
                 },
                 current: None,
+                stale_payload_source: None,
                 stale_payload: None,
             },
             bucket_write_reservation: proof,

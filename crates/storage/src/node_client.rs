@@ -328,10 +328,13 @@ fn load_direct_put_commit_snapshot_from_pg(
     let existing_etag = current
         .as_ref()
         .and_then(|stored| stored.as_live().map(|record| record.etag.format()));
+    let (stale_payload_source, stale_payload) =
+        snapshot_direct_put_stale_payload_for_snapshot(pg, bucket, key, 0)?;
     Ok(DirectPutCommitStorageSnapshot {
         auth_snapshot: DirectPutCommitSnapshot { existing_etag },
         current,
-        stale_payload: snapshot_direct_put_stale_payload_command(pg, bucket, key, 0)?,
+        stale_payload_source,
+        stale_payload,
     })
 }
 
@@ -397,6 +400,25 @@ fn snapshot_direct_put_stale_payload_command(
     )?))
 }
 
+fn snapshot_direct_put_stale_payload_for_snapshot(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    created_at: u64,
+) -> Result<(Option<StoredObject>, Option<ObjectPayloadReclaimCommand>), MetadataError> {
+    let stored = match PgMetadataStore::get_object_version(pg, bucket, key, VersionId::Null) {
+        Ok(stored) => stored,
+        Err(MetadataError::ObjectNotFound) => return Ok((None, None)),
+        Err(error) => return Err(error),
+    };
+    let StoredObject::Live(record) = &stored else {
+        return Ok((None, None));
+    };
+    let reclaim =
+        snapshot_live_object_payload_reclaim_command(pg, bucket, key, record, created_at)?;
+    Ok((Some(stored), Some(reclaim)))
+}
+
 fn normalize_reclaim_created_at(reclaim: &mut Option<ObjectPayloadReclaimCommand>) {
     match reclaim {
         Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => reclaim.created_at = 0,
@@ -423,23 +445,23 @@ fn reclaim_matches_bucket_key(
 
 fn reclaim_matches_snapshot_live_object(
     reclaim: Option<&ObjectPayloadReclaimCommand>,
-    current: &Option<StoredObject>,
+    source: &Option<StoredObject>,
 ) -> bool {
-    let Some(reclaim) = reclaim else {
-        return true;
-    };
-    let Some(StoredObject::Live(live)) = current else {
-        return false;
-    };
-    match (reclaim, live.layout) {
-        (ObjectPayloadReclaimCommand::Segments(reclaim), ObjectLayout::Standard) => {
-            reclaim.generation_id == live.generation_id
-        }
-        (
-            ObjectPayloadReclaimCommand::Multipart(reclaim),
-            ObjectLayout::MultipartManifest { .. },
-        ) => reclaim.generation_id == live.generation_id,
-        _ => false,
+    match (reclaim, source) {
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
+        (Some(_), Some(StoredObject::Live(live))) if !live.version_id.is_null() => false,
+        (Some(reclaim), Some(StoredObject::Live(live))) => match (reclaim, live.layout) {
+            (ObjectPayloadReclaimCommand::Segments(reclaim), ObjectLayout::Standard) => {
+                reclaim.generation_id == live.generation_id
+            }
+            (
+                ObjectPayloadReclaimCommand::Multipart(reclaim),
+                ObjectLayout::MultipartManifest { .. },
+            ) => reclaim.generation_id == live.generation_id,
+            _ => false,
+        },
+        (Some(_), Some(StoredObject::DeleteMarker(_))) => false,
     }
 }
 
@@ -4100,11 +4122,21 @@ impl UnixStorageNodeClient {
                 "stale payload identity does not match request".to_string(),
             )));
         }
-        if !reclaim_matches_snapshot_live_object(snapshot.stale_payload.as_ref(), &snapshot.current)
-        {
+        if let Some(source) = snapshot.stale_payload_source.as_ref() {
+            if source.bucket() != bucket || source.key() != key {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate direct PUT commit snapshot response",
+                    "stale payload source identity does not match request".to_string(),
+                )));
+            }
+        }
+        if !reclaim_matches_snapshot_live_object(
+            snapshot.stale_payload.as_ref(),
+            &snapshot.stale_payload_source,
+        ) {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate direct PUT commit snapshot response",
-                "stale payload shape does not match current live object".to_string(),
+                "stale payload shape does not match source live object".to_string(),
             )));
         }
         Ok(())
@@ -6781,6 +6813,7 @@ mod tests {
         StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandNextIdResponse,
         StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcReadHandleAcquireResponse,
     };
+    use crate::types::{DeleteMarkerRecord, ObjectEncryption, ObjectLockState, StorageClass};
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
         StorageNodeProcessConfig {
@@ -6803,6 +6836,104 @@ mod tests {
     fn private_socket_dir(path: &std::path::Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn test_live_stored_object(
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+        layout: ObjectLayout,
+    ) -> StoredObject {
+        StoredObject::Live(LiveObjectRecord {
+            bucket,
+            key,
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: 0,
+            etag: ObjectEtag::single_part(0),
+            last_modified: 0,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 4, m: 2 },
+            layout,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        })
+    }
+
+    fn test_delete_marker_stored_object(bucket: BucketName, key: ObjectKey) -> StoredObject {
+        StoredObject::DeleteMarker(DeleteMarkerRecord {
+            bucket,
+            key,
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal("owner"),
+            last_modified: 0,
+        })
+    }
+
+    fn test_segments_reclaim(
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+    ) -> ObjectPayloadReclaimCommand {
+        ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+            bucket,
+            key,
+            generation_id,
+            created_at: 0,
+            segments: Vec::new(),
+        })
+    }
+
+    fn test_multipart_layout() -> ObjectLayout {
+        ObjectLayout::MultipartManifest {
+            parts_count: std::num::NonZeroU32::new(1).unwrap(),
+        }
+    }
+
+    fn assert_direct_put_snapshot_rejected(
+        snapshot: &DirectPutCommitStorageSnapshot,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let err = client
+            .validate_direct_put_commit_snapshot_response(snapshot, bucket, key)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate direct PUT commit snapshot response",
+                ..
+            })
+        ));
+    }
+
+    fn assert_direct_put_snapshot_accepted(
+        snapshot: &DirectPutCommitStorageSnapshot,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        client
+            .validate_direct_put_commit_snapshot_response(snapshot, bucket, key)
+            .unwrap();
     }
 
     fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
@@ -6939,12 +7070,6 @@ mod tests {
 
     #[test]
     fn unix_direct_put_snapshot_response_rejects_mismatched_auth_etag() {
-        let tmp = test_util::tempdir();
-        let client = UnixStorageNodeClient::new(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            tmp.path().join("unused.sock"),
-        );
         let bucket = crate::tests::bucket_name("direct-put-snapshot-validate");
         let key = crate::tests::object_key("direct-put-snapshot-validate-key");
         let snapshot = DirectPutCommitStorageSnapshot {
@@ -6952,29 +7077,15 @@ mod tests {
                 existing_etag: Some("unexpected-etag".to_string()),
             },
             current: None,
+            stale_payload_source: None,
             stale_payload: None,
         };
 
-        let err = client
-            .validate_direct_put_commit_snapshot_response(&snapshot, &bucket, &key)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ObjectPgActionError::Store(StoreError::StorageRpc {
-                operation: "validate direct PUT commit snapshot response",
-                ..
-            })
-        ));
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
     }
 
     #[test]
     fn unix_direct_put_snapshot_response_rejects_mismatched_stale_payload_identity() {
-        let tmp = test_util::tempdir();
-        let client = UnixStorageNodeClient::new(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            tmp.path().join("unused.sock"),
-        );
         let bucket = crate::tests::bucket_name("direct-put-snapshot-stale");
         let key = crate::tests::object_key("direct-put-snapshot-stale-key");
         let snapshot = DirectPutCommitStorageSnapshot {
@@ -6982,6 +7093,7 @@ mod tests {
                 existing_etag: None,
             },
             current: None,
+            stale_payload_source: None,
             stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
                 ObjectSegmentsReclaimRecord {
                     bucket: crate::tests::bucket_name("wrong-direct-put-snapshot-stale"),
@@ -6993,26 +7105,11 @@ mod tests {
             )),
         };
 
-        let err = client
-            .validate_direct_put_commit_snapshot_response(&snapshot, &bucket, &key)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ObjectPgActionError::Store(StoreError::StorageRpc {
-                operation: "validate direct PUT commit snapshot response",
-                ..
-            })
-        ));
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
     }
 
     #[test]
-    fn unix_direct_put_snapshot_response_rejects_stale_payload_without_live_current() {
-        let tmp = test_util::tempdir();
-        let client = UnixStorageNodeClient::new(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            tmp.path().join("unused.sock"),
-        );
+    fn unix_direct_put_snapshot_response_rejects_stale_payload_without_source() {
         let bucket = crate::tests::bucket_name("direct-put-snapshot-stale-shape");
         let key = crate::tests::object_key("direct-put-snapshot-stale-shape-key");
         let snapshot = DirectPutCommitStorageSnapshot {
@@ -7020,6 +7117,7 @@ mod tests {
                 existing_etag: None,
             },
             current: None,
+            stale_payload_source: None,
             stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
                 ObjectSegmentsReclaimRecord {
                     bucket: bucket.clone(),
@@ -7031,16 +7129,175 @@ mod tests {
             )),
         };
 
-        let err = client
-            .validate_direct_put_commit_snapshot_response(&snapshot, &bucket, &key)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ObjectPgActionError::Store(StoreError::StorageRpc {
-                operation: "validate direct PUT commit snapshot response",
-                ..
-            })
-        ));
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_stale_source_without_payload() {
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-source-only");
+        let key = crate::tests::object_key("direct-put-snapshot-source-only-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload_source: Some(test_live_stored_object(
+                bucket.clone(),
+                key.clone(),
+                generation_id,
+                ObjectLayout::Standard,
+            )),
+            stale_payload: None,
+        };
+
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_stale_payload_delete_marker_source() {
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-delete-marker-source");
+        let key = crate::tests::object_key("direct-put-snapshot-delete-marker-source-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload_source: Some(test_delete_marker_stored_object(
+                bucket.clone(),
+                key.clone(),
+            )),
+            stale_payload: Some(test_segments_reclaim(
+                bucket.clone(),
+                key.clone(),
+                generation_id,
+            )),
+        };
+
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_stale_payload_generation_mismatch() {
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-generation");
+        let key = crate::tests::object_key("direct-put-snapshot-generation-key");
+        let source_generation = GenerationId::new(9).unwrap();
+        let reclaim_generation = GenerationId::new(10).unwrap();
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload_source: Some(test_live_stored_object(
+                bucket.clone(),
+                key.clone(),
+                source_generation,
+                ObjectLayout::Standard,
+            )),
+            stale_payload: Some(test_segments_reclaim(
+                bucket.clone(),
+                key.clone(),
+                reclaim_generation,
+            )),
+        };
+
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_numbered_stale_source() {
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-numbered-source");
+        let key = crate::tests::object_key("direct-put-snapshot-numbered-source-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let mut source = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+            ObjectLayout::Standard,
+        );
+        let StoredObject::Live(source_record) = &mut source else {
+            unreachable!("test helper always builds a live object");
+        };
+        source_record.version_id = VersionId::from_u64(2);
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload_source: Some(source),
+            stale_payload: Some(test_segments_reclaim(
+                bucket.clone(),
+                key.clone(),
+                generation_id,
+            )),
+        };
+
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_rejects_stale_payload_layout_mismatch() {
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-layout");
+        let key = crate::tests::object_key("direct-put-snapshot-layout-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: None,
+            },
+            current: None,
+            stale_payload_source: Some(test_live_stored_object(
+                bucket.clone(),
+                key.clone(),
+                generation_id,
+                test_multipart_layout(),
+            )),
+            stale_payload: Some(test_segments_reclaim(
+                bucket.clone(),
+                key.clone(),
+                generation_id,
+            )),
+        };
+
+        assert_direct_put_snapshot_rejected(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_direct_put_snapshot_response_accepts_stale_null_source_under_numbered_current() {
+        let bucket = crate::tests::bucket_name("direct-put-snapshot-null-source");
+        let key = crate::tests::object_key("direct-put-snapshot-null-source-key");
+        let current_generation = GenerationId::new(10).unwrap();
+        let stale_generation = GenerationId::new(9).unwrap();
+        let mut current = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            current_generation,
+            ObjectLayout::Standard,
+        );
+        let StoredObject::Live(current_record) = &mut current else {
+            unreachable!("test helper always builds a live object");
+        };
+        current_record.version_id = VersionId::from_u64(2);
+        let expected_etag = current_record.etag.format();
+        let snapshot = DirectPutCommitStorageSnapshot {
+            auth_snapshot: crate::DirectPutCommitSnapshot {
+                existing_etag: Some(expected_etag),
+            },
+            current: Some(current),
+            stale_payload_source: Some(test_live_stored_object(
+                bucket.clone(),
+                key.clone(),
+                stale_generation,
+                ObjectLayout::Standard,
+            )),
+            stale_payload: Some(test_segments_reclaim(
+                bucket.clone(),
+                key.clone(),
+                stale_generation,
+            )),
+        };
+
+        assert_direct_put_snapshot_accepted(&snapshot, &bucket, &key);
     }
 
     #[test]
