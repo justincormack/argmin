@@ -131,6 +131,8 @@ const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
         + 4
         + STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN
         + 11;
+const STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -179,6 +181,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketSnapshotPairLoad = 42,
     DirectPutCommitSnapshotLoad = 43,
     DirectPutCommitCommandBuild = 44,
+    CompletedMultipartOrderCommandBuild = 45,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +272,7 @@ impl StorageRpcMessageKind {
             Self::BucketSnapshotPairLoad => "bucket snapshot pair load",
             Self::DirectPutCommitSnapshotLoad => "direct PUT commit snapshot load",
             Self::DirectPutCommitCommandBuild => "direct PUT commit command build",
+            Self::CompletedMultipartOrderCommandBuild => "completed multipart order command build",
         }
     }
 
@@ -318,6 +322,7 @@ impl StorageRpcMessageKind {
             42 => Ok(Self::BucketSnapshotPairLoad),
             43 => Ok(Self::DirectPutCommitSnapshotLoad),
             44 => Ok(Self::DirectPutCommitCommandBuild),
+            45 => Ok(Self::CompletedMultipartOrderCommandBuild),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -560,6 +565,21 @@ pub(crate) enum StorageRpcCreateBucketCommandBuildOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct StorageRpcCreateBucketCommandBuildResponse {
     pub(crate) outcome: StorageRpcCreateBucketCommandBuildOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) bucket: BucketName,
+    pub(crate) command_id: crate::metadata_command::MetadataCommandId,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildResponse {
+    pub(crate) completion_order: u64,
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1162,6 +1182,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::BucketCreateCommandBuild => {
             STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::CompletedMultipartOrderCommandBuild => {
+            STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectGenerationNext => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
         }
@@ -1760,6 +1783,52 @@ pub(crate) fn decode_create_bucket_command_build_request(
     })
 }
 
+pub(crate) fn encode_completed_multipart_order_command_build_request(
+    request: &StorageRpcCompletedMultipartOrderCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.command_id.cluster_epoch() != request.cluster_epoch
+        || request.command_id.pg_id() != request.pg_id
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "command id route must match request route",
+        ));
+    }
+    let mut out = encode_bucket_request(&StorageRpcBucketRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        bucket: request.bucket.clone(),
+    });
+    put_u64(&mut out, request.command_id.log_index().get());
+    Ok(out)
+}
+
+pub(crate) fn decode_completed_multipart_order_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcCompletedMultipartOrderCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name()?;
+    let log_index = crate::metadata_command::MetadataCommandLogIndex::new(decoder.read_u64()?)
+        .ok_or(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "metadata command log index must not be zero",
+        ))?;
+    decoder.finish()?;
+    Ok(StorageRpcCompletedMultipartOrderCommandBuildRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        bucket,
+        command_id: crate::metadata_command::MetadataCommandId::new(
+            cluster_epoch,
+            pg_id,
+            log_index,
+        ),
+    })
+}
+
 pub(crate) fn encode_bucket_info_outcome_response(
     response: &StorageRpcBucketInfoOutcomeResponse,
 ) -> Vec<u8> {
@@ -1907,6 +1976,30 @@ pub(crate) fn decode_create_bucket_command_build_response(
     };
     decoder.finish()?;
     Ok(StorageRpcCreateBucketCommandBuildResponse { outcome })
+}
+
+pub(crate) fn encode_completed_multipart_order_command_build_response(
+    response: &StorageRpcCompletedMultipartOrderCommandBuildResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, response.completion_order);
+    put_bytes(&mut out, &response.command.command_bytes());
+    out
+}
+
+pub(crate) fn decode_completed_multipart_order_command_build_response(
+    bytes: &[u8],
+) -> Result<StorageRpcCompletedMultipartOrderCommandBuildResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let completion_order = decoder.read_u64()?;
+    let command_bytes = decoder.read_bytes()?.to_vec();
+    decoder.finish()?;
+    let command = decode_metadata_command_envelope(&command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    Ok(StorageRpcCompletedMultipartOrderCommandBuildResponse {
+        completion_order,
+        command,
+    })
 }
 
 pub(crate) fn encode_metadata_command_pending_slot_request(
@@ -5265,8 +5358,9 @@ mod tests {
 
     use crate::{
         metadata_command::{
-            CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
-            MetadataCommandLogIndex, MetadataCommandPayload,
+            AdvanceCompletedMultipartUploadSequenceCommand, CreateBucketCommand,
+            MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+            MetadataCommandPayload,
         },
         types::{
             AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
@@ -6811,6 +6905,56 @@ mod tests {
         let bytes = encode_direct_put_command_build_response(&response);
         let decoded = decode_direct_put_command_build_response(&bytes).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn completed_multipart_order_command_build_request_and_response_round_trip() {
+        let bucket = BucketName::try_from("completed-order-bucket").unwrap();
+        let command_id = MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(3),
+            MetadataCommandLogIndex::new(9).unwrap(),
+        );
+        let request = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            bucket: bucket.clone(),
+            command_id,
+        };
+
+        let bytes = encode_completed_multipart_order_command_build_request(&request).unwrap();
+        let decoded = decode_completed_multipart_order_command_build_request(&bytes).unwrap();
+        assert_eq!(decoded, request);
+
+        let wrong_route = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+            pg_id: PgId::new(4),
+            ..request.clone()
+        };
+        assert_eq!(
+            encode_completed_multipart_order_command_build_request(&wrong_route),
+            Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "command id route must match request route"
+            ))
+        );
+
+        let command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: bucket.clone(),
+                    completion_order: 11,
+                },
+            ),
+        );
+        let response = StorageRpcCompletedMultipartOrderCommandBuildResponse {
+            completion_order: 11,
+            command,
+        };
+        let bytes = encode_completed_multipart_order_command_build_response(&response);
+        let decoded = decode_completed_multipart_order_command_build_response(&bytes).unwrap();
+        assert_eq!(decoded.completion_order, 11);
+        assert_eq!(decoded.command, response.command);
     }
 
     #[test]

@@ -5562,9 +5562,12 @@ client/RPC surface, so the precondition/auth snapshot is read from the
 storage-node-owned object PG. Direct PUT commit command construction also now
 routes through that dedicated RPC surface, preserving typed stale-snapshot
 retries and validating the returned command identity before the frontend
-publishes it. Remaining non-command surfaces still need other object snapshot
-reads and the operation-shaped builders for the rest of the metadata mutation
-paths before frontend/combined roles can be enabled.
+publishes it. Completed-multipart order allocation now builds
+`AdvanceCompletedMultipartUploadSequence` commands through the bucket metadata
+RPC boundary as well, validating returned command id, bucket, and order
+identity before publishing. Remaining non-command surfaces still need other
+object snapshot reads and the operation-shaped builders for the rest of the
+metadata mutation paths before frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5620,7 +5623,8 @@ Implementation slices:
    bucket snapshot reads, object generation/version allocation, bucket-write
    reservations, proof release, direct PUT commit snapshot loads, and direct
    PUT commit command construction now have dedicated node-client/RPC surfaces.
-   Remaining work includes other object snapshot reads, order allocation,
+   Completed-multipart order allocation also now routes through the bucket
+   metadata RPC boundary. Remaining work includes other object snapshot reads,
    durable pending/drain/coordination checks, lifecycle/object-read snapshot
    helpers used by command builders, and operation-shaped command-builder calls
    that must execute against a storage-node-owned snapshot rather than a

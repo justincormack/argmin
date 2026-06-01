@@ -27,6 +27,7 @@ use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
     decode_bucket_info_outcome_response, decode_bucket_snapshot_pair_response,
     decode_bucket_snapshot_response, decode_bucket_write_reservation_record_response,
+    decode_completed_multipart_order_command_build_response,
     decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
     decode_direct_put_commit_snapshot_response, decode_metadata_command_acceptance_response,
     decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
@@ -42,10 +43,11 @@ use crate::storage_rpc::{
     decode_storage_rpc_response_payload, encode_bucket_request,
     encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
-    encode_bucket_write_reservation_record_request, encode_create_bucket_command_build_request,
-    encode_direct_put_command_build_request, encode_direct_put_commit_snapshot_request,
-    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
-    encode_metadata_command_pending_slot_replace_request,
+    encode_bucket_write_reservation_record_request,
+    encode_completed_multipart_order_command_build_request,
+    encode_create_bucket_command_build_request, encode_direct_put_command_build_request,
+    encode_direct_put_commit_snapshot_request, encode_metadata_command_matching_applied_request,
+    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_object_generation_reservation_request,
     encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
@@ -57,6 +59,7 @@ use crate::storage_rpc::{
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
+    StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommitSnapshotRequest,
@@ -708,6 +711,13 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
+
+    fn build_advance_completed_multipart_upload_sequence_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
 }
 
 pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
@@ -3396,6 +3406,17 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
             self, pg_id, bucket, command_id, config,
         )
     }
+
+    fn build_advance_completed_multipart_upload_sequence_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::build_advance_completed_multipart_upload_sequence_command(
+            self, pg_id, bucket, command_id,
+        )
+    }
 }
 
 impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
@@ -3669,6 +3690,48 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             bucket,
             command_id,
             config,
+        )
+    }
+
+    fn build_advance_completed_multipart_upload_sequence_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
+        let request = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            command_id,
+        };
+        let payload =
+            encode_completed_multipart_order_command_build_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode completed multipart order command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::CompletedMultipartOrderCommandBuild,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_completed_multipart_order_command_build_response(&response).map_err(
+            |error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode completed multipart order command build response",
+                    error.to_string(),
+                ))
+            },
+        )?;
+        self.validate_completed_multipart_order_command_build_response(
+            response.completion_order,
+            response.command,
+            bucket,
+            command_id,
         )
     }
 }
@@ -4208,6 +4271,38 @@ impl UnixStorageNodeClient {
                 Ok(CreateBucketCommandBuild::Command(command))
             }
         }
+    }
+
+    fn validate_completed_multipart_order_command_build_response(
+        &self,
+        completion_order: u64,
+        command: MetadataCommandEnvelope,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
+        if command.id() != command_id {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate completed multipart order command build response",
+                "response command id does not match request".to_string(),
+            )));
+        }
+        if completion_order == 0 {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate completed multipart order command build response",
+                "response completion order must not be zero".to_string(),
+            )));
+        }
+        match command.payload() {
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance)
+                if advance.bucket == *bucket && advance.completion_order == completion_order => {}
+            _ => {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate completed multipart order command build response",
+                    "response command payload does not match request".to_string(),
+                )))
+            }
+        }
+        Ok((completion_order, command))
     }
 
     fn validate_bucket_snapshot_pair_response(
@@ -7069,6 +7164,89 @@ mod tests {
     }
 
     #[test]
+    fn unix_completed_multipart_order_build_response_rejects_mismatched_identity() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("completed-order-rpc-expected");
+        let wrong_bucket = crate::tests::bucket_name("completed-order-rpc-wrong");
+        let command_id = MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        );
+        let command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: wrong_bucket,
+                    completion_order: 3,
+                },
+            ),
+        );
+
+        let err = client
+            .validate_completed_multipart_order_command_build_response(
+                3, command, &bucket, command_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate completed multipart order command build response",
+                ..
+            })
+        ));
+
+        let command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: bucket.clone(),
+                    completion_order: 0,
+                },
+            ),
+        );
+        let err = client
+            .validate_completed_multipart_order_command_build_response(
+                0, command, &bucket, command_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate completed multipart order command build response",
+                ..
+            })
+        ));
+
+        let command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: bucket.clone(),
+                    completion_order: 4,
+                },
+            ),
+        );
+        let err = client
+            .validate_completed_multipart_order_command_build_response(
+                3, command, &bucket, command_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate completed multipart order command build response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn unix_direct_put_snapshot_response_rejects_mismatched_auth_etag() {
         let bucket = crate::tests::bucket_name("direct-put-snapshot-validate");
         let key = crate::tests::object_key("direct-put-snapshot-validate-key");
@@ -7636,6 +7814,66 @@ mod tests {
             pair.destination().cors,
             crate::types::LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string())
         );
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("completed-order-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let command_id = MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        );
+
+        let (completion_order, command) =
+            BucketMetadataNodeClient::build_advance_completed_multipart_upload_sequence_command(
+                &client,
+                PgId::new(0),
+                &bucket,
+                command_id,
+            )
+            .unwrap();
+
+        assert_eq!(completion_order, 1);
+        assert_eq!(command.id(), command_id);
+        match command.payload() {
+            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) => {
+                assert_eq!(advance.bucket, bucket);
+                assert_eq!(advance.completion_order, completion_order);
+            }
+            other => panic!("unexpected command payload: {other:?}"),
+        }
         server_thread.join().unwrap();
     }
 

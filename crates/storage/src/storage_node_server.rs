@@ -19,10 +19,11 @@ use crate::node_client::{
 use crate::storage_rpc::{
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
     decode_bucket_write_reservation_acquire_request, decode_bucket_write_reservation_proof_request,
-    decode_bucket_write_reservation_record_request, decode_create_bucket_command_build_request,
-    decode_direct_put_command_build_request, decode_direct_put_commit_snapshot_request,
-    decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
-    decode_metadata_command_pending_slot_replace_request,
+    decode_bucket_write_reservation_record_request,
+    decode_completed_multipart_order_command_build_request,
+    decode_create_bucket_command_build_request, decode_direct_put_command_build_request,
+    decode_direct_put_commit_snapshot_request, decode_metadata_command_matching_applied_request,
+    decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_object_generation_reservation_request,
     decode_object_request, decode_proof_release_request, decode_read_handle_acquire_request,
@@ -30,12 +31,14 @@ use crate::storage_rpc::{
     decode_shard_ack_batch_request, decode_shard_delete_request, decode_shard_read_range_request,
     decode_shard_read_request, decode_shard_write_request, encode_bucket_info_outcome_response,
     encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
-    encode_bucket_write_reservation_record_response, encode_create_bucket_command_build_response,
-    encode_direct_put_command_build_response, encode_direct_put_commit_snapshot_response,
-    encode_health_response, encode_metadata_command_acceptance_response,
-    encode_metadata_command_applied_hashes_response, encode_metadata_command_bool_outcome_response,
-    encode_metadata_command_bool_response, encode_metadata_command_max_log_index_response,
-    encode_metadata_command_next_id_response, encode_metadata_command_pending_envelope_response,
+    encode_bucket_write_reservation_record_response,
+    encode_completed_multipart_order_command_build_response,
+    encode_create_bucket_command_build_response, encode_direct_put_command_build_response,
+    encode_direct_put_commit_snapshot_response, encode_health_response,
+    encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
+    encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
+    encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
+    encode_metadata_command_pending_envelope_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
@@ -51,6 +54,8 @@ use crate::storage_rpc::{
     StorageRpcBucketSnapshotResponse, StorageRpcBucketWriteReservationAcquireOutcome,
     StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
     StorageRpcBucketWriteReservationRecordRequest, StorageRpcBucketWriteReservationRecordResponse,
+    StorageRpcCompletedMultipartOrderCommandBuildRequest,
+    StorageRpcCompletedMultipartOrderCommandBuildResponse,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketCommandBuildResponse, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommandBuildResponse,
@@ -477,6 +482,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::DirectPutCommitCommandBuild => {
                 match decode_direct_put_command_build_request(&frame.payload) {
                     Ok(request) => self.direct_put_commit_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::CompletedMultipartOrderCommandBuild => {
+                match decode_completed_multipart_order_command_build_request(&frame.payload) {
+                    Ok(request) => self.completed_multipart_order_command_build_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1323,6 +1337,42 @@ impl StorageNodeConnectionHandler {
                 let payload = encode_create_bucket_command_build_response(
                     &StorageRpcCreateBucketCommandBuildResponse {
                         outcome: StorageRpcCreateBucketCommandBuildOutcome::Command(command),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn completed_multipart_order_command_build_response(
+        &self,
+        request: StorageRpcCompletedMultipartOrderCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.bucket,
+            "completed multipart order command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketMetadataNodeClient::build_advance_completed_multipart_upload_sequence_command(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
+            request.command_id,
+        ) {
+            Ok((completion_order, command)) => {
+                let payload = encode_completed_multipart_order_command_build_response(
+                    &StorageRpcCompletedMultipartOrderCommandBuildResponse {
+                        completion_order,
+                        command,
                     },
                 );
                 Ok(encode_storage_rpc_success_response(&payload))

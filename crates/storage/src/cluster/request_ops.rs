@@ -7134,7 +7134,11 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<u64, ObjectPgActionError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let storage_client = self.metadata_pg_primary_client(pg_id)?;
+        let bucket_metadata_client = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .bucket_metadata_client()
+            .clone();
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if self
@@ -7181,7 +7185,7 @@ impl super::StorageCluster {
             else {
                 continue;
             };
-            let (completion_order, command) = storage_client
+            let (completion_order, command) = bucket_metadata_client
                 .build_advance_completed_multipart_upload_sequence_command(
                     pg_id, bucket, command_id,
                 )
