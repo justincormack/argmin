@@ -16,9 +16,9 @@ use crate::node::BucketLockGuard;
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
-    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
-    UnixStorageNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient, PlacedShardNodeClient, ShardAckNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -107,6 +107,12 @@ pub struct LocalUnixObjectVersionMetadataNodeClientConfig {
 
 #[derive(Debug, Clone)]
 pub struct LocalUnixDirectPutMetadataNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalUnixObjectMutationMetadataNodeClientConfig {
     node_id: NodeId,
     socket_path: PathBuf,
 }
@@ -219,6 +225,23 @@ impl LocalUnixDirectPutMetadataNodeClientConfig {
     }
 }
 
+impl LocalUnixObjectMutationMetadataNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
 impl LocalUnixObjectReadMetadataNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -246,6 +269,7 @@ pub struct LocalNodeStore {
     object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient>,
     object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient>,
     direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient>,
+    object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient>,
     object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient>,
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
@@ -269,6 +293,8 @@ impl LocalNodeStore {
         let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> =
             local_client.clone();
         let direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient> = local_client.clone();
+        let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> =
+            local_client.clone();
         let object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient> =
             local_client.clone();
         let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = local_client.clone();
@@ -286,6 +312,7 @@ impl LocalNodeStore {
             object_generation_metadata_client,
             object_version_metadata_client,
             direct_put_metadata_client,
+            object_mutation_metadata_client,
             object_read_metadata_client,
             metadata_command_client,
             shard_client,
@@ -335,6 +362,12 @@ impl LocalNodeStore {
 
     pub(crate) fn direct_put_metadata_client(&self) -> &Arc<dyn DirectPutMetadataNodeClient> {
         &self.direct_put_metadata_client
+    }
+
+    pub(crate) fn object_mutation_metadata_client(
+        &self,
+    ) -> &Arc<dyn ObjectMutationMetadataNodeClient> {
+        &self.object_mutation_metadata_client
     }
 
     pub(crate) fn object_read_metadata_client(&self) -> &Arc<dyn ObjectReadMetadataNodeClient> {
@@ -1213,6 +1246,52 @@ impl LocalClusterMap {
             ));
             let direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient> = client;
             node.direct_put_metadata_client = direct_put_metadata_client;
+        }
+        Ok(())
+    }
+
+    pub fn install_unix_object_mutation_metadata_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixObjectMutationMetadataNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixObjectMutationMetadataNodeClientConfig> =
+            configs.into_iter().collect();
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in &configs {
+            if !seen.insert(config.node_id) {
+                return Err(
+                    ClusterBuildError::DuplicateRemoteObjectMutationMetadataClientNodeId {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(
+                    ClusterBuildError::RemoteObjectMutationMetadataClientSocketPathNotAbsolute {
+                        path: config.socket_path.clone(),
+                    },
+                );
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(
+                    ClusterBuildError::RemoteObjectMutationMetadataClientNodeNotFound {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+        }
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote object-mutation metadata client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> = client;
+            node.object_mutation_metadata_client = object_mutation_metadata_client;
         }
         Ok(())
     }
@@ -7765,6 +7844,37 @@ mod tests {
             err,
             ClusterBuildError::RemoteDirectPutMetadataClientSocketPathNotAbsolute { path }
                 if path == Path::new("relative-direct-put-node-1.sock")
+        ));
+    }
+
+    #[test]
+    fn unix_object_mutation_metadata_client_install_rejects_relative_socket_path() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+
+        let err = map
+            .install_unix_object_mutation_metadata_clients([
+                LocalUnixObjectMutationMetadataNodeClientConfig::new(
+                    node_id,
+                    PathBuf::from("relative-object-mutation-node-1.sock"),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteObjectMutationMetadataClientSocketPathNotAbsolute { path }
+                if path == Path::new("relative-object-mutation-node-1.sock")
         ));
     }
 

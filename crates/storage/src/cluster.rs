@@ -1929,6 +1929,19 @@ impl StorageCluster {
         self.metadata_pg_primary_client(PgId::new(self.object_metadata_pg_id(bucket, key)))
     }
 
+    fn object_mutation_metadata_primary_client(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<&Arc<dyn crate::node_client::ObjectMutationMetadataNodeClient>, StoreError> {
+        self.local_map
+            .metadata_pg_primary_node(
+                self.operation_epoch(),
+                PgId::new(self.object_metadata_pg_id(bucket, key)),
+            )
+            .map(|node| node.object_mutation_metadata_client())
+    }
+
     fn object_generation_metadata_primary_client(
         &self,
         bucket: &BucketName,

@@ -1,8 +1,9 @@
 use crate::{
     cluster::ShardLocation,
     metadata_command::{
-        decode_metadata_command_envelope, BucketWriteReservationProof, MetadataCommandAcceptance,
-        MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+        decode_metadata_command_envelope, BucketWriteReservationProof, DeleteObjectVersionTarget,
+        MetadataCommandAcceptance, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+        PutObjectMetadataMutation,
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
@@ -109,6 +110,9 @@ const STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
@@ -198,6 +202,14 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectReadAuthSubjectLoad = 46,
     ObjectReadSnapshotLoad = 47,
     ObjectTagsForSubjectLoad = 48,
+    ObjectMetadataPutSnapshotLoad = 49,
+    ObjectMetadataPutCommandBuild = 50,
+    ObjectDeleteCurrentSnapshotLoad = 51,
+    ObjectDeleteSpecificSnapshotLoad = 52,
+    ObjectDeleteSpecificCommandBuild = 53,
+    ObjectDeleteCurrentCommandBuild = 54,
+    ObjectInsertDeleteMarkerCommandBuild = 55,
+    ObjectLifecycleVersionListLoad = 56,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +304,16 @@ impl StorageRpcMessageKind {
             Self::ObjectReadAuthSubjectLoad => "object read auth subject load",
             Self::ObjectReadSnapshotLoad => "object read snapshot load",
             Self::ObjectTagsForSubjectLoad => "object tags for subject load",
+            Self::ObjectMetadataPutSnapshotLoad => "object metadata PUT snapshot load",
+            Self::ObjectMetadataPutCommandBuild => "object metadata PUT command build",
+            Self::ObjectDeleteCurrentSnapshotLoad => "object delete current snapshot load",
+            Self::ObjectDeleteSpecificSnapshotLoad => "object delete specific snapshot load",
+            Self::ObjectDeleteSpecificCommandBuild => "object delete specific command build",
+            Self::ObjectDeleteCurrentCommandBuild => "object delete current command build",
+            Self::ObjectInsertDeleteMarkerCommandBuild => {
+                "object insert delete marker command build"
+            }
+            Self::ObjectLifecycleVersionListLoad => "object lifecycle version list load",
         }
     }
 
@@ -345,6 +367,14 @@ impl StorageRpcMessageKind {
             46 => Ok(Self::ObjectReadAuthSubjectLoad),
             47 => Ok(Self::ObjectReadSnapshotLoad),
             48 => Ok(Self::ObjectTagsForSubjectLoad),
+            49 => Ok(Self::ObjectMetadataPutSnapshotLoad),
+            50 => Ok(Self::ObjectMetadataPutCommandBuild),
+            51 => Ok(Self::ObjectDeleteCurrentSnapshotLoad),
+            52 => Ok(Self::ObjectDeleteSpecificSnapshotLoad),
+            53 => Ok(Self::ObjectDeleteSpecificCommandBuild),
+            54 => Ok(Self::ObjectDeleteCurrentCommandBuild),
+            55 => Ok(Self::ObjectInsertDeleteMarkerCommandBuild),
+            56 => Ok(Self::ObjectLifecycleVersionListLoad),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -572,6 +602,125 @@ pub(crate) enum StorageRpcObjectTagsForSubjectOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcObjectTagsForSubjectResponse {
     pub(crate) outcome: StorageRpcObjectTagsForSubjectOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPutObjectMetadataSnapshotRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) version_id: Option<VersionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcPutObjectMetadataSnapshotOutcome {
+    Loaded(Box<StoredObject>),
+    ObjectNotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPutObjectMetadataSnapshotResponse {
+    pub(crate) outcome: StorageRpcPutObjectMetadataSnapshotOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPutObjectMetadataCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) requested_version_id: Option<VersionId>,
+    pub(crate) expected_stored: StoredObject,
+    pub(crate) version_id: VersionId,
+    pub(crate) mutation: PutObjectMetadataMutation,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcObjectMetadataCommandBuildOutcome {
+    Command(Box<crate::metadata_command::MetadataCommandEnvelope>),
+    StaleSnapshot,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectMetadataCommandBuildResponse {
+    pub(crate) outcome: StorageRpcObjectMetadataCommandBuildOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectDeleteSnapshotRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) version_id: Option<VersionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectDeleteSnapshotResponse {
+    pub(crate) stored: Option<StoredObject>,
+    pub(crate) target: Option<DeleteObjectVersionTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectLifecycleVersionListResponse {
+    pub(crate) versions: Vec<StoredObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcDeleteSpecificObjectCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) version_id: VersionId,
+    pub(crate) expected_stored: Option<StoredObject>,
+    pub(crate) expected_target: Option<DeleteObjectVersionTarget>,
+    pub(crate) expected_version_list: Option<Vec<StoredObject>>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcDeleteCurrentObjectCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) expected_current: Option<StoredObject>,
+    pub(crate) expected_target: Option<DeleteObjectVersionTarget>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcInsertDeleteMarkerStalePayload {
+    Explicit(Option<ObjectPayloadReclaimCommand>),
+    SnapshotCurrentNullLive { created_at: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcInsertDeleteMarkerCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) expected_current: Option<StoredObject>,
+    pub(crate) expected_stale_payload_source: Option<StoredObject>,
+    pub(crate) version_id: VersionId,
+    pub(crate) owner: OwnerIdentity,
+    pub(crate) stale_payload: StorageRpcInsertDeleteMarkerStalePayload,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+fn object_payload_reclaim_matches_object(
+    reclaim: &ObjectPayloadReclaimCommand,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> bool {
+    match reclaim {
+        ObjectPayloadReclaimCommand::Segments(reclaim) => {
+            reclaim.bucket == *bucket && reclaim.key == *key
+        }
+        ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+            reclaim.bucket == *bucket && reclaim.key == *key
+        }
+    }
+}
+
+fn delete_target_matches_object(
+    target: &DeleteObjectVersionTarget,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> bool {
+    match target {
+        DeleteObjectVersionTarget::DeleteMarker => true,
+        DeleteObjectVersionTarget::Live { payload, .. } => {
+            object_payload_reclaim_matches_object(payload, bucket, key)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1271,6 +1420,18 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectTagsForSubjectLoad => {
             STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad
+        | StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad
+        | StorageRpcMessageKind::ObjectDeleteSpecificSnapshotLoad
+        | StorageRpcMessageKind::ObjectLifecycleVersionListLoad => {
+            STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectMetadataPutCommandBuild
+        | StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild
+        | StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild
+        | StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild => {
+            STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectGenerationNext => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
         }
@@ -1688,6 +1849,270 @@ pub(crate) fn decode_object_tags_for_subject_request(
     })
 }
 
+pub(crate) fn encode_put_object_metadata_snapshot_request(
+    request: &StorageRpcPutObjectMetadataSnapshotRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_optional_version_id(&mut out, request.version_id);
+    out
+}
+
+pub(crate) fn decode_put_object_metadata_snapshot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let version_id = decoder.read_optional_version_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcPutObjectMetadataSnapshotRequest { object, version_id })
+}
+
+pub(crate) fn encode_object_delete_snapshot_request(
+    request: &StorageRpcObjectDeleteSnapshotRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_optional_version_id(&mut out, request.version_id);
+    out
+}
+
+pub(crate) fn decode_object_delete_snapshot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectDeleteSnapshotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let version_id = decoder.read_optional_version_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectDeleteSnapshotRequest { object, version_id })
+}
+
+pub(crate) fn encode_put_object_metadata_command_build_request(
+    request: &StorageRpcPutObjectMetadataCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.expected_stored.bucket() != &request.object.bucket
+        || request.expected_stored.key() != &request.object.key
+        || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "object metadata command build request identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_optional_version_id(&mut out, request.requested_version_id);
+    put_stored_object(&mut out, &request.expected_stored);
+    put_u64(&mut out, request.version_id.to_u64());
+    put_put_object_metadata_mutation(&mut out, &request.mutation);
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_put_object_metadata_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let requested_version_id = decoder.read_optional_version_id()?;
+    let expected_stored = decoder.read_stored_object()?;
+    let version_id = VersionId::from_u64(decoder.read_u64()?);
+    let mutation = decoder.read_put_object_metadata_mutation()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    if expected_stored.bucket() != &object.bucket
+        || expected_stored.key() != &object.key
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "object metadata command build request identity mismatch",
+        ));
+    }
+    Ok(StorageRpcPutObjectMetadataCommandBuildRequest {
+        object,
+        requested_version_id,
+        expected_stored,
+        version_id,
+        mutation,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_delete_specific_object_command_build_request(
+    request: &StorageRpcDeleteSpecificObjectCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.expected_stored.as_ref().is_some_and(|stored| {
+        stored.bucket() != &request.object.bucket || stored.key() != &request.object.key
+    }) || request.expected_target.as_ref().is_some_and(|target| {
+        !delete_target_matches_object(target, &request.object.bucket, &request.object.key)
+    }) || request
+        .expected_version_list
+        .as_ref()
+        .is_some_and(|versions| {
+            versions.iter().any(|stored| {
+                stored.bucket() != &request.object.bucket || stored.key() != &request.object.key
+            })
+        })
+        || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "delete-specific command build request identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_u64(&mut out, request.version_id.to_u64());
+    put_optional_stored_object(&mut out, request.expected_stored.as_ref());
+    put_optional_delete_object_version_target(&mut out, request.expected_target.as_ref());
+    put_optional_stored_object_list(&mut out, request.expected_version_list.as_deref());
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_delete_specific_object_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let version_id = VersionId::from_u64(decoder.read_u64()?);
+    let expected_stored = decoder.read_optional_stored_object()?;
+    let expected_target = decoder.read_optional_delete_object_version_target()?;
+    let expected_version_list = decoder.read_optional_stored_object_list()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    if expected_stored
+        .as_ref()
+        .is_some_and(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        || expected_target.as_ref().is_some_and(|target| {
+            !delete_target_matches_object(target, &object.bucket, &object.key)
+        })
+        || expected_version_list.as_ref().is_some_and(|versions| {
+            versions
+                .iter()
+                .any(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        })
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "delete-specific command build request identity mismatch",
+        ));
+    }
+    Ok(StorageRpcDeleteSpecificObjectCommandBuildRequest {
+        object,
+        version_id,
+        expected_stored,
+        expected_target,
+        expected_version_list,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_delete_current_object_command_build_request(
+    request: &StorageRpcDeleteCurrentObjectCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.expected_current.as_ref().is_some_and(|stored| {
+        stored.bucket() != &request.object.bucket || stored.key() != &request.object.key
+    }) || request.expected_target.as_ref().is_some_and(|target| {
+        !delete_target_matches_object(target, &request.object.bucket, &request.object.key)
+    }) || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "delete-current command build request identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_optional_stored_object(&mut out, request.expected_current.as_ref());
+    put_optional_delete_object_version_target(&mut out, request.expected_target.as_ref());
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_delete_current_object_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcDeleteCurrentObjectCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let expected_current = decoder.read_optional_stored_object()?;
+    let expected_target = decoder.read_optional_delete_object_version_target()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    if expected_current
+        .as_ref()
+        .is_some_and(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        || expected_target.as_ref().is_some_and(|target| {
+            !delete_target_matches_object(target, &object.bucket, &object.key)
+        })
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "delete-current command build request identity mismatch",
+        ));
+    }
+    Ok(StorageRpcDeleteCurrentObjectCommandBuildRequest {
+        object,
+        expected_current,
+        expected_target,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_insert_delete_marker_command_build_request(
+    request: &StorageRpcInsertDeleteMarkerCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.expected_current.as_ref().is_some_and(|stored| {
+        stored.bucket() != &request.object.bucket || stored.key() != &request.object.key
+    }) || request
+        .expected_stale_payload_source
+        .as_ref()
+        .is_some_and(|stored| {
+            stored.bucket() != &request.object.bucket || stored.key() != &request.object.key
+        })
+        || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "insert-delete-marker command build request identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_optional_stored_object(&mut out, request.expected_current.as_ref());
+    put_optional_stored_object(&mut out, request.expected_stale_payload_source.as_ref());
+    put_u64(&mut out, request.version_id.to_u64());
+    put_owner_identity(&mut out, &request.owner);
+    put_insert_delete_marker_stale_payload(&mut out, &request.stale_payload);
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_insert_delete_marker_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcInsertDeleteMarkerCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let expected_current = decoder.read_optional_stored_object()?;
+    let expected_stale_payload_source = decoder.read_optional_stored_object()?;
+    let version_id = VersionId::from_u64(decoder.read_u64()?);
+    let owner = decoder.read_owner_identity()?;
+    let stale_payload = decoder.read_insert_delete_marker_stale_payload()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    if expected_current
+        .as_ref()
+        .is_some_and(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        || expected_stale_payload_source
+            .as_ref()
+            .is_some_and(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "insert-delete-marker command build request identity mismatch",
+        ));
+    }
+    Ok(StorageRpcInsertDeleteMarkerCommandBuildRequest {
+        object,
+        expected_current,
+        expected_stale_payload_source,
+        version_id,
+        owner,
+        stale_payload,
+        bucket_write_reservation,
+    })
+}
+
 pub(crate) fn encode_direct_put_command_build_request(
     request: &StorageRpcDirectPutCommandBuildRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -1880,6 +2305,110 @@ pub(crate) fn decode_object_tags_for_subject_response(
     Ok(StorageRpcObjectTagsForSubjectResponse { outcome })
 }
 
+pub(crate) fn encode_put_object_metadata_snapshot_response(
+    response: &StorageRpcPutObjectMetadataSnapshotResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcPutObjectMetadataSnapshotOutcome::Loaded(stored) => {
+            put_u8(&mut out, 0);
+            put_stored_object(&mut out, stored);
+        }
+        StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound => put_u8(&mut out, 1),
+    }
+    out
+}
+
+pub(crate) fn decode_put_object_metadata_snapshot_response(
+    bytes: &[u8],
+) -> Result<StorageRpcPutObjectMetadataSnapshotResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcPutObjectMetadataSnapshotOutcome::Loaded(Box::new(
+            decoder.read_stored_object()?,
+        )),
+        1 => StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid object metadata PUT snapshot outcome tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcPutObjectMetadataSnapshotResponse { outcome })
+}
+
+pub(crate) fn encode_object_delete_snapshot_response(
+    response: &StorageRpcObjectDeleteSnapshotResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_optional_stored_object(&mut out, response.stored.as_ref());
+    put_optional_delete_object_version_target(&mut out, response.target.as_ref());
+    out
+}
+
+pub(crate) fn decode_object_delete_snapshot_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectDeleteSnapshotResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let stored = decoder.read_optional_stored_object()?;
+    let target = decoder.read_optional_delete_object_version_target()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectDeleteSnapshotResponse { stored, target })
+}
+
+pub(crate) fn encode_object_lifecycle_version_list_response(
+    response: &StorageRpcObjectLifecycleVersionListResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_stored_object_list(&mut out, &response.versions);
+    out
+}
+
+pub(crate) fn decode_object_lifecycle_version_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectLifecycleVersionListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let versions = decoder.read_stored_object_list()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectLifecycleVersionListResponse { versions })
+}
+
+pub(crate) fn encode_object_metadata_command_build_response(
+    response: &StorageRpcObjectMetadataCommandBuildResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+            put_u8(&mut out, 0);
+            put_metadata_command_envelope_response_item(&mut out, command);
+        }
+        StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => put_u8(&mut out, 1),
+        StorageRpcObjectMetadataCommandBuildOutcome::Missing => put_u8(&mut out, 2),
+    }
+    out
+}
+
+pub(crate) fn decode_object_metadata_command_build_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectMetadataCommandBuildResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(
+            decoder.read_metadata_command_envelope_response_item()?,
+        )),
+        1 => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+        2 => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid object metadata command build outcome tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcObjectMetadataCommandBuildResponse { outcome })
+}
+
 pub(crate) fn encode_object_generation_reservation_response(
     response: &StorageRpcObjectGenerationReservationResponse,
 ) -> Vec<u8> {
@@ -1940,8 +2469,7 @@ pub(crate) fn encode_direct_put_command_build_response(
     match &response.outcome {
         StorageRpcDirectPutCommandBuildOutcome::Command(command) => {
             put_u8(&mut out, 0);
-            put_u64(&mut out, command.checksum_crc64());
-            put_bytes(&mut out, &command.command_bytes());
+            put_metadata_command_envelope_response_item(&mut out, command);
         }
         StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot => put_u8(&mut out, 1),
     }
@@ -1953,21 +2481,9 @@ pub(crate) fn decode_direct_put_command_build_response(
 ) -> Result<StorageRpcDirectPutCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
-        0 => {
-            let command_checksum = decoder.read_u64()?;
-            let command_bytes = decoder.read_bytes()?.to_vec();
-            let item_bytes = {
-                let mut out = Vec::new();
-                put_u64(&mut out, command_checksum);
-                put_bytes(&mut out, &command_bytes);
-                out
-            };
-            let item = decode_metadata_command_item(&item_bytes)?;
-            StorageRpcDirectPutCommandBuildOutcome::Command(Box::new(
-                decode_metadata_command_envelope(&item.command_bytes)
-                    .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?,
-            ))
-        }
+        0 => StorageRpcDirectPutCommandBuildOutcome::Command(Box::new(
+            decoder.read_metadata_command_envelope_response_item()?,
+        )),
         1 => StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
@@ -4765,6 +5281,34 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_optional_stored_object_list(
+        &mut self,
+    ) -> Result<Option<Vec<StoredObject>>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let count = self.read_bounded_remaining_count(1, "stored object list too large")?;
+                let mut objects = Vec::new();
+                for _ in 0..count {
+                    objects.push(self.read_stored_object()?);
+                }
+                Ok(Some(objects))
+            }
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional stored object list tag",
+            )),
+        }
+    }
+
+    fn read_stored_object_list(&mut self) -> Result<Vec<StoredObject>, StorageRpcPayloadError> {
+        let count = self.read_bounded_remaining_count(1, "stored object list too large")?;
+        let mut objects = Vec::new();
+        for _ in 0..count {
+            objects.push(self.read_stored_object()?);
+        }
+        Ok(objects)
+    }
+
     fn read_stored_object(&mut self) -> Result<StoredObject, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => Ok(StoredObject::Live(self.read_live_object_record()?)),
@@ -4775,6 +5319,99 @@ impl<'a> StorageRpcDecoder<'a> {
                 "invalid stored object tag",
             )),
         }
+    }
+
+    fn read_put_object_metadata_mutation(
+        &mut self,
+    ) -> Result<PutObjectMetadataMutation, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(PutObjectMetadataMutation::PutTags(self.read_string()?)),
+            1 => Ok(PutObjectMetadataMutation::DeleteTags),
+            2 => Ok(PutObjectMetadataMutation::PutRetention(ObjectRetention {
+                retain_until_unix_seconds: self.read_u64()?,
+                mode: self.read_object_lock_mode()?,
+            })),
+            3 => Ok(PutObjectMetadataMutation::PutLegalHold(
+                StoredLegalHoldStatus::from_u8(self.read_u8()?).ok_or(
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid stored legal hold status",
+                    ),
+                )?,
+            )),
+            4 => Ok(PutObjectMetadataMutation::PutAcl {
+                acl_grants: self.read_acl_grants()?,
+                public_read: self.read_bool()?,
+            }),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid object metadata mutation tag",
+            )),
+        }
+    }
+
+    fn read_insert_delete_marker_stale_payload(
+        &mut self,
+    ) -> Result<StorageRpcInsertDeleteMarkerStalePayload, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(StorageRpcInsertDeleteMarkerStalePayload::Explicit(
+                self.read_optional_object_payload_reclaim()?,
+            )),
+            1 => Ok(
+                StorageRpcInsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                    created_at: self.read_u64()?,
+                },
+            ),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid insert delete marker stale payload tag",
+            )),
+        }
+    }
+
+    fn read_optional_delete_object_version_target(
+        &mut self,
+    ) -> Result<Option<DeleteObjectVersionTarget>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_delete_object_version_target()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional delete object version target tag",
+            )),
+        }
+    }
+
+    fn read_delete_object_version_target(
+        &mut self,
+    ) -> Result<DeleteObjectVersionTarget, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(DeleteObjectVersionTarget::DeleteMarker),
+            1 => Ok(DeleteObjectVersionTarget::Live {
+                generation_id: GenerationId::new(self.read_u64()?).ok_or(
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid delete target generation id",
+                    ),
+                )?,
+                layout: self.read_object_layout()?,
+                payload: self.read_object_payload_reclaim()?,
+            }),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid delete object version target tag",
+            )),
+        }
+    }
+
+    fn read_metadata_command_envelope_response_item(
+        &mut self,
+    ) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
+        let command_checksum = self.read_u64()?;
+        let command_bytes = self.read_bytes()?.to_vec();
+        let item_bytes = {
+            let mut out = Vec::new();
+            put_u64(&mut out, command_checksum);
+            put_bytes(&mut out, &command_bytes);
+            out
+        };
+        let item = decode_metadata_command_item(&item_bytes)?;
+        decode_metadata_command_envelope(&item.command_bytes)
+            .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
     }
 
     fn read_live_object_record(&mut self) -> Result<LiveObjectRecord, StorageRpcPayloadError> {
@@ -5535,6 +6172,26 @@ fn put_optional_stored_object(out: &mut Vec<u8>, stored: Option<&StoredObject>) 
     }
 }
 
+fn put_optional_stored_object_list(out: &mut Vec<u8>, stored: Option<&[StoredObject]>) {
+    match stored {
+        None => put_u8(out, 0),
+        Some(stored) => {
+            put_u8(out, 1);
+            put_stored_object_list(out, stored);
+        }
+    }
+}
+
+fn put_stored_object_list(out: &mut Vec<u8>, stored: &[StoredObject]) {
+    put_u32(
+        out,
+        u32::try_from(stored.len()).expect("stored object list count must fit in u32"),
+    );
+    for stored in stored {
+        put_stored_object(out, stored);
+    }
+}
+
 fn put_stored_object(out: &mut Vec<u8>, stored: &StoredObject) {
     match stored {
         StoredObject::Live(record) => {
@@ -5546,6 +6203,86 @@ fn put_stored_object(out: &mut Vec<u8>, stored: &StoredObject) {
             put_delete_marker_record(out, record);
         }
     }
+}
+
+fn put_put_object_metadata_mutation(out: &mut Vec<u8>, mutation: &PutObjectMetadataMutation) {
+    match mutation {
+        PutObjectMetadataMutation::PutTags(tags) => {
+            put_u8(out, 0);
+            put_string(out, tags);
+        }
+        PutObjectMetadataMutation::DeleteTags => put_u8(out, 1),
+        PutObjectMetadataMutation::PutRetention(retention) => {
+            put_u8(out, 2);
+            put_u64(out, retention.retain_until_unix_seconds);
+            put_u8(out, retention.mode as u8);
+        }
+        PutObjectMetadataMutation::PutLegalHold(legal_hold) => {
+            put_u8(out, 3);
+            put_u8(out, *legal_hold as u8);
+        }
+        PutObjectMetadataMutation::PutAcl {
+            acl_grants,
+            public_read,
+        } => {
+            put_u8(out, 4);
+            put_string(out, &acl_grants.serialized());
+            put_bool(out, *public_read);
+        }
+    }
+}
+
+fn put_insert_delete_marker_stale_payload(
+    out: &mut Vec<u8>,
+    stale_payload: &StorageRpcInsertDeleteMarkerStalePayload,
+) {
+    match stale_payload {
+        StorageRpcInsertDeleteMarkerStalePayload::Explicit(reclaim) => {
+            put_u8(out, 0);
+            put_optional_object_payload_reclaim(out, reclaim.as_ref());
+        }
+        StorageRpcInsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at } => {
+            put_u8(out, 1);
+            put_u64(out, *created_at);
+        }
+    }
+}
+
+fn put_optional_delete_object_version_target(
+    out: &mut Vec<u8>,
+    target: Option<&DeleteObjectVersionTarget>,
+) {
+    match target {
+        None => put_u8(out, 0),
+        Some(target) => {
+            put_u8(out, 1);
+            put_delete_object_version_target(out, target);
+        }
+    }
+}
+
+fn put_delete_object_version_target(out: &mut Vec<u8>, target: &DeleteObjectVersionTarget) {
+    match target {
+        DeleteObjectVersionTarget::DeleteMarker => put_u8(out, 0),
+        DeleteObjectVersionTarget::Live {
+            generation_id,
+            layout,
+            payload,
+        } => {
+            put_u8(out, 1);
+            put_u64(out, generation_id.get());
+            put_object_layout(out, *layout);
+            put_object_payload_reclaim(out, payload);
+        }
+    }
+}
+
+fn put_metadata_command_envelope_response_item(
+    out: &mut Vec<u8>,
+    command: &crate::metadata_command::MetadataCommandEnvelope,
+) {
+    put_u64(out, command.checksum_crc64());
+    put_bytes(out, &command.command_bytes());
 }
 
 fn put_object_read_auth_subject(out: &mut Vec<u8>, subject: &ObjectReadAuthSubject) {
@@ -6855,6 +7592,46 @@ mod tests {
                 StorageRpcMessageKind::ObjectTagsForSubjectLoad,
                 STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectDeleteSpecificSnapshotLoad,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectLifecycleVersionListLoad,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectMetadataPutCommandBuild,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::BucketWriteReservationAcquire,

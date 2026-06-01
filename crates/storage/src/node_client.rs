@@ -36,9 +36,11 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
-    decode_object_generation_reservation_response, decode_object_generation_response,
-    decode_object_read_auth_subject_response, decode_object_read_snapshot_response,
-    decode_object_tags_for_subject_response, decode_object_version_response,
+    decode_object_delete_snapshot_response, decode_object_generation_reservation_response,
+    decode_object_generation_response, decode_object_lifecycle_version_list_response,
+    decode_object_metadata_command_build_response, decode_object_read_auth_subject_response,
+    decode_object_read_snapshot_response, decode_object_tags_for_subject_response,
+    decode_object_version_response, decode_put_object_metadata_snapshot_response,
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_shard_read_range_response,
     decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
@@ -46,13 +48,17 @@ use crate::storage_rpc::{
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
     encode_bucket_write_reservation_record_request,
     encode_completed_multipart_order_command_build_request,
-    encode_create_bucket_command_build_request, encode_direct_put_command_build_request,
-    encode_direct_put_commit_snapshot_request, encode_metadata_command_matching_applied_request,
-    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
+    encode_create_bucket_command_build_request, encode_delete_current_object_command_build_request,
+    encode_delete_specific_object_command_build_request, encode_direct_put_command_build_request,
+    encode_direct_put_commit_snapshot_request, encode_insert_delete_marker_command_build_request,
+    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+    encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
-    encode_metadata_command_state_request, encode_object_generation_reservation_request,
-    encode_object_read_auth_subject_request, encode_object_read_snapshot_request,
-    encode_object_request, encode_object_tags_for_subject_request, encode_proof_release_request,
+    encode_metadata_command_state_request, encode_object_delete_snapshot_request,
+    encode_object_generation_reservation_request, encode_object_read_auth_subject_request,
+    encode_object_read_snapshot_request, encode_object_request,
+    encode_object_tags_for_subject_request, encode_proof_release_request,
+    encode_put_object_metadata_command_build_request, encode_put_object_metadata_snapshot_request,
     encode_read_handle_acquire_request, encode_read_handle_release_request,
     encode_scavenger_list_files_request, encode_shard_ack_batch_request,
     encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
@@ -64,9 +70,11 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteReservationRecordRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
-    StorageRpcCreateBucketConfig, StorageRpcDirectPutCommandBuildOutcome,
+    StorageRpcCreateBucketConfig, StorageRpcDeleteCurrentObjectCommandBuildRequest,
+    StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommitSnapshotRequest,
-    StorageRpcErrorResponse, StorageRpcFrame, StorageRpcMessageKind,
+    StorageRpcErrorResponse, StorageRpcFrame, StorageRpcInsertDeleteMarkerCommandBuildRequest,
+    StorageRpcInsertDeleteMarkerStalePayload, StorageRpcMessageKind,
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
@@ -74,11 +82,14 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
+    StorageRpcObjectDeleteSnapshotRequest, StorageRpcObjectDeleteSnapshotResponse,
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
-    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
-    StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
-    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
-    StorageRpcObjectTagsForSubjectRequest, StorageRpcProofReleaseRequest,
+    StorageRpcObjectMetadataCommandBuildOutcome, StorageRpcObjectReadAuthSubjectOutcome,
+    StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadSnapshotOutcome,
+    StorageRpcObjectReadSnapshotRequest, StorageRpcObjectRequest,
+    StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
+    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
+    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
     StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
     StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
@@ -437,6 +448,28 @@ fn normalize_reclaim_created_at(reclaim: &mut Option<ObjectPayloadReclaimCommand
     }
 }
 
+fn normalize_delete_target_created_at(target: &mut Option<DeleteObjectVersionTarget>) {
+    let Some(DeleteObjectVersionTarget::Live { payload, .. }) = target else {
+        return;
+    };
+    let mut reclaim = Some(payload.clone());
+    normalize_reclaim_created_at(&mut reclaim);
+    if let Some(normalized) = reclaim {
+        *payload = normalized;
+    }
+}
+
+fn delete_target_matches_expected(
+    actual: Option<&DeleteObjectVersionTarget>,
+    expected: Option<&DeleteObjectVersionTarget>,
+) -> bool {
+    let mut actual = actual.cloned();
+    let mut expected = expected.cloned();
+    normalize_delete_target_created_at(&mut actual);
+    normalize_delete_target_created_at(&mut expected);
+    actual == expected
+}
+
 fn reclaim_matches_bucket_key(
     reclaim: Option<&ObjectPayloadReclaimCommand>,
     bucket: &BucketName,
@@ -574,6 +607,16 @@ fn delete_command_target_from_stored(
             Ok(Some(live_delete_command_target(pg, bucket, key, record)?))
         }
     }
+}
+
+fn load_object_delete_snapshot_from_stored(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    stored: Option<StoredObject>,
+) -> Result<ObjectDeleteStorageSnapshot, MetadataError> {
+    let target = delete_command_target_from_stored(pg, bucket, key, stored.as_ref())?;
+    Ok(ObjectDeleteStorageSnapshot { stored, target })
 }
 
 fn live_delete_command_target(
@@ -803,6 +846,58 @@ pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
+pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
+    fn load_put_object_metadata_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError>;
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn load_current_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
+
+    fn load_specific_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
+
+    fn list_object_versions_for_lifecycle(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError>;
+
+    fn build_delete_specific_object_version_command(
+        &self,
+        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_delete_current_object_command(
+        &self,
+        request: BuildDeleteCurrentObjectCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_insert_delete_marker_command(
+        &self,
+        request: BuildInsertDeleteMarkerCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
 pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
     fn load_object_read_auth_subject(
         &self,
@@ -925,6 +1020,7 @@ pub(crate) struct BuildDeleteSpecificObjectVersionCommandReq<'a> {
     pub(crate) key: &'a ObjectKey,
     pub(crate) version_id: VersionId,
     pub(crate) expected_stored: Option<&'a StoredObject>,
+    pub(crate) expected_target: Option<&'a DeleteObjectVersionTarget>,
     pub(crate) expected_version_list: Option<&'a [StoredObject]>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
@@ -935,7 +1031,14 @@ pub(crate) struct BuildDeleteCurrentObjectCommandReq<'a> {
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
     pub(crate) expected_current: Option<&'a StoredObject>,
+    pub(crate) expected_target: Option<&'a DeleteObjectVersionTarget>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectDeleteStorageSnapshot {
+    pub(crate) stored: Option<StoredObject>,
+    pub(crate) target: Option<DeleteObjectVersionTarget>,
 }
 
 pub(crate) struct BuildInsertDeleteMarkerCommandReq<'a> {
@@ -947,6 +1050,7 @@ pub(crate) struct BuildInsertDeleteMarkerCommandReq<'a> {
     pub(crate) version_id: VersionId,
     pub(crate) owner: &'a OwnerIdentity,
     pub(crate) stale_payload: InsertDeleteMarkerStalePayload,
+    pub(crate) expected_stale_payload_source: Option<&'a StoredObject>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
@@ -1364,7 +1468,7 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
 
     fn load_specific_object_delete_snapshot(
         &self,
@@ -1372,7 +1476,7 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
 
     fn list_object_versions_for_lifecycle(
         &self,
@@ -3551,6 +3655,78 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
+impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
+    fn load_put_object_metadata_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_put_object_metadata_snapshot(
+            self, pg_id, bucket, key, version_id,
+        )
+    }
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_put_object_metadata_command(self, request)
+    }
+
+    fn load_current_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_current_object_delete_snapshot(self, pg_id, bucket, key)
+    }
+
+    fn load_specific_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_specific_object_delete_snapshot(
+            self, pg_id, bucket, key, version_id,
+        )
+    }
+
+    fn list_object_versions_for_lifecycle(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::list_object_versions_for_lifecycle(self, pg_id, bucket, key)
+    }
+
+    fn build_delete_specific_object_version_command(
+        &self,
+        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_delete_specific_object_version_command(self, request)
+    }
+
+    fn build_delete_current_object_command(
+        &self,
+        request: BuildDeleteCurrentObjectCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_delete_current_object_command(self, request)
+    }
+
+    fn build_insert_delete_marker_command(
+        &self,
+        request: BuildInsertDeleteMarkerCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_insert_delete_marker_command(self, request)
+    }
+}
+
 impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
     fn load_object_read_auth_subject(
         &self,
@@ -4128,6 +4304,235 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
     }
 }
 
+impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
+    fn load_put_object_metadata_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        let request = StorageRpcPutObjectMetadataSnapshotRequest {
+            object: self.object_request(pg_id, bucket, key),
+            version_id,
+        };
+        let payload = encode_put_object_metadata_snapshot_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_put_object_metadata_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode object metadata PUT snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcPutObjectMetadataSnapshotOutcome::Loaded(stored) => {
+                self.validate_stored_object_response(
+                    &stored,
+                    bucket,
+                    key,
+                    version_id,
+                    "validate object metadata PUT snapshot response",
+                )?;
+                Ok(*stored)
+            }
+            StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound => {
+                Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound))
+            }
+        }
+    }
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let rpc_request = StorageRpcPutObjectMetadataCommandBuildRequest {
+            object: self.object_request(request.pg_id, request.bucket, request.key),
+            requested_version_id: request.requested_version_id,
+            expected_stored: request.expected_stored.clone(),
+            version_id: request.version_id,
+            mutation: request.mutation.clone(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_put_object_metadata_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode object metadata PUT command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMetadataPutCommandBuild,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode object metadata PUT command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                self.validate_put_object_metadata_command_response(&command, &request)?;
+                Ok(*command)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleObjectReadSubject)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
+                Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode object metadata PUT command build response",
+                    "PUT metadata command build cannot return missing".to_string(),
+                )))
+            }
+        }
+    }
+
+    fn load_current_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
+        self.load_object_delete_snapshot(
+            pg_id,
+            bucket,
+            key,
+            None,
+            StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad,
+        )
+    }
+
+    fn load_specific_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
+        self.load_object_delete_snapshot(
+            pg_id,
+            bucket,
+            key,
+            Some(version_id),
+            StorageRpcMessageKind::ObjectDeleteSpecificSnapshotLoad,
+        )
+    }
+
+    fn list_object_versions_for_lifecycle(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        self.load_object_lifecycle_version_list(pg_id, bucket, key)
+    }
+
+    fn build_delete_specific_object_version_command(
+        &self,
+        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let rpc_request = StorageRpcDeleteSpecificObjectCommandBuildRequest {
+            object: self.object_request(request.pg_id, request.bucket, request.key),
+            version_id: request.version_id,
+            expected_stored: request.expected_stored.cloned(),
+            expected_target: request.expected_target.cloned(),
+            expected_version_list: request.expected_version_list.map(<[StoredObject]>::to_vec),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_delete_specific_object_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode delete-specific object command build request",
+                    error.to_string(),
+                ))
+            })?;
+        self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild,
+            payload,
+            "decode delete-specific object command build response",
+            |command| self.validate_delete_specific_object_command_response(command, &request),
+        )
+    }
+
+    fn build_delete_current_object_command(
+        &self,
+        request: BuildDeleteCurrentObjectCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let rpc_request = StorageRpcDeleteCurrentObjectCommandBuildRequest {
+            object: self.object_request(request.pg_id, request.bucket, request.key),
+            expected_current: request.expected_current.cloned(),
+            expected_target: request.expected_target.cloned(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_delete_current_object_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode delete-current object command build request",
+                    error.to_string(),
+                ))
+            })?;
+        self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild,
+            payload,
+            "decode delete-current object command build response",
+            |command| self.validate_delete_current_object_command_response(command, &request),
+        )
+    }
+
+    fn build_insert_delete_marker_command(
+        &self,
+        request: BuildInsertDeleteMarkerCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let stale_payload = match &request.stale_payload {
+            InsertDeleteMarkerStalePayload::Explicit(reclaim) => {
+                StorageRpcInsertDeleteMarkerStalePayload::Explicit(reclaim.clone())
+            }
+            InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at } => {
+                StorageRpcInsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                    created_at: *created_at,
+                }
+            }
+        };
+        let rpc_request = StorageRpcInsertDeleteMarkerCommandBuildRequest {
+            object: self.object_request(request.pg_id, request.bucket, request.key),
+            expected_current: request.expected_current.cloned(),
+            expected_stale_payload_source: request.expected_stale_payload_source.cloned(),
+            version_id: request.version_id,
+            owner: request.owner.clone(),
+            stale_payload,
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_insert_delete_marker_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode insert-delete-marker command build request",
+                    error.to_string(),
+                ))
+            })?;
+        match self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild,
+            payload,
+            "decode insert-delete-marker command build response",
+            |command| self.validate_insert_delete_marker_command_response(command, &request),
+        )? {
+            Some(command) => Ok(command),
+            None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "decode insert-delete-marker command build response",
+                "insert-delete-marker command build cannot return missing".to_string(),
+            ))),
+        }
+    }
+}
+
 impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
     fn load_object_read_auth_subject(
         &self,
@@ -4257,6 +4662,413 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
 }
 
 impl UnixStorageNodeClient {
+    fn object_request(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> StorageRpcObjectRequest {
+        StorageRpcObjectRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }
+    }
+
+    fn load_object_delete_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        kind: StorageRpcMessageKind,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcObjectDeleteSnapshotRequest {
+            object: self.object_request(pg_id, bucket, key),
+            version_id,
+        };
+        let payload = encode_object_delete_snapshot_request(&request);
+        let response = self
+            .rpc_request(kind, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_object_delete_snapshot_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode object delete snapshot response", error.to_string()),
+            )
+        })?;
+        if let Some(stored) = response.stored.as_ref() {
+            self.validate_stored_object_response(
+                stored,
+                bucket,
+                key,
+                version_id,
+                "validate object delete snapshot response",
+            )?;
+        }
+        if let Some(target) = response.target.as_ref() {
+            self.validate_delete_target_response(
+                target,
+                bucket,
+                key,
+                "validate object delete snapshot response",
+            )?;
+        }
+        if !self.delete_snapshot_target_matches_stored(&response) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate object delete snapshot response",
+                "delete target does not match snapshot object".to_string(),
+            )));
+        }
+        Ok(ObjectDeleteStorageSnapshot {
+            stored: response.stored,
+            target: response.target,
+        })
+    }
+
+    fn load_object_lifecycle_version_list(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
+        let request = StorageRpcObjectDeleteSnapshotRequest {
+            object: self.object_request(pg_id, bucket, key),
+            version_id: None,
+        };
+        let payload = encode_object_delete_snapshot_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectLifecycleVersionListLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_lifecycle_version_list_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode object lifecycle version list response",
+                    error.to_string(),
+                ))
+            })?;
+        for stored in &response.versions {
+            self.validate_stored_object_response(
+                stored,
+                bucket,
+                key,
+                None,
+                "validate object lifecycle version list response",
+            )?;
+        }
+        Ok(response.versions)
+    }
+
+    fn validate_delete_target_response(
+        &self,
+        target: &DeleteObjectVersionTarget,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        match target {
+            DeleteObjectVersionTarget::DeleteMarker => Ok(()),
+            DeleteObjectVersionTarget::Live {
+                generation_id,
+                layout,
+                payload,
+            } => {
+                let payload_matches = match (payload, layout) {
+                    (ObjectPayloadReclaimCommand::Segments(reclaim), ObjectLayout::Standard) => {
+                        reclaim.generation_id == *generation_id
+                    }
+                    (
+                        ObjectPayloadReclaimCommand::Multipart(reclaim),
+                        ObjectLayout::MultipartManifest { .. },
+                    ) => reclaim.generation_id == *generation_id,
+                    _ => false,
+                };
+                if !reclaim_matches_bucket_key(Some(payload), bucket, key) || !payload_matches {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        context,
+                        "delete target payload does not match request".to_string(),
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn delete_snapshot_target_matches_stored(
+        &self,
+        response: &StorageRpcObjectDeleteSnapshotResponse,
+    ) -> bool {
+        match (&response.stored, &response.target) {
+            (None, None) => true,
+            (
+                Some(StoredObject::DeleteMarker(_)),
+                Some(DeleteObjectVersionTarget::DeleteMarker),
+            ) => true,
+            (
+                Some(StoredObject::Live(live)),
+                Some(DeleteObjectVersionTarget::Live {
+                    generation_id,
+                    layout,
+                    payload,
+                }),
+            ) => {
+                *generation_id == live.generation_id
+                    && *layout == live.layout
+                    && reclaim_matches_bucket_key(Some(payload), &live.bucket, &live.key)
+            }
+            _ => false,
+        }
+    }
+
+    fn object_metadata_command_build_request(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        decode_context: &'static str,
+        validate: impl FnOnce(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let response = self
+            .rpc_request(kind, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(
+                    self.rpc_payload_error(decode_context, error.to_string()),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                validate(&command)?;
+                Ok(Some(*command))
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleObjectReadSubject)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => Ok(None),
+        }
+    }
+
+    fn validate_stored_object_response(
+        &self,
+        stored: &StoredObject,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if stored.bucket() != bucket
+            || stored.key() != key
+            || version_id.is_some_and(|version_id| stored.version_id() != version_id)
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stored object identity does not match request".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_object_metadata_command_route(
+        &self,
+        command: &MetadataCommandEnvelope,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if command.id().cluster_epoch() != cluster_epoch || command.id().pg_id() != pg_id {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "command id route does not match request".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_put_object_metadata_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate object metadata PUT command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not object metadata PUT".to_string(),
+            )));
+        };
+        let live = request
+            .expected_stored
+            .as_live()
+            .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
+        let expected = PutObjectMetadataCommand::from_live_object_and_mutation(
+            live.clone(),
+            request.mutation.clone(),
+            request.bucket_write_reservation.clone(),
+        );
+        if update.as_ref() != &expected || request.version_id != live.version_id {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command does not match request".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_delete_specific_object_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildDeleteSpecificObjectVersionCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate delete-specific object command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not object version delete".to_string(),
+            )));
+        };
+        if delete.bucket != *request.bucket
+            || delete.key != *request.key
+            || delete.version_id != request.version_id
+            || delete.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command identity does not match request".to_string(),
+            )));
+        }
+        self.validate_delete_target_response(&delete.target, request.bucket, request.key, context)?;
+        if !delete_target_matches_expected(Some(&delete.target), request.expected_target) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response delete target does not match request snapshot".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_delete_current_object_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildDeleteCurrentObjectCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let Some(StoredObject::Live(expected)) = request.expected_current else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate delete-current object command build response",
+                "missing/delete-marker current must not return delete command".to_string(),
+            )));
+        };
+        let specific = BuildDeleteSpecificObjectVersionCommandReq {
+            pg_id: request.pg_id,
+            cluster_epoch: request.cluster_epoch,
+            bucket: request.bucket,
+            key: request.key,
+            version_id: expected.version_id,
+            expected_stored: request.expected_current,
+            expected_target: request.expected_target,
+            expected_version_list: None,
+            bucket_write_reservation: request.bucket_write_reservation,
+        };
+        self.validate_delete_specific_object_command_response(command, &specific)
+    }
+
+    fn validate_insert_delete_marker_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildInsertDeleteMarkerCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate insert-delete-marker command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not insert delete marker".to_string(),
+            )));
+        };
+        if marker.bucket != *request.bucket
+            || marker.key != *request.key
+            || marker.version_id != request.version_id
+            || marker.owner != *request.owner
+            || marker.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command identity does not match request".to_string(),
+            )));
+        }
+        match &request.stale_payload {
+            InsertDeleteMarkerStalePayload::Explicit(expected) => {
+                let mut actual = marker.stale_payload.clone();
+                normalize_reclaim_created_at(&mut actual);
+                if &actual != expected {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        context,
+                        "response stale payload does not match request".to_string(),
+                    )));
+                }
+            }
+            InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { .. } => {
+                if let Some(payload) = marker.stale_payload.as_ref() {
+                    self.validate_reclaim_payload_response(
+                        payload,
+                        request.bucket,
+                        request.key,
+                        context,
+                    )?;
+                }
+                if !reclaim_matches_snapshot_live_object(
+                    marker.stale_payload.as_ref(),
+                    &request.expected_stale_payload_source.cloned(),
+                ) {
+                    return Err(ObjectPgActionError::Store(
+                        self.rpc_payload_error(
+                            context,
+                            "response stale payload does not match current null live snapshot"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_reclaim_payload_response(
+        &self,
+        payload: &ObjectPayloadReclaimCommand,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if !reclaim_matches_bucket_key(Some(payload), bucket, key) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response reclaim payload does not match request".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_object_read_subject_response(
         &self,
         subject: &ObjectReadAuthSubject,
@@ -5562,9 +6374,12 @@ impl StorageNodeClient for LocalStorageNodeClient {
         pg_id: PgId,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(load_current_object_optional_from_pg(&pg, bucket, key)?)
+        let stored = load_current_object_optional_from_pg(&pg, bucket, key)?;
+        Ok(load_object_delete_snapshot_from_stored(
+            &pg, bucket, key, stored,
+        )?)
     }
 
     fn load_specific_object_delete_snapshot(
@@ -5573,10 +6388,11 @@ impl StorageNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(load_object_version_optional_from_pg(
-            &pg, bucket, key, version_id,
+        let stored = load_object_version_optional_from_pg(&pg, bucket, key, version_id)?;
+        Ok(load_object_delete_snapshot_from_stored(
+            &pg, bucket, key, stored,
         )?)
     }
 
@@ -5631,6 +6447,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         else {
             return Ok(None);
         };
+        if !delete_target_matches_expected(Some(&target), request.expected_target) {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
         let command_id = self.next_metadata_command_id_from_locked_pg(
             request.pg_id,
             request.cluster_epoch,
@@ -5661,6 +6480,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
             return Ok(None);
         };
         let target = live_delete_command_target(&pg, request.bucket, request.key, record)?;
+        if !delete_target_matches_expected(Some(&target), request.expected_target) {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
         let command_id = self.next_metadata_command_id_from_locked_pg(
             request.pg_id,
             request.cluster_epoch,
@@ -5690,12 +6512,16 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let stale_payload = match request.stale_payload {
             InsertDeleteMarkerStalePayload::Explicit(stale_payload) => stale_payload,
             InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at } => {
-                snapshot_direct_put_stale_payload_command(
+                let (source, stale_payload) = snapshot_direct_put_stale_payload_for_snapshot(
                     &pg,
                     request.bucket,
                     request.key,
                     created_at,
-                )?
+                )?;
+                if source.as_ref() != request.expected_stale_payload_source {
+                    return Err(ObjectPgActionError::StaleObjectReadSubject);
+                }
+                stale_payload
             }
         };
         let write_sequence =
@@ -7357,6 +8183,24 @@ mod tests {
         })
     }
 
+    fn test_bucket_write_reservation_proof(
+        bucket: BucketName,
+        key: &ObjectKey,
+    ) -> BucketWriteReservationProof {
+        BucketWriteReservationProof {
+            bucket,
+            reservation_id: "reservation-id".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "object-mutation-test".to_string(),
+            created_at: 1,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        }
+    }
+
     fn test_multipart_layout() -> ObjectLayout {
         ObjectLayout::MultipartManifest {
             parts_count: std::num::NonZeroU32::new(1).unwrap(),
@@ -7984,6 +8828,144 @@ mod tests {
         };
 
         assert_direct_put_snapshot_accepted(&snapshot, &bucket, &key);
+    }
+
+    #[test]
+    fn unix_delete_specific_command_response_rejects_wrong_reclaim_target() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("delete-specific-target-rpc");
+        let key = crate::tests::object_key("delete-specific-target-rpc-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let stored = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+            ObjectLayout::Standard,
+        );
+        let expected_target = DeleteObjectVersionTarget::Live {
+            generation_id,
+            layout: ObjectLayout::Standard,
+            payload: test_segments_reclaim(bucket.clone(), key.clone(), generation_id),
+        };
+        let bad_generation_id = GenerationId::new(10).unwrap();
+        let bad_target = DeleteObjectVersionTarget::Live {
+            generation_id: bad_generation_id,
+            layout: ObjectLayout::Standard,
+            payload: test_segments_reclaim(bucket.clone(), key.clone(), bad_generation_id),
+        };
+        let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: proof.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                target: bad_target,
+            })),
+        );
+
+        let err = client
+            .validate_delete_specific_object_command_response(
+                &command,
+                &BuildDeleteSpecificObjectVersionCommandReq {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    bucket: &bucket,
+                    key: &key,
+                    version_id: VersionId::Null,
+                    expected_stored: Some(&stored),
+                    expected_target: Some(&expected_target),
+                    expected_version_list: None,
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate delete-specific object command build response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_insert_delete_marker_response_rejects_wrong_snapshot_stale_payload() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("insert-marker-stale-rpc");
+        let key = crate::tests::object_key("insert-marker-stale-rpc-key");
+        let generation_id = GenerationId::new(9).unwrap();
+        let stored = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+            ObjectLayout::Standard,
+        );
+        let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: proof.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: OwnerIdentity::from_principal("owner"),
+                write_sequence: 1,
+                last_modified_millis: 1,
+                stale_payload: Some(test_segments_reclaim(
+                    crate::tests::bucket_name("wrong-insert-marker-stale-rpc"),
+                    key.clone(),
+                    generation_id,
+                )),
+            }),
+        );
+        let owner = OwnerIdentity::from_principal("owner");
+
+        let err = client
+            .validate_insert_delete_marker_command_response(
+                &command,
+                &BuildInsertDeleteMarkerCommandReq {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    bucket: &bucket,
+                    key: &key,
+                    expected_current: Some(&stored),
+                    version_id: VersionId::Null,
+                    owner: &owner,
+                    stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                        created_at: 1,
+                    },
+                    expected_stale_payload_source: Some(&stored),
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate insert-delete-marker command build response",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -8835,6 +9817,159 @@ mod tests {
             tags.as_deref(),
             Some("<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>")
         );
+
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("object-mutation-rpc-bucket");
+        let key = crate::tests::object_key("object-mutation-rpc-key");
+        let generation_id = GenerationId::new(19).unwrap();
+        let segment = ObjectSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size: 12,
+            segment_crc64: Some(100),
+            segment_okh: [4; 16],
+            segment_vid: GenerationId::new(20).unwrap(),
+            data_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        };
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &crate::CanonicalUserId::from_principal("owner"),
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::put_object_with_segments(
+                &*pg,
+                &PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id,
+                    size: 12,
+                    etag: ObjectEtag::single_part(100),
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                std::slice::from_ref(&segment),
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..4)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "reservation-id".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "object-mutation-test".to_string(),
+            created_at: 1,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        };
+
+        let stored = ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stored.bucket(), &bucket);
+        assert_eq!(stored.key(), &key);
+
+        let put_command = ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
+            &client,
+            BuildPutObjectMetadataCommandReq {
+                pg_id: PgId::new(0),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                requested_version_id: None,
+                expected_stored: &stored,
+                version_id: VersionId::Null,
+                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            put_command.payload(),
+            MetadataCommandPayload::PutObjectMetadata(update)
+                if update.object.bucket == bucket && update.object.key == key
+        ));
+
+        let current = ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(current.stored.as_ref(), Some(&stored));
+        let delete_command = ObjectMutationMetadataNodeClient::build_delete_current_object_command(
+            &client,
+            BuildDeleteCurrentObjectCommandReq {
+                pg_id: PgId::new(0),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current.stored.as_ref(),
+                expected_target: current.target.as_ref(),
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap()
+        .expect("live current object should build delete command");
+        assert!(matches!(
+            delete_command.payload(),
+            MetadataCommandPayload::DeleteObjectVersion(delete)
+                if delete.bucket == bucket && delete.key == key
+        ));
 
         for thread in server_threads {
             thread.join().unwrap();

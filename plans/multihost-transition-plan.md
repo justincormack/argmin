@@ -5571,10 +5571,15 @@ surface, preserving typed not-found and stale-subject outcomes for the existing
 bounded retry loop. Object tag reads now use the same dedicated object-read
 metadata RPC boundary for the subject load and subject-checked tag reload, and
 legal-hold/retention reads use the shared object-read auth-subject RPC instead
-of the broad storage-client surface. Remaining non-command surfaces still need
-lifecycle/object snapshot reads used by command builders and the
-operation-shaped builders for the rest of the metadata mutation paths before
-frontend/combined roles can be enabled.
+of the broad storage-client surface. PUT-object-metadata, object delete,
+delete-marker insertion, and lifecycle noncurrent/delete-marker cleanup now
+route object mutation snapshot loads, version-list reads, and command builders
+through a dedicated object-mutation metadata RPC surface. Delete snapshots carry
+the expected delete target, and Unix clients validate returned delete/reclaim
+payload identity before publishing the command. Remaining non-command surfaces
+still need operation-shaped builders for stream PUT, multipart, bucket
+properties/subresources, lifecycle MPU abort, and durable pending/drain/
+coordination checks before frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5634,10 +5639,14 @@ Implementation slices:
    metadata RPC boundary. Object-read auth-subject/snapshot helpers now route
    through a dedicated object-read metadata RPC surface, including
    subject-checked object tag reads and legal-hold/retention auth-subject
-   loads. Remaining work includes lifecycle/object snapshot helpers used by
-   command builders, durable pending/drain/coordination checks, and
-   operation-shaped command-builder calls that must execute against a
-   storage-node-owned snapshot rather than a frontend-owned raw PG handle.
+   loads. Object mutation metadata helpers now route PUT-object-metadata,
+   object delete, delete-marker insertion, lifecycle version-list reads, and
+   lifecycle delete command construction through a dedicated RPC surface with
+   delete-target response validation. Remaining work includes durable
+   pending/drain/coordination checks and operation-shaped command-builder calls
+   for stream PUT, multipart, bucket properties/subresources, and lifecycle MPU
+   abort that must execute against a storage-node-owned snapshot rather than a
+   frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
    install/apply for `CreateBucket`, then direct PUT object-generation

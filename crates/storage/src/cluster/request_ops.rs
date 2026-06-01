@@ -3918,7 +3918,7 @@ impl super::StorageCluster {
         mut action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
             let bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
@@ -4414,16 +4414,16 @@ impl super::StorageCluster {
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, version_id) {
-                        let stored = storage_client
+                        let snapshot = storage_client
                             .load_specific_object_delete_snapshot(pg_id, bucket, key, version_id)?;
-                        let value = match action(stored.as_ref()) {
+                        let value = match action(snapshot.stored.as_ref()) {
                             Ok(value) => value,
                             Err(error) => return Ok(Err(error)),
                         };
@@ -4450,10 +4450,10 @@ impl super::StorageCluster {
                 Some(proof) => proof,
                 None => continue,
             };
-            let stored = match storage_client
+            let snapshot = match storage_client
                 .load_specific_object_delete_snapshot(pg_id, bucket, key, version_id)
             {
-                Ok(stored) => stored,
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
@@ -4461,7 +4461,7 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let value = match action(stored.as_ref()) {
+            let value = match action(snapshot.stored.as_ref()) {
                 Ok(value) => value,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -4470,7 +4470,7 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
-            if stored.is_none() {
+            if snapshot.stored.is_none() {
                 self.release_bucket_write_proof_for_object_metadata_command(
                     &bucket_write_reservation,
                 )?;
@@ -4486,7 +4486,8 @@ impl super::StorageCluster {
                     bucket,
                     key,
                     version_id,
-                    expected_stored: stored.as_ref(),
+                    expected_stored: snapshot.stored.as_ref(),
+                    expected_target: snapshot.target.as_ref(),
                     expected_version_list: None,
                     bucket_write_reservation: &bucket_write_reservation,
                 },
@@ -4562,20 +4563,21 @@ impl super::StorageCluster {
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
-                        let stored = storage_client
+                        let snapshot = storage_client
                             .load_current_object_delete_snapshot(pg_id, bucket, key)?;
-                        if stored
+                        if snapshot
+                            .stored
                             .as_ref()
                             .is_some_and(|stored| stored.version_id() == delete.version_id)
                         {
-                            let value = match action(stored.as_ref()) {
+                            let value = match action(snapshot.stored.as_ref()) {
                                 Ok(value) => value,
                                 Err(error) => return Ok(Err(error)),
                             };
@@ -4605,9 +4607,9 @@ impl super::StorageCluster {
                 Some(proof) => proof,
                 None => continue,
             };
-            let stored =
+            let snapshot =
                 match storage_client.load_current_object_delete_snapshot(pg_id, bucket, key) {
-                    Ok(stored) => stored,
+                    Ok(snapshot) => snapshot,
                     Err(error) => {
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
@@ -4615,7 +4617,7 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
-            let value = match action(stored.as_ref()) {
+            let value = match action(snapshot.stored.as_ref()) {
                 Ok(value) => value,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -4624,7 +4626,7 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
-            let Some(stored) = stored.as_ref() else {
+            let Some(stored) = snapshot.stored.as_ref() else {
                 self.release_bucket_write_proof_for_object_metadata_command(
                     &bucket_write_reservation,
                 )?;
@@ -4649,6 +4651,7 @@ impl super::StorageCluster {
                     bucket,
                     key,
                     expected_current: Some(stored),
+                    expected_target: snapshot.target.as_ref(),
                     bucket_write_reservation: &bucket_write_reservation,
                 },
             );
@@ -4724,16 +4727,16 @@ impl super::StorageCluster {
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() {
                     if marker.matches_request(bucket, key) {
-                        let stored = storage_client
+                        let snapshot = storage_client
                             .load_current_object_delete_snapshot(pg_id, bucket, key)?;
-                        let value = match action(stored.as_ref()) {
+                        let value = match action(snapshot.stored.as_ref()) {
                             Ok(value) => value,
                             Err(error) => return Ok(Err(error)),
                         };
@@ -4760,9 +4763,9 @@ impl super::StorageCluster {
                 Some(proof) => proof,
                 None => continue,
             };
-            let stored =
+            let snapshot =
                 match storage_client.load_current_object_delete_snapshot(pg_id, bucket, key) {
-                    Ok(stored) => stored,
+                    Ok(snapshot) => snapshot,
                     Err(error) => {
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
@@ -4770,7 +4773,7 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
-            let value = match action(stored.as_ref()) {
+            let value = match action(snapshot.stored.as_ref()) {
                 Ok(value) => value,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -4796,8 +4799,9 @@ impl super::StorageCluster {
                     key,
                     version_id: marker_vid,
                     owner: &owner,
-                    expected_current: stored.as_ref(),
+                    expected_current: snapshot.stored.as_ref(),
                     stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+                    expected_stale_payload_source: None,
                     bucket_write_reservation: &bucket_write_reservation,
                 },
             );
@@ -4878,7 +4882,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .node_id();
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
             Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
         } else {
@@ -4894,13 +4898,13 @@ impl super::StorageCluster {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.matches_request(bucket, key, expected_version_id) =>
                     {
-                        let stored = storage_client.load_specific_object_delete_snapshot(
+                        let snapshot = storage_client.load_specific_object_delete_snapshot(
                             pg_id,
                             bucket,
                             key,
                             expected_version_id,
                         )?;
-                        let Some(StoredObject::Live(record)) = stored else {
+                        let Some(StoredObject::Live(record)) = snapshot.stored else {
                             self.apply_exact_pending_object_metadata_command(
                                 pg_id,
                                 super::ExactPendingObjectMetadataCommand::for_checked_request(
@@ -4926,9 +4930,9 @@ impl super::StorageCluster {
                     MetadataCommandPayload::InsertDeleteMarker(marker)
                         if marker.matches_request(bucket, key) =>
                     {
-                        let stored = storage_client
+                        let snapshot = storage_client
                             .load_current_object_delete_snapshot(pg_id, bucket, key)?;
-                        let Some(StoredObject::Live(record)) = stored else {
+                        let Some(StoredObject::Live(record)) = snapshot.stored else {
                             self.apply_exact_pending_object_metadata_command(
                                 pg_id,
                                 super::ExactPendingObjectMetadataCommand::for_checked_request(
@@ -4977,9 +4981,9 @@ impl super::StorageCluster {
                 Some(proof) => proof,
                 None => return Ok(Ok(None)),
             };
-            let stored =
+            let snapshot =
                 match storage_client.load_current_object_delete_snapshot(pg_id, bucket, key) {
-                    Ok(stored) => stored,
+                    Ok(snapshot) => snapshot,
                     Err(error) => {
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
@@ -4987,7 +4991,7 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
-            let Some(StoredObject::Live(record)) = stored.as_ref() else {
+            let Some(StoredObject::Live(record)) = snapshot.stored.as_ref() else {
                 self.release_bucket_write_proof_for_object_metadata_command(
                     &bucket_write_reservation,
                 )?;
@@ -5022,7 +5026,8 @@ impl super::StorageCluster {
                         cluster_epoch: self.operation_epoch(),
                         bucket,
                         key,
-                        expected_current: stored.as_ref(),
+                        expected_current: snapshot.stored.as_ref(),
+                        expected_target: snapshot.target.as_ref(),
                         bucket_write_reservation: &bucket_write_reservation,
                     })
                     .and_then(|command| command.ok_or(ObjectPgActionError::StaleObjectReadSubject)),
@@ -5042,28 +5047,37 @@ impl super::StorageCluster {
                             cluster_epoch: self.operation_epoch(),
                             bucket,
                             key,
-                            expected_current: stored.as_ref(),
+                            expected_current: snapshot.stored.as_ref(),
                             version_id: marker_vid,
                             owner: &owner,
                             stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+                            expected_stale_payload_source: None,
                             bucket_write_reservation: &bucket_write_reservation,
                         },
                     )
                 }
-                BucketVersioningState::Suspended => storage_client
-                    .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
-                        pg_id,
-                        cluster_epoch: self.operation_epoch(),
-                        bucket,
-                        key,
-                        expected_current: stored.as_ref(),
-                        version_id: VersionId::Null,
-                        owner: &owner,
-                        stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
-                            created_at: crate::clock::current_time_millis(),
+                BucketVersioningState::Suspended => match storage_client
+                    .load_specific_object_delete_snapshot(pg_id, bucket, key, VersionId::Null)
+                {
+                    Ok(null_snapshot) => storage_client.build_insert_delete_marker_command(
+                        BuildInsertDeleteMarkerCommandReq {
+                            pg_id,
+                            cluster_epoch: self.operation_epoch(),
+                            bucket,
+                            key,
+                            expected_current: snapshot.stored.as_ref(),
+                            version_id: VersionId::Null,
+                            owner: &owner,
+                            stale_payload:
+                                InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                                    created_at: crate::clock::current_time_millis(),
+                                },
+                            expected_stale_payload_source: null_snapshot.stored.as_ref(),
+                            bucket_write_reservation: &bucket_write_reservation,
                         },
-                        bucket_write_reservation: &bucket_write_reservation,
-                    }),
+                    ),
+                    Err(error) => Err(error),
+                },
             };
             let command = match command {
                 Ok(command) => command,
@@ -5149,7 +5163,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .node_id();
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
             Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
         } else {
@@ -5219,6 +5233,15 @@ impl super::StorageCluster {
 
             for stored in delete_targets {
                 let version_id = stored.version_id();
+                let snapshot = match storage_client
+                    .load_specific_object_delete_snapshot(pg_id, bucket, key, version_id)
+                {
+                    Ok(snapshot) if snapshot.stored.as_ref() == Some(&stored) => snapshot,
+                    Ok(_) | Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                        return Ok(Ok(completed_reclaimed_generation_ids));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let bucket_write_reservation = match self
                     .try_acquire_bucket_write_proof_for_object_metadata_command(
                         bucket,
@@ -5236,7 +5259,8 @@ impl super::StorageCluster {
                         bucket,
                         key,
                         version_id,
-                        expected_stored: Some(&stored),
+                        expected_stored: snapshot.stored.as_ref(),
+                        expected_target: snapshot.target.as_ref(),
                         expected_version_list: Some(&versions),
                         bucket_write_reservation: &bucket_write_reservation,
                     },
@@ -5323,7 +5347,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .node_id();
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
             Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
         } else {
@@ -5413,6 +5437,26 @@ impl super::StorageCluster {
                 )?;
                 return Ok(Ok(false));
             };
+            let snapshot = match storage_client.load_specific_object_delete_snapshot(
+                pg_id,
+                bucket,
+                key,
+                expected_version_id,
+            ) {
+                Ok(snapshot) if snapshot.stored.as_ref() == Some(expected_marker) => snapshot,
+                Ok(_) | Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Ok(Ok(false));
+                }
+                Err(error) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
+            };
             let command = storage_client.build_delete_specific_object_version_command(
                 BuildDeleteSpecificObjectVersionCommandReq {
                     pg_id,
@@ -5420,7 +5464,8 @@ impl super::StorageCluster {
                     bucket,
                     key,
                     version_id: expected_version_id,
-                    expected_stored: Some(expected_marker),
+                    expected_stored: snapshot.stored.as_ref(),
+                    expected_target: snapshot.target.as_ref(),
                     expected_version_list: Some(&versions),
                     bucket_write_reservation: &bucket_write_reservation,
                 },
@@ -6160,7 +6205,7 @@ impl super::StorageCluster {
                 let current_object = storage_client
                     .load_current_object_delete_snapshot(pg_id, bucket, key)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-                let existing_object = match current_object.as_ref() {
+                let existing_object = match current_object.stored.as_ref() {
                     Some(StoredObject::Live(record)) => Some(StoredObject::Live(record.clone())),
                     Some(StoredObject::DeleteMarker(_)) | None => None,
                 };
@@ -6192,7 +6237,7 @@ impl super::StorageCluster {
                         cluster_epoch: self.operation_epoch(),
                         request: &create,
                         precondition: CreateStreamUploadPrecondition::PutObject {
-                            expected_current: current_object.as_ref(),
+                            expected_current: current_object.stored.as_ref(),
                             require_generation_reservation: true,
                         },
                         bucket_write_reservation: &proof,
@@ -6602,7 +6647,7 @@ impl super::StorageCluster {
                 let current_object = storage_client
                     .load_current_object_delete_snapshot(pg_id, bucket, key)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-                let existing_object = match current_object.as_ref() {
+                let existing_object = match current_object.stored.as_ref() {
                     Some(StoredObject::Live(record)) => Some(StoredObject::Live(record.clone())),
                     Some(StoredObject::DeleteMarker(_)) | None => None,
                 };
@@ -6630,7 +6675,7 @@ impl super::StorageCluster {
                         pg_id,
                         cluster_epoch: self.operation_epoch(),
                         request: &create,
-                        expected_current: current_object.as_ref(),
+                        expected_current: current_object.stored.as_ref(),
                         bucket_write_reservation: &proof,
                     },
                 ) {
