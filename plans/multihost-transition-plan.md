@@ -5542,15 +5542,18 @@ driven from a frontend through the storage-node-owned object PG. Generation
 reservation now rereads the storage-node-owned allocator before final command-id
 allocation and treats exact stale-generation apply conflicts as retryable, so
 two frontend handles racing on the same key converge to distinct generations
-instead of surfacing an internal uniqueness failure. Remaining non-command
-surfaces still need object snapshots, version allocation, and broader
+instead of surfacing an internal uniqueness failure. Object version allocation
+now routes through a dedicated object-version metadata client, so
+`ReserveObjectVersion` command construction no longer reads the broad storage
+client surface and frontend maps can reserve version ids on the storage-node
+object PG. Remaining non-command
+surfaces still need object snapshots and broader
 bucket-write reservation acquire/snapshot/release coordination. Proof-release
 cleanup for command-owned bucket write reservations has an RPC/client surface,
 but production cleanup should move only with the matching remote acquire/snapshot
 path so one reservation identity never spans local and remote stores. Direct PUT
-still needs the object snapshot/command-builder surface and version allocation
-before its metadata path is remote end to end and before frontend/combined roles
-can be enabled.
+still needs the object snapshot/command-builder surface before its metadata path
+is remote end to end and before frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the

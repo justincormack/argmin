@@ -9,8 +9,8 @@ use crate::{
         BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketState, ChecksumBytes,
         ClusterEpoch, CreateBucketConfig, DataPgId, EffectiveBucketEncryptionConfig, GenerationId,
         ManagedEncryptionAlgorithm, ObjectKey, ObjectPayloadReclaimKind, PgId,
-        PublicAccessBlockConfig, SessionId, ShardIndex, ShardKey, WriteAck, SESSION_ID_LEN,
-        SHARD_KEY_LEN,
+        PublicAccessBlockConfig, SessionId, ShardIndex, ShardKey, VersionId, WriteAck,
+        SESSION_ID_LEN, SHARD_KEY_LEN,
     },
     BucketName, NodeId,
 };
@@ -64,6 +64,8 @@ const STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN: usize =
     4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN;
 const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
+const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 8
@@ -116,6 +118,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketCreateCommandBuild = 34,
     ObjectGenerationNext = 35,
     ObjectGenerationReservation = 36,
+    ObjectVersionNext = 37,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +201,7 @@ impl StorageRpcMessageKind {
             Self::BucketCreateCommandBuild => "bucket create command build",
             Self::ObjectGenerationNext => "object generation next",
             Self::ObjectGenerationReservation => "object generation reservation",
+            Self::ObjectVersionNext => "object version next",
         }
     }
 
@@ -239,6 +243,7 @@ impl StorageRpcMessageKind {
             34 => Ok(Self::BucketCreateCommandBuild),
             35 => Ok(Self::ObjectGenerationNext),
             36 => Ok(Self::ObjectGenerationReservation),
+            37 => Ok(Self::ObjectVersionNext),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -374,6 +379,11 @@ pub(crate) struct StorageRpcObjectGenerationReservationRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcObjectGenerationResponse {
     pub(crate) generation_id: GenerationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectVersionResponse {
+    pub(crate) version_id: VersionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,6 +981,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectGenerationReservation => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectVersionNext => {
+            STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN
+        }
         _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
@@ -1237,6 +1250,29 @@ pub(crate) fn decode_object_generation_response(
     let generation_id = decoder.read_generation_id()?;
     decoder.finish()?;
     Ok(StorageRpcObjectGenerationResponse { generation_id })
+}
+
+pub(crate) fn encode_object_version_response(
+    response: &StorageRpcObjectVersionResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, response.version_id.to_u64());
+    out
+}
+
+pub(crate) fn decode_object_version_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectVersionResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let raw = decoder.read_u64()?;
+    decoder.finish()?;
+    let version_id = VersionId::from_u64(raw);
+    if version_id.is_null() {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "object version response must not contain null version",
+        ));
+    }
+    Ok(StorageRpcObjectVersionResponse { version_id })
 }
 
 pub(crate) fn encode_object_generation_reservation_response(
@@ -4630,6 +4666,11 @@ mod tests {
                 STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN,
             ),
+            (
+                StorageRpcMessageKind::ObjectVersionNext,
+                STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN,
+            ),
         ] {
             let mut bytes = Vec::new();
             put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
@@ -4817,6 +4858,23 @@ mod tests {
         let bytes = encode_object_generation_reservation_response(&response);
         let decoded = decode_object_generation_reservation_response(&bytes).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn object_version_response_round_trip_rejects_null_version() {
+        let response = StorageRpcObjectVersionResponse {
+            version_id: VersionId::from_u64(42),
+        };
+        let bytes = encode_object_version_response(&response);
+        let decoded = decode_object_version_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        assert_eq!(
+            decode_object_version_response(&0_u64.to_be_bytes()),
+            Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "object version response must not contain null version"
+            ))
+        );
     }
 
     #[test]

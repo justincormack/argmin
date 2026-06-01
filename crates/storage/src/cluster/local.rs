@@ -15,8 +15,9 @@ use crate::metadata_command::{
 use crate::node::BucketLockGuard;
 use crate::node_client::{
     BucketMetadataNodeClient, LocalStorageNodeClient, MetadataCommandNodeClient,
-    ObjectGenerationMetadataNodeClient, PlacedShardNodeClient, ShardAckNodeClient,
-    ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
+    ObjectGenerationMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
+    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
+    UnixStorageNodeClient,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -91,6 +92,12 @@ pub struct LocalUnixObjectGenerationMetadataNodeClientConfig {
     socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalUnixObjectVersionMetadataNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
 impl LocalUnixMetadataCommandNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -142,6 +149,23 @@ impl LocalUnixObjectGenerationMetadataNodeClientConfig {
     }
 }
 
+impl LocalUnixObjectVersionMetadataNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
 pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
@@ -149,6 +173,7 @@ pub struct LocalNodeStore {
     storage_client: Arc<dyn StorageNodeClient>,
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
     object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient>,
+    object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient>,
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
     shard_ack_client: Arc<dyn ShardAckNodeClient>,
@@ -166,6 +191,8 @@ impl LocalNodeStore {
         let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = local_client.clone();
         let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
             local_client.clone();
+        let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> =
+            local_client.clone();
         let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = local_client.clone();
         let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
         let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
@@ -178,6 +205,7 @@ impl LocalNodeStore {
             storage_client,
             bucket_metadata_client,
             object_generation_metadata_client,
+            object_version_metadata_client,
             metadata_command_client,
             shard_client,
             shard_ack_client,
@@ -210,6 +238,12 @@ impl LocalNodeStore {
         &self,
     ) -> &Arc<dyn ObjectGenerationMetadataNodeClient> {
         &self.object_generation_metadata_client
+    }
+
+    pub(crate) fn object_version_metadata_client(
+        &self,
+    ) -> &Arc<dyn ObjectVersionMetadataNodeClient> {
+        &self.object_version_metadata_client
     }
 
     pub(crate) fn metadata_command_client(&self) -> &Arc<dyn MetadataCommandNodeClient> {
@@ -946,6 +980,52 @@ impl LocalClusterMap {
             let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
                 client;
             node.object_generation_metadata_client = object_generation_metadata_client;
+        }
+        Ok(())
+    }
+
+    pub fn install_unix_object_version_metadata_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixObjectVersionMetadataNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixObjectVersionMetadataNodeClientConfig> =
+            configs.into_iter().collect();
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in &configs {
+            if !seen.insert(config.node_id) {
+                return Err(
+                    ClusterBuildError::DuplicateRemoteObjectVersionMetadataClientNodeId {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(
+                    ClusterBuildError::RemoteObjectVersionMetadataClientSocketPathNotAbsolute {
+                        path: config.socket_path.clone(),
+                    },
+                );
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(
+                    ClusterBuildError::RemoteObjectVersionMetadataClientNodeNotFound {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+        }
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote object-version metadata client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> = client;
+            node.object_version_metadata_client = object_version_metadata_client;
         }
         Ok(())
     }
@@ -6657,6 +6737,88 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_object_version_mode_reserves_on_storage_node() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp
+            .path()
+            .join("remote-object-version-metadata-node-1-owned");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("object-version-metadata-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let frontend_data_dir = tmp
+            .path()
+            .join("frontend-only-object-version-metadata-routing");
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                frontend_data_dir.join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        map.install_unix_metadata_command_clients([LocalUnixMetadataCommandNodeClientConfig::new(
+            node_id,
+            socket_path.clone(),
+        )])
+        .unwrap();
+        map.install_unix_object_version_metadata_clients([
+            LocalUnixObjectVersionMetadataNodeClientConfig::new(node_id, socket_path),
+        ])
+        .unwrap();
+        let map = Arc::new(map);
+        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let bucket = crate::tests::bucket_name("remote-object-version-reserve");
+        let key = crate::tests::object_key("key");
+
+        let version_id = cluster
+            .reserve_next_object_version(PgId::new(0), &bucket, &key)
+            .unwrap();
+
+        assert_eq!(version_id, crate::VersionId::from_u64(1));
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::next_version_id(&*frontend_pg, &bucket, &key).unwrap(),
+            crate::VersionId::from_u64(1)
+        );
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let remote_pg = remote.get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::next_version_id(&*remote_pg, &bucket, &key).unwrap(),
+            crate::VersionId::from_u64(2)
+        );
+    }
+
+    #[test]
     fn frontend_unix_object_generation_loser_retries_stale_generation() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);
@@ -7000,6 +7162,37 @@ mod tests {
             err,
             ClusterBuildError::RemoteObjectGenerationMetadataClientSocketPathNotAbsolute { path }
                 if path == Path::new("relative-object-generation-node-1.sock")
+        ));
+    }
+
+    #[test]
+    fn unix_object_version_metadata_client_install_rejects_relative_socket_path() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+
+        let err = map
+            .install_unix_object_version_metadata_clients([
+                LocalUnixObjectVersionMetadataNodeClientConfig::new(
+                    node_id,
+                    PathBuf::from("relative-object-version-node-1.sock"),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteObjectVersionMetadataClientSocketPathNotAbsolute { path }
+                if path == Path::new("relative-object-version-node-1.sock")
         ));
     }
 

@@ -454,6 +454,17 @@ pub enum ClusterBuildError {
     #[error("remote object-generation metadata client socket path {path:?} must be absolute")]
     RemoteObjectGenerationMetadataClientSocketPathNotAbsolute { path: PathBuf },
 
+    #[error("duplicate remote object-version metadata client node id {id}")]
+    DuplicateRemoteObjectVersionMetadataClientNodeId { id: u32 },
+
+    #[error(
+        "remote object-version metadata client node {id} is not present in the local cluster map"
+    )]
+    RemoteObjectVersionMetadataClientNodeNotFound { id: u32 },
+
+    #[error("remote object-version metadata client socket path {path:?} must be absolute")]
+    RemoteObjectVersionMetadataClientSocketPathNotAbsolute { path: PathBuf },
+
     #[error("metadata primary node {id} is not present in the local cluster map")]
     MetadataPrimaryNotFound { id: u32 },
 

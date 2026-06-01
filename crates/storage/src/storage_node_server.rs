@@ -13,7 +13,7 @@ use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     CreateBucketCommandBuild, LocalStorageNodeClient, ObjectGenerationMetadataNodeClient,
-    StorageNodeClient,
+    ObjectVersionMetadataNodeClient, StorageNodeClient,
 };
 use crate::storage_rpc::{
     decode_bucket_request, decode_create_bucket_command_build_request,
@@ -34,21 +34,22 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
     encode_object_generation_reservation_response, encode_object_generation_response,
-    encode_read_handle_acquire_response, encode_read_handle_release_response,
-    encode_scavenger_list_files_response, encode_shard_read_range_response,
-    encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
-    encode_storage_rpc_success_response, read_storage_rpc_request_frame_from,
-    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse,
-    StorageRpcBucketRequest, StorageRpcCreateBucketCommandBuildOutcome,
-    StorageRpcCreateBucketCommandBuildRequest, StorageRpcCreateBucketCommandBuildResponse,
-    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
-    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
-    StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesOutcome,
-    StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcMetadataCommandBoolOutcome,
-    StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandBoolResponse,
-    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandMaxLogIndexResponse,
-    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
-    StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandPendingEnvelopeResponse,
+    encode_object_version_response, encode_read_handle_acquire_response,
+    encode_read_handle_release_response, encode_scavenger_list_files_response,
+    encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
+    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    read_storage_rpc_request_frame_from, write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome,
+    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketRequest,
+    StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
+    StorageRpcCreateBucketCommandBuildResponse, StorageRpcErrorCode, StorageRpcErrorResponse,
+    StorageRpcFrame, StorageRpcHealthResponse, StorageRpcMessageKind,
+    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAcceptanceResponse,
+    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
+    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
+    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
+    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
+    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
+    StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -58,12 +59,12 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
     StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
-    StorageRpcObjectRequest, StorageRpcProofReleaseRequest, StorageRpcReadHandleAcquireRequest,
-    StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
-    StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
-    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
-    STORAGE_RPC_FRAME_ENCODING_VERSION,
+    StorageRpcObjectRequest, StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
+    StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamError, STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::{BucketName, EcShape, NodeId, ObjectPgActionError, ShardLocation};
@@ -424,6 +425,14 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::ObjectVersionNext => match decode_object_request(&frame.payload)
+            {
+                Ok(request) => self.object_version_next_response(request),
+                Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: error.to_string(),
+                }),
+            },
             StorageRpcMessageKind::ShardWrite => match decode_shard_write_request(&frame.payload) {
                 Ok(request) => self.shard_write_response(request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -784,6 +793,39 @@ impl StorageNodeConnectionHandler {
                     encode_object_generation_response(&StorageRpcObjectGenerationResponse {
                         generation_id,
                     });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
+    }
+
+    fn object_version_next_response(
+        &self,
+        request: StorageRpcObjectRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_pg_for_object(
+            request.pg_id,
+            &request.bucket,
+            &request.key,
+            "object version allocation",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectVersionMetadataNodeClient::next_object_version_id(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
+            &request.key,
+        ) {
+            Ok(version_id) => {
+                let payload =
+                    encode_object_version_response(&StorageRpcObjectVersionResponse { version_id });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
@@ -1936,6 +1978,16 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
+        self.validate_pg_for_object(pg_id, bucket, key, operation)
+    }
+
+    fn validate_pg_for_object(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &crate::ObjectKey,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
         let expected_pg_id = PgId::new(self.node.pg_topology().object_pg_for(bucket, key));
         if pg_id != expected_pg_id {
             return Err(StorageRpcErrorResponse {

@@ -34,12 +34,12 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
     decode_object_generation_reservation_response, decode_object_generation_response,
-    decode_read_handle_acquire_response, decode_read_handle_release_response,
-    decode_scavenger_list_files_response, decode_shard_read_range_response,
-    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
-    encode_bucket_request, encode_create_bucket_command_build_request,
-    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
-    encode_metadata_command_pending_slot_replace_request,
+    decode_object_version_response, decode_read_handle_acquire_response,
+    decode_read_handle_release_response, decode_scavenger_list_files_response,
+    decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
+    decode_storage_rpc_response_payload, encode_bucket_request,
+    encode_create_bucket_command_build_request, encode_metadata_command_matching_applied_request,
+    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_object_generation_reservation_request,
     encode_object_request, encode_proof_release_request, encode_read_handle_acquire_request,
@@ -636,6 +636,15 @@ pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectVersionMetadataNodeClient: Send + Sync {
+    fn next_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
@@ -3262,6 +3271,17 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
+impl ObjectVersionMetadataNodeClient for LocalStorageNodeClient {
+    fn next_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        <Self as StorageNodeClient>::next_object_version_id(self, pg_id, bucket, key)
+    }
+}
+
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
     fn head_bucket_raw(
         &self,
@@ -3415,6 +3435,34 @@ impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
             .map_err(|error| {
                 ObjectPgActionError::Store(
                     self.rpc_payload_error("decode object generation response", error.to_string()),
+                )
+            })
+    }
+}
+
+impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
+    fn next_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        let request = StorageRpcObjectRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+        let payload = encode_object_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectVersionNext, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        decode_object_version_response(&response)
+            .map(|response| response.version_id)
+            .map_err(|error| {
+                ObjectPgActionError::Store(
+                    self.rpc_payload_error("decode object version response", error.to_string()),
                 )
             })
     }
@@ -6508,6 +6556,34 @@ mod tests {
         for thread in server_threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn unix_object_version_metadata_client_routes_version_reads() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let bucket = crate::tests::bucket_name("object-version-rpc-bucket");
+        let key = crate::tests::object_key("object-version-rpc-key");
+
+        assert_eq!(
+            ObjectVersionMetadataNodeClient::next_object_version_id(
+                &client,
+                PgId::new(0),
+                &bucket,
+                &key
+            )
+            .unwrap(),
+            VersionId::from_u64(1)
+        );
+        server_thread.join().unwrap();
     }
 
     #[test]

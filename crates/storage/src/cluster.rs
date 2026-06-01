@@ -11,7 +11,7 @@ use local::LocalClusterRuntimeState;
 pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixObjectGenerationMetadataNodeClientConfig,
-    LocalUnixShardNodeClientConfig,
+    LocalUnixObjectVersionMetadataNodeClientConfig, LocalUnixShardNodeClientConfig,
 };
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
@@ -2446,7 +2446,7 @@ impl StorageCluster {
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             let candidate = node
-                .storage_client()
+                .object_version_metadata_client()
                 .next_object_version_id(pg_id, bucket, key)?;
             if candidate.to_u64() > version_id.to_u64() {
                 version_id = candidate;
