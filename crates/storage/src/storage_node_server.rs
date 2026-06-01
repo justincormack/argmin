@@ -12,9 +12,11 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
-    BucketMetadataNodeClient, BucketWriteReservationNodeClient, BuildDeleteCurrentObjectCommandReq,
-    BuildDeleteSpecificObjectVersionCommandReq, BuildDirectPutCommitCommandReq,
-    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq, CreateBucketCommandBuild,
+    BucketMetadataNodeClient, BucketWriteReservationNodeClient,
+    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
+    BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
+    BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
+    BuildPutObjectMetadataCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, LocalStorageNodeClient,
     ObjectGenerationMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
@@ -24,23 +26,26 @@ use crate::storage_rpc::{
     decode_bucket_write_reservation_acquire_request, decode_bucket_write_reservation_proof_request,
     decode_bucket_write_reservation_record_request,
     decode_completed_multipart_order_command_build_request,
-    decode_create_bucket_command_build_request, decode_delete_current_object_command_build_request,
+    decode_create_bucket_command_build_request,
+    decode_create_multipart_upload_command_build_request,
+    decode_create_stream_upload_command_build_request,
+    decode_delete_current_object_command_build_request,
     decode_delete_specific_object_command_build_request, decode_direct_put_command_build_request,
     decode_direct_put_commit_snapshot_request, decode_insert_delete_marker_command_build_request,
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
-    decode_metadata_command_state_request, decode_object_delete_snapshot_request,
-    decode_object_generation_reservation_request, decode_object_read_auth_subject_request,
-    decode_object_read_snapshot_request, decode_object_request,
-    decode_object_tags_for_subject_request, decode_proof_release_request,
+    decode_metadata_command_state_request, decode_multipart_upload_match_request,
+    decode_object_delete_snapshot_request, decode_object_generation_reservation_request,
+    decode_object_read_auth_subject_request, decode_object_read_snapshot_request,
+    decode_object_request, decode_object_tags_for_subject_request, decode_proof_release_request,
     decode_put_object_metadata_command_build_request, decode_put_object_metadata_snapshot_request,
     decode_read_handle_acquire_request, decode_read_handle_release_request,
     decode_scavenger_list_files_request, decode_shard_ack_batch_request,
     decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
-    decode_shard_write_request, encode_bucket_info_outcome_response,
-    encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
-    encode_bucket_write_reservation_record_response,
+    decode_shard_write_request, decode_stream_upload_match_request,
+    encode_bucket_info_outcome_response, encode_bucket_snapshot_pair_response,
+    encode_bucket_snapshot_response, encode_bucket_write_reservation_record_response,
     encode_completed_multipart_order_command_build_response,
     encode_create_bucket_command_build_response, encode_direct_put_command_build_response,
     encode_direct_put_commit_snapshot_response, encode_health_response,
@@ -51,15 +56,16 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
-    encode_object_delete_snapshot_response, encode_object_generation_reservation_response,
-    encode_object_generation_response, encode_object_lifecycle_version_list_response,
-    encode_object_metadata_command_build_response, encode_object_read_auth_subject_response,
-    encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
-    encode_object_version_response, encode_put_object_metadata_snapshot_response,
-    encode_read_handle_acquire_response, encode_read_handle_release_response,
-    encode_scavenger_list_files_response, encode_shard_read_range_response,
-    encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
-    encode_storage_rpc_success_response, read_storage_rpc_request_frame_from,
+    encode_multipart_upload_match_response, encode_object_delete_snapshot_response,
+    encode_object_generation_reservation_response, encode_object_generation_response,
+    encode_object_lifecycle_version_list_response, encode_object_metadata_command_build_response,
+    encode_object_read_auth_subject_response, encode_object_read_snapshot_response,
+    encode_object_tags_for_subject_response, encode_object_version_response,
+    encode_put_object_metadata_snapshot_response, encode_read_handle_acquire_response,
+    encode_read_handle_release_response, encode_scavenger_list_files_response,
+    encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
+    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    encode_stream_upload_match_response, read_storage_rpc_request_frame_from,
     write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse,
     StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotPairResponse,
@@ -70,7 +76,9 @@ use crate::storage_rpc::{
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildResponse,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
-    StorageRpcCreateBucketCommandBuildResponse, StorageRpcDeleteCurrentObjectCommandBuildRequest,
+    StorageRpcCreateBucketCommandBuildResponse, StorageRpcCreateMultipartUploadCommandBuildRequest,
+    StorageRpcCreateStreamUploadCommandBuildRequest, StorageRpcCreateStreamUploadPrecondition,
+    StorageRpcDeleteCurrentObjectCommandBuildRequest,
     StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommandBuildResponse,
     StorageRpcDirectPutCommitSnapshotRequest, StorageRpcDirectPutCommitSnapshotResponse,
@@ -90,6 +98,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
+    StorageRpcMultipartUploadMatchRequest, StorageRpcMultipartUploadMatchResponse,
     StorageRpcObjectDeleteSnapshotRequest, StorageRpcObjectDeleteSnapshotResponse,
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
     StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
@@ -107,6 +116,7 @@ use crate::storage_rpc::{
     StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
     StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadMatchResponse,
     STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
@@ -595,6 +605,42 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild => {
                 match decode_insert_delete_marker_command_build_request(&frame.payload) {
                     Ok(request) => self.insert_delete_marker_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamUploadMatch => {
+                match decode_stream_upload_match_request(&frame.payload) {
+                    Ok(request) => self.stream_upload_match_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartUploadMatch => {
+                match decode_multipart_upload_match_request(&frame.payload) {
+                    Ok(request) => self.multipart_upload_match_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamUploadCommandBuild => {
+                match decode_create_stream_upload_command_build_request(&frame.payload) {
+                    Ok(request) => self.create_stream_upload_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
+                match decode_create_multipart_upload_command_build_request(&frame.payload) {
+                    Ok(request) => self.create_multipart_upload_command_build_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1598,6 +1644,170 @@ impl StorageNodeConnectionHandler {
             }
             Err(error) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload = encode_object_metadata_command_build_response(
+            &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
+        );
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_upload_match_response(
+        &self,
+        request: StorageRpcStreamUploadMatchRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream upload match",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let exists = match ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
+            &local_client,
+            request.object.pg_id,
+            &request.request,
+            request.expected_command.as_ref(),
+        ) {
+            Ok(exists) => exists,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload =
+            encode_stream_upload_match_response(&StorageRpcStreamUploadMatchResponse { exists });
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn multipart_upload_match_response(
+        &self,
+        request: StorageRpcMultipartUploadMatchRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "multipart upload match",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let initiated_at =
+            match ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+                &local_client,
+                request.object.pg_id,
+                &request.request,
+                request.expected_command.as_ref(),
+            ) {
+                Ok(initiated_at) => initiated_at,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
+                }
+            };
+        let payload =
+            encode_multipart_upload_match_response(&StorageRpcMultipartUploadMatchResponse {
+                initiated_at,
+            });
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn create_stream_upload_command_build_response(
+        &self,
+        request: StorageRpcCreateStreamUploadCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_object_mutation_command_request(
+            &request.object,
+            &request.bucket_write_reservation,
+            "stream upload command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let precondition = match &request.precondition {
+            StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                require_generation_reservation,
+            } => CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                require_generation_reservation: *require_generation_reservation,
+            },
+            StorageRpcCreateStreamUploadPrecondition::PutObject {
+                expected_current,
+                require_generation_reservation,
+            } => CreateStreamUploadPrecondition::PutObject {
+                expected_current: expected_current.as_ref(),
+                require_generation_reservation: *require_generation_reservation,
+            },
+            StorageRpcCreateStreamUploadPrecondition::UploadPart { expected_upload } => {
+                CreateStreamUploadPrecondition::UploadPart { expected_upload }
+            }
+        };
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let response = match ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
+            &local_client,
+            BuildCreateStreamUploadCommandReq {
+                pg_id: request.object.pg_id,
+                cluster_epoch: request.object.cluster_epoch,
+                request: &request.request,
+                precondition,
+                bucket_write_reservation: &request.bucket_write_reservation,
+            },
+        ) {
+            Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
+            Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload = encode_object_metadata_command_build_response(
+            &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
+        );
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn create_multipart_upload_command_build_response(
+        &self,
+        request: StorageRpcCreateMultipartUploadCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_object_mutation_command_request(
+            &request.object,
+            &request.bucket_write_reservation,
+            "multipart upload command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let response = match ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
+            &local_client,
+            BuildCreateMultipartUploadCommandReq {
+                pg_id: request.object.pg_id,
+                cluster_epoch: request.object.cluster_epoch,
+                request: &request.request,
+                expected_current: request.expected_current.as_ref(),
+                bucket_write_reservation: &request.bucket_write_reservation,
+            },
+        ) {
+            Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
+            Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
         let payload = encode_object_metadata_command_build_response(

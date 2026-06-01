@@ -1,7 +1,8 @@
 use crate::{
     cluster::ShardLocation,
     metadata_command::{
-        decode_metadata_command_envelope, BucketWriteReservationProof, DeleteObjectVersionTarget,
+        decode_metadata_command_envelope, BucketWriteReservationProof,
+        CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
         MetadataCommandAcceptance, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
         PutObjectMetadataMutation,
     },
@@ -9,19 +10,21 @@ use crate::{
     types::{
         BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
         BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-        BucketWriteReservationRecord, ChecksumBytes, ClusterEpoch, CommitDirectPutObjectReq,
-        CreateBucketConfig, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
-        EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LiveObjectRecord,
-        LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartPartSegmentRecord,
-        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
-        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-        ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
-        ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-        OwnerIdentity, PgId, PublicAccessBlockConfig, SerializedMetadataBlob,
-        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-        StorageClass, StoredLegalHoldStatus, StoredObject, UploadId, VersionId, WriteAck,
-        SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
+        BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch,
+        CommitDirectPutObjectReq, CreateBucketConfig, CreateMultipartUploadReq,
+        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
+        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LiveObjectRecord,
+        LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
+        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+        MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType,
+        ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
+        ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
+        ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord,
+        ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
+        PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+        SerializedTagSet, SessionId, ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus,
+        StoredObject, StreamUploadState, StreamUploadTarget, UploadId, UploadState, VersionId,
+        WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -210,6 +213,10 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectDeleteCurrentCommandBuild = 54,
     ObjectInsertDeleteMarkerCommandBuild = 55,
     ObjectLifecycleVersionListLoad = 56,
+    ObjectStreamUploadMatch = 57,
+    ObjectMultipartUploadMatch = 58,
+    ObjectStreamUploadCommandBuild = 59,
+    ObjectMultipartUploadCommandBuild = 60,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +321,10 @@ impl StorageRpcMessageKind {
                 "object insert delete marker command build"
             }
             Self::ObjectLifecycleVersionListLoad => "object lifecycle version list load",
+            Self::ObjectStreamUploadMatch => "object stream upload match",
+            Self::ObjectMultipartUploadMatch => "object multipart upload match",
+            Self::ObjectStreamUploadCommandBuild => "object stream upload command build",
+            Self::ObjectMultipartUploadCommandBuild => "object multipart upload command build",
         }
     }
 
@@ -375,6 +386,10 @@ impl StorageRpcMessageKind {
             54 => Ok(Self::ObjectDeleteCurrentCommandBuild),
             55 => Ok(Self::ObjectInsertDeleteMarkerCommandBuild),
             56 => Ok(Self::ObjectLifecycleVersionListLoad),
+            57 => Ok(Self::ObjectStreamUploadMatch),
+            58 => Ok(Self::ObjectMultipartUploadMatch),
+            59 => Ok(Self::ObjectStreamUploadCommandBuild),
+            60 => Ok(Self::ObjectMultipartUploadCommandBuild),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -695,6 +710,60 @@ pub(crate) struct StorageRpcInsertDeleteMarkerCommandBuildRequest {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcCreateStreamUploadPrecondition {
+    PutObjectNoCurrentCheck {
+        require_generation_reservation: bool,
+    },
+    PutObject {
+        expected_current: Option<StoredObject>,
+        require_generation_reservation: bool,
+    },
+    UploadPart {
+        expected_upload: MultipartUploadRecord,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadMatchRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) request: CreateStreamUploadReq,
+    pub(crate) expected_command: Option<CreateStreamUploadCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadMatchResponse {
+    pub(crate) exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartUploadMatchRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) request: CreateMultipartUploadReq,
+    pub(crate) expected_command: Option<CreateMultipartUploadCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartUploadMatchResponse {
+    pub(crate) initiated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCreateStreamUploadCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) request: CreateStreamUploadReq,
+    pub(crate) precondition: StorageRpcCreateStreamUploadPrecondition,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCreateMultipartUploadCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) request: CreateMultipartUploadReq,
+    pub(crate) expected_current: Option<StoredObject>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
 fn object_payload_reclaim_matches_object(
     reclaim: &ObjectPayloadReclaimCommand,
     bucket: &BucketName,
@@ -721,6 +790,96 @@ fn delete_target_matches_object(
             object_payload_reclaim_matches_object(payload, bucket, key)
         }
     }
+}
+
+fn validate_create_stream_upload_request_identity(
+    object: &StorageRpcObjectRequest,
+    request: &CreateStreamUploadReq,
+) -> Result<(), StorageRpcPayloadError> {
+    if request.bucket != object.bucket || request.key != object.key {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream upload request identity mismatch",
+        ));
+    }
+    match &request.target {
+        StreamUploadTarget::PutObject => {}
+        StreamUploadTarget::UploadPart { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_create_multipart_upload_request_identity(
+    object: &StorageRpcObjectRequest,
+    request: &CreateMultipartUploadReq,
+) -> Result<(), StorageRpcPayloadError> {
+    if request.bucket != object.bucket || request.key != object.key {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "multipart upload request identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_create_stream_upload_precondition_identity(
+    object: &StorageRpcObjectRequest,
+    precondition: &StorageRpcCreateStreamUploadPrecondition,
+) -> Result<(), StorageRpcPayloadError> {
+    match precondition {
+        StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck { .. } => Ok(()),
+        StorageRpcCreateStreamUploadPrecondition::PutObject {
+            expected_current, ..
+        } => {
+            if expected_current.as_ref().is_some_and(|stored| {
+                stored.bucket() != &object.bucket || stored.key() != &object.key
+            }) {
+                return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "stream upload PUT precondition identity mismatch",
+                ));
+            }
+            Ok(())
+        }
+        StorageRpcCreateStreamUploadPrecondition::UploadPart { expected_upload } => {
+            if expected_upload.bucket != object.bucket || expected_upload.key != object.key {
+                return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "stream upload part precondition identity mismatch",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn create_stream_upload_command_matches_request(
+    command: &CreateStreamUploadCommand,
+    request: &CreateStreamUploadReq,
+) -> bool {
+    command.session.session_id == request.session_id
+        && command.session.bucket == request.bucket
+        && command.session.key == request.key
+        && command.session.target == request.target
+        && command.session.state == StreamUploadState::InProgress
+        && command.session.encryption == request.encryption
+        && command.initial_next_segment_vid == GenerationId::MIN
+}
+
+fn create_multipart_upload_command_matches_request(
+    command: &CreateMultipartUploadCommand,
+    request: &CreateMultipartUploadReq,
+) -> bool {
+    command.upload.upload_id == request.upload_id
+        && command.upload.bucket == request.bucket
+        && command.upload.key == request.key
+        && command.upload.state == UploadState::InProgress
+        && command.upload.tags == request.tags
+        && command.upload.metadata_blob == request.metadata_blob
+        && command.upload.system_metadata_blob == request.system_metadata_blob
+        && command.upload.initiator == request.initiator
+        && command.upload.owner == request.owner
+        && command.upload.acl_grants == request.acl_grants
+        && command.upload.public_read == request.public_read
+        && command.upload.object_lock == request.object_lock
+        && command.upload.checksum == request.checksum
+        && command.upload.encryption == request.encryption
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1429,7 +1588,11 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectMetadataPutCommandBuild
         | StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild
         | StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild
-        | StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild => {
+        | StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild
+        | StorageRpcMessageKind::ObjectStreamUploadMatch
+        | StorageRpcMessageKind::ObjectMultipartUploadMatch
+        | StorageRpcMessageKind::ObjectStreamUploadCommandBuild
+        | StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
             STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectGenerationNext => {
@@ -2109,6 +2272,209 @@ pub(crate) fn decode_insert_delete_marker_command_build_request(
         version_id,
         owner,
         stale_payload,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_stream_upload_match_request(
+    request: &StorageRpcStreamUploadMatchRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_create_stream_upload_request_identity(&request.object, &request.request)?;
+    if request.expected_command.as_ref().is_some_and(|command| {
+        !create_stream_upload_command_matches_request(command, &request.request)
+    }) {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream upload match expected command identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_create_stream_upload_req(&mut out, &request.request);
+    put_optional_create_stream_upload_command(&mut out, request.expected_command.as_ref());
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_upload_match_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadMatchRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let request = decoder.read_create_stream_upload_req()?;
+    let expected_command = decoder.read_optional_create_stream_upload_command()?;
+    decoder.finish()?;
+    validate_create_stream_upload_request_identity(&object, &request)?;
+    if expected_command
+        .as_ref()
+        .is_some_and(|command| !create_stream_upload_command_matches_request(command, &request))
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream upload match expected command identity mismatch",
+        ));
+    }
+    Ok(StorageRpcStreamUploadMatchRequest {
+        object,
+        request,
+        expected_command,
+    })
+}
+
+pub(crate) fn encode_multipart_upload_match_request(
+    request: &StorageRpcMultipartUploadMatchRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_create_multipart_upload_request_identity(&request.object, &request.request)?;
+    if request.expected_command.as_ref().is_some_and(|command| {
+        !create_multipart_upload_command_matches_request(command, &request.request)
+    }) {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "multipart upload match expected command identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_create_multipart_upload_req(&mut out, &request.request);
+    put_optional_create_multipart_upload_command(&mut out, request.expected_command.as_ref());
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_upload_match_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartUploadMatchRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let request = decoder.read_create_multipart_upload_req()?;
+    let expected_command = decoder.read_optional_create_multipart_upload_command()?;
+    decoder.finish()?;
+    validate_create_multipart_upload_request_identity(&object, &request)?;
+    if expected_command
+        .as_ref()
+        .is_some_and(|command| !create_multipart_upload_command_matches_request(command, &request))
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "multipart upload match expected command identity mismatch",
+        ));
+    }
+    Ok(StorageRpcMultipartUploadMatchRequest {
+        object,
+        request,
+        expected_command,
+    })
+}
+
+pub(crate) fn encode_stream_upload_match_response(
+    response: &StorageRpcStreamUploadMatchResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bool(&mut out, response.exists);
+    out
+}
+
+pub(crate) fn decode_stream_upload_match_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadMatchResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let exists = decoder.read_bool()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadMatchResponse { exists })
+}
+
+pub(crate) fn encode_multipart_upload_match_response(
+    response: &StorageRpcMultipartUploadMatchResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_optional_u64(&mut out, response.initiated_at);
+    out
+}
+
+pub(crate) fn decode_multipart_upload_match_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartUploadMatchResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let initiated_at = decoder.read_optional_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMultipartUploadMatchResponse { initiated_at })
+}
+
+pub(crate) fn encode_create_stream_upload_command_build_request(
+    request: &StorageRpcCreateStreamUploadCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_create_stream_upload_request_identity(&request.object, &request.request)?;
+    validate_create_stream_upload_precondition_identity(&request.object, &request.precondition)?;
+    if request.bucket_write_reservation.bucket != request.object.bucket {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream upload command build reservation bucket mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_create_stream_upload_req(&mut out, &request.request);
+    put_create_stream_upload_precondition(&mut out, &request.precondition);
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_create_stream_upload_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcCreateStreamUploadCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let request = decoder.read_create_stream_upload_req()?;
+    let precondition = decoder.read_create_stream_upload_precondition()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    validate_create_stream_upload_request_identity(&object, &request)?;
+    validate_create_stream_upload_precondition_identity(&object, &precondition)?;
+    if bucket_write_reservation.bucket != object.bucket {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream upload command build reservation bucket mismatch",
+        ));
+    }
+    Ok(StorageRpcCreateStreamUploadCommandBuildRequest {
+        object,
+        request,
+        precondition,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_create_multipart_upload_command_build_request(
+    request: &StorageRpcCreateMultipartUploadCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_create_multipart_upload_request_identity(&request.object, &request.request)?;
+    if request.expected_current.as_ref().is_some_and(|stored| {
+        stored.bucket() != &request.object.bucket || stored.key() != &request.object.key
+    }) || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "multipart upload command build request identity mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_create_multipart_upload_req(&mut out, &request.request);
+    put_optional_stored_object(&mut out, request.expected_current.as_ref());
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_create_multipart_upload_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcCreateMultipartUploadCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let request = decoder.read_create_multipart_upload_req()?;
+    let expected_current = decoder.read_optional_stored_object()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    validate_create_multipart_upload_request_identity(&object, &request)?;
+    if expected_current
+        .as_ref()
+        .is_some_and(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "multipart upload command build request identity mismatch",
+        ));
+    }
+    Ok(StorageRpcCreateMultipartUploadCommandBuildRequest {
+        object,
+        request,
+        expected_current,
         bucket_write_reservation,
     })
 }
@@ -5366,6 +5732,213 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_create_stream_upload_req(
+        &mut self,
+    ) -> Result<CreateStreamUploadReq, StorageRpcPayloadError> {
+        Ok(CreateStreamUploadReq {
+            session_id: SessionId::try_from(self.read_string()?).map_err(|_| {
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream session id")
+            })?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            target: self.read_stream_upload_target()?,
+            encryption: self.read_object_encryption()?,
+        })
+    }
+
+    fn read_create_multipart_upload_req(
+        &mut self,
+    ) -> Result<CreateMultipartUploadReq, StorageRpcPayloadError> {
+        Ok(CreateMultipartUploadReq {
+            upload_id: self.read_upload_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            tags: self.read_optional_serialized_tag_set()?,
+            metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
+            system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
+            initiator: self.read_optional_owner_identity()?,
+            owner: self.read_owner_identity()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            object_lock: self.read_object_lock_state()?,
+            checksum: self.read_optional_multipart_checksum_config()?,
+            encryption: self.read_object_encryption()?,
+        })
+    }
+
+    fn read_optional_owner_identity(
+        &mut self,
+    ) -> Result<Option<OwnerIdentity>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_owner_identity()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional owner identity tag",
+            )),
+        }
+    }
+
+    fn read_optional_multipart_checksum_config(
+        &mut self,
+    ) -> Result<Option<MultipartChecksumConfig>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let algorithm = ChecksumAlgorithm::from_u8(self.read_u8()?).ok_or(
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid multipart checksum algorithm",
+                    ),
+                )?;
+                let checksum_type = ChecksumType::from_u8(self.read_u8()?).ok_or(
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid multipart checksum type",
+                    ),
+                )?;
+                Ok(Some(
+                    MultipartChecksumConfig::new(algorithm, Some(checksum_type)).map_err(|_| {
+                        StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "invalid multipart checksum config",
+                        )
+                    })?,
+                ))
+            }
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional multipart checksum tag",
+            )),
+        }
+    }
+
+    fn read_stream_upload_target(&mut self) -> Result<StreamUploadTarget, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(StreamUploadTarget::PutObject),
+            1 => Ok(StreamUploadTarget::UploadPart {
+                upload_id: self.read_upload_id()?,
+                part_number: self.read_u32()?,
+            }),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream upload target tag",
+            )),
+        }
+    }
+
+    fn read_create_stream_upload_precondition(
+        &mut self,
+    ) -> Result<StorageRpcCreateStreamUploadPrecondition, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(
+                StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                    require_generation_reservation: self.read_bool()?,
+                },
+            ),
+            1 => Ok(StorageRpcCreateStreamUploadPrecondition::PutObject {
+                expected_current: self.read_optional_stored_object()?,
+                require_generation_reservation: self.read_bool()?,
+            }),
+            2 => Ok(StorageRpcCreateStreamUploadPrecondition::UploadPart {
+                expected_upload: self.read_multipart_upload_record()?,
+            }),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream upload precondition tag",
+            )),
+        }
+    }
+
+    fn read_optional_create_stream_upload_command(
+        &mut self,
+    ) -> Result<Option<CreateStreamUploadCommand>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_create_stream_upload_command()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional stream upload command tag",
+            )),
+        }
+    }
+
+    fn read_create_stream_upload_command(
+        &mut self,
+    ) -> Result<CreateStreamUploadCommand, StorageRpcPayloadError> {
+        Ok(CreateStreamUploadCommand {
+            session: self.read_stream_upload_command_record()?,
+            initial_next_segment_vid: GenerationId::new(self.read_u64()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid initial stream segment generation",
+                ),
+            )?,
+            bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
+        })
+    }
+
+    fn read_optional_create_multipart_upload_command(
+        &mut self,
+    ) -> Result<Option<CreateMultipartUploadCommand>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_create_multipart_upload_command()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional multipart upload command tag",
+            )),
+        }
+    }
+
+    fn read_create_multipart_upload_command(
+        &mut self,
+    ) -> Result<CreateMultipartUploadCommand, StorageRpcPayloadError> {
+        Ok(CreateMultipartUploadCommand {
+            upload: self.read_multipart_upload_record()?,
+            bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
+        })
+    }
+
+    fn read_multipart_upload_record(
+        &mut self,
+    ) -> Result<MultipartUploadRecord, StorageRpcPayloadError> {
+        Ok(MultipartUploadRecord {
+            upload_id: self.read_upload_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            initiated_at: self.read_u64()?,
+            state: UploadState::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid multipart upload state",
+                ),
+            )?,
+            tags: self.read_optional_serialized_tag_set()?,
+            metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
+            system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
+            initiator: self.read_optional_owner_identity()?,
+            owner: self.read_owner_identity()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            object_generation_id: GenerationId::new(self.read_u64()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid multipart object generation id",
+                ),
+            )?,
+            object_lock: self.read_object_lock_state()?,
+            checksum: self.read_optional_multipart_checksum_config()?,
+            encryption: self.read_object_encryption()?,
+        })
+    }
+
+    fn read_stream_upload_command_record(
+        &mut self,
+    ) -> Result<crate::types::StreamUploadCommandRecord, StorageRpcPayloadError> {
+        Ok(crate::types::StreamUploadCommandRecord {
+            session_id: SessionId::try_from(self.read_string()?).map_err(|_| {
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream session id")
+            })?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            target: self.read_stream_upload_target()?,
+            state: StreamUploadState::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream upload state"),
+            )?,
+            created_at: self.read_u64()?,
+            encryption: self.read_object_encryption()?,
+        })
+    }
+
     fn read_optional_delete_object_version_target(
         &mut self,
     ) -> Result<Option<DeleteObjectVersionTarget>, StorageRpcPayloadError> {
@@ -6246,6 +6819,163 @@ fn put_insert_delete_marker_stale_payload(
             put_u64(out, *created_at);
         }
     }
+}
+
+fn put_create_stream_upload_req(out: &mut Vec<u8>, request: &CreateStreamUploadReq) {
+    put_string(out, request.session_id.as_str());
+    put_string(out, request.bucket.as_str());
+    put_string(out, request.key.as_str());
+    put_stream_upload_target(out, &request.target);
+    put_object_encryption(out, &request.encryption);
+}
+
+fn put_stream_upload_target(out: &mut Vec<u8>, target: &StreamUploadTarget) {
+    match target {
+        StreamUploadTarget::PutObject => put_u8(out, 0),
+        StreamUploadTarget::UploadPart {
+            upload_id,
+            part_number,
+        } => {
+            put_u8(out, 1);
+            put_string(out, upload_id.as_str());
+            put_u32(out, *part_number);
+        }
+    }
+}
+
+fn put_create_stream_upload_precondition(
+    out: &mut Vec<u8>,
+    precondition: &StorageRpcCreateStreamUploadPrecondition,
+) {
+    match precondition {
+        StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+            require_generation_reservation,
+        } => {
+            put_u8(out, 0);
+            put_bool(out, *require_generation_reservation);
+        }
+        StorageRpcCreateStreamUploadPrecondition::PutObject {
+            expected_current,
+            require_generation_reservation,
+        } => {
+            put_u8(out, 1);
+            put_optional_stored_object(out, expected_current.as_ref());
+            put_bool(out, *require_generation_reservation);
+        }
+        StorageRpcCreateStreamUploadPrecondition::UploadPart { expected_upload } => {
+            put_u8(out, 2);
+            put_multipart_upload_record(out, expected_upload);
+        }
+    }
+}
+
+fn put_optional_create_stream_upload_command(
+    out: &mut Vec<u8>,
+    command: Option<&CreateStreamUploadCommand>,
+) {
+    match command {
+        None => put_u8(out, 0),
+        Some(command) => {
+            put_u8(out, 1);
+            put_create_stream_upload_command(out, command);
+        }
+    }
+}
+
+fn put_create_stream_upload_command(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
+    put_stream_upload_command_record(out, &command.session);
+    put_u64(out, command.initial_next_segment_vid.get());
+    put_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+}
+
+fn put_stream_upload_command_record(
+    out: &mut Vec<u8>,
+    record: &crate::types::StreamUploadCommandRecord,
+) {
+    put_string(out, record.session_id.as_str());
+    put_string(out, record.bucket.as_str());
+    put_string(out, record.key.as_str());
+    put_stream_upload_target(out, &record.target);
+    put_u8(out, record.state as u8);
+    put_u64(out, record.created_at);
+    put_object_encryption(out, &record.encryption);
+}
+
+fn put_create_multipart_upload_req(out: &mut Vec<u8>, request: &CreateMultipartUploadReq) {
+    put_string(out, request.upload_id.as_str());
+    put_string(out, request.bucket.as_str());
+    put_string(out, request.key.as_str());
+    put_optional_string(out, request.tags.as_ref().map(|tags| tags.as_str()));
+    put_bytes(out, request.metadata_blob.as_slice());
+    put_bytes(out, request.system_metadata_blob.as_slice());
+    put_optional_owner_identity(out, request.initiator.as_ref());
+    put_owner_identity(out, &request.owner);
+    put_string(out, &request.acl_grants.serialized());
+    put_bool(out, request.public_read);
+    put_object_lock_state(out, request.object_lock);
+    put_optional_multipart_checksum_config(out, request.checksum);
+    put_object_encryption(out, &request.encryption);
+}
+
+fn put_optional_owner_identity(out: &mut Vec<u8>, owner: Option<&OwnerIdentity>) {
+    match owner {
+        None => put_u8(out, 0),
+        Some(owner) => {
+            put_u8(out, 1);
+            put_owner_identity(out, owner);
+        }
+    }
+}
+
+fn put_optional_multipart_checksum_config(
+    out: &mut Vec<u8>,
+    checksum: Option<MultipartChecksumConfig>,
+) {
+    match checksum {
+        None => put_u8(out, 0),
+        Some(checksum) => {
+            put_u8(out, 1);
+            put_u8(out, checksum.algorithm() as u8);
+            put_u8(out, checksum.checksum_type() as u8);
+        }
+    }
+}
+
+fn put_optional_create_multipart_upload_command(
+    out: &mut Vec<u8>,
+    command: Option<&CreateMultipartUploadCommand>,
+) {
+    match command {
+        None => put_u8(out, 0),
+        Some(command) => {
+            put_u8(out, 1);
+            put_create_multipart_upload_command(out, command);
+        }
+    }
+}
+
+fn put_create_multipart_upload_command(out: &mut Vec<u8>, command: &CreateMultipartUploadCommand) {
+    put_multipart_upload_record(out, &command.upload);
+    put_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+}
+
+fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord) {
+    put_string(out, record.upload_id.as_str());
+    put_string(out, record.bucket.as_str());
+    put_string(out, record.key.as_str());
+    put_u64(out, record.initiated_at);
+    put_u8(out, record.state as u8);
+    put_optional_string(out, record.tags.as_ref().map(|tags| tags.as_str()));
+    put_bytes(out, record.metadata_blob.as_slice());
+    put_bytes(out, record.system_metadata_blob.as_slice());
+    put_optional_owner_identity(out, record.initiator.as_ref());
+    put_owner_identity(out, &record.owner);
+    put_string(out, &record.acl_grants.serialized());
+    put_bool(out, record.public_read);
+    put_u64(out, record.object_generation_id.get());
+    put_object_lock_state(out, record.object_lock);
+    put_optional_multipart_checksum_config(out, record.checksum);
+    put_object_encryption(out, &record.encryption);
 }
 
 fn put_optional_delete_object_version_target(

@@ -6201,8 +6201,8 @@ impl super::StorageCluster {
                     request,
                 )?;
 
-                let storage_client = self.object_metadata_primary_client(bucket, key)?;
-                let current_object = storage_client
+                let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+                let current_object = mutation_client
                     .load_current_object_delete_snapshot(pg_id, bucket, key)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                 let existing_object = match current_object.stored.as_ref() {
@@ -6214,7 +6214,7 @@ impl super::StorageCluster {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(Err(error)),
                 };
-                if storage_client
+                if mutation_client
                     .matching_stream_upload_exists(
                         pg_id,
                         &create,
@@ -6231,7 +6231,7 @@ impl super::StorageCluster {
                 maybe_run_before_stream_put_create_command_id_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
-                let command = match storage_client.build_create_stream_upload_command(
+                let command = match mutation_client.build_create_stream_upload_command(
                     BuildCreateStreamUploadCommandReq {
                         pg_id,
                         cluster_epoch: self.operation_epoch(),
@@ -6643,8 +6643,8 @@ impl super::StorageCluster {
                     request,
                 )?;
 
-                let storage_client = self.object_metadata_primary_client(bucket, key)?;
-                let current_object = storage_client
+                let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+                let current_object = mutation_client
                     .load_current_object_delete_snapshot(pg_id, bucket, key)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                 let existing_object = match current_object.stored.as_ref() {
@@ -6656,7 +6656,7 @@ impl super::StorageCluster {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(Err(error)),
                 };
-                if let Some(initiated_at) = storage_client
+                if let Some(initiated_at) = mutation_client
                     .matching_multipart_upload_initiated_at(
                         pg_id,
                         &create,
@@ -6670,7 +6670,7 @@ impl super::StorageCluster {
                     })));
                 }
 
-                let command = match storage_client.build_create_multipart_upload_command(
+                let command = match mutation_client.build_create_multipart_upload_command(
                     BuildCreateMultipartUploadCommandReq {
                         pg_id,
                         cluster_epoch: self.operation_epoch(),
@@ -6846,7 +6846,8 @@ impl super::StorageCluster {
                 },
                 encryption: upload.encryption.clone(),
             };
-            match storage_client.matching_stream_upload_exists(
+            let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
+            match mutation_client.matching_stream_upload_exists(
                 pg_id,
                 &create,
                 super::applied_stream_create_command(&applied_commands, &create),
@@ -6865,7 +6866,7 @@ impl super::StorageCluster {
                     ));
                 }
             }
-            let command = match storage_client.build_create_stream_upload_command(
+            let command = match mutation_client.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
                     pg_id,
                     cluster_epoch: self.operation_epoch(),
@@ -6993,7 +6994,8 @@ impl super::StorageCluster {
                 },
                 encryption: upload.encryption.clone(),
             };
-            match storage_client.matching_stream_upload_exists(
+            let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+            match mutation_client.matching_stream_upload_exists(
                 pg_id,
                 &create,
                 super::applied_stream_create_command(&applied_commands, &create),
@@ -7010,7 +7012,7 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             }
-            let command = match storage_client.build_create_stream_upload_command(
+            let command = match mutation_client.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
                     pg_id,
                     cluster_epoch: self.operation_epoch(),

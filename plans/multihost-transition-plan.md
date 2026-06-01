@@ -5576,8 +5576,12 @@ delete-marker insertion, and lifecycle noncurrent/delete-marker cleanup now
 route object mutation snapshot loads, version-list reads, and command builders
 through a dedicated object-mutation metadata RPC surface. Delete snapshots carry
 the expected delete target, and Unix clients validate returned delete/reclaim
-payload identity before publishing the command. Remaining non-command surfaces
-still need operation-shaped builders for stream PUT, multipart, bucket
+payload identity before publishing the command. Stream upload session creation
+and multipart upload initiation now use the same object-mutation metadata RPC
+surface for retry matching and command construction; Unix clients validate the
+returned session/upload identity and bucket-write proof before publishing.
+Remaining non-command surfaces still need operation-shaped builders for stream
+PUT/part finalization, multipart completion/abort, bucket
 properties/subresources, lifecycle MPU abort, and durable pending/drain/
 coordination checks before frontend/combined roles can be enabled.
 
@@ -5642,10 +5646,13 @@ Implementation slices:
    loads. Object mutation metadata helpers now route PUT-object-metadata,
    object delete, delete-marker insertion, lifecycle version-list reads, and
    lifecycle delete command construction through a dedicated RPC surface with
-   delete-target response validation. Remaining work includes durable
-   pending/drain/coordination checks and operation-shaped command-builder calls
-   for stream PUT, multipart, bucket properties/subresources, and lifecycle MPU
-   abort that must execute against a storage-node-owned snapshot rather than a
+   delete-target response validation. Stream upload session creation and
+   multipart upload initiation builders now route through the object-mutation
+   metadata RPC boundary with request/proof response validation. Remaining
+   work includes durable pending/drain/coordination checks and operation-shaped
+   command-builder calls for stream PUT/part finalization, multipart
+   completion/abort, bucket properties/subresources, and lifecycle MPU abort
+   that must execute against a storage-node-owned snapshot rather than a
    frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
@@ -5689,7 +5696,8 @@ Required tests:
 8. non-command metadata RPCs used by create-bucket/direct PUT run remotely:
    bucket raw/info and bucket snapshot reads, object read snapshot and
    tag/legal-hold/retention subject reads, generation/version/order allocation,
-   bucket-write reservation/proof release, durable pending/drain checks, and
+   bucket-write reservation/proof release, stream-upload and multipart-upload
+   initiation command builders, durable pending/drain checks, and remaining
    operation-shaped command builders. Proof release must reject the correct PG
    on a non-primary node even when that node appears first in the acting-set
    route list.
