@@ -12,8 +12,6 @@ use super::authz_results::{
     AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads, AuthorizedListParts,
 };
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
-#[cfg(test)]
-use super::maybe_run_multipart_complete_pre_commit_hook;
 use super::object_state::StaleObjectPayload;
 use super::request_types::{
     AppendStreamPartRequest, BeginStreamPartRequest, CompleteMultipartUploadRequest,
@@ -33,6 +31,10 @@ use super::{
 use super::{
     maybe_run_bucket_write_handle_loaded_hook, should_probe_begin_stream_part_session,
     should_probe_finalize_stream_part_commit,
+};
+#[cfg(test)]
+use super::{
+    maybe_run_multipart_complete_pre_commit_hook, maybe_run_multipart_complete_snapshot_hook,
 };
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
@@ -358,21 +360,6 @@ impl Coordinator {
             let parts = req.parts;
             let claimed_checksum = req.claimed_checksum;
             let expected_object_size = req.expected_object_size;
-            let completion_preflight = self
-                .storage_node
-                .load_multipart_completion_preflight(&upload)
-                .map_err(Coordinator::map_object_pg_action_error)?;
-
-            if !req.cond.is_empty() {
-                let existing_etag = completion_preflight.existing_etag.as_deref();
-                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                    return Err(ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    });
-                }
-                check_write_conditions(req.cond, existing_etag)?;
-            }
             if parts.is_empty() {
                 return Err(ServerError::InvalidRequest {
                     reason: "part list must not be empty".to_string(),
@@ -394,6 +381,8 @@ impl Coordinator {
 
             let requested_part_numbers: Vec<u32> =
                 parts.iter().map(|part| part.part_number).collect();
+            #[cfg(test)]
+            maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
             let completion_snapshot = self
                 .storage_node
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
@@ -403,6 +392,17 @@ impl Coordinator {
                     ) => ServerError::InvalidPart { part_number },
                     other => Coordinator::map_object_pg_action_error(other),
                 })?;
+
+            if !req.cond.is_empty() {
+                let existing_etag = completion_snapshot.existing_etag.as_deref();
+                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                    return Err(ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    });
+                }
+                check_write_conditions(req.cond, existing_etag)?;
+            }
 
             let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
             let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);

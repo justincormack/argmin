@@ -6765,9 +6765,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_upload(pg_id, bucket, key, upload_id)
     }
 
@@ -6787,7 +6785,7 @@ impl super::StorageCluster {
             bucket_write_reservation,
         } = req;
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
-        let storage_client = self.object_metadata_primary_client(&bucket, &key)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
         let _bucket_guard = self.lock_bucket_on_object_metadata_primary(&bucket, &key)?;
         macro_rules! release_caller_bucket_write_proof {
             () => {{
@@ -6807,7 +6805,7 @@ impl super::StorageCluster {
                     ));
                 }
             };
-            let upload = match storage_client
+            let upload = match mutation_client
                 .load_in_progress_multipart_upload(pg_id, &bucket, &key, &upload_id)
             {
                 Ok(upload) => upload,
@@ -6846,7 +6844,6 @@ impl super::StorageCluster {
                 },
                 encryption: upload.encryption.clone(),
             };
-            let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
             match mutation_client.matching_stream_upload_exists(
                 pg_id,
                 &create,
@@ -6929,7 +6926,7 @@ impl super::StorageCluster {
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         loop {
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
@@ -6966,7 +6963,7 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let upload = match storage_client
+            let upload = match mutation_client
                 .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
             {
                 Ok(upload) => upload,
@@ -6994,7 +6991,6 @@ impl super::StorageCluster {
                 },
                 encryption: upload.encryption.clone(),
             };
-            let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
             match mutation_client.matching_stream_upload_exists(
                 pg_id,
                 &create,
@@ -7070,9 +7066,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
     }
 
@@ -7097,9 +7091,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .load_in_progress_multipart_upload_for_listing(pg_id, bucket, key, upload_id)
     }
 
@@ -7111,9 +7103,7 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_completion_snapshot(pg_id, authorized_upload, requested_part_numbers)
     }
 
@@ -7124,9 +7114,7 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_completion_preflight(pg_id, authorized_upload)
     }
 
@@ -7842,9 +7830,7 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .list_multipart_parts_for_authorized_upload(
                 pg_id,
                 authorized_upload,
@@ -7860,9 +7846,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+        self.object_mutation_metadata_primary_client(bucket, key)?
             .lookup_multipart_upload_management(pg_id, bucket, key, upload_id)
     }
 
@@ -8235,7 +8219,7 @@ impl super::StorageCluster {
         }
 
         let upload = match self
-            .object_metadata_primary_client(bucket, key)?
+            .object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_upload(pg_id, bucket, key, upload_id)
         {
             Ok(upload) => upload,

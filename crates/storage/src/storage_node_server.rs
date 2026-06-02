@@ -40,7 +40,9 @@ use crate::storage_rpc::{
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
-    decode_metadata_command_state_request, decode_multipart_upload_match_request,
+    decode_metadata_command_state_request, decode_multipart_completion_preflight_request,
+    decode_multipart_completion_snapshot_request, decode_multipart_parts_list_request,
+    decode_multipart_upload_load_request, decode_multipart_upload_match_request,
     decode_object_delete_snapshot_request, decode_object_generation_reservation_request,
     decode_object_read_auth_subject_request, decode_object_read_snapshot_request,
     decode_object_request, decode_object_tags_for_subject_request, decode_proof_release_request,
@@ -64,19 +66,22 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
-    encode_multipart_completion_stale_source_response, encode_multipart_upload_match_response,
-    encode_object_delete_snapshot_response, encode_object_generation_reservation_response,
-    encode_object_generation_response, encode_object_lifecycle_version_list_response,
-    encode_object_metadata_command_build_response, encode_object_read_auth_subject_response,
-    encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
-    encode_object_version_response, encode_put_object_metadata_snapshot_response,
-    encode_read_handle_acquire_response, encode_read_handle_release_response,
-    encode_scavenger_list_files_response, encode_shard_read_range_response,
-    encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
-    encode_storage_rpc_success_response, encode_stream_part_finalize_snapshot_response,
-    encode_stream_put_finalize_snapshot_response, encode_stream_upload_match_response,
-    read_storage_rpc_request_frame_from, write_storage_rpc_frame_to,
-    StorageRpcAbortMultipartCleanupResponse, StorageRpcAbortMultipartCommandBuildRequest,
+    encode_multipart_completion_preflight_response, encode_multipart_completion_snapshot_response,
+    encode_multipart_completion_stale_source_response, encode_multipart_management_lookup_response,
+    encode_multipart_parts_list_response, encode_multipart_upload_load_response,
+    encode_multipart_upload_match_response, encode_object_delete_snapshot_response,
+    encode_object_generation_reservation_response, encode_object_generation_response,
+    encode_object_lifecycle_version_list_response, encode_object_metadata_command_build_response,
+    encode_object_read_auth_subject_response, encode_object_read_snapshot_response,
+    encode_object_tags_for_subject_response, encode_object_version_response,
+    encode_put_object_metadata_snapshot_response, encode_read_handle_acquire_response,
+    encode_read_handle_release_response, encode_scavenger_list_files_response,
+    encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
+    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    encode_stream_part_finalize_snapshot_response, encode_stream_put_finalize_snapshot_response,
+    encode_stream_upload_match_response, read_storage_rpc_request_frame_from,
+    write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
+    StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
     StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
@@ -110,25 +115,31 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
-    StorageRpcMultipartCompletionStaleSourceResponse, StorageRpcMultipartUploadMatchRequest,
-    StorageRpcMultipartUploadMatchResponse, StorageRpcObjectDeleteSnapshotRequest,
-    StorageRpcObjectDeleteSnapshotResponse, StorageRpcObjectGenerationReservationOutcome,
-    StorageRpcObjectGenerationReservationRequest, StorageRpcObjectGenerationReservationResponse,
-    StorageRpcObjectGenerationResponse, StorageRpcObjectLifecycleVersionListResponse,
-    StorageRpcObjectMetadataCommandBuildOutcome, StorageRpcObjectMetadataCommandBuildResponse,
-    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
-    StorageRpcObjectReadAuthSubjectResponse, StorageRpcObjectReadSnapshotOutcome,
-    StorageRpcObjectReadSnapshotRequest, StorageRpcObjectReadSnapshotResponse,
-    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
-    StorageRpcObjectTagsForSubjectRequest, StorageRpcObjectTagsForSubjectResponse,
-    StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
-    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
-    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcPutObjectMetadataSnapshotResponse,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
-    StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
+    StorageRpcMultipartCompletionPreflightResponse, StorageRpcMultipartCompletionSnapshotOutcome,
+    StorageRpcMultipartCompletionSnapshotRequest, StorageRpcMultipartCompletionSnapshotResponse,
+    StorageRpcMultipartCompletionStaleSourceResponse, StorageRpcMultipartManagementLookupResponse,
+    StorageRpcMultipartPartsListOutcome, StorageRpcMultipartPartsListRequest,
+    StorageRpcMultipartPartsListResponse, StorageRpcMultipartUploadLoadOutcome,
+    StorageRpcMultipartUploadLoadRequest, StorageRpcMultipartUploadLoadResponse,
+    StorageRpcMultipartUploadMatchRequest, StorageRpcMultipartUploadMatchResponse,
+    StorageRpcObjectDeleteSnapshotRequest, StorageRpcObjectDeleteSnapshotResponse,
+    StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
+    StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
+    StorageRpcObjectLifecycleVersionListResponse, StorageRpcObjectMetadataCommandBuildOutcome,
+    StorageRpcObjectMetadataCommandBuildResponse, StorageRpcObjectReadAuthSubjectOutcome,
+    StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadAuthSubjectResponse,
+    StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
+    StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest,
+    StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
+    StorageRpcObjectTagsForSubjectResponse, StorageRpcObjectVersionResponse,
+    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
+    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
+    StorageRpcPutObjectMetadataSnapshotResponse, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
+    StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
+    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
@@ -639,6 +650,53 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectMultipartUploadMatch => {
                 match decode_multipart_upload_match_request(&frame.payload) {
                     Ok(request) => self.multipart_upload_match_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartUploadLoad
+            | StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad
+            | StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad => {
+                match decode_multipart_upload_load_request(&frame.payload) {
+                    Ok(request) => self.multipart_upload_load_response(frame.kind, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad => {
+                match decode_multipart_completion_snapshot_request(&frame.payload) {
+                    Ok(request) => self.multipart_completion_snapshot_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad => {
+                match decode_multipart_completion_preflight_request(&frame.payload) {
+                    Ok(request) => self.multipart_completion_preflight_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartPartsList => {
+                match decode_multipart_parts_list_request(&frame.payload) {
+                    Ok(request) => self.multipart_parts_list_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartManagementLookup => {
+                match decode_multipart_upload_load_request(&frame.payload) {
+                    Ok(request) => self.multipart_management_lookup_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1821,6 +1879,277 @@ impl StorageNodeConnectionHandler {
             encode_multipart_upload_match_response(&StorageRpcMultipartUploadMatchResponse {
                 initiated_at,
             });
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn multipart_upload_load_response(
+        &self,
+        kind: StorageRpcMessageKind,
+        request: StorageRpcMultipartUploadLoadRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "multipart upload load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let outcome = match kind {
+            StorageRpcMessageKind::ObjectMultipartUploadLoad => {
+                match ObjectMutationMetadataNodeClient::load_multipart_upload(
+                    &local_client,
+                    request.object.pg_id,
+                    &request.object.bucket,
+                    &request.object.key,
+                    &request.upload_id,
+                ) {
+                    Ok(upload) => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(upload)),
+                    Err(BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload {
+                        ..
+                    })) => StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                        upload_id: request.upload_id,
+                    },
+                    Err(error) => {
+                        return encode_storage_rpc_error_response(
+                            &bucket_snapshot_error_response(error),
+                        );
+                    }
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad => {
+                match ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
+                    &local_client,
+                    request.object.pg_id,
+                    &request.object.bucket,
+                    &request.object.key,
+                    &request.upload_id,
+                ) {
+                    Ok(upload) => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(upload)),
+                    Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                        StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                            upload_id: request.upload_id,
+                        }
+                    }
+                    Err(error) => {
+                        return encode_storage_rpc_error_response(
+                            &object_pg_error_response(error),
+                        );
+                    }
+                }
+            }
+            StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad => {
+                match ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
+                    &local_client,
+                    request.object.pg_id,
+                    &request.object.bucket,
+                    &request.object.key,
+                    &request.upload_id,
+                ) {
+                    Ok(upload) => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(upload)),
+                    Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                        StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                            upload_id: request.upload_id,
+                        }
+                    }
+                    Err(error) => {
+                        return encode_storage_rpc_error_response(
+                            &object_pg_error_response(error),
+                        );
+                    }
+                }
+            }
+            _ => unreachable!("multipart upload load handler called for wrong kind"),
+        };
+        let payload =
+            encode_multipart_upload_load_response(&StorageRpcMultipartUploadLoadResponse {
+                outcome,
+            })?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn multipart_completion_snapshot_response(
+        &self,
+        request: StorageRpcMultipartCompletionSnapshotRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "multipart completion snapshot load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+            request.authorized_upload,
+        );
+        let outcome = match ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
+            &local_client,
+            request.object.pg_id,
+            &authorized_upload,
+            &request.requested_part_numbers,
+        ) {
+            Ok(snapshot) => {
+                StorageRpcMultipartCompletionSnapshotOutcome::Loaded(Box::new(snapshot))
+            }
+            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
+                    upload_id: authorized_upload.upload_id.clone(),
+                }
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_multipart_completion_snapshot_response(
+            &StorageRpcMultipartCompletionSnapshotResponse { outcome },
+        )?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn multipart_completion_preflight_response(
+        &self,
+        request: StorageRpcMultipartCompletionPreflightRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "multipart completion preflight load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+            request.authorized_upload,
+        );
+        let outcome = match ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
+            &local_client,
+            request.object.pg_id,
+            &authorized_upload,
+        ) {
+            Ok(preflight) => StorageRpcMultipartCompletionPreflightOutcome::Loaded(preflight),
+            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload {
+                    upload_id: authorized_upload.upload_id.clone(),
+                }
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_multipart_completion_preflight_response(
+            &StorageRpcMultipartCompletionPreflightResponse { outcome },
+        );
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn multipart_parts_list_response(
+        &self,
+        request: StorageRpcMultipartPartsListRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "multipart parts list",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+            request.authorized_upload,
+        );
+        let outcome =
+            match ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
+                &local_client,
+                request.object.pg_id,
+                &authorized_upload,
+                request.part_number_marker,
+                request.max_parts,
+            ) {
+                Ok(listed) => StorageRpcMultipartPartsListOutcome::Loaded(Box::new(listed)),
+                Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                    StorageRpcMultipartPartsListOutcome::NoSuchUpload {
+                        upload_id: authorized_upload.upload_id.clone(),
+                    }
+                }
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
+                }
+            };
+        let payload =
+            encode_multipart_parts_list_response(&StorageRpcMultipartPartsListResponse {
+                outcome,
+            })?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn multipart_management_lookup_response(
+        &self,
+        request: StorageRpcMultipartUploadLoadRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "multipart management lookup",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let lookup = match ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.upload_id,
+        ) {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_multipart_management_lookup_response(
+            &StorageRpcMultipartManagementLookupResponse { lookup },
+        );
         Ok(encode_storage_rpc_success_response(&payload))
     }
 

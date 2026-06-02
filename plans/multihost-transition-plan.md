@@ -5588,11 +5588,13 @@ identity, staged segment rows, multipart part rows, and bucket-write proof
 before publishing. Multipart completion and abort command builders now use that
 same object-mutation metadata RPC boundary; Unix clients preserve typed stale
 completion snapshots and validate returned completion/abort command identity
-before publication. Remaining non-command surfaces still need operation-shaped
-builders for bucket properties/subresources, lifecycle MPU abort, and durable
-pending/drain/coordination checks, plus broader multipart metadata
-read/list/management RPC surfaces, before frontend/combined roles can be
-enabled.
+before publication. Broader multipart upload metadata read/list/management
+helpers now also use the object-mutation metadata RPC boundary, so
+authorization, completion preflight/snapshot, part listing, and management
+lookups run against the storage-node-owned object PG. Remaining non-command
+surfaces still need operation-shaped builders for bucket properties/subresources,
+lifecycle MPU abort, and durable pending/drain/coordination checks before
+frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5663,12 +5665,12 @@ Implementation slices:
    stream commit/part command identity before publication. Multipart completion
    and abort command builders now also use the object-mutation metadata RPC
    boundary, preserving stale-completion retry outcomes and validating returned
-   completion/abort command identity before publication. Remaining work includes
-   durable pending/drain/coordination checks, operation-shaped command-builder
-   calls for bucket properties/subresources and lifecycle MPU abort, and broader
-   multipart metadata read/list/management RPC surfaces that must execute
-   against a storage-node-owned snapshot rather than a frontend-owned raw PG
-   handle.
+   completion/abort command identity before publication. Multipart upload
+   read/list/management helpers now use the same object-mutation metadata RPC
+   boundary and validate returned upload, completion snapshot, part list, and
+   management lookup identities. Remaining work includes durable
+   pending/drain/coordination checks and operation-shaped command-builder calls
+   for bucket properties/subresources and lifecycle MPU abort.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
    install/apply for `CreateBucket`, then direct PUT object-generation

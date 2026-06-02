@@ -15407,6 +15407,13 @@ impl PgMetadataStore for PgStore {
                 upload_id: req.upload_id.to_string(),
             });
         }
+        if req.max_parts == 0 {
+            return Ok(ListPartsResp {
+                parts: Vec::new(),
+                is_truncated: false,
+                next_part_number_marker: Some(req.part_number_marker.unwrap_or(0)),
+            });
+        }
 
         let limit = req.max_parts as i64 + 1;
 

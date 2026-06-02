@@ -3154,7 +3154,7 @@ pub struct CompletedMultipartUploadRecord {
     pub owner: OwnerIdentity,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipartUploadManagementLookup {
     InProgress(Box<MultipartUploadRecord>),
     NonInProgress(Box<MultipartUploadRecord>),
@@ -3183,7 +3183,7 @@ pub struct MultipartPartRecord {
     pub checksum: Option<ChecksumBytes>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartCompletionSnapshot {
     pub existing_etag: Option<String>,
     pub stale_payload_source: Option<StoredObject>,
@@ -3192,7 +3192,7 @@ pub struct MultipartCompletionSnapshot {
     pub cleanup: CompleteMultipartCommitCleanup,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartCompletionPreflight {
     pub existing_etag: Option<String>,
 }
@@ -3333,14 +3333,14 @@ pub struct ListPartsReq {
 }
 
 /// Response from listing parts of a multipart upload.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListPartsResp {
     pub parts: Vec<MultipartPartRecord>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedMultipartParts {
     pub upload: MultipartUploadRecord,
     pub response: ListPartsResp,

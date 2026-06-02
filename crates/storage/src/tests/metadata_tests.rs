@@ -2775,6 +2775,17 @@ fn mpu_list_parts_pagination() {
     assert_eq!(resp.parts[1].part_number, 2);
     assert_eq!(resp.next_part_number_marker, Some(2));
 
+    let resp = store
+        .list_multipart_parts(&ListPartsReq {
+            upload_id: multipart_upload_id("uid-5"),
+            part_number_marker: None,
+            max_parts: 0,
+        })
+        .unwrap();
+    assert!(!resp.is_truncated);
+    assert!(resp.parts.is_empty());
+    assert_eq!(resp.next_part_number_marker, Some(0));
+
     // List second page
     let resp = store
         .list_multipart_parts(&ListPartsReq {

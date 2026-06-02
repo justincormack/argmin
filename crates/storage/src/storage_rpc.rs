@@ -12,12 +12,14 @@ use crate::{
         BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
         BucketState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType,
         ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
-        CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
-        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
-        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LiveObjectRecord,
+        CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
+        CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
+        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
+        GenerationId, ListPartsResp, ListedMultipartParts, LiveObjectRecord,
         LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
-        MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-        MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+        MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
+        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+        MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord,
         ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
         ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
         ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
@@ -120,6 +122,15 @@ const STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_MULTIPART_UPLOAD_LOAD_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + UPLOAD_ID_LEN;
+const STORAGE_RPC_MAX_MULTIPART_COMPLETION_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_MULTIPART_COMPLETION_PREFLIGHT_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_MULTIPART_COMPLETION_SNAPSHOT_REQUEST_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_MULTIPART_PARTS_LIST_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_MULTIPART_COMPLETION_SNAPSHOT_REQUEST_PAYLOAD_LEN + 1 + 4 + 4;
+const STORAGE_RPC_MAX_MULTIPART_MANAGEMENT_LOOKUP_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_MULTIPART_UPLOAD_LOAD_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_MULTIPART_ABORT_CLEANUP_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + UPLOAD_ID_LEN;
 const STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
@@ -245,6 +256,13 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectMultipartAuthorizedAbortCommandBuild = 67,
     ObjectMultipartCompletionStaleSourceLoad = 68,
     ObjectMultipartAbortCleanupLoad = 69,
+    ObjectMultipartUploadLoad = 70,
+    ObjectMultipartInProgressUploadLoad = 71,
+    ObjectMultipartInProgressUploadForListingLoad = 72,
+    ObjectMultipartCompletionSnapshotLoad = 73,
+    ObjectMultipartCompletionPreflightLoad = 74,
+    ObjectMultipartPartsList = 75,
+    ObjectMultipartManagementLookup = 76,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +386,19 @@ impl StorageRpcMessageKind {
                 "object multipart completion stale source load"
             }
             Self::ObjectMultipartAbortCleanupLoad => "object multipart abort cleanup load",
+            Self::ObjectMultipartUploadLoad => "object multipart upload load",
+            Self::ObjectMultipartInProgressUploadLoad => "object multipart in-progress upload load",
+            Self::ObjectMultipartInProgressUploadForListingLoad => {
+                "object multipart in-progress upload listing load"
+            }
+            Self::ObjectMultipartCompletionSnapshotLoad => {
+                "object multipart completion snapshot load"
+            }
+            Self::ObjectMultipartCompletionPreflightLoad => {
+                "object multipart completion preflight load"
+            }
+            Self::ObjectMultipartPartsList => "object multipart parts list",
+            Self::ObjectMultipartManagementLookup => "object multipart management lookup",
         }
     }
 
@@ -442,6 +473,13 @@ impl StorageRpcMessageKind {
             67 => Ok(Self::ObjectMultipartAuthorizedAbortCommandBuild),
             68 => Ok(Self::ObjectMultipartCompletionStaleSourceLoad),
             69 => Ok(Self::ObjectMultipartAbortCleanupLoad),
+            70 => Ok(Self::ObjectMultipartUploadLoad),
+            71 => Ok(Self::ObjectMultipartInProgressUploadLoad),
+            72 => Ok(Self::ObjectMultipartInProgressUploadForListingLoad),
+            73 => Ok(Self::ObjectMultipartCompletionSnapshotLoad),
+            74 => Ok(Self::ObjectMultipartCompletionPreflightLoad),
+            75 => Ok(Self::ObjectMultipartPartsList),
+            76 => Ok(Self::ObjectMultipartManagementLookup),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -733,6 +771,82 @@ pub(crate) struct StorageRpcMultipartCompletionStaleSourceResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartUploadLoadRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) upload_id: UploadId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMultipartUploadLoadOutcome {
+    Loaded(Box<MultipartUploadRecord>),
+    NoSuchUpload { upload_id: UploadId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartUploadLoadResponse {
+    pub(crate) outcome: StorageRpcMultipartUploadLoadOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartCompletionSnapshotRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) authorized_upload: MultipartUploadRecord,
+    pub(crate) requested_part_numbers: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum StorageRpcMultipartCompletionSnapshotOutcome {
+    Loaded(Box<MultipartCompletionSnapshot>),
+    NoSuchUpload { upload_id: UploadId },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcMultipartCompletionSnapshotResponse {
+    pub(crate) outcome: StorageRpcMultipartCompletionSnapshotOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartCompletionPreflightRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) authorized_upload: MultipartUploadRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMultipartCompletionPreflightOutcome {
+    Loaded(MultipartCompletionPreflight),
+    NoSuchUpload { upload_id: UploadId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartCompletionPreflightResponse {
+    pub(crate) outcome: StorageRpcMultipartCompletionPreflightOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMultipartPartsListRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) authorized_upload: MultipartUploadRecord,
+    pub(crate) part_number_marker: Option<u32>,
+    pub(crate) max_parts: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum StorageRpcMultipartPartsListOutcome {
+    Loaded(Box<ListedMultipartParts>),
+    NoSuchUpload { upload_id: UploadId },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcMultipartPartsListResponse {
+    pub(crate) outcome: StorageRpcMultipartPartsListOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcMultipartManagementLookupResponse {
+    pub(crate) lookup: MultipartUploadManagementLookup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcDeleteSpecificObjectCommandBuildRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) version_id: VersionId,
@@ -977,6 +1091,17 @@ fn validate_create_multipart_upload_request_identity(
         return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
             "multipart upload request identity mismatch",
         ));
+    }
+    Ok(())
+}
+
+fn validate_multipart_upload_record_identity(
+    object: &StorageRpcObjectRequest,
+    upload: &MultipartUploadRecord,
+    error: &'static str,
+) -> Result<(), StorageRpcPayloadError> {
+    if upload.bucket != object.bucket || upload.key != object.key {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(error));
     }
     Ok(())
 }
@@ -1967,6 +2092,23 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad => {
             STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectMultipartUploadLoad
+        | StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad
+        | StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad => {
+            STORAGE_RPC_MAX_MULTIPART_UPLOAD_LOAD_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad => {
+            STORAGE_RPC_MAX_MULTIPART_COMPLETION_SNAPSHOT_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad => {
+            STORAGE_RPC_MAX_MULTIPART_COMPLETION_PREFLIGHT_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectMultipartPartsList => {
+            STORAGE_RPC_MAX_MULTIPART_PARTS_LIST_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectMultipartManagementLookup => {
+            STORAGE_RPC_MAX_MULTIPART_MANAGEMENT_LOOKUP_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad => {
             STORAGE_RPC_MAX_MULTIPART_ABORT_CLEANUP_REQUEST_PAYLOAD_LEN
         }
@@ -2292,6 +2434,309 @@ pub(crate) fn decode_multipart_completion_stale_source_response(
     let source = decoder.read_optional_stored_object()?;
     decoder.finish()?;
     Ok(StorageRpcMultipartCompletionStaleSourceResponse { source })
+}
+
+pub(crate) fn encode_multipart_upload_load_request(
+    request: &StorageRpcMultipartUploadLoadRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.upload_id.as_str());
+    out
+}
+
+pub(crate) fn decode_multipart_upload_load_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartUploadLoadRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let upload_id = decoder.read_upload_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcMultipartUploadLoadRequest { object, upload_id })
+}
+
+pub(crate) fn encode_multipart_upload_load_response(
+    response: &StorageRpcMultipartUploadLoadResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcMultipartUploadLoadOutcome::Loaded(upload) => {
+            put_u8(&mut out, 0);
+            put_multipart_upload_record(&mut out, upload);
+        }
+        StorageRpcMultipartUploadLoadOutcome::NoSuchUpload { upload_id } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_upload_load_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartUploadLoadResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(
+            decoder.read_multipart_upload_record()?,
+        )),
+        1 => StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+            upload_id: decoder.read_upload_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart upload load outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMultipartUploadLoadResponse { outcome })
+}
+
+pub(crate) fn encode_multipart_completion_snapshot_request(
+    request: &StorageRpcMultipartCompletionSnapshotRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_multipart_upload_record_identity(
+        &request.object,
+        &request.authorized_upload,
+        "multipart completion snapshot request identity mismatch",
+    )?;
+    let mut out = encode_object_request(&request.object);
+    put_multipart_upload_record(&mut out, &request.authorized_upload);
+    put_u32(
+        &mut out,
+        u32::try_from(request.requested_part_numbers.len())
+            .expect("requested part number count must fit in u32"),
+    );
+    for part_number in &request.requested_part_numbers {
+        put_u32(&mut out, *part_number);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_completion_snapshot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartCompletionSnapshotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let authorized_upload = decoder.read_multipart_upload_record()?;
+    validate_multipart_upload_record_identity(
+        &object,
+        &authorized_upload,
+        "multipart completion snapshot request identity mismatch",
+    )?;
+    let part_number_count = decoder.read_bounded_remaining_count(
+        4,
+        "multipart completion requested part count exceeds payload",
+    )?;
+    let mut requested_part_numbers = Vec::new();
+    for _ in 0..part_number_count {
+        requested_part_numbers.push(decoder.read_u32()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcMultipartCompletionSnapshotRequest {
+        object,
+        authorized_upload,
+        requested_part_numbers,
+    })
+}
+
+pub(crate) fn encode_multipart_completion_snapshot_response(
+    response: &StorageRpcMultipartCompletionSnapshotResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcMultipartCompletionSnapshotOutcome::Loaded(snapshot) => {
+            put_u8(&mut out, 0);
+            put_multipart_completion_snapshot(&mut out, snapshot);
+        }
+        StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload { upload_id } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_completion_snapshot_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartCompletionSnapshotResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMultipartCompletionSnapshotOutcome::Loaded(Box::new(
+            decoder.read_multipart_completion_snapshot()?,
+        )),
+        1 => StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
+            upload_id: decoder.read_upload_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart completion snapshot outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMultipartCompletionSnapshotResponse { outcome })
+}
+
+pub(crate) fn encode_multipart_completion_preflight_request(
+    request: &StorageRpcMultipartCompletionPreflightRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_multipart_upload_record_identity(
+        &request.object,
+        &request.authorized_upload,
+        "multipart completion preflight request identity mismatch",
+    )?;
+    let mut out = encode_object_request(&request.object);
+    put_multipart_upload_record(&mut out, &request.authorized_upload);
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_completion_preflight_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartCompletionPreflightRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let authorized_upload = decoder.read_multipart_upload_record()?;
+    validate_multipart_upload_record_identity(
+        &object,
+        &authorized_upload,
+        "multipart completion preflight request identity mismatch",
+    )?;
+    decoder.finish()?;
+    Ok(StorageRpcMultipartCompletionPreflightRequest {
+        object,
+        authorized_upload,
+    })
+}
+
+pub(crate) fn encode_multipart_completion_preflight_response(
+    response: &StorageRpcMultipartCompletionPreflightResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcMultipartCompletionPreflightOutcome::Loaded(preflight) => {
+            put_u8(&mut out, 0);
+            put_optional_string(&mut out, preflight.existing_etag.as_deref());
+        }
+        StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload { upload_id } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_multipart_completion_preflight_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartCompletionPreflightResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMultipartCompletionPreflightOutcome::Loaded(MultipartCompletionPreflight {
+            existing_etag: decoder.read_optional_string()?,
+        }),
+        1 => StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload {
+            upload_id: decoder.read_upload_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart completion preflight outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMultipartCompletionPreflightResponse { outcome })
+}
+
+pub(crate) fn encode_multipart_parts_list_request(
+    request: &StorageRpcMultipartPartsListRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_multipart_upload_record_identity(
+        &request.object,
+        &request.authorized_upload,
+        "multipart parts list request identity mismatch",
+    )?;
+    let mut out = encode_object_request(&request.object);
+    put_multipart_upload_record(&mut out, &request.authorized_upload);
+    put_optional_u32(&mut out, request.part_number_marker);
+    put_u32(&mut out, request.max_parts);
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_parts_list_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartPartsListRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let authorized_upload = decoder.read_multipart_upload_record()?;
+    validate_multipart_upload_record_identity(
+        &object,
+        &authorized_upload,
+        "multipart parts list request identity mismatch",
+    )?;
+    let part_number_marker = decoder.read_optional_u32()?;
+    let max_parts = decoder.read_u32()?;
+    decoder.finish()?;
+    Ok(StorageRpcMultipartPartsListRequest {
+        object,
+        authorized_upload,
+        part_number_marker,
+        max_parts,
+    })
+}
+
+pub(crate) fn encode_multipart_parts_list_response(
+    response: &StorageRpcMultipartPartsListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcMultipartPartsListOutcome::Loaded(listed) => {
+            put_u8(&mut out, 0);
+            put_listed_multipart_parts(&mut out, listed);
+        }
+        StorageRpcMultipartPartsListOutcome::NoSuchUpload { upload_id } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_multipart_parts_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartPartsListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcMultipartPartsListOutcome::Loaded(Box::new(
+            decoder.read_listed_multipart_parts()?,
+        )),
+        1 => StorageRpcMultipartPartsListOutcome::NoSuchUpload {
+            upload_id: decoder.read_upload_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart parts list outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMultipartPartsListResponse { outcome })
+}
+
+pub(crate) fn encode_multipart_management_lookup_response(
+    response: &StorageRpcMultipartManagementLookupResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_multipart_upload_management_lookup(&mut out, &response.lookup);
+    out
+}
+
+pub(crate) fn decode_multipart_management_lookup_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMultipartManagementLookupResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let lookup = decoder.read_multipart_upload_management_lookup()?;
+    decoder.finish()?;
+    Ok(StorageRpcMultipartManagementLookupResponse { lookup })
 }
 
 pub(crate) fn encode_object_generation_reservation_request(
@@ -6794,6 +7239,98 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
+    fn read_completed_multipart_upload_record(
+        &mut self,
+    ) -> Result<CompletedMultipartUploadRecord, StorageRpcPayloadError> {
+        Ok(CompletedMultipartUploadRecord {
+            upload_id: self.read_upload_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            completion_order: self.read_u64()?,
+            completed_at: self.read_u64()?,
+            initiator: self.read_optional_owner_identity()?,
+            owner: self.read_owner_identity()?,
+        })
+    }
+
+    fn read_multipart_completion_snapshot(
+        &mut self,
+    ) -> Result<MultipartCompletionSnapshot, StorageRpcPayloadError> {
+        let existing_etag = self.read_optional_string()?;
+        let stale_payload_source = self.read_optional_stored_object()?;
+        let part_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN,
+            "multipart completion snapshot part count exceeds payload",
+        )?;
+        let mut part_records = Vec::new();
+        for _ in 0..part_count {
+            part_records.push(self.read_multipart_part_record()?);
+        }
+        let selected_segment_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
+            "multipart completion snapshot segment count exceeds payload",
+        )?;
+        let mut selected_streaming_segments = Vec::new();
+        for _ in 0..selected_segment_count {
+            selected_streaming_segments.push(self.read_multipart_part_segment_record()?);
+        }
+        let cleanup = self.read_complete_multipart_commit_cleanup()?;
+        Ok(MultipartCompletionSnapshot {
+            existing_etag,
+            stale_payload_source,
+            part_records,
+            selected_streaming_segments,
+            cleanup,
+        })
+    }
+
+    fn read_list_parts_resp(&mut self) -> Result<ListPartsResp, StorageRpcPayloadError> {
+        let part_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN,
+            "multipart parts list count exceeds payload",
+        )?;
+        let mut parts = Vec::new();
+        for _ in 0..part_count {
+            parts.push(self.read_multipart_part_record()?);
+        }
+        let is_truncated = self.read_bool()?;
+        let next_part_number_marker = self.read_optional_u32()?;
+        Ok(ListPartsResp {
+            parts,
+            is_truncated,
+            next_part_number_marker,
+        })
+    }
+
+    fn read_listed_multipart_parts(
+        &mut self,
+    ) -> Result<ListedMultipartParts, StorageRpcPayloadError> {
+        Ok(ListedMultipartParts {
+            upload: self.read_multipart_upload_record()?,
+            response: self.read_list_parts_resp()?,
+        })
+    }
+
+    fn read_multipart_upload_management_lookup(
+        &mut self,
+    ) -> Result<MultipartUploadManagementLookup, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(MultipartUploadManagementLookup::InProgress(Box::new(
+                self.read_multipart_upload_record()?,
+            ))),
+            1 => Ok(MultipartUploadManagementLookup::NonInProgress(Box::new(
+                self.read_multipart_upload_record()?,
+            ))),
+            2 => Ok(MultipartUploadManagementLookup::Completed(
+                self.read_completed_multipart_upload_record()?,
+            )),
+            3 => Ok(MultipartUploadManagementLookup::Missing),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart management lookup tag",
+            )),
+        }
+    }
+
     fn read_stream_upload_command_record(
         &mut self,
     ) -> Result<crate::types::StreamUploadCommandRecord, StorageRpcPayloadError> {
@@ -8440,6 +8977,79 @@ fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord
     put_object_lock_state(out, record.object_lock);
     put_optional_multipart_checksum_config(out, record.checksum);
     put_object_encryption(out, &record.encryption);
+}
+
+fn put_completed_multipart_upload_record(
+    out: &mut Vec<u8>,
+    record: &CompletedMultipartUploadRecord,
+) {
+    put_string(out, record.upload_id.as_str());
+    put_string(out, record.bucket.as_str());
+    put_string(out, record.key.as_str());
+    put_u64(out, record.completion_order);
+    put_u64(out, record.completed_at);
+    put_optional_owner_identity(out, record.initiator.as_ref());
+    put_owner_identity(out, &record.owner);
+}
+
+fn put_multipart_completion_snapshot(out: &mut Vec<u8>, snapshot: &MultipartCompletionSnapshot) {
+    put_optional_string(out, snapshot.existing_etag.as_deref());
+    put_optional_stored_object(out, snapshot.stale_payload_source.as_ref());
+    put_u32(
+        out,
+        u32::try_from(snapshot.part_records.len())
+            .expect("multipart completion snapshot part count must fit in u32"),
+    );
+    for part in &snapshot.part_records {
+        put_multipart_part_record(out, part);
+    }
+    put_u32(
+        out,
+        u32::try_from(snapshot.selected_streaming_segments.len())
+            .expect("multipart completion snapshot segment count must fit in u32"),
+    );
+    for segment in &snapshot.selected_streaming_segments {
+        put_multipart_part_segment_record(out, segment);
+    }
+    put_complete_multipart_commit_cleanup(out, &snapshot.cleanup);
+}
+
+fn put_list_parts_resp(out: &mut Vec<u8>, response: &ListPartsResp) {
+    put_u32(
+        out,
+        u32::try_from(response.parts.len()).expect("multipart parts count must fit in u32"),
+    );
+    for part in &response.parts {
+        put_multipart_part_record(out, part);
+    }
+    put_bool(out, response.is_truncated);
+    put_optional_u32(out, response.next_part_number_marker);
+}
+
+fn put_listed_multipart_parts(out: &mut Vec<u8>, listed: &ListedMultipartParts) {
+    put_multipart_upload_record(out, &listed.upload);
+    put_list_parts_resp(out, &listed.response);
+}
+
+fn put_multipart_upload_management_lookup(
+    out: &mut Vec<u8>,
+    lookup: &MultipartUploadManagementLookup,
+) {
+    match lookup {
+        MultipartUploadManagementLookup::InProgress(upload) => {
+            put_u8(out, 0);
+            put_multipart_upload_record(out, upload);
+        }
+        MultipartUploadManagementLookup::NonInProgress(upload) => {
+            put_u8(out, 1);
+            put_multipart_upload_record(out, upload);
+        }
+        MultipartUploadManagementLookup::Completed(completed) => {
+            put_u8(out, 2);
+            put_completed_multipart_upload_record(out, completed);
+        }
+        MultipartUploadManagementLookup::Missing => put_u8(out, 3),
+    }
 }
 
 fn put_optional_delete_object_version_target(

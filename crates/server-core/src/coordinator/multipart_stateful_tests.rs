@@ -1,7 +1,7 @@
 use super::test_helpers;
 use super::test_topology::*;
 use super::*;
-use crate::conditional::ReadCondition;
+use crate::conditional::{ReadCondition, SpecificEtag};
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
@@ -535,6 +535,34 @@ fn install_one_shot_multipart_complete_pre_commit_race_hooks(
                 reached_hook.wait();
                 resume_hook.wait();
             }
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompletePreCommitRaceSync {
+        reached,
+        resume,
+        _serial_guard: serial,
+        _guard: guard,
+    }
+}
+
+fn install_multipart_complete_snapshot_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompletePreCommitRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let reached_hook = Arc::clone(&reached);
+    let resume_hook = Arc::clone(&resume);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        before_multipart_complete_snapshot: Some(Arc::new(move || {
+            reached_hook.wait();
+            resume_hook.wait();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -1353,6 +1381,104 @@ fn upload_part_replace_after_complete_snapshot_is_revalidated_before_publish() {
         .unwrap();
     assert_eq!(listed.parts.len(), 1, "{invariant}");
     assert_eq!(listed.parts[0].etag, replacement.etag, "{invariant}");
+}
+
+#[test]
+fn complete_multipart_if_match_uses_identity_validated_snapshot_etag() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let completer =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let writer = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-complete-if-match-bucket";
+    let key = "race-complete-if-match-key";
+    let invariant =
+        "CompleteMultipartUpload If-Match must be checked against the same snapshot used to build the command";
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let initial = test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            object: object_request(bucket, key, test_requester()),
+            data: b"initial object",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+        },
+    )
+    .unwrap();
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, b"mpu object")]);
+
+    let sync = install_multipart_complete_snapshot_race_hooks(bucket, key);
+    let upload_id_for_complete = upload_id.clone();
+    let parts_for_complete = parts.clone();
+    let initial_etag = initial.etag.clone();
+    let t_complete = std::thread::spawn(move || {
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(initial_etag).unwrap());
+        completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                bucket,
+                key,
+                &upload_id_for_complete,
+                test_requester(),
+            ),
+            parts: &parts_for_complete,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &cond,
+            sse_customer: None,
+        })
+    });
+
+    sync.reached.wait();
+    let intervening = test_helpers::put_object(
+        &writer,
+        &PutObjectRequest {
+            object: object_request(bucket, key, test_requester()),
+            data: b"intervening object",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+        },
+    )
+    .unwrap();
+    assert_ne!(
+        intervening.etag, initial.etag,
+        "{invariant}: intervening write must change the current object etag"
+    );
+    sync.resume.wait();
+
+    let err = t_complete.join().unwrap().unwrap_err();
+    assert!(
+        matches!(err, ServerError::PreconditionFailed),
+        "{invariant}: completion should fail its If-Match against the updated snapshot, got {err:?}"
+    );
+
+    let current = admin
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(bucket, key, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        current.etag, intervening.etag,
+        "{invariant}: failed completion must not replace the intervening object"
+    );
 }
 
 #[test]

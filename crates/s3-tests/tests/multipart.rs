@@ -1779,6 +1779,58 @@ fn test_list_parts() {
 }
 
 #[test]
+fn test_list_parts_zero_max_parts() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "list-parts-zero-max";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .max_parts(0)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.parts().len(), 0);
+        assert_eq!(resp.is_truncated(), Some(false));
+        assert_eq!(resp.next_part_number_marker(), Some("0"));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_list_parts_pagination_with_checksums() {
     use aws_sdk_s3::types::ChecksumAlgorithm;
 
