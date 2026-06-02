@@ -5591,7 +5591,11 @@ completion snapshots and validate returned completion/abort command identity
 before publication. Broader multipart upload metadata read/list/management
 helpers now also use the object-mutation metadata RPC boundary, so
 authorization, completion preflight/snapshot, part listing, and management
-lookups run against the storage-node-owned object PG. Remaining non-command
+lookups run against the storage-node-owned object PG. Stream upload session
+loads, staged-segment listing, and stream segment append preparation now also
+route through the object-mutation metadata RPC boundary; Unix clients preserve
+typed stream-session-not-found outcomes and validate returned session/segment
+identity before the frontend writes staged payload shards. Remaining non-command
 surfaces still need operation-shaped builders for bucket properties/subresources,
 lifecycle MPU abort, and durable pending/drain/coordination checks before
 frontend/combined roles can be enabled.

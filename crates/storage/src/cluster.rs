@@ -3973,8 +3973,8 @@ impl StorageCluster {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        storage_client.load_stream_upload_session(pg_id, bucket, key, session_id)
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        mutation_client.load_stream_upload_session(pg_id, bucket, key, session_id)
     }
 
     pub fn prepare_stream_segment_append(
@@ -3986,8 +3986,8 @@ impl StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        storage_client.prepare_stream_segment_append(pg_id, bucket, key, request)
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        mutation_client.prepare_stream_segment_append(pg_id, bucket, key, request)
     }
 
     pub fn write_stream_segment_payload_shards(
@@ -4034,7 +4034,7 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
-        let storage_client = match self.object_metadata_primary_client(bucket, key) {
+        let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {
             Ok(client) => client,
             Err(error) => {
                 self.delete_payload_shard_keys_best_effort(
@@ -4067,7 +4067,7 @@ impl StorageCluster {
                 return Err(error);
             }
             let existing_stream_segment =
-                match storage_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
+                match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
                     Ok(segments) => segments
                         .into_iter()
                         .find(|segment| segment.segment_index == segment_index),
@@ -4589,13 +4589,13 @@ impl StorageCluster {
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let mut pending_completed_session =
             self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
         {
-            match storage_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
+            match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
                 Ok(_) => {}
                 Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                     ..
@@ -4616,7 +4616,7 @@ impl StorageCluster {
             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
             let staged_segments =
-                match storage_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
+                match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
                     Ok(staged_segments) => staged_segments,
                     Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                         ..

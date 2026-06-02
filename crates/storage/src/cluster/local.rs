@@ -7426,6 +7426,125 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-stream-append-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("remote-stream-append-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let bucket = crate::tests::bucket_name("remote-stream-append-rpc");
+        let key = crate::tests::object_key("key");
+        let session_id = crate::tests::stream_session_id("rsappend");
+        {
+            let remote =
+                SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &[0], ec_shape)
+                    .unwrap();
+            let remote_pg = remote.get_pg(0).unwrap();
+            crate::PgMetadataStore::create_stream_upload(
+                &*remote_pg,
+                &crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::reserve_object_generation(
+                    &*remote_pg,
+                    &bucket,
+                    &key,
+                    &session_id,
+                )
+                .unwrap(),
+                GenerationId::new(1).unwrap()
+            );
+        }
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir,
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("frontend-stream-append").join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        map.install_unix_object_mutation_metadata_clients([
+            LocalUnixObjectMutationMetadataNodeClientConfig::new(node_id, socket_path),
+        ])
+        .unwrap();
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*frontend_pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+        let mutation_client =
+            Arc::clone(map.node(node_id).unwrap().object_mutation_metadata_client());
+
+        let loaded = mutation_client
+            .load_stream_upload_session(PgId::new(0), &bucket, &key, &session_id)
+            .unwrap();
+        assert_eq!(loaded.session_id, session_id);
+        let segments = mutation_client
+            .load_stream_upload_segments(PgId::new(0), &bucket, &key, &loaded.session_id)
+            .unwrap();
+        assert!(segments.is_empty());
+        let (target, segment) = mutation_client
+            .prepare_stream_segment_append(
+                PgId::new(0),
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: loaded.session_id.clone(),
+                    segment_index: 0,
+                    size: 11,
+                    segment_crc64: Some(123),
+                    segment_okh: [7; 16],
+                },
+            )
+            .unwrap();
+        assert_eq!(target, crate::StreamUploadTarget::PutObject);
+        assert_eq!(segment.session_id, loaded.session_id);
+        assert_eq!(segment.segment_index, 0);
+        assert_eq!(segment.size, 11);
+        assert_eq!(segment.segment_crc64, Some(123));
+        assert_eq!(
+            segment.segment_okh,
+            crate::segment_key_hash(
+                bucket.as_str(),
+                key.as_str(),
+                GenerationId::new(1).unwrap(),
+                0
+            )
+        );
+    }
+
+    #[test]
     fn frontend_unix_object_generation_loser_retries_stale_generation() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);

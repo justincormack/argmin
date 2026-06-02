@@ -24,10 +24,10 @@ use crate::{
         ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
         ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
         ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-        OwnerIdentity, PgId, PublicAccessBlockConfig, SerializedMetadataBlob,
-        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
-        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        OwnerIdentity, PgId, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
+        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
+        ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus, StoredObject,
+        StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
         StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
         StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
         VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
@@ -137,6 +137,12 @@ const STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
 const STORAGE_RPC_MAX_STREAM_PART_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN + 4 + UPLOAD_ID_LEN + 4;
+const STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
+const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 1 + 8 + 4 + 16;
 const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;
@@ -263,6 +269,9 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectMultipartCompletionPreflightLoad = 74,
     ObjectMultipartPartsList = 75,
     ObjectMultipartManagementLookup = 76,
+    ObjectStreamUploadSessionLoad = 77,
+    ObjectStreamUploadSegmentsLoad = 78,
+    ObjectStreamSegmentAppendPrepare = 79,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +408,9 @@ impl StorageRpcMessageKind {
             }
             Self::ObjectMultipartPartsList => "object multipart parts list",
             Self::ObjectMultipartManagementLookup => "object multipart management lookup",
+            Self::ObjectStreamUploadSessionLoad => "object stream upload session load",
+            Self::ObjectStreamUploadSegmentsLoad => "object stream upload segments load",
+            Self::ObjectStreamSegmentAppendPrepare => "object stream segment append prepare",
         }
     }
 
@@ -480,6 +492,9 @@ impl StorageRpcMessageKind {
             74 => Ok(Self::ObjectMultipartCompletionPreflightLoad),
             75 => Ok(Self::ObjectMultipartPartsList),
             76 => Ok(Self::ObjectMultipartManagementLookup),
+            77 => Ok(Self::ObjectStreamUploadSessionLoad),
+            78 => Ok(Self::ObjectStreamUploadSegmentsLoad),
+            79 => Ok(Self::ObjectStreamSegmentAppendPrepare),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -905,6 +920,56 @@ pub(crate) struct StorageRpcStreamUploadMatchRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcStreamUploadMatchResponse {
     pub(crate) exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadSessionRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcStreamUploadSessionOutcome {
+    Loaded(Box<StreamUploadRecord>),
+    NotFound { session_id: SessionId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadSessionResponse {
+    pub(crate) outcome: StorageRpcStreamUploadSessionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcStreamUploadSegmentsOutcome {
+    Loaded(Vec<StreamUploadSegmentRecord>),
+    NotFound { session_id: SessionId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadSegmentsResponse {
+    pub(crate) outcome: StorageRpcStreamUploadSegmentsOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamSegmentAppendPrepareRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) request: PrepareStreamUploadSegmentAppendReq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcStreamSegmentAppendPrepareOutcome {
+    Prepared {
+        target: StreamUploadTarget,
+        segment: Box<StreamUploadSegmentRecord>,
+    },
+    NotFound {
+        session_id: SessionId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamSegmentAppendPrepareResponse {
+    pub(crate) outcome: StorageRpcStreamSegmentAppendPrepareOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2112,6 +2177,15 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad => {
             STORAGE_RPC_MAX_MULTIPART_ABORT_CLEANUP_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
+            STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad => {
+            STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare => {
+            STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad => {
             STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }
@@ -3237,6 +3311,176 @@ pub(crate) fn decode_stream_upload_match_response(
     let exists = decoder.read_bool()?;
     decoder.finish()?;
     Ok(StorageRpcStreamUploadMatchResponse { exists })
+}
+
+pub(crate) fn encode_stream_upload_session_request(
+    request: &StorageRpcStreamUploadSessionRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.session_id.as_str());
+    out
+}
+
+pub(crate) fn decode_stream_upload_session_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadSessionRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let session_id = decoder.read_session_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadSessionRequest { object, session_id })
+}
+
+pub(crate) fn encode_stream_upload_session_response(
+    response: &StorageRpcStreamUploadSessionResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcStreamUploadSessionOutcome::Loaded(session) => {
+            put_u8(&mut out, 1);
+            put_stream_upload_record(&mut out, session);
+        }
+        StorageRpcStreamUploadSessionOutcome::NotFound { session_id } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, session_id.as_str());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_stream_upload_session_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadSessionResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        1 => StorageRpcStreamUploadSessionOutcome::Loaded(Box::new(
+            decoder.read_stream_upload_record()?,
+        )),
+        2 => StorageRpcStreamUploadSessionOutcome::NotFound {
+            session_id: decoder.read_session_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream upload session outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadSessionResponse { outcome })
+}
+
+pub(crate) fn encode_stream_upload_segments_response(
+    response: &StorageRpcStreamUploadSegmentsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcStreamUploadSegmentsOutcome::Loaded(segments) => {
+            put_u8(&mut out, 1);
+            put_u32(
+                &mut out,
+                u32::try_from(segments.len()).map_err(|_| {
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "too many stream upload segments",
+                    )
+                })?,
+            );
+            for segment in segments {
+                put_stream_upload_segment_record(&mut out, segment);
+            }
+        }
+        StorageRpcStreamUploadSegmentsOutcome::NotFound { session_id } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, session_id.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_upload_segments_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadSegmentsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        1 => {
+            let segment_count = decoder.read_bounded_remaining_count(
+                STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN,
+                "too many stream upload segments",
+            )?;
+            let mut segments = Vec::new();
+            for _ in 0..segment_count {
+                segments.push(decoder.read_stream_upload_segment_record()?);
+            }
+            StorageRpcStreamUploadSegmentsOutcome::Loaded(segments)
+        }
+        2 => StorageRpcStreamUploadSegmentsOutcome::NotFound {
+            session_id: decoder.read_session_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream upload segments outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadSegmentsResponse { outcome })
+}
+
+pub(crate) fn encode_stream_segment_append_prepare_request(
+    request: &StorageRpcStreamSegmentAppendPrepareRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_prepare_stream_segment_append_req(&mut out, &request.request);
+    out
+}
+
+pub(crate) fn decode_stream_segment_append_prepare_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let request = decoder.read_prepare_stream_segment_append_req()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamSegmentAppendPrepareRequest { object, request })
+}
+
+pub(crate) fn encode_stream_segment_append_prepare_response(
+    response: &StorageRpcStreamSegmentAppendPrepareResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcStreamSegmentAppendPrepareOutcome::Prepared { target, segment } => {
+            put_u8(&mut out, 1);
+            put_stream_upload_target(&mut out, target);
+            put_stream_upload_segment_record(&mut out, segment);
+        }
+        StorageRpcStreamSegmentAppendPrepareOutcome::NotFound { session_id } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, session_id.as_str());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_stream_segment_append_prepare_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamSegmentAppendPrepareResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        1 => StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
+            target: decoder.read_stream_upload_target()?,
+            segment: Box::new(decoder.read_stream_upload_segment_record()?),
+        },
+        2 => StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
+            session_id: decoder.read_session_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream segment append prepare outcome",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcStreamSegmentAppendPrepareResponse { outcome })
 }
 
 pub(crate) fn encode_multipart_upload_match_response(
@@ -7064,6 +7308,18 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
+    fn read_prepare_stream_segment_append_req(
+        &mut self,
+    ) -> Result<PrepareStreamUploadSegmentAppendReq, StorageRpcPayloadError> {
+        Ok(PrepareStreamUploadSegmentAppendReq {
+            session_id: self.read_session_id()?,
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64()?,
+            segment_okh: self.read_fixed_16_bytes("stream segment append OKH")?,
+        })
+    }
+
     fn read_create_multipart_upload_req(
         &mut self,
     ) -> Result<CreateMultipartUploadReq, StorageRpcPayloadError> {
@@ -8569,6 +8825,17 @@ fn put_create_stream_upload_req(out: &mut Vec<u8>, request: &CreateStreamUploadR
     put_string(out, request.key.as_str());
     put_stream_upload_target(out, &request.target);
     put_object_encryption(out, &request.encryption);
+}
+
+fn put_prepare_stream_segment_append_req(
+    out: &mut Vec<u8>,
+    request: &PrepareStreamUploadSegmentAppendReq,
+) {
+    put_string(out, request.session_id.as_str());
+    put_u32(out, request.segment_index);
+    put_u64(out, request.size);
+    put_optional_u64(out, request.segment_crc64);
+    put_bytes(out, &request.segment_okh);
 }
 
 fn put_stream_upload_target(out: &mut Vec<u8>, target: &StreamUploadTarget) {

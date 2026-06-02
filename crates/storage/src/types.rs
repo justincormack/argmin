@@ -3513,7 +3513,7 @@ pub struct CreateStreamUploadReq {
 }
 
 /// Request to append one staging segment to an in-progress streaming session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareStreamUploadSegmentAppendReq {
     pub session_id: SessionId,
     pub segment_index: u32,

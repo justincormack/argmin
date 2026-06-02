@@ -49,8 +49,10 @@ use crate::storage_rpc::{
     decode_read_handle_release_response, decode_scavenger_list_files_response,
     decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
     decode_storage_rpc_response_payload, decode_stream_part_finalize_snapshot_response,
-    decode_stream_put_finalize_snapshot_response, decode_stream_upload_match_response,
-    encode_abort_multipart_cleanup_request, encode_abort_multipart_command_build_request,
+    decode_stream_put_finalize_snapshot_response, decode_stream_segment_append_prepare_response,
+    decode_stream_upload_match_response, decode_stream_upload_segments_response,
+    decode_stream_upload_session_response, encode_abort_multipart_cleanup_request,
+    encode_abort_multipart_command_build_request,
     encode_authorized_abort_multipart_command_build_request, encode_bucket_request,
     encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
@@ -78,7 +80,8 @@ use crate::storage_rpc::{
     encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
     encode_shard_write_request, encode_stream_part_commit_command_build_request,
     encode_stream_part_finalize_snapshot_request, encode_stream_put_commit_command_build_request,
-    encode_stream_put_finalize_snapshot_request, encode_stream_upload_match_request,
+    encode_stream_put_finalize_snapshot_request, encode_stream_segment_append_prepare_request,
+    encode_stream_upload_match_request, encode_stream_upload_session_request,
     read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketInfoOutcome,
@@ -121,7 +124,9 @@ use crate::storage_rpc::{
     StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
-    StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadSegmentsOutcome,
+    StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -1030,6 +1035,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError>;
 
+    fn load_stream_upload_session(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError>;
+
     fn load_multipart_upload(
         &self,
         pg_id: PgId,
@@ -1092,6 +1105,22 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         &self,
         request: BuildCreateMultipartUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn load_stream_upload_segments(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
+
+    fn prepare_stream_segment_append(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
 
     fn load_stream_put_finalize_snapshot(
         &self,
@@ -4036,6 +4065,18 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn load_stream_upload_session(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_stream_upload_session(
+            self, pg_id, bucket, key, session_id,
+        )
+    }
+
     fn load_multipart_upload(
         &self,
         pg_id: PgId,
@@ -4136,6 +4177,30 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         request: BuildCreateMultipartUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         <Self as StorageNodeClient>::build_create_multipart_upload_command(self, request)
+    }
+
+    fn load_stream_upload_segments(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_stream_upload_segments(
+            self, pg_id, bucket, key, session_id,
+        )
+    }
+
+    fn prepare_stream_segment_append(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        <Self as StorageNodeClient>::prepare_stream_segment_append(
+            self, pg_id, bucket, key, request,
+        )
     }
 
     fn load_stream_put_finalize_snapshot(
@@ -4864,6 +4929,57 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.initiated_at)
     }
 
+    fn load_stream_upload_session(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadSessionRequest {
+            object: self.object_request(pg_id, bucket, key),
+            session_id: session_id.clone(),
+        };
+        let payload = encode_stream_upload_session_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadSessionLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_upload_session_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode stream upload session response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcStreamUploadSessionOutcome::Loaded(session) => {
+                self.validate_stream_upload_session_response(
+                    &session,
+                    bucket,
+                    key,
+                    session_id,
+                    "validate stream upload session response",
+                )?;
+                Ok(*session)
+            }
+            StorageRpcStreamUploadSessionOutcome::NotFound {
+                session_id: returned_session_id,
+            } => {
+                if returned_session_id != *session_id {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate stream upload session response",
+                        "missing session id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::StreamSessionNotFound {
+                    session_id: session_id.as_str().to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
     fn load_multipart_upload(
         &self,
         pg_id: PgId,
@@ -5317,6 +5433,111 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 "decode multipart upload command build response",
                 "multipart upload command build cannot return missing".to_string(),
             ))),
+        }
+    }
+
+    fn load_stream_upload_segments(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadSessionRequest {
+            object: self.object_request(pg_id, bucket, key),
+            session_id: session_id.clone(),
+        };
+        let payload = encode_stream_upload_session_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_upload_segments_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode stream upload segments response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcStreamUploadSegmentsOutcome::Loaded(segments) => {
+                self.validate_stream_upload_segments_response(
+                    &segments,
+                    session_id,
+                    "validate stream upload segments response",
+                )?;
+                Ok(segments)
+            }
+            StorageRpcStreamUploadSegmentsOutcome::NotFound {
+                session_id: returned_session_id,
+            } => {
+                if returned_session_id != *session_id {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate stream upload segments response",
+                        "missing session id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::StreamSessionNotFound {
+                    session_id: session_id.as_str().to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
+    fn prepare_stream_segment_append(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let expected_session =
+            self.load_stream_upload_session(pg_id, bucket, key, &request.session_id)?;
+        let expected_target = expected_session.target;
+        let rpc_request = StorageRpcStreamSegmentAppendPrepareRequest {
+            object: self.object_request(pg_id, bucket, key),
+            request: request.clone(),
+        };
+        let payload = encode_stream_segment_append_prepare_request(&rpc_request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_segment_append_prepare_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream segment append prepare response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcStreamSegmentAppendPrepareOutcome::Prepared { target, segment } => {
+                self.validate_stream_segment_append_prepare_response(
+                    &segment,
+                    &target,
+                    &expected_target,
+                    request,
+                    "validate stream segment append prepare response",
+                )?;
+                Ok((target, *segment))
+            }
+            StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
+                session_id: returned_session_id,
+            } => {
+                if returned_session_id != request.session_id {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate stream segment append prepare response",
+                        "missing session id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::StreamSessionNotFound {
+                    session_id: request.session_id.as_str().to_string(),
+                }
+                .into())
+            }
         }
     }
 
@@ -6055,6 +6276,93 @@ impl UnixStorageNodeClient {
             bucket: bucket.clone(),
             key: key.clone(),
         }
+    }
+
+    fn validate_stream_upload_session_response(
+        &self,
+        session: &StreamUploadRecord,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if session.session_id != *session_id {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stream session id does not match request".to_string(),
+            )));
+        }
+        validate_stream_upload_session_binding(session, bucket, key).map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(context, error.to_string()))
+        })
+    }
+
+    fn validate_stream_upload_segments_response(
+        &self,
+        segments: &[StreamUploadSegmentRecord],
+        session_id: &SessionId,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut seen = BTreeSet::new();
+        for segment in segments {
+            if segment.session_id != *session_id {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "stream segment session id does not match request".to_string(),
+                )));
+            }
+            if !seen.insert(segment.segment_index) {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "duplicate stream segment index in response".to_string(),
+                )));
+            }
+        }
+        if !segments
+            .windows(2)
+            .all(|pair| pair[0].segment_index < pair[1].segment_index)
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stream segments are not strictly ascending".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_stream_segment_append_prepare_response(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+        returned_target: &StreamUploadTarget,
+        expected_target: &StreamUploadTarget,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if returned_target != expected_target {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stream segment append target does not match session".to_string(),
+            )));
+        }
+        if segment.session_id != request.session_id
+            || segment.segment_index != request.segment_index
+            || segment.size != request.size
+            || segment.segment_crc64 != request.segment_crc64
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stream segment append response does not match request".to_string(),
+            )));
+        }
+        if matches!(expected_target, StreamUploadTarget::UploadPart { .. })
+            && segment.segment_okh != request.segment_okh
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stream upload-part segment OKH does not match request".to_string(),
+            )));
+        }
+        Ok(())
     }
 
     fn load_object_delete_snapshot(
@@ -13083,6 +13391,175 @@ mod tests {
         ));
         server_thread.join().unwrap();
         build_server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("stream-append-rpc-bucket");
+        let key = crate::tests::object_key("stream-append-rpc-key");
+        let session_id = crate::tests::stream_session_id("append-rpc");
+        let session = StreamUploadRecord {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            state: StreamUploadState::InProgress,
+            created_at: 1,
+            encryption: ObjectEncryption::None,
+            next_segment_vid: GenerationId::new(2).unwrap(),
+        };
+        client
+            .validate_stream_upload_session_response(
+                &session,
+                &bucket,
+                &key,
+                &session_id,
+                "validate stream append read response",
+            )
+            .unwrap();
+        let mut bad_session = session.clone();
+        bad_session.session_id = crate::tests::stream_session_id("wrong-rpc");
+        let err = client
+            .validate_stream_upload_session_response(
+                &bad_session,
+                &bucket,
+                &key,
+                &session_id,
+                "validate stream append read response",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream append read response",
+                ..
+            })
+        ));
+
+        let request = PrepareStreamUploadSegmentAppendReq {
+            session_id: session_id.clone(),
+            segment_index: 0,
+            size: 16,
+            segment_crc64: Some(44),
+            segment_okh: [3; 16],
+        };
+        let segment = StreamUploadSegmentRecord {
+            session_id: session_id.clone(),
+            segment_index: 0,
+            size: request.size,
+            segment_crc64: request.segment_crc64,
+            segment_okh: request.segment_okh,
+            segment_vid: GenerationId::new(1).unwrap(),
+            data_pg_id: 0,
+            ec_k: 1,
+            ec_m: 0,
+        };
+        client
+            .validate_stream_segment_append_prepare_response(
+                &segment,
+                &StreamUploadTarget::PutObject,
+                &StreamUploadTarget::PutObject,
+                &request,
+                "validate stream append read response",
+            )
+            .unwrap();
+        let mut bad_segment = segment.clone();
+        bad_segment.size += 1;
+        let err = client
+            .validate_stream_segment_append_prepare_response(
+                &bad_segment,
+                &StreamUploadTarget::PutObject,
+                &StreamUploadTarget::PutObject,
+                &request,
+                "validate stream append read response",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream append read response",
+                ..
+            })
+        ));
+        let upload_part_target = StreamUploadTarget::UploadPart {
+            upload_id: crate::tests::multipart_upload_id("append-rpc-upload"),
+            part_number: 1,
+        };
+        let mut bad_upload_part_segment = segment.clone();
+        bad_upload_part_segment.segment_okh = [9; 16];
+        let err = client
+            .validate_stream_segment_append_prepare_response(
+                &bad_upload_part_segment,
+                &StreamUploadTarget::PutObject,
+                &upload_part_target,
+                &request,
+                "validate stream append read response",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream append read response",
+                ..
+            })
+        ));
+        let err = client
+            .validate_stream_segment_append_prepare_response(
+                &bad_upload_part_segment,
+                &upload_part_target,
+                &upload_part_target,
+                &request,
+                "validate stream append read response",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream append read response",
+                ..
+            })
+        ));
+        client
+            .validate_stream_upload_segments_response(
+                &[
+                    segment.clone(),
+                    StreamUploadSegmentRecord {
+                        segment_index: 1,
+                        segment_vid: GenerationId::new(2).unwrap(),
+                        ..segment.clone()
+                    },
+                ],
+                &session_id,
+                "validate stream append read response",
+            )
+            .unwrap();
+        let err = client
+            .validate_stream_upload_segments_response(
+                &[
+                    StreamUploadSegmentRecord {
+                        segment_index: 1,
+                        segment_vid: GenerationId::new(2).unwrap(),
+                        ..segment.clone()
+                    },
+                    segment,
+                ],
+                &session_id,
+                "validate stream append read response",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream append read response",
+                ..
+            })
+        ));
     }
 
     #[test]

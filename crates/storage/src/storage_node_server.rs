@@ -52,7 +52,8 @@ use crate::storage_rpc::{
     decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
     decode_shard_write_request, decode_stream_part_commit_command_build_request,
     decode_stream_part_finalize_snapshot_request, decode_stream_put_commit_command_build_request,
-    decode_stream_put_finalize_snapshot_request, decode_stream_upload_match_request,
+    decode_stream_put_finalize_snapshot_request, decode_stream_segment_append_prepare_request,
+    decode_stream_upload_match_request, decode_stream_upload_session_request,
     encode_abort_multipart_cleanup_response, encode_bucket_info_outcome_response,
     encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
     encode_bucket_write_reservation_record_response,
@@ -79,9 +80,10 @@ use crate::storage_rpc::{
     encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
     encode_storage_rpc_error_response, encode_storage_rpc_success_response,
     encode_stream_part_finalize_snapshot_response, encode_stream_put_finalize_snapshot_response,
-    encode_stream_upload_match_response, read_storage_rpc_request_frame_from,
-    write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
-    StorageRpcAbortMultipartCommandBuildRequest,
+    encode_stream_segment_append_prepare_response, encode_stream_upload_match_response,
+    encode_stream_upload_segments_response, encode_stream_upload_session_response,
+    read_storage_rpc_request_frame_from, write_storage_rpc_frame_to,
+    StorageRpcAbortMultipartCleanupResponse, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
     StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
@@ -143,7 +145,11 @@ use crate::storage_rpc::{
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
-    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadMatchResponse,
+    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamSegmentAppendPrepareResponse, StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamUploadMatchResponse, StorageRpcStreamUploadSegmentsOutcome,
+    StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
+    StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
     STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::types::{ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
@@ -641,6 +647,33 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectStreamUploadMatch => {
                 match decode_stream_upload_match_request(&frame.payload) {
                     Ok(request) => self.stream_upload_match_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
+                match decode_stream_upload_session_request(&frame.payload) {
+                    Ok(request) => self.stream_upload_session_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad => {
+                match decode_stream_upload_session_request(&frame.payload) {
+                    Ok(request) => self.stream_upload_segments_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare => {
+                match decode_stream_segment_append_prepare_request(&frame.payload) {
+                    Ok(request) => self.stream_segment_append_prepare_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1840,6 +1873,140 @@ impl StorageNodeConnectionHandler {
         };
         let payload =
             encode_stream_upload_match_response(&StorageRpcStreamUploadMatchResponse { exists });
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_upload_session_response(
+        &self,
+        request: StorageRpcStreamUploadSessionRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream upload session load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let outcome = match ObjectMutationMetadataNodeClient::load_stream_upload_session(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.session_id,
+        ) {
+            Ok(session) => StorageRpcStreamUploadSessionOutcome::Loaded(Box::new(session)),
+            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
+                StorageRpcStreamUploadSessionOutcome::NotFound {
+                    session_id: request.session_id,
+                }
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload =
+            encode_stream_upload_session_response(&StorageRpcStreamUploadSessionResponse {
+                outcome,
+            });
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_upload_segments_response(
+        &self,
+        request: StorageRpcStreamUploadSessionRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream upload segments load",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let outcome = match ObjectMutationMetadataNodeClient::load_stream_upload_segments(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.session_id,
+        ) {
+            Ok(segments) => StorageRpcStreamUploadSegmentsOutcome::Loaded(segments),
+            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
+                StorageRpcStreamUploadSegmentsOutcome::NotFound {
+                    session_id: request.session_id,
+                }
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload =
+            encode_stream_upload_segments_response(&StorageRpcStreamUploadSegmentsResponse {
+                outcome,
+            })?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_segment_append_prepare_response(
+        &self,
+        request: StorageRpcStreamSegmentAppendPrepareRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream segment append prepare",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let outcome = match ObjectMutationMetadataNodeClient::prepare_stream_segment_append(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.request,
+        ) {
+            Ok((target, segment)) => StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
+                target,
+                segment: Box::new(segment),
+            },
+            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
+                StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
+                    session_id: request.request.session_id,
+                }
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload = encode_stream_segment_append_prepare_response(
+            &StorageRpcStreamSegmentAppendPrepareResponse { outcome },
+        );
         Ok(encode_storage_rpc_success_response(&payload))
     }
 
