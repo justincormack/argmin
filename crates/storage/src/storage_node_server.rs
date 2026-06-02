@@ -16,7 +16,8 @@ use crate::node_client::{
     BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
     BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
     BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
-    BuildPutObjectMetadataCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
+    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
+    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, LocalStorageNodeClient,
     ObjectGenerationMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
@@ -43,7 +44,9 @@ use crate::storage_rpc::{
     decode_read_handle_acquire_request, decode_read_handle_release_request,
     decode_scavenger_list_files_request, decode_shard_ack_batch_request,
     decode_shard_delete_request, decode_shard_read_range_request, decode_shard_read_request,
-    decode_shard_write_request, decode_stream_upload_match_request,
+    decode_shard_write_request, decode_stream_part_commit_command_build_request,
+    decode_stream_part_finalize_snapshot_request, decode_stream_put_commit_command_build_request,
+    decode_stream_put_finalize_snapshot_request, decode_stream_upload_match_request,
     encode_bucket_info_outcome_response, encode_bucket_snapshot_pair_response,
     encode_bucket_snapshot_response, encode_bucket_write_reservation_record_response,
     encode_completed_multipart_order_command_build_response,
@@ -65,6 +68,7 @@ use crate::storage_rpc::{
     encode_read_handle_release_response, encode_scavenger_list_files_response,
     encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
     encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    encode_stream_part_finalize_snapshot_response, encode_stream_put_finalize_snapshot_response,
     encode_stream_upload_match_response, read_storage_rpc_request_frame_from,
     write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse,
     StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
@@ -116,6 +120,9 @@ use crate::storage_rpc::{
     StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
     StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
+    StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
+    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
     StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadMatchResponse,
     STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
@@ -641,6 +648,42 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
                 match decode_create_multipart_upload_command_build_request(&frame.payload) {
                     Ok(request) => self.create_multipart_upload_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad => {
+                match decode_stream_put_finalize_snapshot_request(&frame.payload) {
+                    Ok(request) => self.stream_put_finalize_snapshot_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild => {
+                match decode_stream_put_commit_command_build_request(&frame.payload) {
+                    Ok(request) => self.stream_put_commit_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad => {
+                match decode_stream_part_finalize_snapshot_request(&frame.payload) {
+                    Ok(request) => self.stream_part_finalize_snapshot_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild => {
+                match decode_stream_part_commit_command_build_request(&frame.payload) {
+                    Ok(request) => self.stream_part_commit_command_build_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1804,6 +1847,166 @@ impl StorageNodeConnectionHandler {
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_object_metadata_command_build_response(
+            &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
+        );
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_put_finalize_snapshot_response(
+        &self,
+        request: StorageRpcStreamPutFinalizeSnapshotRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream PUT finalize snapshot",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let snapshot = match ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.session_id,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_stream_put_finalize_snapshot_response(
+            &StorageRpcStreamPutFinalizeSnapshotResponse { snapshot },
+        )?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_put_commit_command_build_response(
+        &self,
+        request: StorageRpcStreamPutCommitCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_object_mutation_command_request(
+            &request.object,
+            &request.bucket_write_reservation,
+            "stream PUT commit command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let response = match ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
+            &local_client,
+            BuildStreamPutCommitCommandReq {
+                pg_id: request.object.pg_id,
+                cluster_epoch: request.object.cluster_epoch,
+                bucket: &request.object.bucket,
+                key: &request.object.key,
+                session_id: &request.session_id,
+                total_size: request.total_size,
+                expected_snapshot: &request.expected_snapshot,
+                commit: &request.commit,
+                bucket_write_reservation: &request.bucket_write_reservation,
+            },
+        ) {
+            Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
+            Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            }
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_object_metadata_command_build_response(
+            &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
+        );
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_part_finalize_snapshot_response(
+        &self,
+        request: StorageRpcStreamPartFinalizeSnapshotRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream part finalize snapshot",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let snapshot = match ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.upload_id,
+            &request.session_id,
+            request.part_number,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload = encode_stream_part_finalize_snapshot_response(
+            &StorageRpcStreamPartFinalizeSnapshotResponse { snapshot },
+        )?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_part_commit_command_build_response(
+        &self,
+        request: StorageRpcStreamPartCommitCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_object_mutation_command_request(
+            &request.object,
+            &request.bucket_write_reservation,
+            "stream part commit command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let response = match ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
+            &local_client,
+            BuildStreamPartCommitCommandReq {
+                pg_id: request.object.pg_id,
+                cluster_epoch: request.object.cluster_epoch,
+                bucket: &request.object.bucket,
+                key: &request.object.key,
+                upload_id: &request.upload_id,
+                session_id: &request.session_id,
+                part_number: request.part_number,
+                expected_snapshot: &request.expected_snapshot,
+                part: &request.part,
+                segments: &request.segments,
+                bucket_write_reservation: &request.bucket_write_reservation,
+            },
+        ) {
+            Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
+            Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
             Err(error) => {

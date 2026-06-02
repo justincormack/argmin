@@ -44,7 +44,8 @@ use crate::storage_rpc::{
     decode_put_object_metadata_snapshot_response, decode_read_handle_acquire_response,
     decode_read_handle_release_response, decode_scavenger_list_files_response,
     decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-    decode_storage_rpc_response_payload, decode_stream_upload_match_response,
+    decode_storage_rpc_response_payload, decode_stream_part_finalize_snapshot_response,
+    decode_stream_put_finalize_snapshot_response, decode_stream_upload_match_response,
     encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
     encode_bucket_write_reservation_record_request,
@@ -66,9 +67,11 @@ use crate::storage_rpc::{
     encode_read_handle_acquire_request, encode_read_handle_release_request,
     encode_scavenger_list_files_request, encode_shard_ack_batch_request,
     encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
-    encode_shard_write_request, encode_stream_upload_match_request, read_storage_rpc_frame_from,
-    write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome, StorageRpcBucketRequest,
-    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    encode_shard_write_request, encode_stream_part_commit_command_build_request,
+    encode_stream_part_finalize_snapshot_request, encode_stream_put_commit_command_build_request,
+    encode_stream_put_finalize_snapshot_request, encode_stream_upload_match_request,
+    read_storage_rpc_frame_from, write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome,
+    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
@@ -100,6 +103,8 @@ use crate::storage_rpc::{
     StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
     StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
+    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
     StorageRpcStreamUploadMatchRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
@@ -290,10 +295,17 @@ fn load_stream_put_finalize_snapshot_from_pg(
         Err(MetadataError::ObjectNotFound) => None,
         Err(other) => return Err(other.into()),
     };
+    let generation_id =
+        PgMetadataStore::get_object_generation_reservation(pg, bucket, key, session_id)?;
+    let (stale_payload_source, stale_payload) =
+        snapshot_direct_put_stale_payload_for_snapshot(pg, bucket, key, 0)?;
     let staging_segments = pg.list_stream_segments(session_id)?;
     Ok(StreamPutFinalizeStorageSnapshot {
         session,
         existing_etag,
+        generation_id,
+        stale_payload_source,
+        stale_payload,
         staging_segments,
     })
 }
@@ -926,6 +938,34 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
     fn build_create_multipart_upload_command(
         &self,
         request: BuildCreateMultipartUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn load_stream_put_finalize_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
+
+    fn build_stream_put_commit_command(
+        &self,
+        request: BuildStreamPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn load_stream_part_finalize_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError>;
+
+    fn build_stream_part_commit_command(
+        &self,
+        request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
@@ -3798,6 +3838,52 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         <Self as StorageNodeClient>::build_create_multipart_upload_command(self, request)
     }
+
+    fn load_stream_put_finalize_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_stream_put_finalize_snapshot(
+            self, pg_id, bucket, key, session_id,
+        )
+    }
+
+    fn build_stream_put_commit_command(
+        &self,
+        request: BuildStreamPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_stream_put_commit_command(self, request)
+    }
+
+    fn load_stream_part_finalize_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_stream_part_finalize_snapshot(
+            self,
+            pg_id,
+            bucket,
+            key,
+            upload_id,
+            session_id,
+            part_number,
+        )
+    }
+
+    fn build_stream_part_commit_command(
+        &self,
+        request: BuildStreamPartCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_stream_part_commit_command(self, request)
+    }
 }
 
 impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
@@ -4521,6 +4607,180 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 "decode multipart upload command build response",
                 "multipart upload command build cannot return missing".to_string(),
             ))),
+        }
+    }
+
+    fn load_stream_put_finalize_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcStreamPutFinalizeSnapshotRequest {
+            object: self.object_request(pg_id, bucket, key),
+            session_id: session_id.clone(),
+        };
+        let payload = encode_stream_put_finalize_snapshot_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_put_finalize_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream PUT finalize snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        self.validate_stream_put_finalize_snapshot_response(
+            &response.snapshot,
+            bucket,
+            key,
+            session_id,
+        )?;
+        Ok(response.snapshot)
+    }
+
+    fn build_stream_put_commit_command(
+        &self,
+        request: BuildStreamPutCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let rpc_request = StorageRpcStreamPutCommitCommandBuildRequest {
+            object: self.object_request(request.pg_id, request.bucket, request.key),
+            session_id: request.session_id.clone(),
+            total_size: request.total_size,
+            expected_snapshot: request.expected_snapshot.clone(),
+            commit: request.commit.clone(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_stream_put_commit_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode stream PUT commit command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream PUT commit command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                self.validate_stream_put_commit_command_response(&command, &request)?;
+                Ok(*command)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
+                Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream PUT commit command build response",
+                    "stream PUT commit command build cannot return missing".to_string(),
+                )))
+            }
+        }
+    }
+
+    fn load_stream_part_finalize_snapshot(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcStreamPartFinalizeSnapshotRequest {
+            object: self.object_request(pg_id, bucket, key),
+            upload_id: upload_id.clone(),
+            session_id: session_id.clone(),
+            part_number,
+        };
+        let payload = encode_stream_part_finalize_snapshot_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_part_finalize_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream part finalize snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        self.validate_stream_part_finalize_snapshot_response(
+            &response.snapshot,
+            bucket,
+            key,
+            upload_id,
+            session_id,
+            part_number,
+        )?;
+        Ok(response.snapshot)
+    }
+
+    fn build_stream_part_commit_command(
+        &self,
+        request: BuildStreamPartCommitCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let rpc_request = StorageRpcStreamPartCommitCommandBuildRequest {
+            object: self.object_request(request.pg_id, request.bucket, request.key),
+            upload_id: request.upload_id.clone(),
+            session_id: request.session_id.clone(),
+            part_number: request.part_number,
+            expected_snapshot: request.expected_snapshot.clone(),
+            part: request.part.clone(),
+            segments: request.segments.to_vec(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_stream_part_commit_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode stream part commit command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream part commit command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                self.validate_stream_part_commit_command_response(&command, &request)?;
+                Ok(*command)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
+                Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream part commit command build response",
+                    "stream part commit command build cannot return missing".to_string(),
+                )))
+            }
         }
     }
 
@@ -5378,6 +5638,267 @@ impl UnixStorageNodeClient {
             || upload.checksum != request.request.checksum
             || upload.encryption != request.request.encryption
             || create.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command does not match request".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_stream_put_finalize_snapshot_response(
+        &self,
+        snapshot: &StreamPutFinalizeStorageSnapshot,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate stream PUT finalize snapshot response";
+        if snapshot.session.session_id != *session_id
+            || snapshot.session.bucket != *bucket
+            || snapshot.session.key != *key
+            || snapshot.session.target != StreamUploadTarget::PutObject
+            || snapshot.session.state != StreamUploadState::InProgress
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "snapshot session identity does not match request".to_string(),
+            )));
+        }
+        for segment in &snapshot.staging_segments {
+            if segment.session_id != *session_id {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "snapshot segment identity does not match request".to_string(),
+                )));
+            }
+        }
+        if let Some(source) = snapshot.stale_payload_source.as_ref() {
+            if source.bucket() != bucket || source.key() != key {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "stale payload source identity does not match request".to_string(),
+                )));
+            }
+        }
+        if !reclaim_matches_bucket_key(snapshot.stale_payload.as_ref(), bucket, key) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stale payload identity does not match request".to_string(),
+            )));
+        }
+        if !reclaim_matches_snapshot_live_object(
+            snapshot.stale_payload.as_ref(),
+            &snapshot.stale_payload_source,
+        ) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "stale payload shape does not match source live object".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_stream_part_finalize_snapshot_response(
+        &self,
+        snapshot: &StreamUploadPartStorageSnapshot,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate stream part finalize snapshot response";
+        let auth = &snapshot.auth_snapshot;
+        if auth.session.session_id != *session_id
+            || auth.session.bucket != *bucket
+            || auth.session.key != *key
+            || auth.session.target
+                != (StreamUploadTarget::UploadPart {
+                    upload_id: upload_id.clone(),
+                    part_number,
+                })
+            || auth.session.state != StreamUploadState::InProgress
+            || auth.upload.upload_id != *upload_id
+            || auth.upload.bucket != *bucket
+            || auth.upload.key != *key
+            || auth.upload.state != UploadState::InProgress
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "snapshot identity does not match request".to_string(),
+            )));
+        }
+        for segment in &auth.staging_segments {
+            if segment.session_id != *session_id {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "snapshot segment identity does not match request".to_string(),
+                )));
+            }
+        }
+        if snapshot
+            .existing_part
+            .as_ref()
+            .is_some_and(|part| part.upload_id != *upload_id || part.part_number != part_number)
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "existing part identity does not match request".to_string(),
+            )));
+        }
+        for segment in &snapshot.displaced_segments {
+            if segment.bucket != *bucket
+                || segment.key != *key
+                || segment.upload_id != *upload_id
+                || segment.part_number != part_number
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "displaced segment identity does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_stream_put_commit_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildStreamPutCommitCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate stream PUT commit command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not stream PUT commit".to_string(),
+            )));
+        };
+        if !commit.matches_request(
+            request.bucket,
+            request.key,
+            request.session_id,
+            request.expected_snapshot.generation_id,
+        ) || commit.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command identity does not match request".to_string(),
+            )));
+        }
+        let object = &commit.object;
+        let expected_etag = ObjectEtag::single_part(request.commit.etag_crc64);
+        if object.generation_id != request.expected_snapshot.generation_id
+            || object.version_id != request.commit.version_id
+            || object.owner != request.commit.owner
+            || object.acl_grants != request.commit.acl_grants
+            || object.public_read != request.commit.public_read
+            || object.size != request.commit.size
+            || object.etag != expected_etag
+            || object.layout != ObjectLayout::Standard
+            || object.tags != request.commit.tags
+            || object.metadata_blob.as_ref() != Some(&request.commit.metadata_blob)
+            || object.system_metadata_blob.as_ref() != Some(&request.commit.system_metadata_blob)
+            || object.object_lock != request.commit.object_lock
+            || object.encryption != request.commit.encryption
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command object does not match request".to_string(),
+            )));
+        }
+        let segments_total: u64 = request
+            .expected_snapshot
+            .staging_segments
+            .iter()
+            .map(|segment| segment.size)
+            .sum();
+        if segments_total != request.total_size
+            || commit.segments.len() != request.expected_snapshot.staging_segments.len()
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command segment shape does not match request".to_string(),
+            )));
+        }
+        for (actual, expected) in commit
+            .segments
+            .iter()
+            .zip(request.expected_snapshot.staging_segments.iter())
+        {
+            if actual.bucket != *request.bucket
+                || actual.key != *request.key
+                || actual.version_id != request.commit.version_id
+                || actual.segment_index != expected.segment_index
+                || actual.size != expected.size
+                || actual.segment_crc64 != expected.segment_crc64
+                || actual.segment_okh != expected.segment_okh
+                || actual.segment_vid != expected.segment_vid
+                || actual.data_pg_id != expected.data_pg_id
+                || actual.ec_k != expected.ec_k
+                || actual.ec_m != expected.ec_m
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response command segment does not match snapshot".to_string(),
+                )));
+            }
+        }
+        if request.commit.version_id.is_null() {
+            let mut actual_stale_payload = commit.stale_payload.clone();
+            normalize_reclaim_created_at(&mut actual_stale_payload);
+            if actual_stale_payload != request.expected_snapshot.stale_payload {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response command stale payload does not match expected snapshot".to_string(),
+                )));
+            }
+        } else if commit.stale_payload.is_some() {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "versioned stream PUT response must not reclaim stale null payload".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_stream_part_commit_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildStreamPartCommitCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate stream part commit command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::CommitStreamPart(commit) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not stream part commit".to_string(),
+            )));
+        };
+        if !commit.matches_request(
+            request.bucket,
+            request.key,
+            request.upload_id,
+            request.session_id,
+            request.part_number,
+        ) || commit.upload != request.expected_snapshot.auth_snapshot.upload
+            || commit.part != *request.part
+            || commit.segments != request.segments
+            || commit.existing_part != request.expected_snapshot.existing_part
+            || commit.displaced_segments != request.expected_snapshot.displaced_segments
+            || commit.bucket_write_reservation != *request.bucket_write_reservation
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 context,
@@ -7641,12 +8162,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 reason: "unversioned stream PUT commit must use null version id".to_string(),
             });
         }
-        let generation_id = PgMetadataStore::get_object_generation_reservation(
-            &*pg,
-            request.bucket,
-            request.key,
-            request.session_id,
-        )?;
+        let generation_id = current.generation_id;
         let last_modified_millis = crate::clock::current_time_millis();
         let write_sequence =
             pg.next_object_write_sequence(request.bucket.as_str(), request.key.as_str())?;
@@ -8437,8 +8953,8 @@ mod tests {
         StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcReadHandleAcquireResponse,
     };
     use crate::types::{
-        DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedTagSet,
-        StorageClass,
+        DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedMetadataBlob,
+        SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
     };
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
@@ -10681,6 +11197,338 @@ mod tests {
         ));
         server_thread.join().unwrap();
         build_server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("stream-put-rpc-bucket");
+        let key = crate::tests::object_key("stream-put-rpc-key");
+        let session_id = crate::tests::stream_session_id("stream-put-rpc");
+        let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let segment = StreamUploadSegmentRecord {
+            session_id: session_id.clone(),
+            segment_index: 0,
+            size: 12,
+            segment_crc64: Some(99),
+            segment_okh: [4; 16],
+            segment_vid: GenerationId::new(10).unwrap(),
+            data_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        };
+        let snapshot = StreamPutFinalizeStorageSnapshot {
+            session: StreamUploadRecord {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::PutObject,
+                state: StreamUploadState::InProgress,
+                created_at: 1,
+                encryption: ObjectEncryption::None,
+                next_segment_vid: GenerationId::new(11).unwrap(),
+            },
+            existing_etag: None,
+            generation_id: GenerationId::new(20).unwrap(),
+            stale_payload_source: None,
+            stale_payload: None,
+            staging_segments: vec![segment.clone()],
+        };
+        let commit_input = StreamPutCommitInput {
+            versioning: BucketVersioningState::Suspended,
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            size: 12,
+            etag_crc64: 99,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: commit_input.owner.clone(),
+                    acl_grants: commit_input.acl_grants.clone(),
+                    public_read: commit_input.public_read,
+                    generation_id: snapshot.generation_id,
+                    size: commit_input.size,
+                    etag: ObjectEtag::single_part(commit_input.etag_crc64),
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::Standard,
+                    tags: commit_input.tags.clone(),
+                    metadata_blob: Some(commit_input.metadata_blob.clone()),
+                    system_metadata_blob: Some(commit_input.system_metadata_blob.clone()),
+                    object_lock: commit_input.object_lock,
+                    encryption: commit_input.encryption.clone(),
+                },
+                segments: vec![ObjectSegmentRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    segment_crc64: segment.segment_crc64,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec_k: segment.ec_k,
+                    ec_m: segment.ec_m,
+                }],
+                generation_reservation_id: session_id.clone(),
+                write_sequence: 1,
+                last_modified_millis: 1,
+                stale_payload: None,
+                bucket_write_reservation: proof.clone(),
+            })),
+        );
+        let request = BuildStreamPutCommitCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket: &bucket,
+            key: &key,
+            session_id: &session_id,
+            total_size: 12,
+            expected_snapshot: &snapshot,
+            commit: &commit_input,
+            bucket_write_reservation: &proof,
+        };
+        client
+            .validate_stream_put_commit_command_response(&command, &request)
+            .unwrap();
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(bad_commit) = &mut bad_payload else {
+            panic!("expected stream PUT commit command");
+        };
+        bad_commit.object.generation_id = GenerationId::new(21).unwrap();
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_stream_put_commit_command_response(&bad_command, &request)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream PUT commit command build response",
+                ..
+            })
+        ));
+
+        let stale_generation = GenerationId::new(50).unwrap();
+        let mut snapshot_with_stale = snapshot.clone();
+        snapshot_with_stale.stale_payload_source = Some(test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            stale_generation,
+            ObjectLayout::Standard,
+        ));
+        snapshot_with_stale.stale_payload = Some(test_segments_reclaim(
+            bucket.clone(),
+            key.clone(),
+            stale_generation,
+        ));
+        let mut stale_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(stale_commit) = &mut stale_payload else {
+            panic!("expected stream PUT commit command");
+        };
+        stale_commit.stale_payload = snapshot_with_stale.stale_payload.clone();
+        let stale_command = MetadataCommandEnvelope::new(command.id(), stale_payload);
+        let stale_request = BuildStreamPutCommitCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket: &bucket,
+            key: &key,
+            session_id: &session_id,
+            total_size: 12,
+            expected_snapshot: &snapshot_with_stale,
+            commit: &commit_input,
+            bucket_write_reservation: &proof,
+        };
+        client
+            .validate_stream_put_commit_command_response(&stale_command, &stale_request)
+            .unwrap();
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(bad_commit) = &mut bad_payload else {
+            panic!("expected stream PUT commit command");
+        };
+        bad_commit.stale_payload = Some(test_segments_reclaim(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(51).unwrap(),
+        ));
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_stream_put_commit_command_response(&bad_command, &stale_request)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream PUT commit command build response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("stream-part-rpc-bucket");
+        let key = crate::tests::object_key("stream-part-rpc-key");
+        let upload_id = crate::tests::multipart_upload_id("stream-part-rpc-upload");
+        let session_id = crate::tests::stream_session_id("stream-part-rpc");
+        let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let upload = MultipartUploadRecord {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: 1,
+            state: UploadState::InProgress,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: None,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_generation_id: GenerationId::new(30).unwrap(),
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        };
+        let snapshot = StreamUploadPartStorageSnapshot {
+            auth_snapshot: StreamUploadPartSnapshot {
+                session: StreamUploadRecord {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: StreamUploadTarget::UploadPart {
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                    },
+                    state: StreamUploadState::InProgress,
+                    created_at: 1,
+                    encryption: ObjectEncryption::None,
+                    next_segment_vid: GenerationId::new(31).unwrap(),
+                },
+                upload: upload.clone(),
+                existing_part_generation: None,
+                staging_segments: vec![StreamUploadSegmentRecord {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: 12,
+                    segment_crc64: Some(100),
+                    segment_okh: [5; 16],
+                    segment_vid: GenerationId::new(32).unwrap(),
+                    data_pg_id: 0,
+                    ec_k: 4,
+                    ec_m: 2,
+                }],
+            },
+            existing_part: None,
+            displaced_segments: Vec::new(),
+        };
+        let part = MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 1,
+            size: 12,
+            etag: vec![1; 8],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [6; 16],
+            part_vid: GenerationId::new(40).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 10,
+            checksum: None,
+        };
+        let segments = vec![MultipartPartSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            version_id: 1,
+            part_number: 1,
+            segment_index: 0,
+            size: 12,
+            segment_crc64: Some(100),
+            segment_okh: [5; 16],
+            segment_vid: GenerationId::new(32).unwrap(),
+            data_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        }];
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                upload,
+                part: part.clone(),
+                segments: segments.clone(),
+                existing_part: None,
+                displaced_segments: Vec::new(),
+                bucket_write_reservation: proof.clone(),
+            })),
+        );
+        let request = BuildStreamPartCommitCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket: &bucket,
+            key: &key,
+            upload_id: &upload_id,
+            session_id: &session_id,
+            part_number: 1,
+            expected_snapshot: &snapshot,
+            part: &part,
+            segments: &segments,
+            bucket_write_reservation: &proof,
+        };
+        client
+            .validate_stream_part_commit_command_response(&command, &request)
+            .unwrap();
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitStreamPart(bad_commit) = &mut bad_payload else {
+            panic!("expected stream part commit command");
+        };
+        bad_commit.segments[0].key = crate::tests::object_key("wrong-stream-part-key");
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_stream_part_commit_command_response(&bad_command, &request)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream part commit command build response",
+                ..
+            })
+        ));
     }
 
     #[test]

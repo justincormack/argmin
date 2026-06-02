@@ -2793,6 +2793,9 @@ pub struct StreamPutFinalizeSnapshot {
 pub struct StreamPutFinalizeStorageSnapshot {
     pub session: StreamUploadRecord,
     pub existing_etag: Option<String>,
+    pub generation_id: GenerationId,
+    pub(crate) stale_payload_source: Option<StoredObject>,
+    pub(crate) stale_payload: Option<crate::metadata_command::ObjectPayloadReclaimCommand>,
     pub staging_segments: Vec<StreamUploadSegmentRecord>,
 }
 

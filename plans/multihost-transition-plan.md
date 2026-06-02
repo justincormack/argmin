@@ -5580,10 +5580,15 @@ payload identity before publishing the command. Stream upload session creation
 and multipart upload initiation now use the same object-mutation metadata RPC
 surface for retry matching and command construction; Unix clients validate the
 returned session/upload identity and bucket-write proof before publishing.
-Remaining non-command surfaces still need operation-shaped builders for stream
-PUT/part finalization, multipart completion/abort, bucket
-properties/subresources, lifecycle MPU abort, and durable pending/drain/
-coordination checks before frontend/combined roles can be enabled.
+Stream PUT finalization and upload-part stream finalization now also route
+their storage snapshot loads and command builders through the object-mutation
+metadata RPC boundary; Unix clients preserve the typed stale-finalize-snapshot
+retry outcome and validate the returned command route, object/session/upload
+identity, staged segment rows, multipart part rows, and bucket-write proof
+before publishing. Remaining non-command surfaces still need operation-shaped
+builders for multipart completion/abort, bucket properties/subresources,
+lifecycle MPU abort, and durable pending/drain/coordination checks before
+frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5648,12 +5653,14 @@ Implementation slices:
    lifecycle delete command construction through a dedicated RPC surface with
    delete-target response validation. Stream upload session creation and
    multipart upload initiation builders now route through the object-mutation
-   metadata RPC boundary with request/proof response validation. Remaining
-   work includes durable pending/drain/coordination checks and operation-shaped
-   command-builder calls for stream PUT/part finalization, multipart
-   completion/abort, bucket properties/subresources, and lifecycle MPU abort
-   that must execute against a storage-node-owned snapshot rather than a
-   frontend-owned raw PG handle.
+   metadata RPC boundary with request/proof response validation. Stream
+   PUT/part finalization snapshot loads and command builders now use that same
+   boundary, preserving typed stale-snapshot retries and validating returned
+   stream commit/part command identity before publication. Remaining work
+   includes durable pending/drain/coordination checks and operation-shaped
+   command-builder calls for multipart completion/abort, bucket
+   properties/subresources, and lifecycle MPU abort that must execute against a
+   storage-node-owned snapshot rather than a frontend-owned raw PG handle.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
    install/apply for `CreateBucket`, then direct PUT object-generation

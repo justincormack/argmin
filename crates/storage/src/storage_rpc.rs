@@ -15,16 +15,19 @@ use crate::{
         CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
         EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LiveObjectRecord,
         LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
-        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-        MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType,
-        ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
-        ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
-        ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord,
-        ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
-        PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-        SerializedTagSet, SessionId, ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus,
-        StoredObject, StreamUploadState, StreamUploadTarget, UploadId, UploadState, VersionId,
-        WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
+        MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+        MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
+        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+        ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
+        ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+        OwnerIdentity, PgId, PublicAccessBlockConfig, SerializedMetadataBlob,
+        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
+        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+        StreamUploadState, StreamUploadTarget, UploadId, UploadState, VersionId, WriteAck,
+        SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -116,9 +119,18 @@ const STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
+const STORAGE_RPC_MAX_STREAM_PART_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN + 4 + UPLOAD_ID_LEN + 4;
+const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
+const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
+    4 + SESSION_ID_LEN + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
+const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
+    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
     4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
@@ -217,6 +229,10 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectMultipartUploadMatch = 58,
     ObjectStreamUploadCommandBuild = 59,
     ObjectMultipartUploadCommandBuild = 60,
+    ObjectStreamPutFinalizeSnapshotLoad = 61,
+    ObjectStreamPutCommitCommandBuild = 62,
+    ObjectStreamPartFinalizeSnapshotLoad = 63,
+    ObjectStreamPartCommitCommandBuild = 64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +341,12 @@ impl StorageRpcMessageKind {
             Self::ObjectMultipartUploadMatch => "object multipart upload match",
             Self::ObjectStreamUploadCommandBuild => "object stream upload command build",
             Self::ObjectMultipartUploadCommandBuild => "object multipart upload command build",
+            Self::ObjectStreamPutFinalizeSnapshotLoad => "object stream PUT finalize snapshot load",
+            Self::ObjectStreamPutCommitCommandBuild => "object stream PUT commit command build",
+            Self::ObjectStreamPartFinalizeSnapshotLoad => {
+                "object stream part finalize snapshot load"
+            }
+            Self::ObjectStreamPartCommitCommandBuild => "object stream part commit command build",
         }
     }
 
@@ -390,6 +412,10 @@ impl StorageRpcMessageKind {
             58 => Ok(Self::ObjectMultipartUploadMatch),
             59 => Ok(Self::ObjectStreamUploadCommandBuild),
             60 => Ok(Self::ObjectMultipartUploadCommandBuild),
+            61 => Ok(Self::ObjectStreamPutFinalizeSnapshotLoad),
+            62 => Ok(Self::ObjectStreamPutCommitCommandBuild),
+            63 => Ok(Self::ObjectStreamPartFinalizeSnapshotLoad),
+            64 => Ok(Self::ObjectStreamPartCommitCommandBuild),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -764,6 +790,52 @@ pub(crate) struct StorageRpcCreateMultipartUploadCommandBuildRequest {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamPutFinalizeSnapshotRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamPutFinalizeSnapshotResponse {
+    pub(crate) snapshot: StreamPutFinalizeStorageSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcStreamPutCommitCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) session_id: SessionId,
+    pub(crate) total_size: u64,
+    pub(crate) expected_snapshot: StreamPutFinalizeStorageSnapshot,
+    pub(crate) commit: StreamPutCommitInput,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamPartFinalizeSnapshotRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) upload_id: UploadId,
+    pub(crate) session_id: SessionId,
+    pub(crate) part_number: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamPartFinalizeSnapshotResponse {
+    pub(crate) snapshot: StreamUploadPartStorageSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcStreamPartCommitCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) upload_id: UploadId,
+    pub(crate) session_id: SessionId,
+    pub(crate) part_number: u32,
+    pub(crate) expected_snapshot: StreamUploadPartStorageSnapshot,
+    pub(crate) part: MultipartPartRecord,
+    pub(crate) segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
 fn object_payload_reclaim_matches_object(
     reclaim: &ObjectPayloadReclaimCommand,
     bucket: &BucketName,
@@ -789,6 +861,28 @@ fn delete_target_matches_object(
         DeleteObjectVersionTarget::Live { payload, .. } => {
             object_payload_reclaim_matches_object(payload, bucket, key)
         }
+    }
+}
+
+fn object_payload_reclaim_matches_snapshot_live_object(
+    reclaim: Option<&ObjectPayloadReclaimCommand>,
+    source: &Option<StoredObject>,
+) -> bool {
+    match (reclaim, source) {
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
+        (Some(_), Some(StoredObject::Live(live))) if !live.version_id.is_null() => false,
+        (Some(reclaim), Some(StoredObject::Live(live))) => match (reclaim, live.layout) {
+            (ObjectPayloadReclaimCommand::Segments(reclaim), ObjectLayout::Standard) => {
+                reclaim.generation_id == live.generation_id
+            }
+            (
+                ObjectPayloadReclaimCommand::Multipart(reclaim),
+                ObjectLayout::MultipartManifest { .. },
+            ) => reclaim.generation_id == live.generation_id,
+            _ => false,
+        },
+        (Some(_), Some(StoredObject::DeleteMarker(_))) => false,
     }
 }
 
@@ -880,6 +974,103 @@ fn create_multipart_upload_command_matches_request(
         && command.upload.object_lock == request.object_lock
         && command.upload.checksum == request.checksum
         && command.upload.encryption == request.encryption
+}
+
+fn validate_stream_put_finalize_snapshot_identity(
+    object: &StorageRpcObjectRequest,
+    session_id: &SessionId,
+    snapshot: &StreamPutFinalizeStorageSnapshot,
+) -> Result<(), StorageRpcPayloadError> {
+    if snapshot.session.session_id != *session_id
+        || snapshot.session.bucket != object.bucket
+        || snapshot.session.key != object.key
+        || snapshot.session.target != StreamUploadTarget::PutObject
+        || snapshot.session.state != StreamUploadState::InProgress
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream PUT finalize snapshot identity mismatch",
+        ));
+    }
+    for segment in &snapshot.staging_segments {
+        if segment.session_id != *session_id {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "stream PUT finalize segment identity mismatch",
+            ));
+        }
+    }
+    if snapshot
+        .stale_payload_source
+        .as_ref()
+        .is_some_and(|stored| stored.bucket() != &object.bucket || stored.key() != &object.key)
+        || snapshot.stale_payload.as_ref().is_some_and(|reclaim| {
+            !object_payload_reclaim_matches_object(reclaim, &object.bucket, &object.key)
+        })
+        || !object_payload_reclaim_matches_snapshot_live_object(
+            snapshot.stale_payload.as_ref(),
+            &snapshot.stale_payload_source,
+        )
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream PUT finalize stale payload identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_part_finalize_snapshot_identity(
+    object: &StorageRpcObjectRequest,
+    upload_id: &UploadId,
+    session_id: &SessionId,
+    part_number: u32,
+    snapshot: &StreamUploadPartStorageSnapshot,
+) -> Result<(), StorageRpcPayloadError> {
+    let auth = &snapshot.auth_snapshot;
+    if auth.session.session_id != *session_id
+        || auth.session.bucket != object.bucket
+        || auth.session.key != object.key
+        || auth.session.target
+            != (StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number,
+            })
+        || auth.session.state != StreamUploadState::InProgress
+        || auth.upload.upload_id != *upload_id
+        || auth.upload.bucket != object.bucket
+        || auth.upload.key != object.key
+        || auth.upload.state != UploadState::InProgress
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream part finalize snapshot identity mismatch",
+        ));
+    }
+    for segment in &auth.staging_segments {
+        if segment.session_id != *session_id {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "stream part finalize staging segment identity mismatch",
+            ));
+        }
+    }
+    if snapshot
+        .existing_part
+        .as_ref()
+        .is_some_and(|part| part.upload_id != *upload_id || part.part_number != part_number)
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream part finalize existing part identity mismatch",
+        ));
+    }
+    for segment in &snapshot.displaced_segments {
+        if segment.bucket != object.bucket
+            || segment.key != object.key
+            || segment.upload_id != *upload_id
+            || segment.part_number != part_number
+        {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "stream part finalize displaced segment identity mismatch",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1585,6 +1776,12 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::ObjectLifecycleVersionListLoad => {
             STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad => {
+            STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad => {
+            STORAGE_RPC_MAX_STREAM_PART_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectMetadataPutCommandBuild
         | StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild
         | StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild
@@ -1594,6 +1791,10 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::ObjectStreamUploadCommandBuild
         | StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
             STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild
+        | StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild => {
+            STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectGenerationNext => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
@@ -2475,6 +2676,272 @@ pub(crate) fn decode_create_multipart_upload_command_build_request(
         object,
         request,
         expected_current,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_stream_put_finalize_snapshot_request(
+    request: &StorageRpcStreamPutFinalizeSnapshotRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.session_id.as_str());
+    out
+}
+
+pub(crate) fn decode_stream_put_finalize_snapshot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let session_id = decoder.read_session_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamPutFinalizeSnapshotRequest { object, session_id })
+}
+
+pub(crate) fn encode_stream_put_finalize_snapshot_response(
+    response: &StorageRpcStreamPutFinalizeSnapshotResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_stream_put_finalize_snapshot_identity(
+        &StorageRpcObjectRequest {
+            node_id: NodeId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).expect("nonzero epoch"),
+            pg_id: PgId::new(0),
+            bucket: response.snapshot.session.bucket.clone(),
+            key: response.snapshot.session.key.clone(),
+        },
+        &response.snapshot.session.session_id,
+        &response.snapshot,
+    )?;
+    let mut out = Vec::new();
+    put_stream_put_finalize_storage_snapshot(&mut out, &response.snapshot);
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_put_finalize_snapshot_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamPutFinalizeSnapshotResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let snapshot = decoder.read_stream_put_finalize_storage_snapshot()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamPutFinalizeSnapshotResponse { snapshot })
+}
+
+pub(crate) fn encode_stream_put_commit_command_build_request(
+    request: &StorageRpcStreamPutCommitCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_stream_put_finalize_snapshot_identity(
+        &request.object,
+        &request.session_id,
+        &request.expected_snapshot,
+    )?;
+    if request.bucket_write_reservation.bucket != request.object.bucket {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream PUT commit reservation bucket mismatch",
+        ));
+    }
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.session_id.as_str());
+    put_u64(&mut out, request.total_size);
+    put_stream_put_finalize_storage_snapshot(&mut out, &request.expected_snapshot);
+    put_stream_put_commit_input(&mut out, &request.commit);
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_put_commit_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let session_id = decoder.read_session_id()?;
+    let total_size = decoder.read_u64()?;
+    let expected_snapshot = decoder.read_stream_put_finalize_storage_snapshot()?;
+    let commit = decoder.read_stream_put_commit_input()?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    validate_stream_put_finalize_snapshot_identity(&object, &session_id, &expected_snapshot)?;
+    if bucket_write_reservation.bucket != object.bucket {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream PUT commit reservation bucket mismatch",
+        ));
+    }
+    Ok(StorageRpcStreamPutCommitCommandBuildRequest {
+        object,
+        session_id,
+        total_size,
+        expected_snapshot,
+        commit,
+        bucket_write_reservation,
+    })
+}
+
+pub(crate) fn encode_stream_part_finalize_snapshot_request(
+    request: &StorageRpcStreamPartFinalizeSnapshotRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.upload_id.as_str());
+    put_string(&mut out, request.session_id.as_str());
+    put_u32(&mut out, request.part_number);
+    out
+}
+
+pub(crate) fn decode_stream_part_finalize_snapshot_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let upload_id = decoder.read_upload_id()?;
+    let session_id = decoder.read_session_id()?;
+    let part_number = decoder.read_u32()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamPartFinalizeSnapshotRequest {
+        object,
+        upload_id,
+        session_id,
+        part_number,
+    })
+}
+
+pub(crate) fn encode_stream_part_finalize_snapshot_response(
+    response: &StorageRpcStreamPartFinalizeSnapshotResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let auth = &response.snapshot.auth_snapshot;
+    let StreamUploadTarget::UploadPart {
+        upload_id,
+        part_number,
+    } = &auth.session.target
+    else {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream part finalize response target mismatch",
+        ));
+    };
+    validate_stream_part_finalize_snapshot_identity(
+        &StorageRpcObjectRequest {
+            node_id: NodeId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).expect("nonzero epoch"),
+            pg_id: PgId::new(0),
+            bucket: auth.session.bucket.clone(),
+            key: auth.session.key.clone(),
+        },
+        upload_id,
+        &auth.session.session_id,
+        *part_number,
+        &response.snapshot,
+    )?;
+    let mut out = Vec::new();
+    put_stream_part_finalize_storage_snapshot(&mut out, &response.snapshot);
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_part_finalize_snapshot_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let snapshot = decoder.read_stream_part_finalize_storage_snapshot()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamPartFinalizeSnapshotResponse { snapshot })
+}
+
+pub(crate) fn encode_stream_part_commit_command_build_request(
+    request: &StorageRpcStreamPartCommitCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_stream_part_finalize_snapshot_identity(
+        &request.object,
+        &request.upload_id,
+        &request.session_id,
+        request.part_number,
+        &request.expected_snapshot,
+    )?;
+    if request.part.upload_id != request.upload_id
+        || request.part.part_number != request.part_number
+        || request.bucket_write_reservation.bucket != request.object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream part commit request identity mismatch",
+        ));
+    }
+    for segment in &request.segments {
+        if segment.bucket != request.object.bucket
+            || segment.key != request.object.key
+            || segment.upload_id != request.upload_id
+            || segment.part_number != request.part_number
+        {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "stream part commit segment identity mismatch",
+            ));
+        }
+    }
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.upload_id.as_str());
+    put_string(&mut out, request.session_id.as_str());
+    put_u32(&mut out, request.part_number);
+    put_stream_part_finalize_storage_snapshot(&mut out, &request.expected_snapshot);
+    put_multipart_part_record(&mut out, &request.part);
+    put_u32(
+        &mut out,
+        u32::try_from(request.segments.len()).expect("stream part segment count must fit in u32"),
+    );
+    for segment in &request.segments {
+        put_multipart_part_segment_record(&mut out, segment);
+    }
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_part_commit_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let upload_id = decoder.read_upload_id()?;
+    let session_id = decoder.read_session_id()?;
+    let part_number = decoder.read_u32()?;
+    let expected_snapshot = decoder.read_stream_part_finalize_storage_snapshot()?;
+    let part = decoder.read_multipart_part_record()?;
+    let segment_count = decoder.read_bounded_remaining_count(
+        STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
+        "stream part commit segment count exceeds payload",
+    )?;
+    let mut segments = Vec::new();
+    for _ in 0..segment_count {
+        segments.push(decoder.read_multipart_part_segment_record()?);
+    }
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    validate_stream_part_finalize_snapshot_identity(
+        &object,
+        &upload_id,
+        &session_id,
+        part_number,
+        &expected_snapshot,
+    )?;
+    if part.upload_id != upload_id
+        || part.part_number != part_number
+        || bucket_write_reservation.bucket != object.bucket
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream part commit request identity mismatch",
+        ));
+    }
+    for segment in &segments {
+        if segment.bucket != object.bucket
+            || segment.key != object.key
+            || segment.upload_id != upload_id
+            || segment.part_number != part_number
+        {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "stream part commit segment identity mismatch",
+            ));
+        }
+    }
+    Ok(StorageRpcStreamPartCommitCommandBuildRequest {
+        object,
+        upload_id,
+        session_id,
+        part_number,
+        expected_snapshot,
+        part,
+        segments,
         bucket_write_reservation,
     })
 }
@@ -5246,6 +5713,16 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_optional_u32(&mut self) -> Result<Option<u32>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u32()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional u32 tag",
+            )),
+        }
+    }
+
     fn read_optional_version_id(&mut self) -> Result<Option<VersionId>, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => Ok(None),
@@ -5936,6 +6413,157 @@ impl<'a> StorageRpcDecoder<'a> {
             )?,
             created_at: self.read_u64()?,
             encryption: self.read_object_encryption()?,
+        })
+    }
+
+    fn read_stream_upload_record(&mut self) -> Result<StreamUploadRecord, StorageRpcPayloadError> {
+        Ok(StreamUploadRecord {
+            session_id: self.read_session_id()?,
+            bucket: self.read_bucket_name()?,
+            key: self.read_object_key()?,
+            target: self.read_stream_upload_target()?,
+            state: StreamUploadState::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream upload state"),
+            )?,
+            created_at: self.read_u64()?,
+            encryption: self.read_object_encryption()?,
+            next_segment_vid: self.read_generation_id()?,
+        })
+    }
+
+    fn read_stream_upload_segment_record(
+        &mut self,
+    ) -> Result<StreamUploadSegmentRecord, StorageRpcPayloadError> {
+        Ok(StreamUploadSegmentRecord {
+            session_id: self.read_session_id()?,
+            segment_index: self.read_u32()?,
+            size: self.read_u64()?,
+            segment_crc64: self.read_optional_u64()?,
+            segment_okh: self.read_fixed_16_bytes("stream upload segment OKH")?,
+            segment_vid: self.read_generation_id()?,
+            data_pg_id: self.read_u32()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+        })
+    }
+
+    fn read_stream_put_finalize_storage_snapshot(
+        &mut self,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, StorageRpcPayloadError> {
+        let session = self.read_stream_upload_record()?;
+        let existing_etag = self.read_optional_string()?;
+        let generation_id = self.read_generation_id()?;
+        let stale_payload_source = self.read_optional_stored_object()?;
+        let stale_payload = self.read_optional_object_payload_reclaim()?;
+        let segment_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN,
+            "stream PUT finalize segment count exceeds payload",
+        )?;
+        let mut staging_segments = Vec::new();
+        for _ in 0..segment_count {
+            staging_segments.push(self.read_stream_upload_segment_record()?);
+        }
+        Ok(StreamPutFinalizeStorageSnapshot {
+            session,
+            existing_etag,
+            generation_id,
+            stale_payload_source,
+            stale_payload,
+            staging_segments,
+        })
+    }
+
+    fn read_stream_put_commit_input(
+        &mut self,
+    ) -> Result<StreamPutCommitInput, StorageRpcPayloadError> {
+        Ok(StreamPutCommitInput {
+            versioning: self.read_bucket_versioning_state()?,
+            version_id: VersionId::from_u64(self.read_u64()?),
+            owner: self.read_owner_identity()?,
+            acl_grants: self.read_acl_grants()?,
+            public_read: self.read_bool()?,
+            size: self.read_u64()?,
+            etag_crc64: self.read_u64()?,
+            tags: self.read_optional_serialized_tag_set()?,
+            metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
+            system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
+            object_lock: self.read_object_lock_state()?,
+            encryption: self.read_object_encryption()?,
+        })
+    }
+
+    fn read_stream_upload_part_snapshot(
+        &mut self,
+    ) -> Result<StreamUploadPartSnapshot, StorageRpcPayloadError> {
+        let session = self.read_stream_upload_record()?;
+        let upload = self.read_multipart_upload_record()?;
+        let existing_part_generation = self.read_optional_u32()?;
+        let segment_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN,
+            "stream part finalize segment count exceeds payload",
+        )?;
+        let mut staging_segments = Vec::new();
+        for _ in 0..segment_count {
+            staging_segments.push(self.read_stream_upload_segment_record()?);
+        }
+        Ok(StreamUploadPartSnapshot {
+            session,
+            upload,
+            existing_part_generation,
+            staging_segments,
+        })
+    }
+
+    fn read_optional_multipart_part_record(
+        &mut self,
+    ) -> Result<Option<MultipartPartRecord>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_multipart_part_record()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional multipart part tag",
+            )),
+        }
+    }
+
+    fn read_multipart_part_record(
+        &mut self,
+    ) -> Result<MultipartPartRecord, StorageRpcPayloadError> {
+        Ok(MultipartPartRecord {
+            upload_id: self.read_upload_id()?,
+            part_number: self.read_u32()?,
+            generation: self.read_u32()?,
+            size: self.read_u64()?,
+            etag: self.read_bytes()?.to_vec(),
+            etag_kind: EtagKind::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid etag kind"),
+            )?,
+            part_okh: self.read_fixed_16_bytes("multipart part OKH")?,
+            part_vid: self.read_generation_id()?,
+            ec_k: self.read_u8()?,
+            ec_m: self.read_u8()?,
+            last_modified: self.read_u64()?,
+            checksum: self.read_optional_checksum_bytes()?,
+        })
+    }
+
+    fn read_stream_part_finalize_storage_snapshot(
+        &mut self,
+    ) -> Result<StreamUploadPartStorageSnapshot, StorageRpcPayloadError> {
+        let auth_snapshot = self.read_stream_upload_part_snapshot()?;
+        let existing_part = self.read_optional_multipart_part_record()?;
+        let segment_count = self.read_bounded_remaining_count(
+            STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
+            "stream part finalize displaced segment count exceeds payload",
+        )?;
+        let mut displaced_segments = Vec::new();
+        for _ in 0..segment_count {
+            displaced_segments.push(self.read_multipart_part_segment_record()?);
+        }
+        Ok(StreamUploadPartStorageSnapshot {
+            auth_snapshot,
+            existing_part,
+            displaced_segments,
         })
     }
 
@@ -6901,6 +7529,121 @@ fn put_stream_upload_command_record(
     put_object_encryption(out, &record.encryption);
 }
 
+fn put_stream_upload_record(out: &mut Vec<u8>, record: &StreamUploadRecord) {
+    put_string(out, record.session_id.as_str());
+    put_string(out, record.bucket.as_str());
+    put_string(out, record.key.as_str());
+    put_stream_upload_target(out, &record.target);
+    put_u8(out, record.state as u8);
+    put_u64(out, record.created_at);
+    put_object_encryption(out, &record.encryption);
+    put_u64(out, record.next_segment_vid.get());
+}
+
+fn put_stream_upload_segment_record(out: &mut Vec<u8>, segment: &StreamUploadSegmentRecord) {
+    put_string(out, segment.session_id.as_str());
+    put_u32(out, segment.segment_index);
+    put_u64(out, segment.size);
+    put_optional_u64(out, segment.segment_crc64);
+    put_bytes(out, &segment.segment_okh);
+    put_u64(out, segment.segment_vid.get());
+    put_u32(out, segment.data_pg_id);
+    put_u8(out, segment.ec_k);
+    put_u8(out, segment.ec_m);
+}
+
+fn put_stream_put_finalize_storage_snapshot(
+    out: &mut Vec<u8>,
+    snapshot: &StreamPutFinalizeStorageSnapshot,
+) {
+    put_stream_upload_record(out, &snapshot.session);
+    put_optional_string(out, snapshot.existing_etag.as_deref());
+    put_u64(out, snapshot.generation_id.get());
+    put_optional_stored_object(out, snapshot.stale_payload_source.as_ref());
+    put_optional_object_payload_reclaim(out, snapshot.stale_payload.as_ref());
+    put_u32(
+        out,
+        u32::try_from(snapshot.staging_segments.len())
+            .expect("stream segment count must fit in u32"),
+    );
+    for segment in &snapshot.staging_segments {
+        put_stream_upload_segment_record(out, segment);
+    }
+}
+
+fn put_stream_put_commit_input(out: &mut Vec<u8>, commit: &StreamPutCommitInput) {
+    put_u8(out, commit.versioning as u8);
+    put_u64(out, commit.version_id.to_u64());
+    put_owner_identity(out, &commit.owner);
+    put_string(out, &commit.acl_grants.serialized());
+    put_bool(out, commit.public_read);
+    put_u64(out, commit.size);
+    put_u64(out, commit.etag_crc64);
+    put_optional_string(out, commit.tags.as_ref().map(|tags| tags.as_str()));
+    put_bytes(out, commit.metadata_blob.as_slice());
+    put_bytes(out, commit.system_metadata_blob.as_slice());
+    put_object_lock_state(out, commit.object_lock);
+    put_object_encryption(out, &commit.encryption);
+}
+
+fn put_stream_upload_part_snapshot(out: &mut Vec<u8>, snapshot: &StreamUploadPartSnapshot) {
+    put_stream_upload_record(out, &snapshot.session);
+    put_multipart_upload_record(out, &snapshot.upload);
+    put_optional_u32(out, snapshot.existing_part_generation);
+    put_u32(
+        out,
+        u32::try_from(snapshot.staging_segments.len())
+            .expect("stream part staging segment count must fit in u32"),
+    );
+    for segment in &snapshot.staging_segments {
+        put_stream_upload_segment_record(out, segment);
+    }
+}
+
+fn put_optional_multipart_part_record(out: &mut Vec<u8>, part: Option<&MultipartPartRecord>) {
+    match part {
+        None => put_u8(out, 0),
+        Some(part) => {
+            put_u8(out, 1);
+            put_multipart_part_record(out, part);
+        }
+    }
+}
+
+fn put_multipart_part_record(out: &mut Vec<u8>, part: &MultipartPartRecord) {
+    put_string(out, part.upload_id.as_str());
+    put_u32(out, part.part_number);
+    put_u32(out, part.generation);
+    put_u64(out, part.size);
+    put_bytes(out, &part.etag);
+    put_u8(out, part.etag_kind as u8);
+    put_bytes(out, &part.part_okh);
+    put_u64(out, part.part_vid.get());
+    put_u8(out, part.ec_k);
+    put_u8(out, part.ec_m);
+    put_u64(out, part.last_modified);
+    put_optional_bytes(
+        out,
+        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
+    );
+}
+
+fn put_stream_part_finalize_storage_snapshot(
+    out: &mut Vec<u8>,
+    snapshot: &StreamUploadPartStorageSnapshot,
+) {
+    put_stream_upload_part_snapshot(out, &snapshot.auth_snapshot);
+    put_optional_multipart_part_record(out, snapshot.existing_part.as_ref());
+    put_u32(
+        out,
+        u32::try_from(snapshot.displaced_segments.len())
+            .expect("stream part displaced segment count must fit in u32"),
+    );
+    for segment in &snapshot.displaced_segments {
+        put_multipart_part_segment_record(out, segment);
+    }
+}
+
 fn put_create_multipart_upload_req(out: &mut Vec<u8>, request: &CreateMultipartUploadReq) {
     put_string(out, request.upload_id.as_str());
     put_string(out, request.bucket.as_str());
@@ -7267,6 +8010,16 @@ fn put_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
         Some(value) => {
             put_u8(out, 1);
             put_u64(out, value);
+        }
+    }
+}
+
+fn put_optional_u32(out: &mut Vec<u8>, value: Option<u32>) {
+    match value {
+        None => put_u8(out, 0),
+        Some(value) => {
+            put_u8(out, 1);
+            put_u32(out, value);
         }
     }
 }

@@ -6390,7 +6390,7 @@ impl super::StorageCluster {
                 return Err(error.into());
             }
         };
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         let (command, new_pending_command, prepared) = loop {
             while let Some(command) = match self.pending_metadata_command_for_bucket(pg_id, bucket)
@@ -6446,7 +6446,7 @@ impl super::StorageCluster {
                 bucket_write_proof_command_owned = true;
             }
 
-            let storage_snapshot = match storage_client
+            let storage_snapshot = match mutation_client
                 .load_stream_put_finalize_snapshot(pg_id, bucket, key, session_id)
             {
                 Ok(snapshot) => snapshot,
@@ -6510,7 +6510,7 @@ impl super::StorageCluster {
                     maybe_run_before_stream_put_finalize_command_id_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                     );
-                    let command = match storage_client.build_stream_put_commit_command(
+                    let command = match mutation_client.build_stream_put_commit_command(
                         BuildStreamPutCommitCommandReq {
                             pg_id,
                             cluster_epoch: self.operation_epoch(),
@@ -7540,7 +7540,7 @@ impl super::StorageCluster {
         mut action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
             let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
@@ -7591,7 +7591,7 @@ impl super::StorageCluster {
                 }};
             }
 
-            let storage_snapshot = match storage_client.load_stream_part_finalize_snapshot(
+            let storage_snapshot = match mutation_client.load_stream_part_finalize_snapshot(
                 pg_id,
                 bucket,
                 key,
@@ -7659,7 +7659,7 @@ impl super::StorageCluster {
                 }
                 command
             } else {
-                let command = match storage_client.build_stream_part_commit_command(
+                let command = match mutation_client.build_stream_part_commit_command(
                     BuildStreamPartCommitCommandReq {
                         pg_id,
                         cluster_epoch: self.operation_epoch(),
