@@ -992,7 +992,7 @@ migrated_simple_object_read_bypasses=$(
             print FILENAME ":" FNR ":" $0
             next
         }
-        if ($0 ~ /\.(matching_stream_upload_exists|build_create_stream_upload_command|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command)\(/) {
+        if ($0 ~ /\.(matching_stream_upload_exists|build_create_stream_upload_command|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command|load_multipart_completion_stale_payload_source|build_complete_multipart_object_command|load_abort_multipart_upload_cleanup|build_abort_multipart_upload_command|build_authorized_abort_multipart_upload_command)\(/) {
             if (pending_object_mutation_metadata_client \
                 || $0 ~ /\.object_mutation_metadata_client\(\)/ \
                 || $0 ~ /mutation_client\./ \
@@ -1004,8 +1004,8 @@ migrated_simple_object_read_bypasses=$(
             print FILENAME ":" FNR ":" $0
             next
         }
-        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_put_object_metadata_snapshot|build_put_object_metadata_command|load_current_object_delete_snapshot|load_specific_object_delete_snapshot|list_object_versions_for_lifecycle|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|prepare_stream_segment_append|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command)\(/) {
-            if (($0 ~ /\.(load_put_object_metadata_snapshot|build_put_object_metadata_command|load_current_object_delete_snapshot|load_specific_object_delete_snapshot|list_object_versions_for_lifecycle|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command|matching_stream_upload_exists|build_create_stream_upload_command|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command)\(/) \
+        if ($0 ~ /\.(load_object_if|load_existing_live_object|load_put_object_metadata_snapshot|build_put_object_metadata_command|load_current_object_delete_snapshot|load_specific_object_delete_snapshot|list_object_versions_for_lifecycle|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|prepare_stream_segment_append|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command|load_multipart_completion_stale_payload_source|build_complete_multipart_object_command|load_abort_multipart_upload_cleanup|build_abort_multipart_upload_command|build_authorized_abort_multipart_upload_command)\(/) {
+            if (($0 ~ /\.(load_put_object_metadata_snapshot|build_put_object_metadata_command|load_current_object_delete_snapshot|load_specific_object_delete_snapshot|list_object_versions_for_lifecycle|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command|matching_stream_upload_exists|build_create_stream_upload_command|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command|load_multipart_completion_stale_payload_source|build_complete_multipart_object_command|load_abort_multipart_upload_cleanup|build_abort_multipart_upload_command|build_authorized_abort_multipart_upload_command)\(/) \
                 && (pending_object_mutation_metadata_client \
                     || $0 ~ /\.object_mutation_metadata_client\(\)/ \
                     || $0 ~ /mutation_client\./ \
@@ -1374,7 +1374,8 @@ multipart_abort_command_build_bypasses=$(
             && ($0 ~ /primary_node\.get_pg\(/ \
                 || $0 ~ /prepare_(authorized_)?abort_multipart_upload_cleanup\(/ \
                 || $0 ~ /next_object_metadata_command_id\(/ \
-                || $0 ~ /AbortMultipartUploadCommand/)) {
+                || ($0 ~ /AbortMultipartUploadCommand/ \
+                    && $0 !~ /Build(Authorized)?AbortMultipartUploadCommandReq/))) {
             print FILENAME ":" FNR ":" $0
         }
     }

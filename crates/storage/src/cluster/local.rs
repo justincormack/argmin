@@ -4154,6 +4154,7 @@ mod tests {
             b"streamed completion",
         );
 
+        let selected_streaming_segment = expected_segment.clone();
         expected_segment.version_id = crate::VersionId::Null.to_u64();
         (
             crate::CompleteMultipartCommitRequest {
@@ -4172,7 +4173,10 @@ mod tests {
                 system_metadata_blob: Some(upload.system_metadata_blob),
                 object_lock: upload.object_lock,
                 encryption: upload.encryption,
+                expected_stale_payload_source: None,
                 part_records: vec![part],
+                selected_streaming_segments: vec![selected_streaming_segment],
+                expected_cleanup: crate::CompleteMultipartCommitCleanup::default(),
             },
             expected_segment,
         )
@@ -5918,6 +5922,17 @@ mod tests {
         let upload_row = cluster
             .load_in_progress_multipart_upload(bucket, &upload.key, &upload.upload_id)
             .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+        let requested_parts = upload
+            .parts
+            .iter()
+            .map(|part| part.part_number)
+            .collect::<Vec<_>>();
+        let completion_snapshot = cluster
+            .load_multipart_completion_snapshot(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload_row.clone()),
+                &requested_parts,
+            )
+            .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
         let size = upload.parts.iter().map(|part| part.size).sum();
         cluster
             .complete_multipart_upload_commit_serialized(
@@ -5937,7 +5952,10 @@ mod tests {
                     system_metadata_blob: Some(upload_row.system_metadata_blob),
                     object_lock: upload_row.object_lock,
                     encryption: upload_row.encryption,
+                    expected_stale_payload_source: completion_snapshot.stale_payload_source,
                     part_records: upload.parts.clone(),
+                    selected_streaming_segments: completion_snapshot.selected_streaming_segments,
+                    expected_cleanup: completion_snapshot.cleanup,
                 },
                 16,
             )
@@ -25843,6 +25861,23 @@ mod tests {
                 )
                 .unwrap());
         }
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &req.upload_id)
+            .unwrap();
+        let requested_parts = req
+            .part_records
+            .iter()
+            .map(|part| part.part_number)
+            .collect::<Vec<_>>();
+        let completion_snapshot = cluster
+            .load_multipart_completion_snapshot(
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                &requested_parts,
+            )
+            .unwrap();
+        req.expected_stale_payload_source = completion_snapshot.stale_payload_source;
+        req.selected_streaming_segments = completion_snapshot.selected_streaming_segments;
+        req.expected_cleanup = completion_snapshot.cleanup;
 
         let outcome = cluster
             .complete_multipart_upload_commit_serialized(req.clone(), 16)

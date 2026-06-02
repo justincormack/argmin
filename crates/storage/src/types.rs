@@ -3186,7 +3186,10 @@ pub struct MultipartPartRecord {
 #[derive(Debug, Clone)]
 pub struct MultipartCompletionSnapshot {
     pub existing_etag: Option<String>,
+    pub stale_payload_source: Option<StoredObject>,
     pub part_records: Vec<MultipartPartRecord>,
+    pub selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub cleanup: CompleteMultipartCommitCleanup,
 }
 
 #[derive(Debug, Clone)]
@@ -3224,7 +3227,10 @@ pub struct CompleteMultipartCommitRequest {
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
+    pub expected_stale_payload_source: Option<StoredObject>,
     pub part_records: Vec<MultipartPartRecord>,
+    pub selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub expected_cleanup: CompleteMultipartCommitCleanup,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -698,7 +698,11 @@ impl Coordinator {
                             upload.object_lock,
                         )?,
                         encryption: final_encryption,
+                        expected_stale_payload_source: completion_snapshot.stale_payload_source,
                         part_records: part_records.clone(),
+                        selected_streaming_segments: completion_snapshot
+                            .selected_streaming_segments,
+                        expected_cleanup: completion_snapshot.cleanup,
                     },
                     COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
                 ) {

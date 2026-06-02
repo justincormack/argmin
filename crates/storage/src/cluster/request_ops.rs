@@ -7327,7 +7327,7 @@ impl super::StorageCluster {
 
     pub fn complete_multipart_upload_commit_serialized(
         &self,
-        req: CompleteMultipartCommitRequest,
+        mut req: CompleteMultipartCommitRequest,
         keep_completed_uploads: usize,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
         let bucket = req.bucket.clone();
@@ -7337,7 +7337,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
         let _completion_guard =
             self.lock_multipart_completion_bucket_on_bucket_metadata_primary(&bucket)?;
-        let storage_client = self.object_metadata_primary_client(&bucket, &key)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
 
         'retry_after_pending_conflict: loop {
             let reservation = match self.acquire_durable_bucket_write_reservation(
@@ -7403,6 +7403,21 @@ impl super::StorageCluster {
                 .into());
             }
 
+            if req.versioning != BucketVersioningState::Enabled {
+                match mutation_client
+                    .load_multipart_completion_stale_payload_source(pg_id, &bucket, &key)
+                {
+                    Ok(current_stale_payload_source) => {
+                        req.expected_stale_payload_source = current_stale_payload_source;
+                    }
+                    Err(error) => {
+                        drop(_bucket_guard);
+                        release_bucket_write_proof!()?;
+                        return Err(error);
+                    }
+                }
+            }
+
             let version_id = if req.versioning == BucketVersioningState::Enabled {
                 match self.reserve_next_object_version(pg_id, &bucket, &key) {
                     Ok(version_id) => version_id,
@@ -7423,7 +7438,7 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let command = match storage_client.build_complete_multipart_object_command(
+            let command = match mutation_client.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
                     pg_id,
                     cluster_epoch: self.operation_epoch(),
@@ -7446,6 +7461,27 @@ impl super::StorageCluster {
                     }
                     drop(_bucket_guard);
                     release_bucket_write_proof!()?;
+                    continue 'retry_after_pending_conflict;
+                }
+                Err(ObjectPgActionError::StaleMultipartCompletionSnapshot)
+                    if version_id.is_null() =>
+                {
+                    let current_stale_payload_source = match mutation_client
+                        .load_multipart_completion_stale_payload_source(pg_id, &bucket, &key)
+                    {
+                        Ok(source) => source,
+                        Err(error) => {
+                            drop(_bucket_guard);
+                            release_bucket_write_proof!()?;
+                            return Err(error);
+                        }
+                    };
+                    drop(_bucket_guard);
+                    release_bucket_write_proof!()?;
+                    if current_stale_payload_source == req.expected_stale_payload_source {
+                        return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);
+                    }
+                    req.expected_stale_payload_source = current_stale_payload_source;
                     continue 'retry_after_pending_conflict;
                 }
                 Err(error) => {
@@ -7915,6 +7951,10 @@ impl super::StorageCluster {
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue 'retry_after_pending_conflict;
                 }
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    continue 'retry_after_pending_conflict;
+                }
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
                     return Err(error);
@@ -8030,6 +8070,10 @@ impl super::StorageCluster {
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue 'retry_after_pending_conflict;
                 }
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                    continue 'retry_after_pending_conflict;
+                }
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
                     return Err(error);
@@ -8096,15 +8140,20 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        self.object_metadata_primary_client(bucket, key)?
-            .build_abort_multipart_upload_command(
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let expected_cleanup =
+            mutation_client.load_abort_multipart_upload_cleanup(pg_id, bucket, key, upload_id)?;
+        mutation_client.build_abort_multipart_upload_command(
+            crate::node_client::BuildAbortMultipartUploadCommandReq {
                 pg_id,
-                self.operation_epoch(),
+                cluster_epoch: self.operation_epoch(),
                 bucket,
                 key,
                 upload_id,
+                expected_cleanup: expected_cleanup.as_ref(),
                 bucket_write_reservation,
-            )
+            },
+        )
     }
 
     fn prepare_authorized_abort_multipart_upload_command(
@@ -8113,15 +8162,30 @@ impl super::StorageCluster {
         authorized_upload: &AuthorizedMultipartUploadRecord,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        self.object_metadata_primary_client(
+        let mutation_client = self.object_mutation_metadata_primary_client(
             &authorized_upload.record().bucket,
             &authorized_upload.record().key,
-        )?
-        .build_authorized_abort_multipart_upload_command(
+        )?;
+        let expected_cleanup = mutation_client.load_abort_multipart_upload_cleanup(
             pg_id,
-            self.operation_epoch(),
-            authorized_upload,
-            bucket_write_reservation,
+            &authorized_upload.record().bucket,
+            &authorized_upload.record().key,
+            &authorized_upload.record().upload_id,
+        )?;
+        if expected_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.upload != *authorized_upload.record())
+        {
+            return Ok(None);
+        }
+        mutation_client.build_authorized_abort_multipart_upload_command(
+            crate::node_client::BuildAuthorizedAbortMultipartUploadCommandReq {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                authorized_upload,
+                expected_cleanup: expected_cleanup.as_ref(),
+                bucket_write_reservation,
+            },
         )
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,8 +25,9 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
-    decode_bucket_info_outcome_response, decode_bucket_snapshot_pair_response,
-    decode_bucket_snapshot_response, decode_bucket_write_reservation_record_response,
+    decode_abort_multipart_cleanup_response, decode_bucket_info_outcome_response,
+    decode_bucket_snapshot_pair_response, decode_bucket_snapshot_response,
+    decode_bucket_write_reservation_record_response,
     decode_completed_multipart_order_command_build_response,
     decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
     decode_direct_put_commit_snapshot_response, decode_metadata_command_acceptance_response,
@@ -36,19 +37,23 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
-    decode_multipart_upload_match_response, decode_object_delete_snapshot_response,
-    decode_object_generation_reservation_response, decode_object_generation_response,
-    decode_object_lifecycle_version_list_response, decode_object_metadata_command_build_response,
-    decode_object_read_auth_subject_response, decode_object_read_snapshot_response,
-    decode_object_tags_for_subject_response, decode_object_version_response,
-    decode_put_object_metadata_snapshot_response, decode_read_handle_acquire_response,
-    decode_read_handle_release_response, decode_scavenger_list_files_response,
-    decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-    decode_storage_rpc_response_payload, decode_stream_part_finalize_snapshot_response,
-    decode_stream_put_finalize_snapshot_response, decode_stream_upload_match_response,
-    encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
+    decode_multipart_completion_stale_source_response, decode_multipart_upload_match_response,
+    decode_object_delete_snapshot_response, decode_object_generation_reservation_response,
+    decode_object_generation_response, decode_object_lifecycle_version_list_response,
+    decode_object_metadata_command_build_response, decode_object_read_auth_subject_response,
+    decode_object_read_snapshot_response, decode_object_tags_for_subject_response,
+    decode_object_version_response, decode_put_object_metadata_snapshot_response,
+    decode_read_handle_acquire_response, decode_read_handle_release_response,
+    decode_scavenger_list_files_response, decode_shard_read_range_response,
+    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
+    decode_stream_upload_match_response, encode_abort_multipart_cleanup_request,
+    encode_abort_multipart_command_build_request,
+    encode_authorized_abort_multipart_command_build_request, encode_bucket_request,
+    encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
     encode_bucket_write_reservation_record_request,
+    encode_complete_multipart_command_build_request,
     encode_completed_multipart_order_command_build_request,
     encode_create_bucket_command_build_request,
     encode_create_multipart_upload_command_build_request,
@@ -70,11 +75,14 @@ use crate::storage_rpc::{
     encode_shard_write_request, encode_stream_part_commit_command_build_request,
     encode_stream_part_finalize_snapshot_request, encode_stream_put_commit_command_build_request,
     encode_stream_put_finalize_snapshot_request, encode_stream_upload_match_request,
-    read_storage_rpc_frame_from, write_storage_rpc_frame_to, StorageRpcBucketInfoOutcome,
+    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
+    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketInfoOutcome,
     StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
+    StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcCreateMultipartUploadCommandBuildRequest,
@@ -109,29 +117,30 @@ use crate::storage_rpc::{
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
-    AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
-    BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
-    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
-    CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
-    CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
-    DirectPutCommitStorageSnapshot, EcShape, GenerationId, LifecycleSweepBuckets,
-    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListMultipartUploadsReq,
-    ListMultipartUploadsResp, ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq,
-    ListObjectsResp, ListPartsReq, ListedMultipartParts, LiveObjectRecord,
-    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag,
-    ObjectKey, ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
-    ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
-    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey,
-    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, StoredObject, StreamPutCommitInput,
-    StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord, StreamUploadPartStorageSnapshot,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
+    AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord,
+    BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot,
+    BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
+    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+    CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
+    CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
+    EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
+    ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
+    ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsReq, ListedMultipartParts,
+    LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
+    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+    PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId,
+    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference, StoredObject,
+    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
+    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+    VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -419,6 +428,55 @@ fn snapshot_upload_part_stream_cleanup_from_pg(
     ))
 }
 
+fn snapshot_complete_multipart_cleanup_from_pg(
+    pg: &crate::PgStore,
+    upload_id: &UploadId,
+    selected_part_numbers: &BTreeSet<u32>,
+) -> Result<
+    (
+        Vec<MultipartPartSegmentRecord>,
+        CompleteMultipartCommitCleanup,
+    ),
+    ObjectPgActionError,
+> {
+    let all_parts = PgMetadataStore::list_multipart_parts(
+        pg,
+        &ListPartsReq {
+            upload_id: upload_id.clone(),
+            part_number_marker: None,
+            max_parts: u32::MAX,
+        },
+    )?
+    .parts;
+    let omitted_parts = all_parts
+        .into_iter()
+        .filter(|part| !selected_part_numbers.contains(&part.part_number))
+        .collect::<Vec<_>>();
+    let all_streaming_segments =
+        PgMetadataStore::get_all_multipart_part_segments_for_upload(pg, upload_id)?;
+    let mut selected_streaming_segments = Vec::new();
+    let mut omitted_streaming_segments = Vec::new();
+    for segment in all_streaming_segments {
+        if selected_part_numbers.contains(&segment.part_number) {
+            selected_streaming_segments.push(segment);
+        } else {
+            omitted_streaming_segments.push(segment);
+        }
+    }
+    let (stream_uploads, stream_upload_segments) =
+        snapshot_upload_part_stream_cleanup_from_pg(pg, upload_id)?;
+
+    Ok((
+        selected_streaming_segments,
+        CompleteMultipartCommitCleanup {
+            omitted_parts,
+            omitted_streaming_segments,
+            stream_uploads,
+            stream_upload_segments,
+        },
+    ))
+}
+
 fn snapshot_direct_put_stale_payload_command(
     pg: &crate::PgStore,
     bucket: &BucketName,
@@ -459,12 +517,46 @@ fn snapshot_direct_put_stale_payload_for_snapshot(
     Ok((Some(stored), Some(reclaim)))
 }
 
+fn load_null_live_stale_payload_source_from_pg(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> Result<Option<StoredObject>, MetadataError> {
+    let stored = match PgMetadataStore::get_object_version(pg, bucket, key, VersionId::Null) {
+        Ok(stored) => stored,
+        Err(MetadataError::ObjectNotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match stored {
+        StoredObject::Live(_) => Ok(Some(stored)),
+        StoredObject::DeleteMarker(_) => Ok(None),
+    }
+}
+
 fn normalize_reclaim_created_at(reclaim: &mut Option<ObjectPayloadReclaimCommand>) {
     match reclaim {
         Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => reclaim.created_at = 0,
         Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => reclaim.created_at = 0,
         None => {}
     }
+}
+
+fn terminal_stream_cleanup_rows_match(
+    left_uploads: &[TerminalStreamCleanupRecord],
+    right_uploads: &[TerminalStreamCleanupRecord],
+    left_segments: &[StreamUploadSegmentRecord],
+    right_segments: &[StreamUploadSegmentRecord],
+) -> bool {
+    left_uploads.len() == right_uploads.len()
+        && left_uploads
+            .iter()
+            .zip(right_uploads)
+            .all(|(left, right)| left == right)
+        && left_segments.len() == right_segments.len()
+        && left_segments
+            .iter()
+            .zip(right_segments)
+            .all(|(left, right)| left == right)
 }
 
 fn normalize_delete_target_created_at(target: &mut Option<DeleteObjectVersionTarget>) {
@@ -967,6 +1059,36 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         &self,
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn load_multipart_completion_stale_payload_source(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError>;
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn load_abort_multipart_upload_cleanup(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError>;
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
@@ -1070,6 +1192,34 @@ pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
     pub(crate) version_id: VersionId,
     pub(crate) completion_order: u64,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+struct AbortMultipartCommandValidation<'a> {
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    upload_id: &'a UploadId,
+    expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
+    bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) struct BuildAbortMultipartUploadCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) bucket: &'a BucketName,
+    pub(crate) key: &'a ObjectKey,
+    pub(crate) upload_id: &'a UploadId,
+    pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+}
+
+pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
+    pub(crate) pg_id: PgId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) authorized_upload: &'a AuthorizedMultipartUploadRecord,
+    pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
@@ -1652,22 +1802,22 @@ pub(crate) trait StorageNodeClient:
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError>;
 
-    fn build_abort_multipart_upload_command(
+    fn load_abort_multipart_upload_cleanup(
         &self,
         pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError>;
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 
     fn build_authorized_abort_multipart_upload_command(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        bucket_write_reservation: BucketWriteReservationProof,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 
     fn payload_reclaim_exists(
@@ -3884,6 +4034,51 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         <Self as StorageNodeClient>::build_stream_part_commit_command(self, request)
     }
+
+    fn load_multipart_completion_stale_payload_source(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(load_null_live_stale_payload_source_from_pg(
+            &pg, bucket, key,
+        )?)
+    }
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_complete_multipart_object_command(self, request)
+    }
+
+    fn load_abort_multipart_upload_cleanup(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::load_abort_multipart_upload_cleanup(
+            self, pg_id, bucket, key, upload_id,
+        )
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_abort_multipart_upload_command(self, request)
+    }
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::build_authorized_abort_multipart_upload_command(self, request)
+    }
 }
 
 impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
@@ -4564,6 +4759,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             StorageRpcMessageKind::ObjectStreamUploadCommandBuild,
             payload,
             "decode stream upload command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
             |command| self.validate_create_stream_upload_command_response(command, &request),
         )? {
             Some(command) => Ok(command),
@@ -4600,6 +4796,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             StorageRpcMessageKind::ObjectMultipartUploadCommandBuild,
             payload,
             "decode multipart upload command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
             |command| self.validate_create_multipart_upload_command_response(command, &request),
         )? {
             Some(command) => Ok(command),
@@ -4784,6 +4981,194 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }
     }
 
+    fn load_multipart_completion_stale_payload_source(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let request = self.object_request(pg_id, bucket, key);
+        let payload = encode_object_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_multipart_completion_stale_source_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode multipart completion stale source response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(source) = response.source.as_ref() {
+            match source {
+                StoredObject::Live(live)
+                    if live.bucket == *bucket && live.key == *key && live.version_id.is_null() => {}
+                _ => {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate multipart completion stale source response",
+                        "stale source must be null live object for requested object".to_string(),
+                    )));
+                }
+            }
+        }
+        Ok(response.source)
+    }
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let rpc_request = StorageRpcCompleteMultipartCommandBuildRequest {
+            object: self.object_request(
+                request.pg_id,
+                &request.request.bucket,
+                &request.request.key,
+            ),
+            request: request.request.clone(),
+            version_id: request.version_id,
+            completion_order: request.completion_order,
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_complete_multipart_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode complete multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        match self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild,
+            payload,
+            "decode complete multipart command build response",
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            |command| self.validate_complete_multipart_command_response(command, &request),
+        )? {
+            Some(command) => Ok(command),
+            None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "decode complete multipart command build response",
+                "complete multipart command build cannot return missing".to_string(),
+            ))),
+        }
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let bucket = request.bucket;
+        let key = request.key;
+        let upload_id = request.upload_id;
+        let rpc_request = StorageRpcAbortMultipartCommandBuildRequest {
+            object: self.object_request(request.pg_id, bucket, key),
+            upload_id: upload_id.clone(),
+            expected_cleanup: request.expected_cleanup.cloned(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_abort_multipart_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode abort multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartAbortCommandBuild,
+            payload,
+            "decode abort multipart command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                self.validate_abort_multipart_command_response(
+                    command,
+                    &AbortMultipartCommandValidation {
+                        pg_id: request.pg_id,
+                        cluster_epoch: request.cluster_epoch,
+                        bucket,
+                        key,
+                        upload_id,
+                        expected_cleanup: request.expected_cleanup,
+                        bucket_write_reservation: &request.bucket_write_reservation,
+                    },
+                )
+            },
+        )
+    }
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let bucket = &request.authorized_upload.record().bucket;
+        let key = &request.authorized_upload.record().key;
+        let upload_id = &request.authorized_upload.record().upload_id;
+        let rpc_request = StorageRpcAuthorizedAbortMultipartCommandBuildRequest {
+            object: self.object_request(request.pg_id, bucket, key),
+            authorized_upload: request.authorized_upload.record().clone(),
+            expected_cleanup: request.expected_cleanup.cloned(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload = encode_authorized_abort_multipart_command_build_request(&rpc_request)
+            .map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode authorized abort multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild,
+            payload,
+            "decode authorized abort multipart command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                self.validate_abort_multipart_command_response(
+                    command,
+                    &AbortMultipartCommandValidation {
+                        pg_id: request.pg_id,
+                        cluster_epoch: request.cluster_epoch,
+                        bucket,
+                        key,
+                        upload_id,
+                        expected_cleanup: request.expected_cleanup,
+                        bucket_write_reservation: &request.bucket_write_reservation,
+                    },
+                )
+            },
+        )
+    }
+
+    fn load_abort_multipart_upload_cleanup(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
+        let request = StorageRpcAbortMultipartCleanupRequest {
+            object: self.object_request(pg_id, bucket, key),
+            upload_id: upload_id.clone(),
+        };
+        let payload = encode_abort_multipart_cleanup_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_abort_multipart_cleanup_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode abort multipart cleanup response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(cleanup) = response.cleanup.as_ref() {
+            self.validate_abort_cleanup_snapshot_response(cleanup, bucket, key, upload_id)?;
+        }
+        Ok(response.cleanup)
+    }
+
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: PgId,
@@ -4938,6 +5323,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild,
             payload,
             "decode delete-specific object command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
             |command| self.validate_delete_specific_object_command_response(command, &request),
         )
     }
@@ -4963,6 +5349,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild,
             payload,
             "decode delete-current object command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
             |command| self.validate_delete_current_object_command_response(command, &request),
         )
     }
@@ -5001,6 +5388,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild,
             payload,
             "decode insert-delete-marker command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
             |command| self.validate_insert_delete_marker_command_response(command, &request),
         )? {
             Some(command) => Ok(command),
@@ -5308,6 +5696,7 @@ impl UnixStorageNodeClient {
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
         decode_context: &'static str,
+        stale_snapshot_error: ObjectPgActionError,
         validate: impl FnOnce(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let response = self
@@ -5324,9 +5713,7 @@ impl UnixStorageNodeClient {
                 validate(&command)?;
                 Ok(Some(*command))
             }
-            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
-                Err(ObjectPgActionError::StaleObjectReadSubject)
-            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => Err(stale_snapshot_error),
             StorageRpcObjectMetadataCommandBuildOutcome::Missing => Ok(None),
         }
     }
@@ -5904,6 +6291,389 @@ impl UnixStorageNodeClient {
                 context,
                 "response command does not match request".to_string(),
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_complete_multipart_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate complete multipart command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not complete multipart".to_string(),
+            )));
+        };
+        let parts_count = std::num::NonZeroU32::new(
+            u32::try_from(request.request.part_records.len()).map_err(|_| {
+                ObjectPgActionError::Store(
+                    self.rpc_payload_error(context, "request part count exceeds u32".to_string()),
+                )
+            })?,
+        )
+        .ok_or_else(|| {
+            ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "complete multipart response requires at least one part".to_string(),
+            ))
+        })?;
+        let expected_etag = ObjectEtag::MultipartComposite {
+            crc64: request.request.etag_crc64,
+            parts: parts_count,
+        };
+        if !commit.matches_request(
+            &request.request.bucket,
+            &request.request.key,
+            &request.request.upload_id,
+            request.request.generation_id,
+            &request.request.part_records,
+        ) || commit.object.version_id != request.version_id
+            || commit.object.owner != request.request.owner
+            || commit.object.acl_grants != request.request.acl_grants
+            || commit.object.public_read != request.request.public_read
+            || commit.object.size != request.request.size
+            || commit.object.etag != expected_etag
+            || commit.object.layout != (ObjectLayout::MultipartManifest { parts_count })
+            || commit.object.tags != request.request.tags
+            || commit.object.metadata_blob != request.request.metadata_blob
+            || commit.object.system_metadata_blob != request.request.system_metadata_blob
+            || commit.object.object_lock != request.request.object_lock
+            || commit.object.encryption != request.request.encryption
+            || commit.completion_order != request.completion_order
+            || commit.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command does not match request".to_string(),
+            )));
+        }
+        for part in &commit.parts {
+            if part.bucket != request.request.bucket
+                || part.key != request.request.key
+                || part.version_id != request.version_id
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response object part identity does not match request".to_string(),
+                )));
+            }
+        }
+        for segment in commit
+            .selected_streaming_segments
+            .iter()
+            .chain(commit.omitted_streaming_segments.iter())
+        {
+            if segment.bucket != request.request.bucket
+                || segment.key != request.request.key
+                || segment.upload_id != request.request.upload_id
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response multipart segment identity does not match request".to_string(),
+                )));
+            }
+        }
+        let mut selected_part_numbers = BTreeMap::new();
+        for part in &request.request.part_records {
+            if selected_part_numbers
+                .insert(part.part_number, part)
+                .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "request contains duplicate multipart part numbers".to_string(),
+                )));
+            }
+        }
+        let mut omitted_part_numbers = BTreeMap::new();
+        for part in &commit.omitted_parts {
+            if part.upload_id != request.request.upload_id
+                || selected_part_numbers.contains_key(&part.part_number)
+                || omitted_part_numbers
+                    .insert(part.part_number, part.generation)
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response omitted part cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        let mut expected_selected_streaming_segments =
+            request.request.selected_streaming_segments.clone();
+        for segment in &mut expected_selected_streaming_segments {
+            segment.version_id = request.version_id.to_u64();
+        }
+        if commit.selected_streaming_segments != expected_selected_streaming_segments {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response selected streaming segment cleanup does not match request".to_string(),
+            )));
+        }
+        let mut omitted_segment_ids = BTreeMap::new();
+        for segment in &commit.omitted_streaming_segments {
+            if selected_part_numbers.contains_key(&segment.part_number)
+                || omitted_segment_ids
+                    .insert(
+                        (segment.part_number, segment.segment_index),
+                        segment.version_id,
+                    )
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response omitted streaming segment cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        if commit.omitted_parts != request.request.expected_cleanup.omitted_parts
+            || commit.omitted_streaming_segments
+                != request.request.expected_cleanup.omitted_streaming_segments
+            || !terminal_stream_cleanup_rows_match(
+                &commit.stream_uploads,
+                &request.request.expected_cleanup.stream_uploads,
+                &commit.stream_upload_segments,
+                &request.request.expected_cleanup.stream_upload_segments,
+            )
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response cleanup does not match expected snapshot".to_string(),
+            )));
+        }
+        self.validate_terminal_stream_cleanup_response(
+            &commit.stream_uploads,
+            &commit.stream_upload_segments,
+            &request.request.bucket,
+            &request.request.key,
+            &request.request.upload_id,
+            context,
+        )?;
+        if request.version_id.is_null() {
+            if let Some(payload) = commit.stale_payload.as_ref() {
+                self.validate_reclaim_payload_response(
+                    payload,
+                    &request.request.bucket,
+                    &request.request.key,
+                    context,
+                )?;
+                if !reclaim_matches_snapshot_live_object(
+                    Some(payload),
+                    &request.request.expected_stale_payload_source,
+                ) {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        context,
+                        "response stale payload does not match expected source".to_string(),
+                    )));
+                }
+            } else if request.request.expected_stale_payload_source.is_some() {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response missing expected stale payload".to_string(),
+                )));
+            }
+        } else if commit.stale_payload.is_some() {
+            return Err(ObjectPgActionError::Store(
+                self.rpc_payload_error(
+                    context,
+                    "versioned complete multipart response must not reclaim stale null payload"
+                        .to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_abort_multipart_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        request: &AbortMultipartCommandValidation<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate abort multipart command build response";
+        self.validate_object_metadata_command_route(
+            command,
+            request.pg_id,
+            request.cluster_epoch,
+            context,
+        )?;
+        let MetadataCommandPayload::AbortMultipartUpload(abort) = command.payload() else {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command payload is not abort multipart".to_string(),
+            )));
+        };
+        if abort.bucket != *request.bucket
+            || abort.key != *request.key
+            || abort.upload_id != *request.upload_id
+            || abort.bucket_write_reservation != *request.bucket_write_reservation
+            || abort.cleanup.upload.bucket != *request.bucket
+            || abort.cleanup.upload.key != *request.key
+            || abort.cleanup.upload.upload_id != *request.upload_id
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response command identity does not match request".to_string(),
+            )));
+        }
+        if request.expected_cleanup != Some(&abort.cleanup) {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response cleanup does not match expected snapshot".to_string(),
+            )));
+        }
+        let mut part_numbers = BTreeMap::new();
+        for part in &abort.cleanup.parts {
+            if part.upload_id != *request.upload_id
+                || part_numbers
+                    .insert(part.part_number, part.generation)
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response part cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        let mut segment_ids = BTreeMap::new();
+        for segment in &abort.cleanup.streaming_segments {
+            if segment.bucket != *request.bucket
+                || segment.key != *request.key
+                || segment.upload_id != *request.upload_id
+                || segment_ids
+                    .insert(
+                        (segment.part_number, segment.segment_index),
+                        segment.version_id,
+                    )
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response streaming segment cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        self.validate_terminal_stream_cleanup_response(
+            &abort.cleanup.stream_uploads,
+            &abort.cleanup.stream_upload_segments,
+            request.bucket,
+            request.key,
+            request.upload_id,
+            context,
+        )?;
+        Ok(())
+    }
+
+    fn validate_abort_cleanup_snapshot_response(
+        &self,
+        cleanup: &AbortMultipartUploadCleanup,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<(), ObjectPgActionError> {
+        let context = "validate abort multipart cleanup response";
+        if cleanup.upload.bucket != *bucket
+            || cleanup.upload.key != *key
+            || cleanup.upload.upload_id != *upload_id
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "cleanup upload does not match request".to_string(),
+            )));
+        }
+        let mut part_numbers = BTreeMap::new();
+        for part in &cleanup.parts {
+            if part.upload_id != *upload_id
+                || part_numbers
+                    .insert(part.part_number, part.generation)
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "part cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        let mut segment_ids = BTreeMap::new();
+        for segment in &cleanup.streaming_segments {
+            if segment.bucket != *bucket
+                || segment.key != *key
+                || segment.upload_id != *upload_id
+                || segment_ids
+                    .insert(
+                        (segment.part_number, segment.segment_index),
+                        segment.version_id,
+                    )
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "streaming segment cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        self.validate_terminal_stream_cleanup_response(
+            &cleanup.stream_uploads,
+            &cleanup.stream_upload_segments,
+            bucket,
+            key,
+            upload_id,
+            context,
+        )
+    }
+
+    fn validate_terminal_stream_cleanup_response(
+        &self,
+        stream_uploads: &[crate::types::TerminalStreamCleanupRecord],
+        stream_upload_segments: &[StreamUploadSegmentRecord],
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut sessions = BTreeMap::new();
+        for stream in stream_uploads {
+            let StreamUploadTarget::UploadPart {
+                upload_id: stream_upload_id,
+                ..
+            } = &stream.target
+            else {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response stream cleanup target is not upload-part".to_string(),
+                )));
+            };
+            if stream.bucket != *bucket
+                || stream.key != *key
+                || stream_upload_id != upload_id
+                || sessions.insert(stream.session_id.clone(), stream).is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response stream cleanup does not match request".to_string(),
+                )));
+            }
+        }
+        let mut segment_ids = BTreeMap::new();
+        for segment in stream_upload_segments {
+            if !sessions.contains_key(&segment.session_id)
+                || segment_ids
+                    .insert((segment.session_id.clone(), segment.segment_index), ())
+                    .is_some()
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response stream segment cleanup does not match request".to_string(),
+                )));
+            }
         }
         Ok(())
     }
@@ -7514,9 +8284,20 @@ impl StorageNodeClient for LocalStorageNodeClient {
         for &part_number in requested_part_numbers {
             part_records.push(pg.get_multipart_part(upload_id, part_number)?);
         }
+        let selected_part_numbers = part_records
+            .iter()
+            .map(|part| part.part_number)
+            .collect::<BTreeSet<_>>();
+        let (selected_streaming_segments, cleanup) =
+            snapshot_complete_multipart_cleanup_from_pg(&pg, upload_id, &selected_part_numbers)?;
+        let (stale_payload_source, _) =
+            snapshot_direct_put_stale_payload_for_snapshot(&pg, bucket, key, 0)?;
         Ok(MultipartCompletionSnapshot {
             existing_etag,
+            stale_payload_source,
             part_records,
+            selected_streaming_segments,
+            cleanup,
         })
     }
 
@@ -7601,55 +8382,76 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(MultipartUploadManagementLookup::Missing)
     }
 
-    fn build_abort_multipart_upload_command(
+    fn load_abort_multipart_upload_cleanup(
         &self,
         pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-        bucket_write_reservation: BucketWriteReservationProof,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        let Some(cleanup) = pg.prepare_abort_multipart_upload_cleanup(bucket, key, upload_id)?
-        else {
+        Ok(pg.prepare_abort_multipart_upload_cleanup(bucket, key, upload_id)?)
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let cleanup = pg.prepare_abort_multipart_upload_cleanup(
+            request.bucket,
+            request.key,
+            request.upload_id,
+        )?;
+        if cleanup.as_ref() != request.expected_cleanup {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let Some(cleanup) = cleanup else {
             return Ok(None);
         };
-        let command_id = self.next_metadata_command_id_from_locked_pg(pg_id, cluster_epoch, &pg)?;
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
         Ok(Some(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                upload_id: upload_id.clone(),
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                upload_id: request.upload_id.clone(),
                 cleanup,
-                bucket_write_reservation,
+                bucket_write_reservation: request.bucket_write_reservation,
             })),
         )))
     }
 
     fn build_authorized_abort_multipart_upload_command(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        bucket_write_reservation: BucketWriteReservationProof,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let Some(cleanup) =
-            pg.prepare_authorized_abort_multipart_upload_cleanup(authorized_upload)?
-        else {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let cleanup =
+            pg.prepare_authorized_abort_multipart_upload_cleanup(request.authorized_upload)?;
+        if cleanup.as_ref() != request.expected_cleanup {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let Some(cleanup) = cleanup else {
             return Ok(None);
         };
-        let command_id = self.next_metadata_command_id_from_locked_pg(pg_id, cluster_epoch, &pg)?;
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id,
+            request.cluster_epoch,
+            &pg,
+        )?;
         Ok(Some(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
-                bucket: authorized_upload.record().bucket.clone(),
-                key: authorized_upload.record().key.clone(),
-                upload_id: authorized_upload.record().upload_id.clone(),
+                bucket: request.authorized_upload.record().bucket.clone(),
+                key: request.authorized_upload.record().key.clone(),
+                upload_id: request.authorized_upload.record().upload_id.clone(),
                 cleanup,
-                bucket_write_reservation,
+                bucket_write_reservation: request.bucket_write_reservation,
             })),
         )))
     }
@@ -8333,6 +9135,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 reason: "unversioned multipart completion must use null version id".to_string(),
             });
         }
+        if request.version_id.is_null() {
+            let (stale_payload_source, _) = snapshot_direct_put_stale_payload_for_snapshot(
+                &pg,
+                &complete.bucket,
+                &complete.key,
+                0,
+            )?;
+            if stale_payload_source != complete.expected_stale_payload_source {
+                return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);
+            }
+        }
 
         let parts_len =
             u32::try_from(complete.part_records.len()).map_err(|_| MetadataError::Db {
@@ -8396,33 +9209,20 @@ impl StorageNodeClient for LocalStorageNodeClient {
             })
             .collect();
 
-        let all_parts = PgMetadataStore::list_multipart_parts(
-            &*pg,
-            &ListPartsReq {
-                upload_id: complete.upload_id.clone(),
-                part_number_marker: None,
-                max_parts: u32::MAX,
-            },
-        )?
-        .parts;
-        let omitted_parts = all_parts
-            .into_iter()
-            .filter(|part| !selected_part_numbers.contains(&part.part_number))
-            .collect::<Vec<_>>();
-        let all_streaming_segments =
-            PgMetadataStore::get_all_multipart_part_segments_for_upload(&*pg, &complete.upload_id)?;
-        let mut selected_streaming_segments = Vec::new();
-        let mut omitted_streaming_segments = Vec::new();
-        for mut segment in all_streaming_segments {
-            if selected_part_numbers.contains(&segment.part_number) {
-                segment.version_id = request.version_id.to_u64();
-                selected_streaming_segments.push(segment);
-            } else {
-                omitted_streaming_segments.push(segment);
-            }
+        let (mut selected_streaming_segments, cleanup) =
+            snapshot_complete_multipart_cleanup_from_pg(
+                &pg,
+                &complete.upload_id,
+                &selected_part_numbers,
+            )?;
+        if selected_streaming_segments != complete.selected_streaming_segments
+            || cleanup != complete.expected_cleanup
+        {
+            return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);
         }
-        let (stream_uploads, stream_upload_segments) =
-            snapshot_upload_part_stream_cleanup_from_pg(&pg, &complete.upload_id)?;
+        for segment in &mut selected_streaming_segments {
+            segment.version_id = request.version_id.to_u64();
+        }
 
         let last_modified_millis = crate::clock::current_time_millis();
         let completed_at_millis = last_modified_millis;
@@ -8471,10 +9271,10 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 },
                 parts: object_parts,
                 selected_streaming_segments,
-                omitted_parts,
-                omitted_streaming_segments,
-                stream_uploads,
-                stream_upload_segments,
+                omitted_parts: cleanup.omitted_parts,
+                omitted_streaming_segments: cleanup.omitted_streaming_segments,
+                stream_uploads: cleanup.stream_uploads,
+                stream_upload_segments: cleanup.stream_upload_segments,
                 write_sequence,
                 completion_order: request.completion_order,
                 completed_at_millis,
@@ -11526,6 +12326,411 @@ mod tests {
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "validate stream part commit command build response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("complete-mpu-rpc-bucket");
+        let key = crate::tests::object_key("complete-mpu-rpc-key");
+        let upload_id = crate::tests::multipart_upload_id("complete-mpu-rpc-upload");
+        let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let part = MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 1,
+            size: 12,
+            etag: vec![1; 8],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [6; 16],
+            part_vid: GenerationId::new(40).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 10,
+            checksum: None,
+        };
+        let request = CompleteMultipartCommitRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            versioning: BucketVersioningState::Enabled,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(30).unwrap(),
+            size: 12,
+            etag_crc64: [8; 8],
+            tags: None,
+            metadata_blob: Some(SerializedMetadataBlob::default()),
+            system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+            expected_stale_payload_source: None,
+            part_records: vec![part.clone()],
+            selected_streaming_segments: Vec::new(),
+            expected_cleanup: CompleteMultipartCommitCleanup::default(),
+        };
+        let version_id = VersionId::from_u64(9);
+        let parts_count = std::num::NonZeroU32::new(1).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
+                upload_id: upload_id.clone(),
+                bucket_write_reservation: proof.clone(),
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                    owner: request.owner.clone(),
+                    acl_grants: request.acl_grants.clone(),
+                    public_read: request.public_read,
+                    generation_id: request.generation_id,
+                    size: request.size,
+                    etag: ObjectEtag::MultipartComposite {
+                        crc64: request.etag_crc64,
+                        parts: parts_count,
+                    },
+                    ec: EcShape { k: 0, m: 0 },
+                    layout: ObjectLayout::MultipartManifest { parts_count },
+                    tags: request.tags.clone(),
+                    metadata_blob: request.metadata_blob.clone(),
+                    system_metadata_blob: request.system_metadata_blob.clone(),
+                    object_lock: request.object_lock,
+                    encryption: request.encryption.clone(),
+                },
+                parts: vec![ObjectPartRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag: part.etag.clone(),
+                    etag_kind: part.etag_kind,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec_k: part.ec_k,
+                    ec_m: part.ec_m,
+                    data_pg_id: 0,
+                    checksum: part.checksum.clone(),
+                }],
+                selected_streaming_segments: Vec::new(),
+                omitted_parts: Vec::new(),
+                omitted_streaming_segments: Vec::new(),
+                stream_uploads: Vec::new(),
+                stream_upload_segments: Vec::new(),
+                write_sequence: 1,
+                completion_order: 2,
+                completed_at_millis: 3,
+                initiator: None,
+                last_modified_millis: 3,
+                stale_payload: None,
+            })),
+        );
+        let build = BuildCompleteMultipartObjectCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            request: &request,
+            version_id,
+            completion_order: 2,
+            bucket_write_reservation: &proof,
+        };
+        client
+            .validate_complete_multipart_command_response(&command, &build)
+            .unwrap();
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitMultipartObject(bad_commit) = &mut bad_payload else {
+            panic!("expected complete multipart command");
+        };
+        bad_commit.parts[0].key = crate::tests::object_key("wrong-complete-mpu-key");
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_complete_multipart_command_response(&bad_command, &build)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate complete multipart command build response",
+                ..
+            })
+        ));
+
+        let mut missing_cleanup_request = request.clone();
+        missing_cleanup_request.expected_cleanup.omitted_parts = vec![MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 2,
+            generation: 1,
+            size: 9,
+            etag: vec![2; 8],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [7; 16],
+            part_vid: GenerationId::new(41).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 11,
+            checksum: None,
+        }];
+        let missing_cleanup_build = BuildCompleteMultipartObjectCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            request: &missing_cleanup_request,
+            version_id,
+            completion_order: 2,
+            bucket_write_reservation: &proof,
+        };
+        let err = client
+            .validate_complete_multipart_command_response(&command, &missing_cleanup_build)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate complete multipart command build response",
+                ..
+            })
+        ));
+
+        let mut bad_cleanup_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitMultipartObject(bad_cleanup) = &mut bad_cleanup_payload
+        else {
+            panic!("expected complete multipart command");
+        };
+        bad_cleanup.omitted_parts.push(part.clone());
+        let bad_cleanup_command = MetadataCommandEnvelope::new(command.id(), bad_cleanup_payload);
+        let err = client
+            .validate_complete_multipart_command_response(&bad_cleanup_command, &build)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate complete multipart command build response",
+                ..
+            })
+        ));
+
+        let stale_source_generation = GenerationId::new(50).unwrap();
+        let mut null_request = request.clone();
+        null_request.versioning = BucketVersioningState::Suspended;
+        null_request.expected_stale_payload_source = Some(test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            stale_source_generation,
+            ObjectLayout::Standard,
+        ));
+        let null_build = BuildCompleteMultipartObjectCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            request: &null_request,
+            version_id: VersionId::Null,
+            completion_order: 2,
+            bucket_write_reservation: &proof,
+        };
+        let mut stale_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitMultipartObject(stale_commit) = &mut stale_payload else {
+            panic!("expected complete multipart command");
+        };
+        stale_commit.object.version_id = VersionId::Null;
+        for part in &mut stale_commit.parts {
+            part.version_id = VersionId::Null;
+        }
+        stale_commit.stale_payload = Some(test_segments_reclaim(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(51).unwrap(),
+        ));
+        let stale_command = MetadataCommandEnvelope::new(command.id(), stale_payload);
+        let err = client
+            .validate_complete_multipart_command_response(&stale_command, &null_build)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate complete multipart command build response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("abort-mpu-rpc-bucket");
+        let key = crate::tests::object_key("abort-mpu-rpc-key");
+        let upload_id = crate::tests::multipart_upload_id("abort-mpu-rpc-upload");
+        let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let upload = MultipartUploadRecord {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: 1,
+            state: UploadState::InProgress,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: None,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_generation_id: GenerationId::new(30).unwrap(),
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        };
+        let cleanup = crate::types::AbortMultipartUploadCleanup {
+            upload,
+            parts: Vec::new(),
+            streaming_segments: Vec::new(),
+            stream_uploads: Vec::new(),
+            stream_upload_segments: Vec::new(),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                cleanup: cleanup.clone(),
+                bucket_write_reservation: proof.clone(),
+            })),
+        );
+        client
+            .validate_abort_multipart_command_response(
+                &command,
+                &AbortMultipartCommandValidation {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &upload_id,
+                    expected_cleanup: Some(&cleanup),
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap();
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::AbortMultipartUpload(bad_abort) = &mut bad_payload else {
+            panic!("expected abort multipart command");
+        };
+        bad_abort.upload_id = crate::tests::multipart_upload_id("abort-mpu-rpc-wrong");
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_abort_multipart_command_response(
+                &bad_command,
+                &AbortMultipartCommandValidation {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &upload_id,
+                    expected_cleanup: Some(&cleanup),
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate abort multipart command build response",
+                ..
+            })
+        ));
+
+        let mut bad_cleanup_payload = command.payload().clone();
+        let MetadataCommandPayload::AbortMultipartUpload(bad_cleanup) = &mut bad_cleanup_payload
+        else {
+            panic!("expected abort multipart command");
+        };
+        bad_cleanup.cleanup.parts.push(MultipartPartRecord {
+            upload_id: crate::tests::multipart_upload_id("abort-mpu-rpc-other"),
+            part_number: 1,
+            generation: 1,
+            size: 12,
+            etag: vec![1; 8],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [6; 16],
+            part_vid: GenerationId::new(40).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 10,
+            checksum: None,
+        });
+        let bad_cleanup_command = MetadataCommandEnvelope::new(command.id(), bad_cleanup_payload);
+        let err = client
+            .validate_abort_multipart_command_response(
+                &bad_cleanup_command,
+                &AbortMultipartCommandValidation {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &upload_id,
+                    expected_cleanup: Some(&cleanup),
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate abort multipart command build response",
+                ..
+            })
+        ));
+
+        let mut expected_missing_cleanup = cleanup.clone();
+        expected_missing_cleanup.parts.push(MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 1,
+            size: 12,
+            etag: vec![1; 8],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [6; 16],
+            part_vid: GenerationId::new(40).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 10,
+            checksum: None,
+        });
+        let err = client
+            .validate_abort_multipart_command_response(
+                &command,
+                &AbortMultipartCommandValidation {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &upload_id,
+                    expected_cleanup: Some(&expected_missing_cleanup),
+                    bucket_write_reservation: &proof,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate abort multipart command build response",
                 ..
             })
         ));

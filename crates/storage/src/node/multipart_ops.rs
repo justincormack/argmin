@@ -108,9 +108,76 @@ impl SharedStorageNode {
         for &part_number in requested_part_numbers {
             part_records.push(pg.get_multipart_part(upload_id, part_number)?);
         }
+        let selected_part_numbers = part_records
+            .iter()
+            .map(|part| part.part_number)
+            .collect::<std::collections::BTreeSet<_>>();
+        let all_parts = PgMetadataStore::list_multipart_parts(
+            &*pg,
+            &crate::ListPartsReq {
+                upload_id: upload_id.clone(),
+                part_number_marker: None,
+                max_parts: u32::MAX,
+            },
+        )?
+        .parts;
+        let omitted_parts = all_parts
+            .into_iter()
+            .filter(|part| !selected_part_numbers.contains(&part.part_number))
+            .collect::<Vec<_>>();
+        let all_streaming_segments =
+            PgMetadataStore::get_all_multipart_part_segments_for_upload(&*pg, upload_id)?;
+        let mut selected_streaming_segments = Vec::new();
+        let mut omitted_streaming_segments = Vec::new();
+        for segment in all_streaming_segments {
+            if selected_part_numbers.contains(&segment.part_number) {
+                selected_streaming_segments.push(segment);
+            } else {
+                omitted_streaming_segments.push(segment);
+            }
+        }
+        let mut stream_uploads = PgMetadataStore::list_all_stream_uploads(&*pg)?
+            .into_iter()
+            .filter(|session| {
+                matches!(
+                    &session.target,
+                    crate::StreamUploadTarget::UploadPart {
+                        upload_id: session_upload_id,
+                        ..
+                    } if session_upload_id == upload_id
+                )
+            })
+            .collect::<Vec<_>>();
+        stream_uploads.sort_by(|a, b| a.session_id.as_str().cmp(b.session_id.as_str()));
+        let mut stream_upload_segments = Vec::new();
+        for session in &stream_uploads {
+            stream_upload_segments.extend(PgMetadataStore::list_stream_segments(
+                &*pg,
+                &session.session_id,
+            )?);
+        }
+        let stream_uploads = stream_uploads
+            .iter()
+            .map(crate::TerminalStreamCleanupRecord::from)
+            .collect();
+        let stale_payload_source =
+            match PgMetadataStore::get_object_version(&*pg, bucket, key, crate::VersionId::Null) {
+                Ok(crate::StoredObject::Live(stored)) => Some(crate::StoredObject::Live(stored)),
+                Ok(crate::StoredObject::DeleteMarker(_))
+                | Err(crate::MetadataError::ObjectNotFound) => None,
+                Err(other) => return Err(other.into()),
+            };
         Ok(MultipartCompletionSnapshot {
             existing_etag,
+            stale_payload_source,
             part_records,
+            selected_streaming_segments,
+            cleanup: crate::CompleteMultipartCommitCleanup {
+                omitted_parts,
+                omitted_streaming_segments,
+                stream_uploads,
+                stream_upload_segments,
+            },
         })
     }
 
