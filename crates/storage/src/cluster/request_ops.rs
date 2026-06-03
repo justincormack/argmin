@@ -3887,7 +3887,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+            .object_mutation_metadata_client()
             .payload_reclaim_exists(pg_id, bucket, key, generation_id)
     }
 

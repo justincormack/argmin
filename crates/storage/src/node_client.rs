@@ -95,8 +95,9 @@ use crate::storage_rpc::{
     encode_multipart_completion_snapshot_request, encode_multipart_parts_list_request,
     encode_multipart_upload_load_request, encode_multipart_upload_match_request,
     encode_object_delete_snapshot_request, encode_object_generation_reservation_request,
-    encode_object_read_auth_subject_request, encode_object_read_snapshot_request,
-    encode_object_request, encode_object_tags_for_subject_request, encode_proof_release_request,
+    encode_object_payload_reclaim_exists_request, encode_object_read_auth_subject_request,
+    encode_object_read_snapshot_request, encode_object_request,
+    encode_object_tags_for_subject_request, encode_proof_release_request,
     encode_put_object_metadata_command_build_request, encode_put_object_metadata_snapshot_request,
     encode_read_handle_acquire_request, encode_read_handle_release_request,
     encode_scavenger_list_files_request, encode_shard_ack_batch_request,
@@ -150,20 +151,21 @@ use crate::storage_rpc::{
     StorageRpcMultipartUploadMatchRequest, StorageRpcObjectDeleteSnapshotRequest,
     StorageRpcObjectDeleteSnapshotResponse, StorageRpcObjectGenerationReservationOutcome,
     StorageRpcObjectGenerationReservationRequest, StorageRpcObjectMetadataCommandBuildOutcome,
-    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
-    StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
-    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
-    StorageRpcObjectTagsForSubjectRequest, StorageRpcProofReleaseRequest,
-    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
-    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcReadHandleAcquireRequest,
-    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
-    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
-    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
-    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
-    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadSegmentsOutcome,
-    StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
+    StorageRpcObjectPayloadReclaimExistsRequest, StorageRpcObjectReadAuthSubjectOutcome,
+    StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadSnapshotOutcome,
+    StorageRpcObjectReadSnapshotRequest, StorageRpcObjectRequest,
+    StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
+    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
+    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamPartCommitCommandBuildRequest,
+    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPutCommitCommandBuildRequest,
+    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamSegmentAppendPrepareOutcome,
+    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSessionOutcome,
+    StorageRpcStreamUploadSessionRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -1433,6 +1435,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
+
+    fn payload_reclaim_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError>;
 
     fn prepare_stream_segment_append(
         &self,
@@ -4909,6 +4919,16 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn payload_reclaim_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        <Self as StorageNodeClient>::payload_reclaim_exists(self, pg_id, bucket, key, generation_id)
+    }
+
     fn prepare_stream_segment_append(
         &self,
         pg_id: PgId,
@@ -7473,6 +7493,30 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             )));
         }
         Ok(response.records)
+    }
+
+    fn payload_reclaim_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let request = StorageRpcObjectPayloadReclaimExistsRequest {
+            object: self.object_request(pg_id, bucket, key),
+            generation_id,
+        };
+        let payload = encode_object_payload_reclaim_exists_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimExists, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_metadata_command_bool_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(
+                "decode object payload reclaim exists response",
+                error.to_string(),
+            ))
+        })?;
+        Ok(response.value)
     }
 
     fn prepare_stream_segment_append(
@@ -15322,6 +15366,7 @@ mod tests {
             owner: OwnerIdentity::from_principal("owner"),
         };
         let generation_id = GenerationId::new(19).unwrap();
+        let reclaim_generation_id = GenerationId::new(21).unwrap();
         let segment = ObjectSegmentRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -15396,11 +15441,28 @@ mod tests {
                     ],
                 )
                 .unwrap();
+            pg.put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id: reclaim_generation_id,
+                created_at: 12,
+                segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                }],
+            })
+            .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..10)
+        let server_threads: Vec<_> = (0..12)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -15479,6 +15541,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(completed_uploads, vec![completed_upload.clone()]);
+        assert!(ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            reclaim_generation_id,
+        )
+        .unwrap());
+        assert!(!ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            GenerationId::new(22).unwrap(),
+        )
+        .unwrap());
         let delete_command = ObjectMutationMetadataNodeClient::build_delete_current_object_command(
             &client,
             BuildDeleteCurrentObjectCommandReq {
@@ -15715,6 +15793,42 @@ mod tests {
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "object stream uploads list",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_payload_reclaim_exists_requires_pg_primary() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let bucket = crate::tests::bucket_name("reclaim-primary-rpc-bucket");
+        let key = crate::tests::object_key("reclaim-primary-rpc-key");
+
+        let err = ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            GenerationId::new(1).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "object payload reclaim exists",
                 ..
             })
         ));

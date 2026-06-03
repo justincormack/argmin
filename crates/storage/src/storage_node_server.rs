@@ -57,8 +57,9 @@ use crate::storage_rpc::{
     decode_multipart_completion_snapshot_request, decode_multipart_parts_list_request,
     decode_multipart_upload_load_request, decode_multipart_upload_match_request,
     decode_object_delete_snapshot_request, decode_object_generation_reservation_request,
-    decode_object_read_auth_subject_request, decode_object_read_snapshot_request,
-    decode_object_request, decode_object_tags_for_subject_request, decode_proof_release_request,
+    decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
+    decode_object_read_snapshot_request, decode_object_request,
+    decode_object_tags_for_subject_request, decode_proof_release_request,
     decode_put_object_metadata_command_build_request, decode_put_object_metadata_snapshot_request,
     decode_read_handle_acquire_request, decode_read_handle_release_request,
     decode_scavenger_list_files_request, decode_shard_ack_batch_request,
@@ -181,19 +182,20 @@ use crate::storage_rpc::{
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
     StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
     StorageRpcObjectLifecycleVersionListResponse, StorageRpcObjectMetadataCommandBuildOutcome,
-    StorageRpcObjectMetadataCommandBuildResponse, StorageRpcObjectReadAuthSubjectOutcome,
-    StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadAuthSubjectResponse,
-    StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
-    StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest,
-    StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
-    StorageRpcObjectTagsForSubjectResponse, StorageRpcObjectVersionResponse,
-    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
-    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
-    StorageRpcPutObjectMetadataSnapshotResponse, StorageRpcReadHandleAcquireRequest,
-    StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
-    StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
-    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcObjectMetadataCommandBuildResponse, StorageRpcObjectPayloadReclaimExistsRequest,
+    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
+    StorageRpcObjectReadAuthSubjectResponse, StorageRpcObjectReadSnapshotOutcome,
+    StorageRpcObjectReadSnapshotRequest, StorageRpcObjectReadSnapshotResponse,
+    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
+    StorageRpcObjectTagsForSubjectRequest, StorageRpcObjectTagsForSubjectResponse,
+    StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
+    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
+    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcPutObjectMetadataSnapshotResponse,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
+    StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamError,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
@@ -899,6 +901,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
                 match decode_bucket_request(&frame.payload) {
                     Ok(request) => self.completed_multipart_uploads_list_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectPayloadReclaimExists => {
+                match decode_object_payload_reclaim_exists_request(&frame.payload) {
+                    Ok(request) => self.object_payload_reclaim_exists_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -2884,6 +2895,45 @@ impl StorageNodeConnectionHandler {
         let payload = encode_completed_multipart_uploads_list_response(
             &StorageRpcCompletedMultipartUploadsListResponse { records },
         )?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn object_payload_reclaim_exists_response(
+        &self,
+        request: StorageRpcObjectPayloadReclaimExistsRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "object payload reclaim exists",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let exists = match ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            request.generation_id,
+        ) {
+            Ok(exists) => exists,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
+        let payload =
+            encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                value: exists,
+            });
         Ok(encode_storage_rpc_success_response(&payload))
     }
 

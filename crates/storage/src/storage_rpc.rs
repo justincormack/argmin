@@ -144,6 +144,8 @@ const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
 const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
@@ -401,6 +403,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketWriteDrainExists = 104,
     ObjectStreamUploadsList = 105,
     ObjectCompletedMultipartUploadsList = 106,
+    ObjectPayloadReclaimExists = 107,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +570,7 @@ impl StorageRpcMessageKind {
             Self::BucketMarkDeletingCommandBuild => "bucket mark deleting command build",
             Self::ObjectStreamUploadsList => "object stream uploads list",
             Self::ObjectCompletedMultipartUploadsList => "object completed multipart uploads list",
+            Self::ObjectPayloadReclaimExists => "object payload reclaim exists",
         }
     }
 
@@ -678,6 +682,7 @@ impl StorageRpcMessageKind {
             104 => Ok(Self::BucketWriteDrainExists),
             105 => Ok(Self::ObjectStreamUploadsList),
             106 => Ok(Self::ObjectCompletedMultipartUploadsList),
+            107 => Ok(Self::ObjectPayloadReclaimExists),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -937,6 +942,12 @@ pub(crate) struct StorageRpcObjectRequest {
 pub(crate) struct StorageRpcObjectGenerationReservationRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) reservation_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimExistsRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) generation_id: GenerationId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2662,6 +2673,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectPayloadReclaimExists => {
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad => {
             STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN
         }
@@ -3244,6 +3258,27 @@ pub(crate) fn decode_object_request(
         pg_id,
         bucket,
         key,
+    })
+}
+
+pub(crate) fn encode_object_payload_reclaim_exists_request(
+    request: &StorageRpcObjectPayloadReclaimExistsRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_u64(&mut out, request.generation_id.get());
+    out
+}
+
+pub(crate) fn decode_object_payload_reclaim_exists_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadReclaimExistsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let generation_id = decoder.read_generation_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectPayloadReclaimExistsRequest {
+        object,
+        generation_id,
     })
 }
 
@@ -13446,6 +13481,11 @@ mod tests {
                 StorageRpcMessageKind::ObjectVersionNext,
                 STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectPayloadReclaimExists,
+                STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::DirectPutCommitSnapshotLoad,
