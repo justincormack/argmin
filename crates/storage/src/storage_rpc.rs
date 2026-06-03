@@ -82,12 +82,12 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
 const STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_NAME_LEN: usize = 63;
+const STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN: usize = 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN: usize = 256;
 const STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN: usize = 128;
 const STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN: usize = 1024;
-const STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN: usize = 4
-    + STORAGE_RPC_MAX_BUCKET_NAME_LEN
+const STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
     + 4
     + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
     + 4
@@ -107,7 +107,7 @@ const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN: usize = 64 * 1024;
 const STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN: usize =
-    4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+    4 + 8 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN;
 const STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS: u32 = 100_000;
 const STORAGE_RPC_MAX_BUCKET_LIST_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
@@ -116,7 +116,7 @@ const STORAGE_RPC_MAX_BUCKET_LIST_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         + 4
-        + STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize * (4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN);
+        + STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize * STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN;
 const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 4;
 const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN: usize =
@@ -139,7 +139,7 @@ const STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN: usize =
         + UPLOAD_ID_LEN
         + 4;
 const STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN: usize =
-    4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN;
+    4 + 8 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN;
 const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
 const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
@@ -208,7 +208,7 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
-const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_LEN
+const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
     + 4
     + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
     + 4
@@ -237,9 +237,10 @@ const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4;
 const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS: usize = 1024;
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS: usize = 1024;
-const STORAGE_RPC_BUCKET_DELETE_FINALIZE_ROOT_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_LEN + 8;
+const STORAGE_RPC_BUCKET_DELETE_FINALIZE_ROOT_MAX_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 8;
 const STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN: usize =
-    STORAGE_RPC_MAX_BUCKET_NAME_LEN
+    STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
         + 8
         + 4
         + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
@@ -12382,7 +12383,8 @@ mod tests {
             MetadataCommandLogIndex, MetadataCommandPayload,
         },
         types::{
-            AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
+            AclGrants, BucketDeleteFinalizeClaimRecord, BucketObjectLockConfig,
+            BucketVersioningState, BucketWriteDrainRecord, BucketWriteDrainState, CanonicalUserId,
             ClusterEpoch, CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
         },
     };
@@ -13537,6 +13539,111 @@ mod tests {
                 })) if len == payload_len && actual_limit == limit
             ));
         }
+    }
+
+    #[test]
+    fn bucket_delete_coordination_max_record_requests_fit_kind_caps() {
+        let bucket = BucketName::try_from("a".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap();
+        let cluster_epoch = ClusterEpoch::INITIAL;
+        let node_id = NodeId::new(1);
+        let pg_id = PgId::new(2);
+        let drain_id = "d".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN);
+        let owner_token = "o".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN);
+
+        let drain_payload =
+            encode_bucket_write_drain_record_request(&StorageRpcBucketWriteDrainRecordRequest {
+                node_id,
+                cluster_epoch,
+                pg_id,
+                record: BucketWriteDrainRecord {
+                    bucket: bucket.clone(),
+                    drain_id: drain_id.clone(),
+                    owner_token: owner_token.clone(),
+                    cluster_epoch,
+                    bucket_execution_generation: 3,
+                    state: BucketWriteDrainState::Draining,
+                    created_at: 4,
+                    lease_deadline: Some(5),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            drain_payload.len(),
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
+        );
+        let drain_frame = encode_storage_rpc_frame(
+            11,
+            StorageRpcMessageKind::BucketWriteDrainClear,
+            &drain_payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(drain_frame)).unwrap();
+        assert_eq!(decoded.payload, drain_payload);
+
+        let mut oversized_drain_payload = drain_payload.clone();
+        oversized_drain_payload.push(0);
+        let oversized_drain_frame = encode_storage_rpc_frame(
+            12,
+            StorageRpcMessageKind::BucketWriteDrainClear,
+            &oversized_drain_payload,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_storage_rpc_request_frame_from(&mut Cursor::new(oversized_drain_frame)),
+            Err(StorageRpcStreamError::Frame(
+                StorageRpcFrameError::PayloadTooLarge { len, limit }
+            )) if len == STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN + 1
+                && limit == STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
+        ));
+
+        let claim_payload = encode_bucket_delete_finalize_claim_record_request(
+            &StorageRpcBucketDeleteFinalizeClaimRecordRequest {
+                node_id,
+                cluster_epoch,
+                pg_id,
+                record: BucketDeleteFinalizeClaimRecord {
+                    bucket,
+                    bucket_incarnation_generation: 6,
+                    claim_id: drain_id,
+                    owner_token,
+                    cluster_epoch,
+                    pg_id: pg_id.get(),
+                    claimed_at: 7,
+                    lease_deadline: Some(8),
+                    attempt_count: 9,
+                    last_error: Some("e".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN)),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            claim_payload.len(),
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
+        );
+        let claim_frame = encode_storage_rpc_frame(
+            13,
+            StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease,
+            &claim_payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(claim_frame)).unwrap();
+        assert_eq!(decoded.payload, claim_payload);
+
+        let mut oversized_claim_payload = claim_payload;
+        oversized_claim_payload.push(0);
+        let oversized_claim_frame = encode_storage_rpc_frame(
+            14,
+            StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease,
+            &oversized_claim_payload,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_storage_rpc_request_frame_from(&mut Cursor::new(oversized_claim_frame)),
+            Err(StorageRpcStreamError::Frame(
+                StorageRpcFrameError::PayloadTooLarge { len, limit }
+            )) if len == STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN + 1
+                && limit == STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
+        ));
     }
 
     #[test]
