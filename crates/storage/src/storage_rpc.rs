@@ -27,17 +27,17 @@ use crate::{
         MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
         MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption,
         ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState,
-        ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-        ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
-        ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-        OwnerIdentity, PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq,
-        PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-        SerializedTagSet, SessionId, ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus,
-        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
-        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck, SESSION_ID_LEN,
-        SHARD_KEY_LEN, UPLOAD_ID_LEN,
+        ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
+        ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
+        ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+        ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
+        PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SerializedMetadataBlob,
+        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
+        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+        VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -59,6 +59,8 @@ const STORAGE_RPC_SHARD_LOCATION_LEN: usize = 8 + 4 + 1 + 4;
 const STORAGE_RPC_SHARD_KEY_FIELD_LEN: usize = 4 + SHARD_KEY_LEN;
 const STORAGE_RPC_WRITE_ACK_LEN: usize = 8 + 8;
 const STORAGE_RPC_SHARD_ACK_ROUTE_LEN: usize = 4 + 8 + 4;
+const STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN: usize =
+    STORAGE_RPC_SHARD_ACK_ROUTE_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK_ROUTE_LEN
     + 4
     + STORAGE_RPC_MAX_SHARD_ACK_ITEMS
@@ -147,6 +149,37 @@ const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_MAX_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_OBJECT_KEY_LEN
+        + 8
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 8
+        + 1
+        + 8
+        + 4;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN
+        + 8
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 1
+        + 8
+        + 8;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
@@ -406,6 +439,12 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectCompletedMultipartUploadsList = 106,
     ObjectPayloadReclaimExists = 107,
     ObjectBucketPayloadReclaimRoot = 108,
+    ObjectPayloadReclaimRoot = 109,
+    ObjectPayloadReclaimLoad = 110,
+    ObjectPayloadReclaimClaimAcquire = 111,
+    ObjectPayloadReclaimClaimRelease = 112,
+    ShardAckLoad = 113,
+    ShardAckDelete = 114,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +500,8 @@ impl StorageRpcMessageKind {
             Self::ProofRelease => "proof release",
             Self::ShardAckRecord => "shard ack record",
             Self::ShardAckValidate => "shard ack validate",
+            Self::ShardAckLoad => "shard ack load",
+            Self::ShardAckDelete => "shard ack delete",
             Self::ShardScavengerListFiles => "shard scavenger list files",
             Self::MetadataCommandReplicaState => "metadata command replica state",
             Self::MetadataCommandAcceptance => "metadata command acceptance",
@@ -574,6 +615,10 @@ impl StorageRpcMessageKind {
             Self::ObjectCompletedMultipartUploadsList => "object completed multipart uploads list",
             Self::ObjectPayloadReclaimExists => "object payload reclaim exists",
             Self::ObjectBucketPayloadReclaimRoot => "object bucket payload reclaim root",
+            Self::ObjectPayloadReclaimRoot => "object payload reclaim root",
+            Self::ObjectPayloadReclaimLoad => "object payload reclaim load",
+            Self::ObjectPayloadReclaimClaimAcquire => "object payload reclaim claim acquire",
+            Self::ObjectPayloadReclaimClaimRelease => "object payload reclaim claim release",
         }
     }
 
@@ -687,6 +732,12 @@ impl StorageRpcMessageKind {
             106 => Ok(Self::ObjectCompletedMultipartUploadsList),
             107 => Ok(Self::ObjectPayloadReclaimExists),
             108 => Ok(Self::ObjectBucketPayloadReclaimRoot),
+            109 => Ok(Self::ObjectPayloadReclaimRoot),
+            110 => Ok(Self::ObjectPayloadReclaimLoad),
+            111 => Ok(Self::ObjectPayloadReclaimClaimAcquire),
+            112 => Ok(Self::ObjectPayloadReclaimClaimRelease),
+            113 => Ok(Self::ShardAckLoad),
+            114 => Ok(Self::ShardAckDelete),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -952,6 +1003,37 @@ pub(crate) struct StorageRpcObjectGenerationReservationRequest {
 pub(crate) struct StorageRpcObjectPayloadReclaimExistsRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) generation_id: GenerationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimResponse {
+    pub(crate) reclaim: Option<ObjectPayloadReclaimCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimClaimAcquireRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) reclaim_kind: ObjectPayloadReclaimKind,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse {
+    pub(crate) record: Option<ObjectPayloadReclaimClaimRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimClaimRecordRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) record: ObjectPayloadReclaimClaimRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2259,6 +2341,14 @@ pub(crate) struct StorageRpcShardAckBatchRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardAckItemRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) shard_key: ShardKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcScavengerListFilesRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -2604,6 +2694,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardRead => STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardReadRange => STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardAckLoad | StorageRpcMessageKind::ShardAckDelete => {
+            STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
             STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN
         }
@@ -2684,6 +2777,18 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectPayloadReclaimRoot => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectPayloadReclaimLoad => {
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire => {
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease => {
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectPayloadReclaimExists => {
             STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN
@@ -3294,6 +3399,23 @@ pub(crate) fn decode_object_payload_reclaim_exists_request(
     })
 }
 
+pub(crate) fn encode_object_payload_reclaim_response(
+    response: &StorageRpcObjectPayloadReclaimResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_optional_object_payload_reclaim(&mut out, response.reclaim.as_ref());
+    out
+}
+
+pub(crate) fn decode_object_payload_reclaim_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadReclaimResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let reclaim = decoder.read_optional_object_payload_reclaim()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectPayloadReclaimResponse { reclaim })
+}
+
 pub(crate) fn encode_payload_reclaim_root_response(
     response: &StorageRpcPayloadReclaimRootResponse,
 ) -> Vec<u8> {
@@ -3309,6 +3431,155 @@ pub(crate) fn decode_payload_reclaim_root_response(
     let root = decoder.read_optional_payload_reclaim_root()?;
     decoder.finish()?;
     Ok(StorageRpcPayloadReclaimRootResponse { root })
+}
+
+pub(crate) fn encode_object_payload_reclaim_claim_acquire_request(
+    request: &StorageRpcObjectPayloadReclaimClaimAcquireRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_drain_identity(&request.claim_id, &request.owner_token)?;
+    if request
+        .lease_deadline
+        .is_some_and(|lease_deadline| lease_deadline <= request.claimed_at)
+    {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim lease deadline must be after claimed time",
+        ));
+    }
+    let mut out = encode_object_payload_reclaim_exists_request(
+        &StorageRpcObjectPayloadReclaimExistsRequest {
+            object: request.object.clone(),
+            generation_id: request.generation_id,
+        },
+    );
+    put_u64(&mut out, request.bucket_incarnation_generation);
+    put_u8(&mut out, request.reclaim_kind as u8);
+    put_string(&mut out, &request.claim_id);
+    put_string(&mut out, &request.owner_token);
+    put_u64(&mut out, request.claimed_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    put_u64(&mut out, request.now);
+    Ok(out)
+}
+
+pub(crate) fn decode_object_payload_reclaim_claim_acquire_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadReclaimClaimAcquireRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let generation_id = decoder.read_generation_id()?;
+    let bucket_incarnation_generation = decoder.read_u64()?;
+    let reclaim_kind = decoder.read_object_payload_reclaim_kind()?;
+    let claim_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+        StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+    )?;
+    let owner_token = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+        StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+    )?;
+    let claimed_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    let now = decoder.read_u64()?;
+    decoder.finish()?;
+    let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
+        object,
+        bucket_incarnation_generation,
+        generation_id,
+        reclaim_kind,
+        claim_id,
+        owner_token,
+        claimed_at,
+        lease_deadline,
+        now,
+    };
+    encode_object_payload_reclaim_claim_acquire_request(&request)?;
+    Ok(request)
+}
+
+pub(crate) fn encode_object_payload_reclaim_claim_optional_record_response(
+    response: &StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.record {
+        Some(record) => {
+            validate_object_payload_reclaim_claim_record(record)?;
+            put_u8(&mut out, 1);
+            put_object_payload_reclaim_claim_record(&mut out, record);
+        }
+        None => put_u8(&mut out, 0),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_object_payload_reclaim_claim_optional_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let record = decoder.read_object_payload_reclaim_claim_record()?;
+            validate_object_payload_reclaim_claim_record(&record)?;
+            Some(record)
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown optional object payload reclaim claim record tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse { record })
+}
+
+pub(crate) fn encode_object_payload_reclaim_claim_record_request(
+    request: &StorageRpcObjectPayloadReclaimClaimRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    if request.pg_id.get() != request.record.pg_id {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route PG must match claim PG",
+        ));
+    }
+    validate_object_payload_reclaim_claim_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_object_payload_reclaim_claim_record(&mut out, &request.record);
+    Ok(out)
+}
+
+pub(crate) fn decode_object_payload_reclaim_claim_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadReclaimClaimRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let record = decoder.read_object_payload_reclaim_claim_record()?;
+    decoder.finish()?;
+    if cluster_epoch != record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    if pg_id.get() != record.pg_id {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route PG must match claim PG",
+        ));
+    }
+    validate_object_payload_reclaim_claim_record(&record)?;
+    Ok(StorageRpcObjectPayloadReclaimClaimRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        record,
+    })
 }
 
 pub(crate) fn encode_multipart_completion_stale_source_response(
@@ -7527,6 +7798,54 @@ pub(crate) fn decode_shard_ack_batch_request(
     })
 }
 
+pub(crate) fn encode_shard_ack_item_request(request: &StorageRpcShardAckItemRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bytes(&mut out, request.shard_key.as_bytes());
+    out
+}
+
+pub(crate) fn decode_shard_ack_item_request(
+    bytes: &[u8],
+) -> Result<StorageRpcShardAckItemRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let shard_key = decoder.read_shard_key()?;
+    decoder.finish()?;
+    Ok(StorageRpcShardAckItemRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        shard_key,
+    })
+}
+
+pub(crate) fn encode_shard_ack_item_response(item: &StorageRpcShardAckItem) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bytes(&mut out, item.shard_key.as_bytes());
+    put_u64(&mut out, item.ack.stored_size);
+    put_u64(&mut out, item.ack.crc64);
+    out
+}
+
+pub(crate) fn decode_shard_ack_item_response(
+    bytes: &[u8],
+) -> Result<StorageRpcShardAckItem, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let shard_key = decoder.read_shard_key()?;
+    let stored_size = decoder.read_u64()?;
+    let crc64 = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcShardAckItem {
+        shard_key,
+        ack: WriteAck { stored_size, crc64 },
+    })
+}
+
 pub(crate) fn encode_scavenger_list_files_request(
     request: &StorageRpcScavengerListFilesRequest,
 ) -> Vec<u8> {
@@ -8760,6 +9079,20 @@ fn validate_bucket_delete_finalize_claim_record(
     Ok(())
 }
 
+fn validate_object_payload_reclaim_claim_record(
+    record: &ObjectPayloadReclaimClaimRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_bucket_write_drain_identity(&record.claim_id, &record.owner_token)?;
+    if record.last_error.as_ref().is_some_and(|last_error| {
+        last_error.len() > STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN
+    }) {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "last error exceeds maximum length",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_bucket_write_drain_identity(
     drain_id: &str,
     owner_token: &str,
@@ -9218,6 +9551,48 @@ impl<'a> StorageRpcDecoder<'a> {
         Ok(BucketDeleteFinalizeClaimRecord {
             bucket,
             bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            pg_id,
+            claimed_at,
+            lease_deadline,
+            attempt_count,
+            last_error,
+        })
+    }
+
+    fn read_object_payload_reclaim_claim_record(
+        &mut self,
+    ) -> Result<ObjectPayloadReclaimClaimRecord, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let key = self.read_object_key()?;
+        let generation_id = self.read_generation_id()?;
+        let reclaim_kind = self.read_object_payload_reclaim_kind()?;
+        let claim_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+        )?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let pg_id = self.read_u32()?;
+        let claimed_at = self.read_u64()?;
+        let lease_deadline = self.read_optional_u64()?;
+        let attempt_count = self.read_u64()?;
+        let last_error = self.read_optional_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("last error exceeds maximum length"),
+        )?;
+        Ok(ObjectPayloadReclaimClaimRecord {
+            bucket,
+            bucket_incarnation_generation,
+            key,
+            generation_id,
+            reclaim_kind,
             claim_id,
             owner_token,
             cluster_epoch,
@@ -11264,6 +11639,25 @@ fn put_bucket_delete_finalize_claim_record(
 ) {
     put_string(out, record.bucket.as_str());
     put_u64(out, record.bucket_incarnation_generation);
+    put_string(out, &record.claim_id);
+    put_string(out, &record.owner_token);
+    put_u64(out, record.cluster_epoch.get());
+    put_u32(out, record.pg_id);
+    put_u64(out, record.claimed_at);
+    put_optional_u64(out, record.lease_deadline);
+    put_u64(out, record.attempt_count);
+    put_optional_string(out, record.last_error.as_deref());
+}
+
+fn put_object_payload_reclaim_claim_record(
+    out: &mut Vec<u8>,
+    record: &ObjectPayloadReclaimClaimRecord,
+) {
+    put_string(out, record.bucket.as_str());
+    put_u64(out, record.bucket_incarnation_generation);
+    put_string(out, record.key.as_str());
+    put_u64(out, record.generation_id.get());
+    put_u8(out, record.reclaim_kind as u8);
     put_string(out, &record.claim_id);
     put_string(out, &record.owner_token);
     put_u64(out, record.cluster_epoch.get());
@@ -13355,6 +13749,35 @@ mod tests {
             }),
             Err(StorageRpcPayloadError::InvalidShardAckBatchRequest(_))
         ));
+    }
+
+    #[test]
+    fn shard_ack_item_request_and_response_carry_identity() {
+        let request = StorageRpcShardAckItemRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(3),
+            shard_key: test_shard_key(2),
+        };
+        let response = StorageRpcShardAckItem {
+            shard_key: request.shard_key.clone(),
+            ack: WriteAck {
+                stored_size: 123,
+                crc64: 0xBEEF,
+            },
+        };
+
+        let request_bytes = encode_shard_ack_item_request(&request);
+        assert_eq!(
+            decode_shard_ack_item_request(&request_bytes).unwrap(),
+            request
+        );
+
+        let response_bytes = encode_shard_ack_item_response(&response);
+        assert_eq!(
+            decode_shard_ack_item_response(&response_bytes).unwrap(),
+            response
+        );
     }
 
     #[test]

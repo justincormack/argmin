@@ -5508,8 +5508,8 @@ Required tests:
 
 - Status: shard-remote scope complete. Phase 10.4 now has storage RPC codecs,
   request payload caps, and storage-node dispatch for shard write/read/range
-  read/delete, read-handle acquire/release, data-PG ack record/validate, and
-  shard-scavenger file listing. Direct PUT writes shards through Unix
+  read/delete, read-handle acquire/release, data-PG ack record/validate/load/delete,
+  and shard-scavenger file listing. Direct PUT writes shards through Unix
   storage-node clients, records exact-idempotent ack rows on the authoritative
   data-PG owner, validates those rows before metadata publication, and refuses
   remote shard files without matching durable ack rows. Reads acquire
@@ -5603,7 +5603,11 @@ live-object helper routes through the object-read metadata RPC boundary.
 Bucket-delete payload reclaim root checks now route through the
 object-mutation metadata RPC boundary, so delete finalization waits on
 storage-node-owned object PG reclaim roots instead of frontend-local object PG
-state.
+state. Durable object payload reclaim root discovery, per-object reclaim
+loading, and reclaim claim acquire/release now use the same object-mutation
+metadata RPC boundary, so reclaim cleanup metadata is coordinated on the
+storage-node-owned object PG before the worker publishes the reclaim-delete
+command.
 Bucket-head reads used by bucket property/subresource writers, delete begin,
 finalization checks, drain waits, and reclaim-incarnation lookup now use the
 dedicated bucket metadata RPC boundary. Durable bucket write-drain existence,
@@ -5698,9 +5702,12 @@ Implementation slices:
    completion/abort command identity before publication. Stream upload
    session loads, staged-segment listing, PG-wide stream-upload listing for
    bucket delete/best-effort cleanup, completed-MPU tombstone listing for
-   bucket-delete cleanup, bucket-delete payload reclaim root checks, and
-   stream-segment append preparation now use the same object-mutation metadata
-   RPC boundary. Multipart upload
+   bucket-delete cleanup, bucket-delete payload reclaim root checks, durable
+   object payload reclaim root/load/claim operations, and stream-segment append
+   preparation now use the same object-mutation metadata RPC boundary. Data-PG
+   shard ack load/delete now use the dedicated shard-ack RPC client instead of
+   the broad storage-client surface for read recovery and cleanup.
+   Multipart upload
    read/list/management helpers now use the same object-mutation metadata RPC
    boundary and validate returned upload, completion snapshot, part list, and
    management lookup identities. Bucket property/subresource command
@@ -5752,8 +5759,9 @@ Required tests:
    bucket-write reservation/proof release, stream-upload and multipart-upload
    initiation command builders, public object/version/multipart-upload listing
    pages, owner bucket listing, bucket execution-generation and fast-path
-   identity batch reads, bucket-delete payload reclaim root scans, durable
-   pending/drain checks, and remaining operation-shaped command builders. Proof
+   identity batch reads, bucket-delete payload reclaim root scans, object
+   payload reclaim root/load/claim operations, durable pending/drain checks,
+   and remaining operation-shaped command builders. Proof
    release must reject the correct PG on a non-primary node even when that node
    appears first in the acting-set route list.
 9. two independent frontend maps over one storage-node must handle stale

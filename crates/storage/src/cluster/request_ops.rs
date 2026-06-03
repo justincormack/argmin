@@ -5763,9 +5763,7 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let node_store = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         if self
             .local_map
             .object_payload_lease_count(bucket, key, generation_id)
@@ -5809,8 +5807,7 @@ impl super::StorageCluster {
                 return Ok(false);
             }
 
-            node_store
-                .storage_client()
+            mutation_client
                 .get_object_payload_reclaim(pg_id, bucket, key, generation_id)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         };
@@ -5840,8 +5837,7 @@ impl super::StorageCluster {
         let claim_id = self.next_object_payload_reclaim_claim_id()?;
         let owner_token = self.bucket_write_owner_token();
         let claimed_at = crate::clock::current_time_millis();
-        let claim = node_store
-            .storage_client()
+        let claim = mutation_client
             .acquire_object_payload_reclaim_claim(
                 pg_id,
                 bucket,
@@ -5862,8 +5858,7 @@ impl super::StorageCluster {
         };
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
-            node_store
-                .storage_client()
+            mutation_client
                 .release_object_payload_reclaim_claim(pg_id, &claim)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };
@@ -6027,7 +6022,7 @@ impl super::StorageCluster {
                 }
             };
             let root = match node
-                .storage_client()
+                .object_mutation_metadata_client()
                 .get_payload_reclaim_root(PgId::new(pg_id))
             {
                 Ok(root) => root,
@@ -6044,6 +6039,18 @@ impl super::StorageCluster {
             let Some(root) = root else {
                 continue;
             };
+            if self.object_metadata_pg_id(&root.bucket, &root.key) != pg_id {
+                scan.errors += 1;
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "object_reclaim_durable_scan_wrong_pg_root",
+                    Some(format_args!(
+                        "pg_id={} root_bucket={} root_key={}",
+                        pg_id, root.bucket, root.key
+                    )),
+                );
+                continue;
+            }
             if self.local_map.object_payload_lease_count(
                 &root.bucket,
                 &root.key,

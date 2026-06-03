@@ -54,12 +54,14 @@ use crate::storage_rpc::{
     decode_multipart_upload_match_response, decode_object_delete_snapshot_response,
     decode_object_generation_reservation_response, decode_object_generation_response,
     decode_object_lifecycle_version_list_response, decode_object_metadata_command_build_response,
-    decode_object_read_auth_subject_response, decode_object_read_snapshot_response,
-    decode_object_tags_for_subject_response, decode_object_version_response,
-    decode_payload_reclaim_root_response, decode_put_object_metadata_snapshot_response,
-    decode_read_handle_acquire_response, decode_read_handle_release_response,
-    decode_scavenger_list_files_response, decode_shard_read_range_response,
-    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    decode_object_payload_reclaim_claim_optional_record_response,
+    decode_object_payload_reclaim_response, decode_object_read_auth_subject_response,
+    decode_object_read_snapshot_response, decode_object_tags_for_subject_response,
+    decode_object_version_response, decode_payload_reclaim_root_response,
+    decode_put_object_metadata_snapshot_response, decode_read_handle_acquire_response,
+    decode_read_handle_release_response, decode_scavenger_list_files_response,
+    decode_shard_ack_item_response, decode_shard_read_range_response, decode_shard_read_response,
+    decode_shard_write_ack, decode_storage_rpc_response_payload,
     decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
     decode_stream_segment_append_prepare_response, decode_stream_upload_match_response,
     decode_stream_upload_segments_response, decode_stream_upload_session_response,
@@ -96,18 +98,20 @@ use crate::storage_rpc::{
     encode_multipart_completion_snapshot_request, encode_multipart_parts_list_request,
     encode_multipart_upload_load_request, encode_multipart_upload_match_request,
     encode_object_delete_snapshot_request, encode_object_generation_reservation_request,
+    encode_object_payload_reclaim_claim_acquire_request,
+    encode_object_payload_reclaim_claim_record_request,
     encode_object_payload_reclaim_exists_request, encode_object_read_auth_subject_request,
     encode_object_read_snapshot_request, encode_object_request,
     encode_object_tags_for_subject_request, encode_proof_release_request,
     encode_put_object_metadata_command_build_request, encode_put_object_metadata_snapshot_request,
     encode_read_handle_acquire_request, encode_read_handle_release_request,
     encode_scavenger_list_files_request, encode_shard_ack_batch_request,
-    encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
-    encode_shard_write_request, encode_stream_part_commit_command_build_request,
-    encode_stream_part_finalize_snapshot_request, encode_stream_put_commit_command_build_request,
-    encode_stream_put_finalize_snapshot_request, encode_stream_segment_append_prepare_request,
-    encode_stream_upload_match_request, encode_stream_upload_session_request,
-    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    encode_shard_ack_item_request, encode_shard_delete_request, encode_shard_read_range_request,
+    encode_shard_read_request, encode_shard_write_request,
+    encode_stream_part_commit_command_build_request, encode_stream_part_finalize_snapshot_request,
+    encode_stream_put_commit_command_build_request, encode_stream_put_finalize_snapshot_request,
+    encode_stream_segment_append_prepare_request, encode_stream_upload_match_request,
+    encode_stream_upload_session_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
@@ -152,16 +156,18 @@ use crate::storage_rpc::{
     StorageRpcMultipartUploadMatchRequest, StorageRpcObjectDeleteSnapshotRequest,
     StorageRpcObjectDeleteSnapshotResponse, StorageRpcObjectGenerationReservationOutcome,
     StorageRpcObjectGenerationReservationRequest, StorageRpcObjectMetadataCommandBuildOutcome,
-    StorageRpcObjectPayloadReclaimExistsRequest, StorageRpcObjectReadAuthSubjectOutcome,
-    StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadSnapshotOutcome,
-    StorageRpcObjectReadSnapshotRequest, StorageRpcObjectRequest,
-    StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
-    StorageRpcPayloadReclaimRootResponse, StorageRpcProofReleaseRequest,
-    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
-    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcReadHandleAcquireRequest,
-    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
-    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcObjectPayloadReclaimClaimAcquireRequest,
+    StorageRpcObjectPayloadReclaimClaimRecordRequest, StorageRpcObjectPayloadReclaimExistsRequest,
+    StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
+    StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
+    StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
+    StorageRpcObjectTagsForSubjectRequest, StorageRpcPayloadReclaimRootResponse,
+    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
+    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
+    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
+    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
+    StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
+    StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
     StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
@@ -645,6 +651,27 @@ fn reclaim_matches_bucket_key(
         }
         Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
             reclaim.bucket == *bucket && reclaim.key == *key
+        }
+        None => true,
+    }
+}
+
+fn reclaim_matches_bucket_key_generation(
+    reclaim: Option<&ObjectPayloadReclaimCommand>,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+) -> bool {
+    match reclaim {
+        Some(ObjectPayloadReclaimCommand::Segments(reclaim)) => {
+            reclaim.bucket == *bucket
+                && reclaim.key == *key
+                && reclaim.generation_id == generation_id
+        }
+        Some(ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
+            reclaim.bucket == *bucket
+                && reclaim.key == *key
+                && reclaim.generation_id == generation_id
         }
         None => true,
     }
@@ -1451,6 +1478,42 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
+    fn get_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
+
+    fn get_object_payload_reclaim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
     fn prepare_stream_segment_append(
         &self,
         pg_id: PgId,
@@ -1761,6 +1824,10 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
         key: &ShardKey,
         ack: WriteAck,
     ) -> Result<(), StoreError>;
+
+    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
+
+    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardScavengerNodeClient: Send + Sync {
@@ -2491,10 +2558,6 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
     ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
 
-    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
-
-    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
-
     fn try_acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
@@ -2704,6 +2767,42 @@ impl UnixStorageNodeClient {
         let payload = self.encode_shard_ack_batch(pg_id, shard_batch)?;
         self.rpc_request(StorageRpcMessageKind::ShardAckValidate, payload)
             .map(|_| ())
+    }
+
+    pub(crate) fn load_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        let payload = self.encode_shard_ack_item(pg_id, key);
+        let response = self.rpc_request(StorageRpcMessageKind::ShardAckLoad, payload)?;
+        let item = decode_shard_ack_item_response(&response).map_err(|error| {
+            self.rpc_payload_error("decode shard ack load response", error.to_string())
+        })?;
+        if item.shard_key != *key {
+            return Err(self.rpc_payload_error(
+                "validate shard ack load response",
+                "shard key does not match request".to_string(),
+            ));
+        }
+        Ok(item.ack)
+    }
+
+    pub(crate) fn delete_written_shard_ack(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let payload = self.encode_shard_ack_item(pg_id, key);
+        let response = self.rpc_request(StorageRpcMessageKind::ShardAckDelete, payload)?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate shard ack delete response",
+                "shard ack delete response payload must be empty".to_string(),
+            ))
+        }
     }
 
     pub(crate) fn list_scavenger_shard_files(
@@ -3391,6 +3490,15 @@ impl UnixStorageNodeClient {
         })
     }
 
+    fn encode_shard_ack_item(&self, pg_id: PgId, key: &ShardKey) -> Vec<u8> {
+        encode_shard_ack_item_request(&StorageRpcShardAckItemRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            shard_key: key.clone(),
+        })
+    }
+
     fn head_bucket_with_kind(
         &self,
         kind: StorageRpcMessageKind,
@@ -3767,6 +3875,14 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::validate_written_shard_acks(self, pg_id, &[(key, ack)])
     }
+
+    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::load_written_shard_ack(self, pg_id, key)
+    }
+
+    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_written_shard_ack(self, pg_id, key)
+    }
 }
 
 impl ShardScavengerNodeClient for UnixStorageNodeClient {
@@ -4127,6 +4243,20 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
     ) -> Result<(), StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.validate_written_shard_ack(key, ack)
+    }
+
+    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let stat = pg.stat_shard(key)?;
+        Ok(WriteAck {
+            crc64: stat.crc64,
+            stored_size: stat.size,
+        })
+    }
+
+    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.delete_shard_record(key)
     }
 }
 
@@ -4942,6 +5072,69 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::get_bucket_payload_reclaim_root(self, pg_id, bucket)
+    }
+
+    fn get_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_payload_reclaim_root(self, pg_id)
+    }
+
+    fn get_object_payload_reclaim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_object_payload_reclaim(
+            self,
+            pg_id,
+            bucket,
+            key,
+            generation_id,
+        )
+    }
+
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::acquire_object_payload_reclaim_claim(
+            self,
+            pg_id,
+            bucket,
+            bucket_incarnation_generation,
+            key,
+            generation_id,
+            reclaim_kind,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )
+    }
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::release_object_payload_reclaim_claim(self, pg_id, claim)
     }
 
     fn prepare_stream_segment_append(
@@ -7560,6 +7753,162 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         })?;
         self.validate_bucket_payload_reclaim_root_response(&response, bucket)?;
         Ok(response.root)
+    }
+
+    fn get_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimRoot, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_payload_reclaim_root_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode object payload reclaim root response",
+                error.to_string(),
+            ))
+        })?;
+        Ok(response.root)
+    }
+
+    fn get_object_payload_reclaim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
+        let request = StorageRpcObjectPayloadReclaimExistsRequest {
+            object: self.object_request(pg_id, bucket, key),
+            generation_id,
+        };
+        let payload = encode_object_payload_reclaim_exists_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimLoad, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_object_payload_reclaim_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode object payload reclaim response", error.to_string()),
+            )
+        })?;
+        if !reclaim_matches_bucket_key_generation(
+            response.reclaim.as_ref(),
+            bucket,
+            key,
+            generation_id,
+        ) {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate object payload reclaim response",
+                "response reclaim payload does not match request".to_string(),
+            )));
+        }
+        Ok(response.reclaim)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            bucket_incarnation_generation,
+            generation_id,
+            reclaim_kind,
+            claim_id: claim_id.to_string(),
+            owner_token: owner_token.to_string(),
+            claimed_at,
+            lease_deadline,
+            now,
+        };
+        let payload =
+            encode_object_payload_reclaim_claim_acquire_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode object payload reclaim claim acquire request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode object payload reclaim claim acquire response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != *bucket
+                || record.bucket_incarnation_generation != bucket_incarnation_generation
+                || record.key != *key
+                || record.generation_id != generation_id
+                || record.reclaim_kind != reclaim_kind
+                || record.claim_id != claim_id
+                || record.owner_token != owner_token
+                || record.cluster_epoch != cluster_epoch
+                || record.pg_id != pg_id.get()
+                || record.claimed_at != claimed_at
+                || record.lease_deadline != lease_deadline
+            {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate object payload reclaim claim acquire response",
+                    "claim response identity does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(response.record)
+    }
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcObjectPayloadReclaimClaimRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: claim.clone(),
+        };
+        let payload =
+            encode_object_payload_reclaim_claim_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode object payload reclaim claim release request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode object payload reclaim claim release response",
+            &response,
+        )
     }
 
     fn prepare_stream_segment_append(
@@ -10490,20 +10839,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?)
-    }
-
-    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let stat = pg.stat_shard(key)?;
-        Ok(WriteAck {
-            crc64: stat.crc64,
-            stored_size: stat.size,
-        })
-    }
-
-    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.delete_shard_record(key)
     }
 
     fn try_acquire_object_payload_lease(
@@ -15523,7 +15858,7 @@ mod tests {
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..13)
+        let server_threads: Vec<_> = (0..17)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -15612,6 +15947,53 @@ mod tests {
         assert_eq!(reclaim_root.bucket, bucket);
         assert_eq!(reclaim_root.key, key);
         assert_eq!(reclaim_root.generation_id, reclaim_generation_id);
+        let pg_reclaim_root =
+            ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, PgId::new(0))
+                .unwrap()
+                .expect("seeded PG reclaim root should exist");
+        assert_eq!(pg_reclaim_root, reclaim_root);
+        let object_reclaim = ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
+            &client,
+            PgId::new(0),
+            &bucket,
+            &key,
+            reclaim_generation_id,
+        )
+        .unwrap()
+        .expect("seeded object reclaim should exist");
+        assert!(matches!(
+            &object_reclaim,
+            ObjectPayloadReclaimCommand::Segments(reclaim)
+                if reclaim.bucket == bucket
+                    && reclaim.key == key
+                    && reclaim.generation_id == reclaim_generation_id
+        ));
+        let claim = ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
+            &client,
+            PgId::new(0),
+            &bucket,
+            1,
+            &key,
+            reclaim_generation_id,
+            object_reclaim.kind(),
+            "object-reclaim-claim",
+            "object-reclaim-owner",
+            ClusterEpoch::new(1).unwrap(),
+            100,
+            Some(1_000),
+            100,
+        )
+        .unwrap()
+        .expect("seeded object reclaim claim should be acquired");
+        assert_eq!(claim.bucket, bucket);
+        assert_eq!(claim.key, key);
+        assert_eq!(claim.generation_id, reclaim_generation_id);
+        ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+            &client,
+            PgId::new(0),
+            &claim,
+        )
+        .unwrap();
         client
             .validate_bucket_payload_reclaim_root_response(
                 &StorageRpcPayloadReclaimRootResponse {
@@ -15945,6 +16327,34 @@ mod tests {
             err,
             BucketSnapshotLoadError::Store(StoreError::StorageRpc {
                 operation: "object bucket payload reclaim root",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_object_payload_reclaim_root_requires_pg_primary() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let err = ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, PgId::new(0))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "object payload reclaim root",
                 ..
             })
         ));

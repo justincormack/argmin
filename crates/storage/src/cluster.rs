@@ -1692,6 +1692,7 @@ impl StorageCluster {
         self.local_map.process_local_registry_key()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_pg_primary_client(
         &self,
         pg_id: PgId,
@@ -4922,8 +4923,8 @@ impl StorageCluster {
         // CRC/size acks are metadata rows in the same PG and are read through
         // that PG's primary.
         let pg_id = PgId::new(data_pg_id);
-        self.metadata_pg_primary_client(pg_id)?
-            .load_written_shard_ack(pg_id, shard_key)
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
+        shard_ack_client.load_written_shard_ack(pg_id, shard_key)
     }
 
     fn segment_payload_locations(
@@ -5077,11 +5078,11 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(data_pg_id);
-        let storage_client = self.metadata_pg_primary_client(pg_id)?;
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
         for shard_key in shard_keys {
             self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
                 .map_err(ObjectPgActionError::Store)?;
-            storage_client.delete_written_shard_ack(pg_id, shard_key)?;
+            shard_ack_client.delete_written_shard_ack(pg_id, shard_key)?;
         }
         Ok(())
     }
@@ -5092,8 +5093,8 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) {
         let pg_id = PgId::new(data_pg_id);
-        let storage_client = match self.metadata_pg_primary_client(pg_id) {
-            Ok(storage_client) => storage_client,
+        let shard_ack_client = match self.metadata_pg_primary_shard_ack_client(pg_id) {
+            Ok(shard_ack_client) => shard_ack_client,
             Err(error) => {
                 self.emit_best_effort_payload_cleanup_error(
                     "resolve payload ack metadata PG primary",
@@ -5109,7 +5110,7 @@ impl StorageCluster {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
                 continue;
             }
-            if let Err(error) = storage_client.delete_written_shard_ack(pg_id, shard_key) {
+            if let Err(error) = shard_ack_client.delete_written_shard_ack(pg_id, shard_key) {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
             }
         }

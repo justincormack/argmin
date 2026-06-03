@@ -6609,6 +6609,22 @@ mod tests {
                 .push((pg_id, key.clone(), ack));
             Ok(())
         }
+
+        fn load_written_shard_ack(
+            &self,
+            _pg_id: PgId,
+            _key: &ShardKey,
+        ) -> Result<WriteAck, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        fn delete_written_shard_ack(
+            &self,
+            _pg_id: PgId,
+            _key: &ShardKey,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::NotFound)
+        }
     }
 
     #[test]
@@ -8858,9 +8874,6 @@ mod tests {
                 .or_default() += 1;
         }
         *expected_connections_by_node
-            .entry(wrong_ack_node)
-            .or_default() += 1;
-        *expected_connections_by_node
             .entry(NodeId::new(0))
             .or_default() += 1;
 
@@ -8922,11 +8935,22 @@ mod tests {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        map.node(wrong_ack_node)
-            .unwrap()
-            .shard_ack_client()
-            .register_written_shard_acks(PgId::new(direct_written.data_pg_id), &shard_batch)
+        let wrong_config = server_configs
+            .iter()
+            .find(|config| config.node_id == wrong_ack_node)
             .unwrap();
+        {
+            let wrong_node = SharedStorageNode::open_with_default_ec_shape(
+                &wrong_config.data_dir,
+                &wrong_config.pg_ids,
+                wrong_config.default_ec_shape,
+            )
+            .unwrap();
+            let wrong_pg = wrong_node.get_pg(direct_written.data_pg_id).unwrap();
+            wrong_pg
+                .register_written_shards_batch_exact(&shard_batch)
+                .unwrap();
+        }
 
         let err = cluster
             .validate_payload_shard_acks(
@@ -8951,10 +8975,6 @@ mod tests {
         for thread in server_threads {
             thread.join().unwrap();
         }
-        let wrong_config = server_configs
-            .iter()
-            .find(|config| config.node_id == wrong_ack_node)
-            .unwrap();
         let wrong_node = SharedStorageNode::open_with_default_ec_shape(
             &wrong_config.data_dir,
             &wrong_config.pg_ids,
