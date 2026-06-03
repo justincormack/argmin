@@ -30,8 +30,8 @@ use crate::storage_rpc::{
     decode_bucket_delete_finalize_claim_record_request,
     decode_bucket_delete_finalize_roots_request,
     decode_bucket_metadata_control_command_build_request,
-    decode_bucket_metadata_control_pending_match_request, decode_bucket_request,
-    decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
+    decode_bucket_metadata_control_pending_match_request, decode_bucket_pg_request,
+    decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
     decode_bucket_subresource_get_request, decode_bucket_write_drain_begin_request,
     decode_bucket_write_drain_clear_expired_request, decode_bucket_write_drain_record_request,
     decode_bucket_write_reservation_acquire_request, decode_bucket_write_reservation_proof_request,
@@ -44,8 +44,10 @@ use crate::storage_rpc::{
     decode_delete_current_object_command_build_request,
     decode_delete_specific_object_command_build_request, decode_direct_put_command_build_request,
     decode_direct_put_commit_snapshot_request, decode_insert_delete_marker_command_build_request,
-    decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
-    decode_metadata_command_pending_slot_replace_request,
+    decode_lifecycle_sweep_claim_acquire_request, decode_lifecycle_sweep_claim_error_request,
+    decode_lifecycle_sweep_claim_heartbeat_request, decode_lifecycle_sweep_claim_record_request,
+    decode_lifecycle_sweep_roots_request, decode_metadata_command_matching_applied_request,
+    decode_metadata_command_next_id_request, decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_multipart_completion_preflight_request,
     decode_multipart_completion_snapshot_request, decode_multipart_parts_list_request,
@@ -73,6 +75,8 @@ use crate::storage_rpc::{
     encode_completed_multipart_order_command_build_response,
     encode_create_bucket_command_build_response, encode_direct_put_command_build_response,
     encode_direct_put_commit_snapshot_response, encode_health_response,
+    encode_lifecycle_sweep_buckets_response, encode_lifecycle_sweep_claim_optional_record_response,
+    encode_lifecycle_sweep_claim_record_response, encode_lifecycle_sweep_roots_response,
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
     encode_metadata_command_bool_outcome_response, encode_metadata_command_bool_response,
     encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
@@ -105,8 +109,8 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteFinalizedResponse, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketMetadataControlCommandBuildRequest,
     StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcBucketMetadataControlMutation,
-    StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketRequest,
-    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
+    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotPairResponse,
     StorageRpcBucketSnapshotRequest, StorageRpcBucketSnapshotResponse,
     StorageRpcBucketSubresourceGetRequest, StorageRpcBucketSubresourceGetResponse,
@@ -127,14 +131,19 @@ use crate::storage_rpc::{
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommandBuildResponse,
     StorageRpcDirectPutCommitSnapshotRequest, StorageRpcDirectPutCommitSnapshotResponse,
     StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
-    StorageRpcInsertDeleteMarkerCommandBuildRequest, StorageRpcMessageKind,
-    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAcceptanceResponse,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
-    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
-    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
-    StorageRpcMetadataCommandPendingEnvelopeResponse,
+    StorageRpcInsertDeleteMarkerCommandBuildRequest, StorageRpcLifecycleSweepBucketsResponse,
+    StorageRpcLifecycleSweepClaimAcquireRequest, StorageRpcLifecycleSweepClaimErrorRequest,
+    StorageRpcLifecycleSweepClaimHeartbeatRequest,
+    StorageRpcLifecycleSweepClaimOptionalRecordResponse,
+    StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcLifecycleSweepClaimRecordResponse,
+    StorageRpcLifecycleSweepRootsRequest, StorageRpcLifecycleSweepRootsResponse,
+    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
+    StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesOutcome,
+    StorageRpcMetadataCommandAppliedHashesResponse, StorageRpcMetadataCommandBoolOutcome,
+    StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandBoolResponse,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandMaxLogIndexResponse,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -613,6 +622,60 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
                 match decode_bucket_delete_finalize_claim_record_request(&frame.payload) {
                     Ok(request) => self.bucket_delete_finalize_claim_release_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::LifecycleSweepBucketsList => {
+                match decode_bucket_pg_request(&frame.payload) {
+                    Ok(request) => self.lifecycle_sweep_buckets_list_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::LifecycleSweepRoots => {
+                match decode_lifecycle_sweep_roots_request(&frame.payload) {
+                    Ok(request) => self.lifecycle_sweep_roots_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::LifecycleSweepClaimAcquire => {
+                match decode_lifecycle_sweep_claim_acquire_request(&frame.payload) {
+                    Ok(request) => self.lifecycle_sweep_claim_acquire_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::LifecycleSweepClaimHeartbeat => {
+                match decode_lifecycle_sweep_claim_heartbeat_request(&frame.payload) {
+                    Ok(request) => self.lifecycle_sweep_claim_heartbeat_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::LifecycleSweepClaimError => {
+                match decode_lifecycle_sweep_claim_error_request(&frame.payload) {
+                    Ok(request) => self.lifecycle_sweep_claim_error_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::LifecycleSweepClaimRelease => {
+                match decode_lifecycle_sweep_claim_record_request(&frame.payload) {
+                    Ok(request) => self.lifecycle_sweep_claim_release_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1747,6 +1810,177 @@ impl StorageNodeConnectionHandler {
             &local_client,
             request.pg_id,
             &request.record,
+        ) {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn lifecycle_sweep_buckets_list_response(
+        &self,
+        request: StorageRpcBucketPgRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(request.pg_id, "lifecycle sweep bucket list") {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(
+            &local_client,
+            request.pg_id,
+        ) {
+            Ok(buckets) => {
+                let payload = encode_lifecycle_sweep_buckets_response(
+                    &StorageRpcLifecycleSweepBucketsResponse { buckets },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn lifecycle_sweep_roots_response(
+        &self,
+        request: StorageRpcLifecycleSweepRootsRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(request.pg_id, "lifecycle sweep roots") {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(
+            &local_client,
+            request.pg_id,
+            request.now,
+            request.limit,
+        ) {
+            Ok(roots) => {
+                let payload = encode_lifecycle_sweep_roots_response(
+                    &StorageRpcLifecycleSweepRootsResponse { roots },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn lifecycle_sweep_claim_acquire_response(
+        &self,
+        request: StorageRpcLifecycleSweepClaimAcquireRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.bucket.node_id,
+            request.bucket.cluster_epoch,
+            request.bucket.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.bucket.pg_id,
+            &request.bucket.bucket,
+            "lifecycle sweep claim acquire",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
+            &local_client,
+            request.bucket.pg_id,
+            &request.bucket.bucket,
+            request.bucket_incarnation_generation,
+            &request.claim_id,
+            &request.owner_token,
+            request.bucket.cluster_epoch,
+            request.claimed_at,
+            request.lease_deadline,
+            request.now,
+        ) {
+            Ok(record) => {
+                let payload = encode_lifecycle_sweep_claim_optional_record_response(
+                    &StorageRpcLifecycleSweepClaimOptionalRecordResponse { record },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn lifecycle_sweep_claim_heartbeat_response(
+        &self,
+        request: StorageRpcLifecycleSweepClaimHeartbeatRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_lifecycle_sweep_claim_route(
+            &request.record,
+            "lifecycle sweep claim heartbeat",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
+            &local_client,
+            request.record.pg_id,
+            &request.record.claim,
+            request.heartbeat_at,
+            request.lease_deadline,
+        ) {
+            Ok(record) => {
+                let payload = encode_lifecycle_sweep_claim_record_response(
+                    &StorageRpcLifecycleSweepClaimRecordResponse { record },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn lifecycle_sweep_claim_error_response(
+        &self,
+        request: StorageRpcLifecycleSweepClaimErrorRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self
+            .validate_lifecycle_sweep_claim_route(&request.record, "lifecycle sweep claim error")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
+            &local_client,
+            request.record.pg_id,
+            &request.record.claim,
+            &request.last_error,
+        ) {
+            Ok(record) => {
+                let payload = encode_lifecycle_sweep_claim_record_response(
+                    &StorageRpcLifecycleSweepClaimRecordResponse { record },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn lifecycle_sweep_claim_release_response(
+        &self,
+        request: StorageRpcLifecycleSweepClaimRecordRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_lifecycle_sweep_claim_route(&request, "lifecycle sweep claim release")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+            &local_client,
+            request.pg_id,
+            &request.claim,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
@@ -4832,6 +5066,25 @@ impl StorageNodeConnectionHandler {
             });
         }
         Ok(())
+    }
+
+    fn validate_lifecycle_sweep_claim_route(
+        &self,
+        request: &StorageRpcLifecycleSweepClaimRecordRequest,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        if request.claim.pg_id != request.pg_id.get() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} request PG {} does not match claim PG {}",
+                    request.pg_id.get(),
+                    request.claim.pg_id
+                ),
+            });
+        }
+        self.validate_primary_pg_for_bucket(request.pg_id, &request.claim.bucket, operation)
     }
 
     fn validate_bucket_metadata_control_route(

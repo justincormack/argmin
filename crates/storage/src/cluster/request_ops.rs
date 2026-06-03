@@ -3058,7 +3058,7 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             let buckets = node
-                .storage_client()
+                .bucket_write_reservation_client()
                 .list_lifecycle_sweep_buckets(PgId::new(pg_id))
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             lifecycle_buckets.extend(buckets.lifecycle_buckets);
@@ -3083,7 +3083,7 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             roots.extend(
-                node.storage_client()
+                node.bucket_write_reservation_client()
                     .get_lifecycle_sweep_roots(
                         PgId::new(pg_id),
                         now,
@@ -3134,7 +3134,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .acquire_lifecycle_sweep_claim(
                 PgId::new(pg_id),
                 bucket,
@@ -3158,7 +3158,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .heartbeat_lifecycle_sweep_claim(
                 PgId::new(pg_id),
                 claim,
@@ -3177,7 +3177,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .record_lifecycle_sweep_claim_error(PgId::new(pg_id), claim, last_error)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
@@ -3190,7 +3190,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .release_lifecycle_sweep_claim(PgId::new(pg_id), claim)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }

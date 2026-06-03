@@ -35,10 +35,13 @@ use crate::storage_rpc::{
     decode_bucket_write_reservation_record_response,
     decode_completed_multipart_order_command_build_response,
     decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
-    decode_direct_put_commit_snapshot_response, decode_metadata_command_acceptance_response,
-    decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
-    decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
-    decode_metadata_command_next_id_response, decode_metadata_command_pending_envelope_response,
+    decode_direct_put_commit_snapshot_response, decode_lifecycle_sweep_buckets_response,
+    decode_lifecycle_sweep_claim_optional_record_response,
+    decode_lifecycle_sweep_claim_record_response, decode_lifecycle_sweep_roots_response,
+    decode_metadata_command_acceptance_response, decode_metadata_command_applied_hashes_response,
+    decode_metadata_command_bool_outcome_response, decode_metadata_command_bool_response,
+    decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
+    decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -63,8 +66,8 @@ use crate::storage_rpc::{
     encode_bucket_delete_finalize_claim_record_request,
     encode_bucket_delete_finalize_roots_request,
     encode_bucket_metadata_control_command_build_request,
-    encode_bucket_metadata_control_pending_match_request, encode_bucket_request,
-    encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
+    encode_bucket_metadata_control_pending_match_request, encode_bucket_pg_request,
+    encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_subresource_get_request, encode_bucket_write_drain_begin_request,
     encode_bucket_write_drain_clear_expired_request, encode_bucket_write_drain_record_request,
     encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
@@ -77,8 +80,10 @@ use crate::storage_rpc::{
     encode_delete_current_object_command_build_request,
     encode_delete_specific_object_command_build_request, encode_direct_put_command_build_request,
     encode_direct_put_commit_snapshot_request, encode_insert_delete_marker_command_build_request,
-    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
-    encode_metadata_command_pending_slot_replace_request,
+    encode_lifecycle_sweep_claim_acquire_request, encode_lifecycle_sweep_claim_error_request,
+    encode_lifecycle_sweep_claim_heartbeat_request, encode_lifecycle_sweep_claim_record_request,
+    encode_lifecycle_sweep_roots_request, encode_metadata_command_matching_applied_request,
+    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_multipart_completion_preflight_request,
     encode_multipart_completion_snapshot_request, encode_multipart_parts_list_request,
@@ -118,11 +123,13 @@ use crate::storage_rpc::{
     StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommitSnapshotRequest,
     StorageRpcErrorResponse, StorageRpcFrame, StorageRpcInsertDeleteMarkerCommandBuildRequest,
-    StorageRpcInsertDeleteMarkerStalePayload, StorageRpcMessageKind,
-    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
-    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
-    StorageRpcMetadataCommandPendingSlotInsertOutcome,
+    StorageRpcInsertDeleteMarkerStalePayload, StorageRpcLifecycleSweepClaimAcquireRequest,
+    StorageRpcLifecycleSweepClaimErrorRequest, StorageRpcLifecycleSweepClaimHeartbeatRequest,
+    StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcLifecycleSweepRootsRequest,
+    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
+    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandBoolOutcome,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdOutcome,
+    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
@@ -652,6 +659,19 @@ fn reclaim_matches_snapshot_live_object(
     }
 }
 
+fn lifecycle_sweep_claim_identity_matches(
+    actual: &LifecycleSweepClaimRecord,
+    expected: &LifecycleSweepClaimRecord,
+) -> bool {
+    actual.bucket == expected.bucket
+        && actual.bucket_incarnation_generation == expected.bucket_incarnation_generation
+        && actual.claim_id == expected.claim_id
+        && actual.owner_token == expected.owner_token
+        && actual.cluster_epoch == expected.cluster_epoch
+        && actual.pg_id == expected.pg_id
+        && actual.claimed_at == expected.claimed_at
+}
+
 fn snapshot_live_object_payload_reclaim_command(
     pg: &crate::PgStore,
     bucket: &BucketName,
@@ -1099,6 +1119,53 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn get_lifecycle_sweep_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError>;
+
+    fn list_lifecycle_sweep_buckets(
+        &self,
+        pg_id: PgId,
+    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError>;
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
+
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 }
 
@@ -4353,6 +4420,83 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::release_bucket_delete_finalize_claim(self, pg_id, claim)
     }
+
+    fn get_lifecycle_sweep_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_lifecycle_sweep_roots(self, pg_id, now, limit)
+    }
+
+    fn list_lifecycle_sweep_buckets(
+        &self,
+        pg_id: PgId,
+    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::list_lifecycle_sweep_buckets(self, pg_id)
+    }
+
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::acquire_lifecycle_sweep_claim(
+            self,
+            pg_id,
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )
+    }
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::heartbeat_lifecycle_sweep_claim(
+            self,
+            pg_id,
+            claim,
+            heartbeat_at,
+            lease_deadline,
+        )
+    }
+
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::record_lifecycle_sweep_claim_error(
+            self, pg_id, claim, last_error,
+        )
+    }
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::release_lifecycle_sweep_claim(self, pg_id, claim)
+    }
 }
 
 impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
@@ -5647,6 +5791,243 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             .map_err(BucketSnapshotLoadError::Store)?;
         self.validate_empty_bucket_write_reservation_response(
             "decode bucket delete finalize claim release response",
+            &response,
+        )
+    }
+
+    fn get_lifecycle_sweep_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
+        let request = StorageRpcLifecycleSweepRootsRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            now,
+            limit,
+        };
+        let payload = encode_lifecycle_sweep_roots_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode lifecycle sweep roots request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::LifecycleSweepRoots, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_lifecycle_sweep_roots_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode lifecycle sweep roots response", error.to_string()),
+            )
+        })?;
+        if response.roots.len() > limit {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate lifecycle sweep roots response",
+                "root count exceeds request limit".to_string(),
+            )));
+        }
+        Ok(response.roots)
+    }
+
+    fn list_lifecycle_sweep_buckets(
+        &self,
+        pg_id: PgId,
+    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketPgRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode lifecycle sweep buckets request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::LifecycleSweepBucketsList, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_lifecycle_sweep_buckets_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode lifecycle sweep buckets response",
+                    error.to_string(),
+                ))
+            })?;
+        Ok(response.buckets)
+    }
+
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcLifecycleSweepClaimAcquireRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            bucket_incarnation_generation,
+            claim_id: claim_id.to_string(),
+            owner_token: owner_token.to_string(),
+            claimed_at,
+            lease_deadline,
+            now,
+        };
+        let payload = encode_lifecycle_sweep_claim_acquire_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode lifecycle sweep claim acquire request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimAcquire, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_lifecycle_sweep_claim_optional_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode lifecycle sweep claim acquire response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != *bucket
+                || record.bucket_incarnation_generation != bucket_incarnation_generation
+                || record.claim_id != claim_id
+                || record.owner_token != owner_token
+                || record.cluster_epoch != cluster_epoch
+                || record.pg_id != pg_id.get()
+                || record.claimed_at != claimed_at
+                || record.lease_deadline != lease_deadline
+            {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate lifecycle sweep claim acquire response",
+                    "claim response identity does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(response.record)
+    }
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
+        let request = StorageRpcLifecycleSweepClaimHeartbeatRequest {
+            record: StorageRpcLifecycleSweepClaimRecordRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                claim: claim.clone(),
+            },
+            heartbeat_at,
+            lease_deadline,
+        };
+        let payload =
+            encode_lifecycle_sweep_claim_heartbeat_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode lifecycle sweep claim heartbeat request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimHeartbeat, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_lifecycle_sweep_claim_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode lifecycle sweep claim heartbeat response",
+                    error.to_string(),
+                ))
+            })?;
+        if !lifecycle_sweep_claim_identity_matches(&response.record, claim)
+            || response.record.heartbeat_at != heartbeat_at
+            || response.record.lease_deadline != lease_deadline
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate lifecycle sweep claim heartbeat response",
+                "claim response identity does not match request".to_string(),
+            )));
+        }
+        Ok(response.record)
+    }
+
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
+        let request = StorageRpcLifecycleSweepClaimErrorRequest {
+            record: StorageRpcLifecycleSweepClaimRecordRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                claim: claim.clone(),
+            },
+            last_error: last_error.to_string(),
+        };
+        let payload = encode_lifecycle_sweep_claim_error_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode lifecycle sweep claim error request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimError, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_lifecycle_sweep_claim_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode lifecycle sweep claim error response",
+                    error.to_string(),
+                ))
+            })?;
+        if !lifecycle_sweep_claim_identity_matches(&response.record, claim)
+            || response.record.last_error.as_deref() != Some(last_error)
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate lifecycle sweep claim error response",
+                "claim response identity does not match request".to_string(),
+            )));
+        }
+        Ok(response.record)
+    }
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        pg_id: PgId,
+        claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcLifecycleSweepClaimRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            claim: claim.clone(),
+        };
+        let payload = encode_lifecycle_sweep_claim_record_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode lifecycle sweep claim release request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimRelease, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode lifecycle sweep claim release response",
             &response,
         )
     }
@@ -13025,6 +13406,131 @@ mod tests {
             &client,
             PgId::new(0),
             &finalize_bucket,
+        )
+        .unwrap();
+
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bucket-lifecycle-sweep-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let bucket_incarnation_generation = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+            PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_incarnation_generation
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..6)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let buckets =
+            BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(&client, PgId::new(0))
+                .unwrap();
+        assert_eq!(buckets.lifecycle_buckets.len(), 1);
+        assert_eq!(buckets.lifecycle_buckets[0].name, bucket);
+        assert!(buckets.aborting_buckets.is_empty());
+
+        let roots = BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(
+            &client,
+            PgId::new(0),
+            10,
+            16,
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].bucket, bucket);
+        assert_eq!(
+            roots[0].source,
+            crate::types::LifecycleSweepRootSource::LifecycleConfig
+        );
+
+        let claim = BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
+            &client,
+            PgId::new(0),
+            &bucket,
+            bucket_incarnation_generation,
+            "lifecycle-claim-rpc-1",
+            "lifecycle-owner-rpc-1",
+            ClusterEpoch::new(1).unwrap(),
+            20,
+            Some(40),
+            20,
+        )
+        .unwrap()
+        .expect("lifecycle claim should acquire");
+        assert_eq!(claim.bucket, bucket);
+        assert_eq!(claim.claim_id, "lifecycle-claim-rpc-1");
+
+        let heartbeat = BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
+            &client,
+            PgId::new(0),
+            &claim,
+            30,
+            Some(50),
+        )
+        .unwrap();
+        assert_eq!(heartbeat.heartbeat_at, 30);
+        assert_eq!(heartbeat.lease_deadline, Some(50));
+
+        let error_record = BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
+            &client,
+            PgId::new(0),
+            &heartbeat,
+            "transient lifecycle error",
+        )
+        .unwrap();
+        assert_eq!(
+            error_record.last_error.as_deref(),
+            Some("transient lifecycle error")
+        );
+
+        BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+            &client,
+            PgId::new(0),
+            &error_record,
         )
         .unwrap();
 

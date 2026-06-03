@@ -1541,6 +1541,55 @@ fail_with_matches \
     "Production durable reclaim/finalizer/lifecycle worker roots and claims must go through the node client boundary" \
     "$migrated_background_worker_bypasses"
 
+lifecycle_sweep_coordination_broad_client_bypasses=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+        in_test_module = 0
+        pending_bucket_write_client = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    {
+        if ($0 ~ /\.bucket_write_reservation_client\(\)/ \
+            || $0 ~ /bucket_write_reservation_client[[:space:]]*$/) {
+            pending_bucket_write_client = 1
+        }
+        if ($0 ~ /\.(list_lifecycle_sweep_buckets|get_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)\(/) {
+            if ($0 ~ /self\.list_lifecycle_sweep_buckets\(/) {
+                next
+            }
+            if (pending_bucket_write_client \
+                || $0 ~ /\.bucket_write_reservation_client\(\)/ \
+                || $0 ~ /bucket_write_reservation_client\./) {
+                pending_bucket_write_client = 0
+                next
+            }
+            print FILENAME ":" FNR ":" $0
+            next
+        }
+        if ($0 ~ /;/) {
+            pending_bucket_write_client = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production lifecycle sweep coordination must use bucket_write_reservation_client" \
+    "$lifecycle_sweep_coordination_broad_client_bypasses"
+
 payload_shard_delete_callers=$(
     awk '
     FNR == 1 {

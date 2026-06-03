@@ -17,7 +17,8 @@ use crate::{
         CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
         CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
         DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
-        GenerationId, ListPartsResp, ListedMultipartParts, LiveObjectRecord,
+        GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
+        LifecycleSweepRootSource, ListPartsResp, ListedMultipartParts, LiveObjectRecord,
         LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
         MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
         MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
@@ -205,6 +206,7 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATIONS_LIST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4;
 const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS: usize = 1024;
+const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS: usize = 1024;
 const STORAGE_RPC_BUCKET_DELETE_FINALIZE_ROOT_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_LEN + 8;
 const STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_NAME_LEN
@@ -250,6 +252,14 @@ const STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN: usize
 const STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1;
+const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN + 8 + 8;
+const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN + 8 + 4 + 4096;
+const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ERROR_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 4 + 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -344,6 +354,12 @@ pub(crate) enum StorageRpcMessageKind {
     BucketMetadataControlPendingMatch = 88,
     BucketMetadataControlCommandBuild = 89,
     BucketSubresourceGet = 90,
+    LifecycleSweepBucketsList = 91,
+    LifecycleSweepRoots = 92,
+    LifecycleSweepClaimAcquire = 93,
+    LifecycleSweepClaimHeartbeat = 94,
+    LifecycleSweepClaimError = 95,
+    LifecycleSweepClaimRelease = 96,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,6 +510,12 @@ impl StorageRpcMessageKind {
             Self::BucketMetadataControlPendingMatch => "bucket metadata control pending match",
             Self::BucketMetadataControlCommandBuild => "bucket metadata control command build",
             Self::BucketSubresourceGet => "bucket subresource get",
+            Self::LifecycleSweepBucketsList => "lifecycle sweep buckets list",
+            Self::LifecycleSweepRoots => "lifecycle sweep roots",
+            Self::LifecycleSweepClaimAcquire => "lifecycle sweep claim acquire",
+            Self::LifecycleSweepClaimHeartbeat => "lifecycle sweep claim heartbeat",
+            Self::LifecycleSweepClaimError => "lifecycle sweep claim error",
+            Self::LifecycleSweepClaimRelease => "lifecycle sweep claim release",
         }
     }
 
@@ -589,6 +611,12 @@ impl StorageRpcMessageKind {
             88 => Ok(Self::BucketMetadataControlPendingMatch),
             89 => Ok(Self::BucketMetadataControlCommandBuild),
             90 => Ok(Self::BucketSubresourceGet),
+            91 => Ok(Self::LifecycleSweepBucketsList),
+            92 => Ok(Self::LifecycleSweepRoots),
+            93 => Ok(Self::LifecycleSweepClaimAcquire),
+            94 => Ok(Self::LifecycleSweepClaimHeartbeat),
+            95 => Ok(Self::LifecycleSweepClaimError),
+            96 => Ok(Self::LifecycleSweepClaimRelease),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1773,6 +1801,67 @@ pub(crate) struct StorageRpcBucketSubresourceGetResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepRootsRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) now: u64,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepRootsResponse {
+    pub(crate) roots: Vec<LifecycleSweepRoot>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcLifecycleSweepBucketsResponse {
+    pub(crate) buckets: LifecycleSweepBuckets,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepClaimAcquireRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepClaimRecordRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) claim: LifecycleSweepClaimRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepClaimHeartbeatRequest {
+    pub(crate) record: StorageRpcLifecycleSweepClaimRecordRequest,
+    pub(crate) heartbeat_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepClaimErrorRequest {
+    pub(crate) record: StorageRpcLifecycleSweepClaimRecordRequest,
+    pub(crate) last_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepClaimOptionalRecordResponse {
+    pub(crate) record: Option<LifecycleSweepClaimRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcLifecycleSweepClaimRecordResponse {
+    pub(crate) record: LifecycleSweepClaimRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingSlotRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -2499,6 +2588,24 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketSubresourceGet => {
             STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::LifecycleSweepBucketsList => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::LifecycleSweepRoots => {
+            STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::LifecycleSweepClaimAcquire => {
+            STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::LifecycleSweepClaimHeartbeat => {
+            STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 8 + 1 + 8
+        }
+        StorageRpcMessageKind::LifecycleSweepClaimError => {
+            STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ERROR_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::LifecycleSweepClaimRelease => {
+            STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -5085,6 +5192,379 @@ pub(crate) fn decode_bucket_subresource_get_response(
     Ok(StorageRpcBucketSubresourceGetResponse { body })
 }
 
+pub(crate) fn encode_lifecycle_sweep_roots_request(
+    request: &StorageRpcLifecycleSweepRootsRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.limit > STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: request.limit,
+            limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+        });
+    }
+    let mut out = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    })?;
+    put_u64(&mut out, request.now);
+    put_u64(
+        &mut out,
+        u64::try_from(request.limit).map_err(|_| StorageRpcPayloadError::PayloadTooLarge {
+            len: request.limit,
+            limit: u64::MAX as usize,
+        })?,
+    );
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_roots_request(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepRootsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let now = decoder.read_u64()?;
+    let limit = usize::try_from(decoder.read_u64()?).map_err(|_| {
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: usize::MAX,
+            limit: usize::MAX,
+        }
+    })?;
+    decoder.finish()?;
+    if limit > STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: limit,
+            limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+        });
+    }
+    Ok(StorageRpcLifecycleSweepRootsRequest {
+        node_id: route.node_id,
+        cluster_epoch: route.cluster_epoch,
+        pg_id: route.pg_id,
+        now,
+        limit,
+    })
+}
+
+pub(crate) fn encode_lifecycle_sweep_roots_response(
+    response: &StorageRpcLifecycleSweepRootsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if response.roots.len() > STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: response.roots.len(),
+            limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.roots.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.roots.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for root in &response.roots {
+        put_lifecycle_sweep_root(&mut out, root);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_roots_response(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepRootsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder
+        .read_bounded_remaining_count(4 + 8 + 1, "lifecycle sweep root count exceeds payload")?;
+    if count > STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+        });
+    }
+    let mut roots = Vec::new();
+    for _ in 0..count {
+        roots.push(decoder.read_lifecycle_sweep_root()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcLifecycleSweepRootsResponse { roots })
+}
+
+pub(crate) fn encode_lifecycle_sweep_buckets_response(
+    response: &StorageRpcLifecycleSweepBucketsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.buckets.lifecycle_buckets.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.buckets.lifecycle_buckets.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for bucket in &response.buckets.lifecycle_buckets {
+        put_bucket_info(&mut out, bucket);
+    }
+    put_u32(
+        &mut out,
+        u32::try_from(response.buckets.aborting_buckets.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.buckets.aborting_buckets.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for bucket in &response.buckets.aborting_buckets {
+        put_string(&mut out, bucket.as_str());
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_buckets_response(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepBucketsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let lifecycle_count =
+        decoder.read_bounded_remaining_count(1, "lifecycle bucket count exceeds payload")?;
+    let mut lifecycle_buckets = Vec::new();
+    for _ in 0..lifecycle_count {
+        lifecycle_buckets.push(decoder.read_bucket_info()?);
+    }
+    let aborting_count =
+        decoder.read_bounded_remaining_count(1, "aborting bucket count exceeds payload")?;
+    let mut aborting_buckets = Vec::new();
+    for _ in 0..aborting_count {
+        aborting_buckets.push(decoder.read_bucket_name()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcLifecycleSweepBucketsResponse {
+        buckets: LifecycleSweepBuckets {
+            lifecycle_buckets,
+            aborting_buckets,
+        },
+    })
+}
+
+pub(crate) fn encode_lifecycle_sweep_claim_acquire_request(
+    request: &StorageRpcLifecycleSweepClaimAcquireRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_reservation_identity(
+        &request.claim_id,
+        &request.owner_token,
+        "lifecycle-sweep",
+        None,
+    )?;
+    let mut out = encode_bucket_request(&request.bucket);
+    put_u64(&mut out, request.bucket_incarnation_generation);
+    put_string(&mut out, &request.claim_id);
+    put_string(&mut out, &request.owner_token);
+    put_u64(&mut out, request.claimed_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    put_u64(&mut out, request.now);
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_claim_acquire_request(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepClaimAcquireRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let bucket_incarnation_generation = decoder.read_u64()?;
+    let claim_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+        StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+    )?;
+    let owner_token = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+        StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+    )?;
+    let claimed_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    let now = decoder.read_u64()?;
+    decoder.finish()?;
+    validate_bucket_write_reservation_identity(&claim_id, &owner_token, "lifecycle-sweep", None)?;
+    Ok(StorageRpcLifecycleSweepClaimAcquireRequest {
+        bucket,
+        bucket_incarnation_generation,
+        claim_id,
+        owner_token,
+        claimed_at,
+        lease_deadline,
+        now,
+    })
+}
+
+pub(crate) fn encode_lifecycle_sweep_claim_record_request(
+    request: &StorageRpcLifecycleSweepClaimRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.claim.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_lifecycle_sweep_claim_record(&request.claim)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_lifecycle_sweep_claim_record(&mut out, &request.claim);
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_claim_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let claim = decoder.read_lifecycle_sweep_claim_record()?;
+    decoder.finish()?;
+    if cluster_epoch != claim.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_lifecycle_sweep_claim_record(&claim)?;
+    Ok(StorageRpcLifecycleSweepClaimRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        claim,
+    })
+}
+
+pub(crate) fn encode_lifecycle_sweep_claim_heartbeat_request(
+    request: &StorageRpcLifecycleSweepClaimHeartbeatRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_lifecycle_sweep_claim_record_request(&request.record)?;
+    put_u64(&mut out, request.heartbeat_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_claim_heartbeat_request(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepClaimHeartbeatRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let claim = decoder.read_lifecycle_sweep_claim_record()?;
+    let heartbeat_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    decoder.finish()?;
+    let record = StorageRpcLifecycleSweepClaimRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        claim,
+    };
+    if record.cluster_epoch != record.claim.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_lifecycle_sweep_claim_record(&record.claim)?;
+    Ok(StorageRpcLifecycleSweepClaimHeartbeatRequest {
+        record,
+        heartbeat_at,
+        lease_deadline,
+    })
+}
+
+pub(crate) fn encode_lifecycle_sweep_claim_error_request(
+    request: &StorageRpcLifecycleSweepClaimErrorRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_lifecycle_sweep_claim_record_request(&request.record)?;
+    put_string(&mut out, &request.last_error);
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_claim_error_request(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepClaimErrorRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let claim = decoder.read_lifecycle_sweep_claim_record()?;
+    let last_error = decoder.read_string_with_limit(
+        4096,
+        StorageRpcPayloadError::InvalidDurableClaimToken("lifecycle error exceeds maximum length"),
+    )?;
+    decoder.finish()?;
+    let record = StorageRpcLifecycleSweepClaimRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        claim,
+    };
+    if record.cluster_epoch != record.claim.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_lifecycle_sweep_claim_record(&record.claim)?;
+    Ok(StorageRpcLifecycleSweepClaimErrorRequest { record, last_error })
+}
+
+pub(crate) fn encode_lifecycle_sweep_claim_optional_record_response(
+    response: &StorageRpcLifecycleSweepClaimOptionalRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.record {
+        Some(record) => {
+            validate_lifecycle_sweep_claim_record(record)?;
+            put_u8(&mut out, 1);
+            put_lifecycle_sweep_claim_record(&mut out, record);
+        }
+        None => put_u8(&mut out, 0),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_claim_optional_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepClaimOptionalRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let record = decoder.read_lifecycle_sweep_claim_record()?;
+            validate_lifecycle_sweep_claim_record(&record)?;
+            Some(record)
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown optional lifecycle sweep claim record tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcLifecycleSweepClaimOptionalRecordResponse { record })
+}
+
+pub(crate) fn encode_lifecycle_sweep_claim_record_response(
+    response: &StorageRpcLifecycleSweepClaimRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_lifecycle_sweep_claim_record(&response.record)?;
+    let mut out = Vec::new();
+    put_lifecycle_sweep_claim_record(&mut out, &response.record);
+    Ok(out)
+}
+
+pub(crate) fn decode_lifecycle_sweep_claim_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcLifecycleSweepClaimRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = decoder.read_lifecycle_sweep_claim_record()?;
+    decoder.finish()?;
+    validate_lifecycle_sweep_claim_record(&record)?;
+    Ok(StorageRpcLifecycleSweepClaimRecordResponse { record })
+}
+
 pub(crate) fn encode_metadata_command_pending_slot_request(
     request: &StorageRpcMetadataCommandPendingSlotRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -7302,6 +7782,23 @@ fn validate_claim_token(token: &StorageRpcDurableClaimToken) -> Result<(), Stora
     Ok(())
 }
 
+fn validate_lifecycle_sweep_claim_record(
+    record: &LifecycleSweepClaimRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_bucket_write_reservation_identity(
+        &record.claim_id,
+        &record.owner_token,
+        "lifecycle-sweep",
+        None,
+    )?;
+    if record.cluster_epoch.get() == 0 {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim epoch must not be zero",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_bucket_write_reservation_proof(
     proof: &BucketWriteReservationProof,
 ) -> Result<(), StorageRpcPayloadError> {
@@ -7781,6 +8278,67 @@ impl<'a> StorageRpcDecoder<'a> {
             cluster_epoch,
             pg_id,
             claimed_at,
+            lease_deadline,
+            attempt_count,
+            last_error,
+        })
+    }
+
+    fn read_lifecycle_sweep_root(&mut self) -> Result<LifecycleSweepRoot, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let source = match self.read_u8()? {
+            0 => LifecycleSweepRootSource::ExpiredClaim,
+            1 => LifecycleSweepRootSource::BusyClaim,
+            2 => LifecycleSweepRootSource::LifecycleConfig,
+            3 => LifecycleSweepRootSource::AbortingMultipartUpload,
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+                    "invalid lifecycle sweep root source",
+                ))
+            }
+        };
+        Ok(LifecycleSweepRoot {
+            bucket,
+            bucket_incarnation_generation,
+            source,
+        })
+    }
+
+    fn read_lifecycle_sweep_claim_record(
+        &mut self,
+    ) -> Result<LifecycleSweepClaimRecord, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let claim_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+        )?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let pg_id = self.read_u32()?;
+        let claimed_at = self.read_u64()?;
+        let heartbeat_at = self.read_u64()?;
+        let lease_deadline = self.read_optional_u64()?;
+        let attempt_count = self.read_u64()?;
+        let last_error = self.read_optional_string_with_limit(
+            4096,
+            StorageRpcPayloadError::InvalidDurableClaimToken(
+                "lifecycle claim error exceeds maximum length",
+            ),
+        )?;
+        Ok(LifecycleSweepClaimRecord {
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            pg_id,
+            claimed_at,
+            heartbeat_at,
             lease_deadline,
             attempt_count,
             last_error,
@@ -9708,6 +10266,34 @@ fn put_bucket_delete_finalize_claim_record(
     put_u64(out, record.cluster_epoch.get());
     put_u32(out, record.pg_id);
     put_u64(out, record.claimed_at);
+    put_optional_u64(out, record.lease_deadline);
+    put_u64(out, record.attempt_count);
+    put_optional_string(out, record.last_error.as_deref());
+}
+
+fn put_lifecycle_sweep_root(out: &mut Vec<u8>, root: &LifecycleSweepRoot) {
+    put_string(out, root.bucket.as_str());
+    put_u64(out, root.bucket_incarnation_generation);
+    put_u8(
+        out,
+        match root.source {
+            LifecycleSweepRootSource::ExpiredClaim => 0,
+            LifecycleSweepRootSource::BusyClaim => 1,
+            LifecycleSweepRootSource::LifecycleConfig => 2,
+            LifecycleSweepRootSource::AbortingMultipartUpload => 3,
+        },
+    );
+}
+
+fn put_lifecycle_sweep_claim_record(out: &mut Vec<u8>, record: &LifecycleSweepClaimRecord) {
+    put_string(out, record.bucket.as_str());
+    put_u64(out, record.bucket_incarnation_generation);
+    put_string(out, &record.claim_id);
+    put_string(out, &record.owner_token);
+    put_u64(out, record.cluster_epoch.get());
+    put_u32(out, record.pg_id);
+    put_u64(out, record.claimed_at);
+    put_u64(out, record.heartbeat_at);
     put_optional_u64(out, record.lease_deadline);
     put_u64(out, record.attempt_count);
     put_optional_string(out, record.last_error.as_deref());
@@ -12034,6 +12620,36 @@ mod tests {
                 STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN,
             ),
+            (
+                StorageRpcMessageKind::LifecycleSweepBucketsList,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepRoots,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepClaimAcquire,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ACQUIRE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ACQUIRE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepClaimHeartbeat,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 8 + 1 + 8 + 1,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 8 + 1 + 8,
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepClaimError,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ERROR_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ERROR_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepClaimRelease,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN,
+            ),
         ] {
             let mut bytes = Vec::new();
             put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
@@ -12415,6 +13031,43 @@ mod tests {
         let bytes = encode_bucket_write_reservation_proof_request(&proof).unwrap();
         let decoded = decode_bucket_write_reservation_proof_request(&bytes).unwrap();
         assert_eq!(decoded, proof);
+    }
+
+    #[test]
+    fn lifecycle_sweep_roots_request_rejects_limit_over_protocol_max() {
+        let request = StorageRpcLifecycleSweepRootsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            now: 100,
+            limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS + 1,
+        };
+        assert_eq!(
+            encode_lifecycle_sweep_roots_request(&request),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS + 1,
+                limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+            })
+        );
+
+        let mut bytes = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+            node_id: request.node_id,
+            cluster_epoch: request.cluster_epoch,
+            pg_id: request.pg_id,
+        })
+        .unwrap();
+        put_u64(&mut bytes, request.now);
+        put_u64(
+            &mut bytes,
+            u64::try_from(STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS + 1).unwrap(),
+        );
+        assert_eq!(
+            decode_lifecycle_sweep_roots_request(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS + 1,
+                limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+            })
+        );
     }
 
     #[test]

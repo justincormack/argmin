@@ -5605,11 +5605,13 @@ finalization checks, drain waits, and reclaim-incarnation lookup now use the
 dedicated bucket metadata RPC boundary. Durable bucket write-drain acquire,
 clear, clear-expired, reservation listing, bucket-delete finalizer claim
 acquire/release, finalize-root scans, and finalized-bucket deletion now route
-through the bucket write coordination RPC boundary. Bucket versioning, ACL,
-property, and subresource command matching/building now route through a bucket
-metadata control RPC, and subresource reads use the bucket metadata RPC
-boundary. Remaining non-command surfaces still need operation-shaped builders
-for lifecycle MPU abort before frontend/combined roles can be enabled.
+through the bucket write coordination RPC boundary. Lifecycle sweep bucket/root
+discovery and durable lifecycle claim acquire/heartbeat/error/release now use
+that same bucket write coordination RPC boundary, so lifecycle sweeper
+coordination runs against the storage-node-owned bucket PG. Bucket versioning,
+ACL, property, and subresource command matching/building now route through a
+bucket metadata control RPC, and subresource reads use the bucket metadata RPC
+boundary.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5683,9 +5685,10 @@ Implementation slices:
    completion/abort command identity before publication. Multipart upload
    read/list/management helpers now use the same object-mutation metadata RPC
    boundary and validate returned upload, completion snapshot, part list, and
-   management lookup identities. Remaining work includes durable
-   pending/drain/coordination checks and operation-shaped command-builder calls
-   for bucket properties/subresources and lifecycle MPU abort.
+   management lookup identities. Bucket property/subresource command
+   matching/builders and reads use dedicated bucket metadata/control RPC
+   surfaces. Durable bucket write-drain, finalizer, and lifecycle sweep
+   coordination checks now use the bucket write coordination RPC boundary.
 6. migrate command construction and convergence helpers in `StorageCluster` to
    the new metadata-command client boundary. Start with bucket-PG command
    install/apply for `CreateBucket`, then direct PUT object-generation
