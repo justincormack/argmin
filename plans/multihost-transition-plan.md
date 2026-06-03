@@ -5833,6 +5833,25 @@ Required tests:
 5. shard scavenger audit can scan remote storage nodes and reports
    location-keyed observations
 
+Status:
+
+- Started Phase 10.6 with the shard-scavenger audit boundary. Shard file scans
+  were already remote-capable through `ShardScavengerNodeClient`; the same
+  narrow client/RPC surface now also carries data-PG shard rows, object-PG
+  payload references, and shard-scavenger observation record/list/resolve
+  operations. Metadata-side scavenger RPCs require PG-primary ownership, while
+  physical file scans remain routed to the storage node that owns the shard
+  location.
+- Focused coverage now includes codec bounds/identity checks, non-primary
+  rejection for all shard-scavenger metadata RPC messages, and a Unix routed
+  shard test proving shard files, ack rows, scavenger shard rows, and
+  observations are stored on the storage-node-owned PG rather than the
+  frontend placeholder PG.
+- Remaining Phase 10.6 work is to turn the background workers back on in
+  frontend/combined startup once object reclaim, bucket finalization, lifecycle,
+  and shard-scavenger worker scheduling/restart behavior have process-shaped
+  coverage.
+
 ### Phase 10.7: Multi-Process Harness
 
 Add an integration harness that starts:

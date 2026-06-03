@@ -6,7 +6,7 @@ use crate::{
         DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandReplicaState,
         ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
     },
-    pg_store::{ScavengerShardFile, ScavengerShardFileScan},
+    pg_store::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow},
     types::{
         AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
         BucketEncryptionConfig, BucketFastPathIdentity, BucketInfo, BucketObjectOwnership,
@@ -33,6 +33,9 @@ use crate::{
         ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
         PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SerializedMetadataBlob,
         SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+        ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+        ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+        ShardScavengerPlacedShardSetReference, ShardScavengerRoutedMultipartPartReference,
         StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
         StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
         StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
@@ -69,6 +72,28 @@ const STORAGE_RPC_MAX_SCAVENGER_SCAN_ERRORS: usize = 4096;
 const STORAGE_RPC_MAX_SCAVENGER_SCAN_ERROR_LEN: usize = 4096;
 const STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK_ROUTE_LEN;
 const STORAGE_RPC_SCAVENGER_FILE_RESPONSE_LEN: usize = STORAGE_RPC_SHARD_KEY_FIELD_LEN + 8;
+const STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS: usize = 100_000;
+const STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN: usize =
+    4 + 4 + 1 + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
+const STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN: usize = 4096;
+const STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN
+        + 1
+        + 8
+        + 1
+        + 8
+        + 1
+        + 1
+        + 1
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN;
+const STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN;
+const STORAGE_RPC_SCAVENGER_PAYLOAD_REFERENCE_MIN_LEN: usize = 1 + 4 + 16 + 8 + 2;
+const STORAGE_RPC_SCAVENGER_OBSERVATION_MIN_LEN: usize =
+    STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
 const STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN: usize =
@@ -445,6 +470,11 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectPayloadReclaimClaimRelease = 112,
     ShardAckLoad = 113,
     ShardAckDelete = 114,
+    ShardScavengerShardRows = 115,
+    ShardScavengerPayloadReferences = 116,
+    ShardScavengerObservationRecord = 117,
+    ShardScavengerObservations = 118,
+    ShardScavengerObservationResolve = 119,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +533,11 @@ impl StorageRpcMessageKind {
             Self::ShardAckLoad => "shard ack load",
             Self::ShardAckDelete => "shard ack delete",
             Self::ShardScavengerListFiles => "shard scavenger list files",
+            Self::ShardScavengerShardRows => "shard scavenger shard rows",
+            Self::ShardScavengerPayloadReferences => "shard scavenger payload references",
+            Self::ShardScavengerObservationRecord => "shard scavenger observation record",
+            Self::ShardScavengerObservations => "shard scavenger observations",
+            Self::ShardScavengerObservationResolve => "shard scavenger observation resolve",
             Self::MetadataCommandReplicaState => "metadata command replica state",
             Self::MetadataCommandAcceptance => "metadata command acceptance",
             Self::MetadataCommandAbandonAcceptance => "metadata command abandon acceptance",
@@ -738,6 +773,11 @@ impl StorageRpcMessageKind {
             112 => Ok(Self::ObjectPayloadReclaimClaimRelease),
             113 => Ok(Self::ShardAckLoad),
             114 => Ok(Self::ShardAckDelete),
+            115 => Ok(Self::ShardScavengerShardRows),
+            116 => Ok(Self::ShardScavengerPayloadReferences),
+            117 => Ok(Self::ShardScavengerObservationRecord),
+            118 => Ok(Self::ShardScavengerObservations),
+            119 => Ok(Self::ShardScavengerObservationResolve),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -2356,6 +2396,18 @@ pub(crate) struct StorageRpcScavengerListFilesRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcScavengerObservationRecordRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) observation: ShardScavengerObservationRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcScavengerObservationKeyRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) key: ShardScavengerObservationKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcReadHandleAcquireRequest {
     pub(crate) read_operation_id: String,
     pub(crate) locations: Vec<ShardLocation>,
@@ -2702,6 +2754,17 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ShardScavengerListFiles => {
             STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ShardScavengerShardRows
+        | StorageRpcMessageKind::ShardScavengerPayloadReferences
+        | StorageRpcMessageKind::ShardScavengerObservations => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ShardScavengerObservationRecord => {
+            STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ShardScavengerObservationResolve => {
+            STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandReplicaState => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
@@ -7933,6 +7996,162 @@ pub(crate) fn decode_scavenger_list_files_response(
     Ok(ScavengerShardFileScan { files, errors })
 }
 
+pub(crate) fn encode_scavenger_shard_rows_response(rows: &[ScavengerShardRow]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(rows.len()).expect("scavenger shard row count must fit in u32"),
+    );
+    for row in rows {
+        put_bytes(&mut out, row.key.as_bytes());
+        put_u64(&mut out, row.ack.stored_size);
+        put_u64(&mut out, row.ack.crc64);
+    }
+    out
+}
+
+pub(crate) fn decode_scavenger_shard_rows_response(
+    bytes: &[u8],
+) -> Result<Vec<ScavengerShardRow>, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()? as usize;
+    if count > STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS,
+        });
+    }
+    let item_bytes = count
+        .checked_mul(STORAGE_RPC_SHARD_KEY_FIELD_LEN + STORAGE_RPC_WRITE_ACK_LEN)
+        .ok_or(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: usize::MAX / (STORAGE_RPC_SHARD_KEY_FIELD_LEN + STORAGE_RPC_WRITE_ACK_LEN),
+        })?;
+    if item_bytes > decoder.remaining_len() {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        rows.push(ScavengerShardRow {
+            key: decoder.read_shard_key()?,
+            ack: WriteAck {
+                stored_size: decoder.read_u64()?,
+                crc64: decoder.read_u64()?,
+            },
+        });
+    }
+    decoder.finish()?;
+    Ok(rows)
+}
+
+pub(crate) fn encode_scavenger_payload_references_response(
+    references: &[ShardScavengerPayloadReference],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(references.len()).expect("scavenger reference count must fit in u32"),
+    );
+    for reference in references {
+        put_scavenger_payload_reference(&mut out, reference);
+    }
+    out
+}
+
+pub(crate) fn decode_scavenger_payload_references_response(
+    bytes: &[u8],
+) -> Result<Vec<ShardScavengerPayloadReference>, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()? as usize;
+    if count > STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS,
+        });
+    }
+    if count > decoder.remaining_len() / STORAGE_RPC_SCAVENGER_PAYLOAD_REFERENCE_MIN_LEN {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut references = Vec::with_capacity(count);
+    for _ in 0..count {
+        references.push(decoder.read_scavenger_payload_reference()?);
+    }
+    decoder.finish()?;
+    Ok(references)
+}
+
+pub(crate) fn encode_scavenger_observation_record_request(
+    request: &StorageRpcScavengerObservationRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_scavenger_observation_record(&mut out, &request.observation);
+    Ok(out)
+}
+
+pub(crate) fn decode_scavenger_observation_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcScavengerObservationRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let observation = decoder.read_scavenger_observation_record()?;
+    decoder.finish()?;
+    Ok(StorageRpcScavengerObservationRecordRequest { route, observation })
+}
+
+pub(crate) fn encode_scavenger_observations_response(
+    observations: &[ShardScavengerObservation],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(observations.len()).expect("scavenger observation count must fit in u32"),
+    );
+    for observation in observations {
+        put_scavenger_observation(&mut out, observation);
+    }
+    out
+}
+
+pub(crate) fn decode_scavenger_observations_response(
+    bytes: &[u8],
+) -> Result<Vec<ShardScavengerObservation>, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()? as usize;
+    if count > STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS,
+        });
+    }
+    if count > decoder.remaining_len() / STORAGE_RPC_SCAVENGER_OBSERVATION_MIN_LEN {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut observations = Vec::with_capacity(count);
+    for _ in 0..count {
+        observations.push(decoder.read_scavenger_observation()?);
+    }
+    decoder.finish()?;
+    Ok(observations)
+}
+
+pub(crate) fn encode_scavenger_observation_key_request(
+    request: &StorageRpcScavengerObservationKeyRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_scavenger_observation_key(&mut out, &request.key);
+    Ok(out)
+}
+
+pub(crate) fn decode_scavenger_observation_key_request(
+    bytes: &[u8],
+) -> Result<StorageRpcScavengerObservationKeyRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let key = decoder.read_scavenger_observation_key()?;
+    decoder.finish()?;
+    Ok(StorageRpcScavengerObservationKeyRequest { route, key })
+}
+
 pub(crate) fn encode_read_handle_acquire_request(
     request: &StorageRpcReadHandleAcquireRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -11311,6 +11530,115 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
+    fn read_16_bytes(&mut self) -> Result<[u8; 16], StorageRpcPayloadError> {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(self.read_exact(16)?);
+        Ok(bytes)
+    }
+
+    fn read_scavenger_observation_reason(
+        &mut self,
+    ) -> Result<ShardScavengerObservationReason, StorageRpcPayloadError> {
+        ShardScavengerObservationReason::from_u8(self.read_u8()?).ok_or(
+            StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid shard scavenger observation reason",
+            ),
+        )
+    }
+
+    fn read_scavenger_observation_key(
+        &mut self,
+    ) -> Result<ShardScavengerObservationKey, StorageRpcPayloadError> {
+        let node_id = self.read_u32()?;
+        let data_pg_id = self.read_u32()?;
+        let shard_index = ShardIndex::new(self.read_u8()?);
+        let shard_key = self.read_shard_key()?;
+        if shard_key.shard_index() != shard_index {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "shard scavenger observation key shard index mismatch",
+            ));
+        }
+        Ok(ShardScavengerObservationKey {
+            node_id,
+            data_pg_id,
+            shard_index,
+            shard_key,
+        })
+    }
+
+    fn read_scavenger_observation_record(
+        &mut self,
+    ) -> Result<ShardScavengerObservationRecord, StorageRpcPayloadError> {
+        Ok(ShardScavengerObservationRecord {
+            key: self.read_scavenger_observation_key()?,
+            data_size: self.read_optional_u64()?,
+            crc64: self.read_optional_u64()?,
+            file_exists: self.read_bool()?,
+            shard_row_exists: self.read_bool()?,
+            reason: self.read_scavenger_observation_reason()?,
+            last_error: self.read_optional_string_with_limit(
+                STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN,
+                StorageRpcPayloadError::PayloadTooLarge {
+                    len: STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN + 1,
+                    limit: STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN,
+                },
+            )?,
+        })
+    }
+
+    fn read_scavenger_observation(
+        &mut self,
+    ) -> Result<ShardScavengerObservation, StorageRpcPayloadError> {
+        Ok(ShardScavengerObservation {
+            key: self.read_scavenger_observation_key()?,
+            first_seen_at: self.read_u64()?,
+            last_seen_at: self.read_u64()?,
+            observation_count: self.read_u64()?,
+            data_size: self.read_optional_u64()?,
+            crc64: self.read_optional_u64()?,
+            file_exists: self.read_bool()?,
+            shard_row_exists: self.read_bool()?,
+            reason: self.read_scavenger_observation_reason()?,
+            last_error: self.read_optional_string_with_limit(
+                STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN,
+                StorageRpcPayloadError::PayloadTooLarge {
+                    len: STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN + 1,
+                    limit: STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_ERROR_LEN,
+                },
+            )?,
+            resolved_at: self.read_optional_u64()?,
+        })
+    }
+
+    fn read_scavenger_payload_reference(
+        &mut self,
+    ) -> Result<ShardScavengerPayloadReference, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(ShardScavengerPayloadReference::Placed(
+                ShardScavengerPlacedShardSetReference {
+                    data_pg_id: self.read_u32()?,
+                    okh: self.read_16_bytes()?,
+                    generation_id: self.read_generation_id()?,
+                    ec: self.read_ec_shape()?,
+                },
+            )),
+            1 => Ok(ShardScavengerPayloadReference::RoutedMultipartPart(
+                ShardScavengerRoutedMultipartPartReference {
+                    bucket: self.read_bucket_name()?,
+                    key: self.read_object_key()?,
+                    object_generation_id: self.read_generation_id()?,
+                    part_number: self.read_u32()?,
+                    part_okh: self.read_16_bytes()?,
+                    part_vid: self.read_generation_id()?,
+                    ec: self.read_ec_shape()?,
+                },
+            )),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid shard scavenger payload reference tag",
+            )),
+        }
+    }
+
     fn read_object_etag(&mut self) -> Result<ObjectEtag, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => {
@@ -12790,6 +13118,62 @@ fn put_ec_shape(out: &mut Vec<u8>, ec: EcShape) {
     put_u8(out, ec.m);
 }
 
+fn put_scavenger_observation_key(out: &mut Vec<u8>, key: &ShardScavengerObservationKey) {
+    put_u32(out, key.node_id);
+    put_u32(out, key.data_pg_id);
+    put_u8(out, key.shard_index.get());
+    put_bytes(out, key.shard_key.as_bytes());
+}
+
+fn put_scavenger_observation_record(
+    out: &mut Vec<u8>,
+    observation: &ShardScavengerObservationRecord,
+) {
+    put_scavenger_observation_key(out, &observation.key);
+    put_optional_u64(out, observation.data_size);
+    put_optional_u64(out, observation.crc64);
+    put_bool(out, observation.file_exists);
+    put_bool(out, observation.shard_row_exists);
+    put_u8(out, observation.reason as u8);
+    put_optional_string(out, observation.last_error.as_deref());
+}
+
+fn put_scavenger_observation(out: &mut Vec<u8>, observation: &ShardScavengerObservation) {
+    put_scavenger_observation_key(out, &observation.key);
+    put_u64(out, observation.first_seen_at);
+    put_u64(out, observation.last_seen_at);
+    put_u64(out, observation.observation_count);
+    put_optional_u64(out, observation.data_size);
+    put_optional_u64(out, observation.crc64);
+    put_bool(out, observation.file_exists);
+    put_bool(out, observation.shard_row_exists);
+    put_u8(out, observation.reason as u8);
+    put_optional_string(out, observation.last_error.as_deref());
+    put_optional_u64(out, observation.resolved_at);
+}
+
+fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavengerPayloadReference) {
+    match reference {
+        ShardScavengerPayloadReference::Placed(reference) => {
+            put_u8(out, 0);
+            put_u32(out, reference.data_pg_id);
+            out.extend_from_slice(&reference.okh);
+            put_u64(out, reference.generation_id.get());
+            put_ec_shape(out, reference.ec);
+        }
+        ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
+            put_u8(out, 1);
+            put_string(out, reference.bucket.as_str());
+            put_string(out, reference.key.as_str());
+            put_u64(out, reference.object_generation_id.get());
+            put_u32(out, reference.part_number);
+            out.extend_from_slice(&reference.part_okh);
+            put_u64(out, reference.part_vid.get());
+            put_ec_shape(out, reference.ec);
+        }
+    }
+}
+
 fn put_object_etag(out: &mut Vec<u8>, etag: ObjectEtag) {
     match etag {
         ObjectEtag::SinglePart(crc64) => {
@@ -13808,6 +14192,187 @@ mod tests {
         assert_eq!(decoded.files[0].key, scan.files[0].key);
         assert_eq!(decoded.files[0].size, scan.files[0].size);
         assert_eq!(decoded.errors, scan.errors);
+    }
+
+    #[test]
+    fn scavenger_metadata_messages_round_trip() {
+        let route = StorageRpcBucketPgRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(3),
+        };
+        let key = test_shard_key(2);
+        let rows = vec![ScavengerShardRow {
+            key: key.clone(),
+            ack: WriteAck {
+                stored_size: 123,
+                crc64: 0xBEEF,
+            },
+        }];
+        let decoded_rows =
+            decode_scavenger_shard_rows_response(&encode_scavenger_shard_rows_response(&rows))
+                .unwrap();
+        assert_eq!(decoded_rows.len(), rows.len());
+        assert_eq!(decoded_rows[0].key, rows[0].key);
+        assert_eq!(decoded_rows[0].ack, rows[0].ack);
+
+        let references = vec![
+            ShardScavengerPayloadReference::Placed(ShardScavengerPlacedShardSetReference {
+                data_pg_id: 3,
+                okh: [7; 16],
+                generation_id: GenerationId::new(5).unwrap(),
+                ec: EcShape { k: 2, m: 1 },
+            }),
+            ShardScavengerPayloadReference::RoutedMultipartPart(
+                ShardScavengerRoutedMultipartPartReference {
+                    bucket: crate::tests::bucket_name("scavenger-codec-bucket"),
+                    key: crate::tests::object_key("scavenger-codec-key"),
+                    object_generation_id: GenerationId::new(6).unwrap(),
+                    part_number: 7,
+                    part_okh: [8; 16],
+                    part_vid: GenerationId::new(9).unwrap(),
+                    ec: EcShape { k: 4, m: 2 },
+                },
+            ),
+        ];
+        assert_eq!(
+            decode_scavenger_payload_references_response(
+                &encode_scavenger_payload_references_response(&references)
+            )
+            .unwrap(),
+            references
+        );
+
+        let observation_key = ShardScavengerObservationKey {
+            node_id: 7,
+            data_pg_id: 3,
+            shard_index: key.shard_index(),
+            shard_key: key,
+        };
+        let record = ShardScavengerObservationRecord {
+            key: observation_key.clone(),
+            data_size: Some(123),
+            crc64: Some(0xBEEF),
+            file_exists: true,
+            shard_row_exists: true,
+            reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+            last_error: Some("scan delayed".to_string()),
+        };
+        let record_request = StorageRpcScavengerObservationRecordRequest {
+            route: route.clone(),
+            observation: record.clone(),
+        };
+        assert_eq!(
+            decode_scavenger_observation_record_request(
+                &encode_scavenger_observation_record_request(&record_request).unwrap()
+            )
+            .unwrap(),
+            record_request
+        );
+
+        let observations = vec![ShardScavengerObservation {
+            key: observation_key.clone(),
+            first_seen_at: 10,
+            last_seen_at: 11,
+            observation_count: 2,
+            data_size: record.data_size,
+            crc64: record.crc64,
+            file_exists: record.file_exists,
+            shard_row_exists: record.shard_row_exists,
+            reason: record.reason,
+            last_error: record.last_error.clone(),
+            resolved_at: Some(12),
+        }];
+        assert_eq!(
+            decode_scavenger_observations_response(&encode_scavenger_observations_response(
+                &observations
+            ))
+            .unwrap(),
+            observations
+        );
+        let minimal_observation = ShardScavengerObservation {
+            key: observation_key.clone(),
+            first_seen_at: 10,
+            last_seen_at: 11,
+            observation_count: 1,
+            data_size: None,
+            crc64: None,
+            file_exists: false,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::ScanIncomplete,
+            last_error: None,
+            resolved_at: None,
+        };
+        assert_eq!(
+            encode_scavenger_observations_response(&[minimal_observation]).len(),
+            4 + STORAGE_RPC_SCAVENGER_OBSERVATION_MIN_LEN
+        );
+
+        let key_request = StorageRpcScavengerObservationKeyRequest {
+            route,
+            key: observation_key,
+        };
+        assert_eq!(
+            decode_scavenger_observation_key_request(
+                &encode_scavenger_observation_key_request(&key_request).unwrap()
+            )
+            .unwrap(),
+            key_request
+        );
+    }
+
+    #[test]
+    fn scavenger_metadata_decoders_reject_oversized_counts_before_allocation() {
+        let mut oversized = Vec::new();
+        put_u32(
+            &mut oversized,
+            u32::try_from(STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS + 1).unwrap(),
+        );
+        assert!(matches!(
+            decode_scavenger_shard_rows_response(&oversized),
+            Err(StorageRpcPayloadError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            decode_scavenger_payload_references_response(&oversized),
+            Err(StorageRpcPayloadError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            decode_scavenger_observations_response(&oversized),
+            Err(StorageRpcPayloadError::PayloadTooLarge { .. })
+        ));
+
+        let mut truncated = Vec::new();
+        put_u32(
+            &mut truncated,
+            STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS as u32,
+        );
+        assert!(matches!(
+            decode_scavenger_payload_references_response(&truncated),
+            Err(StorageRpcPayloadError::Truncated)
+        ));
+        assert!(matches!(
+            decode_scavenger_observations_response(&truncated),
+            Err(StorageRpcPayloadError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn scavenger_observation_key_requires_matching_shard_index() {
+        let route = StorageRpcBucketPgRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(3),
+        };
+        let mut bytes = encode_bucket_pg_request(&route).unwrap();
+        put_u32(&mut bytes, 7);
+        put_u32(&mut bytes, 3);
+        put_u8(&mut bytes, 1);
+        put_bytes(&mut bytes, test_shard_key(2).as_bytes());
+
+        assert!(matches!(
+            decode_scavenger_observation_key_request(&bytes),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(_))
+        ));
     }
 
     #[test]

@@ -338,7 +338,7 @@ migrated_shard_scavenger_metadata_bypasses=$(
     FNR == 1 {
         pending_test_cfg = 0
         pending_storage_client = 0
-        pending_object_listing_metadata_client = 0
+        pending_shard_scavenger_client = 0
         in_test_hook = 0
         in_test_module = 0
     }
@@ -372,15 +372,27 @@ migrated_shard_scavenger_metadata_bypasses=$(
         if ($0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
+        if ($0 ~ /\.shard_scavenger_client\(\)/ || $0 ~ /shard_scavenger_client[[:space:]]*$/ || $0 ~ /scavenger_client[[:space:]]*$/) {
+            pending_shard_scavenger_client = 1
+        }
         if ($0 ~ /\.(list_scavenger_shard_rows|list_shard_scavenger_payload_references|record_shard_scavenger_observation|list_shard_scavenger_observations|resolve_shard_scavenger_observation)\(/) {
             if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
                 pending_storage_client = 0
+                print FILENAME ":" FNR ":" $0
+                next
+            }
+            if (pending_shard_scavenger_client \
+                || $0 ~ /\.shard_scavenger_client\(\)/ \
+                || $0 ~ /shard_scavenger_client\./ \
+                || $0 ~ /scavenger_client\./) {
+                pending_shard_scavenger_client = 0
                 next
             }
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /;/) {
             pending_storage_client = 0
+            pending_shard_scavenger_client = 0
         }
     }
     ' crates/storage/src/cluster.rs \

@@ -7001,7 +7001,7 @@ mod tests {
             }],
         };
         let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..11)
+        let server_threads: Vec<_> = (0..15)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -7065,6 +7065,68 @@ mod tests {
             .unwrap()
             .files
             .is_empty());
+        let remote_rows = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .shard_scavenger_client()
+            .list_scavenger_shard_rows(PgId::new(0))
+            .unwrap();
+        assert_eq!(remote_rows.len(), 1);
+        assert_eq!(remote_rows[0].key, key);
+        assert_eq!(remote_rows[0].ack, ack);
+        assert!(map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap()
+            .list_scavenger_shard_rows()
+            .unwrap()
+            .is_empty());
+        let observation_key = crate::ShardScavengerObservationKey {
+            node_id: 1,
+            data_pg_id: 0,
+            shard_index: key.shard_index(),
+            shard_key: key.clone(),
+        };
+        map.node(NodeId::new(1))
+            .unwrap()
+            .shard_scavenger_client()
+            .record_shard_scavenger_observation(
+                PgId::new(0),
+                &crate::ShardScavengerObservationRecord {
+                    key: observation_key.clone(),
+                    data_size: Some(payload.len() as u64),
+                    crc64: Some(ack.crc64),
+                    file_exists: true,
+                    shard_row_exists: true,
+                    reason: crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+        let observations = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .shard_scavenger_client()
+            .list_shard_scavenger_observations(PgId::new(0))
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].key, observation_key);
+        assert!(map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap()
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
+        map.node(NodeId::new(1))
+            .unwrap()
+            .shard_scavenger_client()
+            .resolve_shard_scavenger_observation(PgId::new(0), &observation_key)
+            .unwrap();
         let missing_key = ShardKey::new(&[0x62; 16], 100, 0);
         let err = map
             .read_payload_shard(ClusterEpoch::INITIAL, location, &missing_key, ack)

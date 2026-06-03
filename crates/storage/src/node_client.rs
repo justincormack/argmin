@@ -60,13 +60,14 @@ use crate::storage_rpc::{
     decode_object_version_response, decode_payload_reclaim_root_response,
     decode_put_object_metadata_snapshot_response, decode_read_handle_acquire_response,
     decode_read_handle_release_response, decode_scavenger_list_files_response,
-    decode_shard_ack_item_response, decode_shard_read_range_response, decode_shard_read_response,
-    decode_shard_write_ack, decode_storage_rpc_response_payload,
-    decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
-    decode_stream_segment_append_prepare_response, decode_stream_upload_match_response,
-    decode_stream_upload_segments_response, decode_stream_upload_session_response,
-    decode_stream_uploads_list_response, encode_abort_multipart_cleanup_request,
-    encode_abort_multipart_command_build_request,
+    decode_scavenger_observations_response, decode_scavenger_payload_references_response,
+    decode_scavenger_shard_rows_response, decode_shard_ack_item_response,
+    decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
+    decode_storage_rpc_response_payload, decode_stream_part_finalize_snapshot_response,
+    decode_stream_put_finalize_snapshot_response, decode_stream_segment_append_prepare_response,
+    decode_stream_upload_match_response, decode_stream_upload_segments_response,
+    decode_stream_upload_session_response, decode_stream_uploads_list_response,
+    encode_abort_multipart_cleanup_request, encode_abort_multipart_command_build_request,
     encode_authorized_abort_multipart_command_build_request, encode_bucket_batch_request,
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
@@ -105,7 +106,8 @@ use crate::storage_rpc::{
     encode_object_tags_for_subject_request, encode_proof_release_request,
     encode_put_object_metadata_command_build_request, encode_put_object_metadata_snapshot_request,
     encode_read_handle_acquire_request, encode_read_handle_release_request,
-    encode_scavenger_list_files_request, encode_shard_ack_batch_request,
+    encode_scavenger_list_files_request, encode_scavenger_observation_key_request,
+    encode_scavenger_observation_record_request, encode_shard_ack_batch_request,
     encode_shard_ack_item_request, encode_shard_delete_request, encode_shard_read_range_request,
     encode_shard_read_request, encode_shard_write_request,
     encode_stream_part_commit_command_build_request, encode_stream_part_finalize_snapshot_request,
@@ -165,9 +167,10 @@ use crate::storage_rpc::{
     StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
     StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
-    StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
-    StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcScavengerListFilesRequest, StorageRpcScavengerObservationKeyRequest,
+    StorageRpcScavengerObservationRecordRequest, StorageRpcShardAckBatchRequest,
+    StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
+    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
     StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
@@ -1835,6 +1838,30 @@ pub(crate) trait ShardScavengerNodeClient: Send + Sync {
         &self,
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError>;
+
+    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError>;
+
+    fn list_shard_scavenger_payload_references(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;
+
+    fn record_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError>;
+
+    fn list_shard_scavenger_observations(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError>;
+
+    fn resolve_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError>;
 }
 
 pub(crate) trait MetadataCommandNodeClient: Send + Sync {
@@ -2528,30 +2555,6 @@ pub(crate) trait StorageNodeClient:
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
-    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError>;
-
-    fn list_shard_scavenger_payload_references(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;
-
-    fn record_shard_scavenger_observation(
-        &self,
-        pg_id: PgId,
-        observation: &ShardScavengerObservationRecord,
-    ) -> Result<(), StoreError>;
-
-    fn list_shard_scavenger_observations(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<ShardScavengerObservation>, StoreError>;
-
-    fn resolve_shard_scavenger_observation(
-        &self,
-        pg_id: PgId,
-        key: &ShardScavengerObservationKey,
-    ) -> Result<(), StoreError>;
-
     fn list_completed_multipart_upload_records_for_bucket(
         &self,
         pg_id: PgId,
@@ -2822,6 +2825,128 @@ impl UnixStorageNodeClient {
                 error.to_string(),
             )
         })
+    }
+
+    pub(crate) fn list_scavenger_shard_rows(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        let request = self.bucket_pg_request(pg_id);
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode shard scavenger shard rows request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardScavengerShardRows, payload)?;
+        decode_scavenger_shard_rows_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode shard scavenger shard rows response",
+                error.to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn list_shard_scavenger_payload_references(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let request = self.bucket_pg_request(pg_id);
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode shard scavenger payload references request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::ShardScavengerPayloadReferences,
+            payload,
+        )?;
+        decode_scavenger_payload_references_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode shard scavenger payload references response",
+                error.to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn record_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcScavengerObservationRecordRequest {
+            route: self.bucket_pg_request(pg_id),
+            observation: observation.clone(),
+        };
+        let payload = encode_scavenger_observation_record_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode shard scavenger observation record request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::ShardScavengerObservationRecord,
+            payload,
+        )?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate shard scavenger observation record response",
+                "shard scavenger observation record response payload must be empty".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn list_shard_scavenger_observations(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let request = self.bucket_pg_request(pg_id);
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode shard scavenger observations request",
+                error.to_string(),
+            )
+        })?;
+        let response =
+            self.rpc_request(StorageRpcMessageKind::ShardScavengerObservations, payload)?;
+        decode_scavenger_observations_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode shard scavenger observations response",
+                error.to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn resolve_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcScavengerObservationKeyRequest {
+            route: self.bucket_pg_request(pg_id),
+            key: key.clone(),
+        };
+        let payload = encode_scavenger_observation_key_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode shard scavenger observation resolve request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::ShardScavengerObservationResolve,
+            payload,
+        )?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate shard scavenger observation resolve response",
+                "shard scavenger observation resolve response payload must be empty".to_string(),
+            ))
+        }
     }
 
     pub(crate) fn metadata_command_replica_state(
@@ -3892,6 +4017,40 @@ impl ShardScavengerNodeClient for UnixStorageNodeClient {
     ) -> Result<ScavengerShardFileScan, StoreError> {
         UnixStorageNodeClient::list_scavenger_shard_files(self, data_pg_id)
     }
+
+    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        UnixStorageNodeClient::list_scavenger_shard_rows(self, pg_id)
+    }
+
+    fn list_shard_scavenger_payload_references(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        UnixStorageNodeClient::list_shard_scavenger_payload_references(self, pg_id)
+    }
+
+    fn record_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::record_shard_scavenger_observation(self, pg_id, observation)
+    }
+
+    fn list_shard_scavenger_observations(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        UnixStorageNodeClient::list_shard_scavenger_observations(self, pg_id)
+    }
+
+    fn resolve_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::resolve_shard_scavenger_observation(self, pg_id, key)
+    }
 }
 
 impl MetadataCommandNodeClient for UnixStorageNodeClient {
@@ -4267,6 +4426,45 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
     ) -> Result<ScavengerShardFileScan, StoreError> {
         self.storage_node
             .list_scavenger_shard_files(data_pg_id.get())
+    }
+
+    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_scavenger_shard_rows()
+    }
+
+    fn list_shard_scavenger_payload_references(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_shard_scavenger_payload_references()
+    }
+
+    fn record_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_shard_scavenger_observation(observation)
+    }
+
+    fn list_shard_scavenger_observations(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_shard_scavenger_observations()
+    }
+
+    fn resolve_shard_scavenger_observation(
+        &self,
+        pg_id: PgId,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.resolve_shard_scavenger_observation(key).map(|_| ())
     }
 }
 
@@ -8689,6 +8887,14 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
 }
 
 impl UnixStorageNodeClient {
+    fn bucket_pg_request(&self, pg_id: PgId) -> StorageRpcBucketPgRequest {
+        StorageRpcBucketPgRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+        }
+    }
+
     fn object_request(
         &self,
         pg_id: PgId,
@@ -10793,45 +10999,6 @@ impl UnixStorageNodeClient {
 }
 
 impl StorageNodeClient for LocalStorageNodeClient {
-    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.list_scavenger_shard_rows()
-    }
-
-    fn list_shard_scavenger_payload_references(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.list_shard_scavenger_payload_references()
-    }
-
-    fn record_shard_scavenger_observation(
-        &self,
-        pg_id: PgId,
-        observation: &ShardScavengerObservationRecord,
-    ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.record_shard_scavenger_observation(observation)
-    }
-
-    fn list_shard_scavenger_observations(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.list_shard_scavenger_observations()
-    }
-
-    fn resolve_shard_scavenger_observation(
-        &self,
-        pg_id: PgId,
-        key: &ShardScavengerObservationKey,
-    ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.resolve_shard_scavenger_observation(key).map(|_| ())
-    }
-
     fn list_completed_multipart_upload_records_for_bucket(
         &self,
         pg_id: PgId,
