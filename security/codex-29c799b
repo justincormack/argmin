@@ -1,0 +1,255 @@
+RPC frame caps undercount bucket-delete record size
+Link: https://chatgpt.com/codex/cloud/security/findings/c9ca123b02748191aaca8e2b60d08f64?sev=
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 29c799b
+Author: justin@specialbusservice.com
+Created: 03/06/2026, 12:26:36
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Resolution
+Fixed by `a4f65f2 Fix bucket delete RPC frame caps`.
+
+What this commit fixed:
+- Introduced `STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN` so encoded bucket-name cap math includes both the 4-byte string length prefix and the bucket bytes.
+- Corrected the bucket-name encoded-size accounting for bucket write drain record, bucket delete finalize claim record, and bucket delete finalize root record caps.
+- Added a max-valid regression for `BucketWriteDrainClear` and `BucketDeleteFinalizeClaimRelease` proving exact maximum encoded payloads fit the kind-specific request cap, while one byte over still fails pre-decode as `PayloadTooLarge`.
+
+What was already correct or only clarified by the commit:
+- `STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN` already counted the 4-byte bucket string length prefix inline before this fix; the commit changed it to use the shared helper for clarity.
+- `STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN`, bucket batch request caps, and object generation request caps also already counted the prefix inline; these were changed to use the shared helper for consistency.
+- This remains an internal robustness/interoperability fix, not an externally reachable S3 attack path.
+
+Verification:
+- `./scripts/ci` passed, including `cargo nextest run --workspace`: 5003/5003 tests passed.
+
+# Summary
+Introduced: undersized RPC request payload limits for newly added bucket delete coordination RPC messages can reject valid maximum-length encoded records.
+The commit adds RPC framing limits for bucket write drain and bucket delete finalize claim record requests. Those constants count only STORAGE_RPC_MAX_BUCKET_NAME_LEN for the bucket field, but the encoders serialize bucket names with put_string, which writes a 4-byte length prefix plus the bucket bytes. Because read_storage_rpc_request_frame_from enforces the per-message cap before decoding, a syntactically valid maximum-sized BucketWriteDrainClear or BucketDeleteFinalizeClaimRelease payload can be rejected as PayloadTooLarge. In normal coordinator-generated flows the drain/claim IDs and owner tokens are much shorter than their maximums, so this is a robustness/interoperability bug rather than a practical remote S3 security vulnerability.
+
+# Validation
+## Rubric
+- [x] Confirm the newly added per-record max length constants omit the bucket string's 4-byte length prefix.
+- [x] Confirm the affected record encoders serialize the bucket via put_string/put_bytes, which includes that prefix.
+- [x] Confirm the undercounted constants are used as request-frame caps for BucketWriteDrainClear and BucketDeleteFinalizeClaimRelease.
+- [x] Confirm the request frame reader applies the cap before payload decoding, so valid payloads can be rejected as PayloadTooLarge.
+- [x] Dynamically reproduce with maximum-valid encoded records and verify rejection is exactly 4 bytes over the effective cap while the generic frame reader accepts the same frames.
+## Report
+Validated the finding. The undersized constants are present: STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN at crates/storage/src/storage_rpc.rs:180-200 and STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN at crates/storage/src/storage_rpc.rs:209-235 start with STORAGE_RPC_MAX_BUCKET_NAME_LEN but omit the 4-byte string length prefix. The encoder path uses put_string for those bucket fields at crates/storage/src/storage_rpc.rs:9363-9365 and 9384-9390; put_string calls put_bytes, which writes a u32 length prefix at crates/storage/src/storage_rpc.rs:9286-9293. The capped request reader enforces effective_max_payload_len before payload decoding at crates/storage/src/storage_rpc.rs:2255-2263, and BucketWriteDrainClear / BucketDeleteFinalizeClaimRelease are wired to the undercounted limits at crates/storage/src/storage_rpc.rs:2423-2440.
+
+I added a targeted unit-test PoC that constructs maximum-valid drain and finalize-claim records using the real request encoders. The test shows both encoded payloads are exactly 4 bytes over their message-specific caps, then confirms read_storage_rpc_request_frame_from rejects them with PayloadTooLarge while the generic read_storage_rpc_frame_from accepts the same frames. Command output: `cargo test -p storage --lib poc_max_bucket_drain_and_finalize_claim_requests_exceed_kind_specific_caps_by_four -- --nocapture` => `running 1 test ... ok`.
+
+Debugger validation with lldb stopped at the cap check in storage_rpc.rs:2259. For BucketWriteDrainClear, lldb showed `payload_len = 1405`, `effective_max_payload_len = 1401`, `kind = BucketWriteDrainClear`. For BucketDeleteFinalizeClaimRelease, it showed `payload_len = 2445`, `effective_max_payload_len = 2441`, `kind = BucketDeleteFinalizeClaimRelease`. This proves the reader rejects syntactically valid maximum-sized encoded records by exactly the missing 4-byte bucket string prefix.
+
+Crash/valgrind/ASan attempts: this is a logical interoperability/robustness bug rather than a memory-corruption crash. A normal crash was not expected; the direct reproduction is the targeted unit test plus debugger trace. `valgrind` and `gdb` are not installed in the container. ASan via `RUSTFLAGS='-Zsanitizer=address'` failed because the active Rust toolchain is stable and rejects nightly `-Z` flags.
+
+# Evidence
+crates/storage/src/storage_rpc.rs (L180 to 200)
+  Note: The new bucket write drain record max length omits the 4-byte length prefix for the bucket string, yet this value is used to cap BucketWriteDrainClear request frames.
+```
+const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+    + 8
+    + 8
+    + 1
+    + 8
+    + 9;
+const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 9;
+const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN;
+```
+
+crates/storage/src/storage_rpc.rs (L209 to 235)
+  Note: The new bucket delete finalize claim record max length has the same undercount for the bucket string and feeds the claim release request cap.
+```
+const STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 4
+        + 8
+        + 9
+        + 8
+        + 5
+        + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
+const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 9
+        + 8;
+const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN;
+```
+
+crates/storage/src/storage_rpc.rs (L2255 to 2263)
+  Note: The RPC frame reader rejects payloads larger than the per-message effective limit before payload decoding can occur.
+```
+    let kind = StorageRpcMessageKind::from_u16(raw_kind)?;
+    let payload_len = read_u32_from(reader)?;
+    put_u32(&mut bytes, payload_len);
+    let effective_max_payload_len = effective_payload_limit(kind, max_payload_len);
+    if payload_len as usize > effective_max_payload_len {
+        return Err(StorageRpcFrameError::PayloadTooLarge {
+            len: payload_len as usize,
+            limit: effective_max_payload_len,
+        }
+```
+
+crates/storage/src/storage_rpc.rs (L2423 to 2440)
+  Note: The undercounted constants are wired into the request frame limits for BucketWriteDrainClear and BucketDeleteFinalizeClaimRelease.
+```
+        StorageRpcMessageKind::BucketWriteDrainClear => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteDrainClearExpired => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteReservationsList
+        | StorageRpcMessageKind::BucketDeleteFinalized => {
+            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeRoots => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
+```
+
+crates/storage/src/storage_rpc.rs (L6527 to 6540)
+  Note: BucketWriteDrainClear request encoding appends the drain record whose size is capped by the undercounted constant.
+```
+pub(crate) fn encode_bucket_write_drain_record_request(
+    request: &StorageRpcBucketWriteDrainRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match drain epoch",
+        ));
+    }
+    validate_bucket_write_drain_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_write_drain_record(&mut out, &request.record);
+```
+
+crates/storage/src/storage_rpc.rs (L6880 to 6894)
+  Note: BucketDeleteFinalizeClaimRelease request encoding appends the finalize claim record whose size is capped by the undercounted constant.
+```
+pub(crate) fn encode_bucket_delete_finalize_claim_record_request(
+    request: &StorageRpcBucketDeleteFinalizeClaimRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_bucket_delete_finalize_claim_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_delete_finalize_claim_record(&mut out, &request.record);
+    Ok(out)
+```
+
+crates/storage/src/storage_rpc.rs (L9363 to 9366)
+  Note: The drain record encoder writes the bucket with put_string, which includes a length prefix not counted in the new max-length constant.
+```
+fn put_bucket_write_drain_record(out: &mut Vec<u8>, record: &BucketWriteDrainRecord) {
+    put_string(out, record.bucket.as_str());
+    put_string(out, &record.drain_id);
+    put_string(out, &record.owner_token);
+```
+
+crates/storage/src/storage_rpc.rs (L9384 to 9391)
+  Note: The finalize claim record encoder also writes the bucket with put_string, requiring the missing 4-byte prefix in the max-length calculation.
+```
+fn put_bucket_delete_finalize_claim_record(
+    out: &mut Vec<u8>,
+    record: &BucketDeleteFinalizeClaimRecord,
+) {
+    put_string(out, record.bucket.as_str());
+    put_u64(out, record.bucket_incarnation_generation);
+    put_string(out, &record.claim_id);
+    put_string(out, &record.owner_token);
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from low to ignore for security triage. The sizing bug is real and validated, but it is an internal robustness/interoperability issue. The affected path is a storage-node Unix socket guarded by private directory requirements, not a public ingress; remote frontend routing is rejected as not wired; the legacy-local S3 frontend uses local storage nodes; and the normal coordinator-generated drain/claim IDs plus owner tokens are far below the maximums required for the PoC. Probability of attacker reachability from the threat-model surface is therefore negligible, and impact is limited to an internal request rejection rather than meaningful security compromise.
+## Likelihood
+ignore - Exploitation from the important remote S3 attacker surface is not evidenced. Triggering requires local/private Unix socket access or control of internal RPC fields that normal coordinator code generates as short values.
+## Impact
+ignore - The proven effect is rejection of an edge-case maximum-sized internal RPC record. There is no demonstrated confidentiality, integrity, identity, or code-execution impact, and normal S3 flows do not generate the maximum internal fields required to trigger the bug.
+## Assumptions
+- Static review is limited to repository artifacts in /workspace/argmin; no deployment-specific environment, manifests, or runtime socket permissions were observed beyond code defaults.
+- The earlier validation PoC is treated as proving the sizing bug in direct storage-RPC framing, but not as proving an externally reachable S3 security impact.
+- The important attacker model is the documented S3 HTTP client/network attacker unless repository evidence shows another exposed production surface.
+- storage-node role must be running
+- attacker or caller must be able to connect to the storage-node Unix-domain socket, whose parent directory is required to be private
+- caller must send BucketWriteDrainClear or BucketDeleteFinalizeClaimRelease records with maximum-sized internal fields, or otherwise control internal RPC record contents beyond normal coordinator generation
+- to affect S3 users, the internal coordinator would need to generate maximum-length drain or claim identifiers/owner tokens, which the code does not do
+## Path
+Internal Unix socket client
+  -> StorageNodeServer::handle_session
+  -> read_storage_rpc_request_frame_from
+  -> undercounted per-message cap
+  -> PayloadTooLarge for max-valid internal record
+## Path evidence
+- `crates/storage/src/storage_rpc.rs:180-200` - BucketWriteDrain record max length starts with STORAGE_RPC_MAX_BUCKET_NAME_LEN but omits the 4-byte length prefix for the bucket string.
+- `crates/storage/src/storage_rpc.rs:209-235` - BucketDeleteFinalizeClaim record max length has the same bucket-string prefix undercount.
+- `crates/storage/src/storage_rpc.rs:9286-9293` - put_string delegates to put_bytes, which writes a u32 length prefix before bytes.
+- `crates/storage/src/storage_rpc.rs:9363-9391` - Both affected record encoders serialize the bucket via put_string.
+- `crates/storage/src/storage_rpc.rs:2255-2263` - The request frame reader rejects payloads over the effective cap before decoding.
+- `crates/storage/src/storage_rpc.rs:2423-2440` - BucketWriteDrainClear and BucketDeleteFinalizeClaimRelease are wired to the undercounted caps.
+- `crates/storage/src/storage_node_server.rs:329-344` - Storage-node RPC binds a Unix-domain socket, not a TCP listener.
+- `crates/storage/src/storage_node_server.rs:442-454` - The storage-node session loop reads frames through read_storage_rpc_request_frame_from, confirming the internal RPC reachability of the bug.
+- `crates/storage/src/storage_node_server.rs:5060-5082` - The socket parent directory must be private; group/world-accessible directories are rejected.
+- `crates/argmin-s3/src/config.rs:116-123` - Frontend/combined remote routing roles are rejected during configuration as not wired.
+- `crates/argmin-s3/src/main.rs:238-267` - The legacy-local HTTP frontend opens local storage nodes and builds the coordinator from that local cluster, not from remote storage RPC.
+- `crates/storage/src/cluster.rs:1856-1909` - Normal coordinator-generated drain/claim IDs are prefix plus 16 random bytes in hex, and owner tokens are process-local strings; they are much shorter than the maximum internal RPC field sizes needed to trigger the validated 4-byte-over-cap case.
+## Narrative
+The finding is a real implementation bug: two storage-RPC maximum-size constants omit the 4-byte length prefix written by put_string for bucket names, and the request frame reader enforces these caps before decoding. The validation PoC proves maximum-valid crafted internal records are rejected by exactly four bytes. However, repository evidence does not support a security vulnerability from the main threat-model surface. The affected RPC is served over a Unix-domain socket with a private-directory check, remote frontend/combined routing is rejected in this commit, and the single-node HTTP frontend opens local storage nodes rather than using this socket RPC path. Additionally, normal coordinator-generated drain/claim IDs and owner tokens are short random/process strings, not attacker-controlled maximum-length fields. Impact is therefore interoperability/robustness of an internal edge case, not auth bypass, data disclosure, RCE, or meaningful attacker-driven DoS.
+## Controls
+- SigV4 authentication and authorization on the S3 HTTP API
+- Default HTTP listen address is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR overrides it
+- Storage-node RPC uses Unix-domain sockets rather than TCP
+- Storage-node socket parent directory must be private: mode & 0o077 must be zero
+- Frontend/combined remote routing is explicitly rejected as not wired in this commit
+- HTTP server has configurable max connections and max in-flight requests
+- Storage RPC has pre-decode frame payload limits
+## Blindspots
+- No deployment manifests or runtime environment were present, so actual operator listen addresses, socket directory ownership, and filesystem ACLs could not be verified.
+- Future phases may wire remote frontend routing differently; this assessment is for commit 29c799b4dd45995655422d1c0a7116b07bad6518.
+- Static review cannot prove all possible internal callers avoid maximum-length fields, but the visible coordinator generation paths use short IDs/tokens.
