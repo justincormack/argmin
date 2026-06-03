@@ -59,7 +59,30 @@ pub struct LocalUnixShardNodeClientConfig {
     socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUnixStorageNodeClientConfig {
+    node_id: NodeId,
+    socket_path: PathBuf,
+}
+
 impl LocalUnixShardNodeClientConfig {
+    pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+impl LocalUnixStorageNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             node_id,
@@ -853,6 +876,57 @@ impl LocalClusterMap {
         pg_ids: &[u32],
         default_ec_shape: EcShape,
     ) -> Result<Self, ClusterBuildError> {
+        Self::open_with_configs_and_epoch(
+            metadata_primary_node_id,
+            configs,
+            pg_ids,
+            default_ec_shape,
+            ClusterEpoch::INITIAL,
+        )
+    }
+
+    pub fn open_with_configs_and_epoch(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Self, ClusterBuildError> {
+        Self::open_with_configs_inner(
+            metadata_primary_node_id,
+            configs,
+            pg_ids,
+            default_ec_shape,
+            cluster_epoch,
+            true,
+        )
+    }
+
+    pub fn open_frontend_placeholder_with_configs_and_epoch(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Self, ClusterBuildError> {
+        Self::open_with_configs_inner(
+            metadata_primary_node_id,
+            configs,
+            pg_ids,
+            default_ec_shape,
+            cluster_epoch,
+            false,
+        )
+    }
+
+    fn open_with_configs_inner(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+        validate_local_metadata_command_replay: bool,
+    ) -> Result<Self, ClusterBuildError> {
         let configs: Vec<LocalNodeStoreConfig> = configs.into_iter().collect();
         if configs.is_empty() {
             return Err(ClusterBuildError::EmptyCluster);
@@ -900,7 +974,7 @@ impl LocalClusterMap {
             }
         })?;
         let pg_routes = build_static_pg_routes(
-            ClusterEpoch::INITIAL,
+            cluster_epoch,
             metadata_primary_node_id,
             Arc::clone(&acting_set),
             &pg_ids,
@@ -922,14 +996,16 @@ impl LocalClusterMap {
                 LocalNodeStore::new(node_id, canonical_data_dir, Arc::new(storage_node)),
             );
         }
-        validate_metadata_command_replay_state(&nodes, &pg_routes, &pg_ids, ClusterEpoch::INITIAL)?;
+        if validate_local_metadata_command_replay {
+            validate_metadata_command_replay_state(&nodes, &pg_routes, &pg_ids, cluster_epoch)?;
+        }
 
         let metadata_primary = nodes
             .get(&metadata_primary_node_id)
             .expect("validated metadata primary should have been opened");
 
         Ok(Self {
-            epoch: ClusterEpoch::INITIAL,
+            epoch: cluster_epoch,
             metadata_primary_node_id,
             pg_ids: storage_pg_ids.into_boxed_slice(),
             pg_topology,
@@ -1013,6 +1089,97 @@ impl LocalClusterMap {
             node.shard_ack_client = shard_ack_client;
             node.shard_read_handle_client = shard_read_handle_client;
             node.shard_scavenger_client = shard_scavenger_client;
+        }
+        Ok(())
+    }
+
+    pub fn install_unix_storage_node_clients(
+        &mut self,
+        configs: impl IntoIterator<Item = LocalUnixStorageNodeClientConfig>,
+    ) -> Result<(), ClusterBuildError> {
+        let configs: Vec<LocalUnixStorageNodeClientConfig> = configs.into_iter().collect();
+        self.validate_unix_storage_node_client_configs(&configs)?;
+
+        self.install_unix_bucket_metadata_clients(configs.iter().map(|config| {
+            LocalUnixBucketMetadataNodeClientConfig::new(config.node_id, config.socket_path.clone())
+        }))?;
+        self.install_unix_bucket_write_reservation_clients(configs.iter().map(|config| {
+            LocalUnixBucketWriteReservationNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_metadata_command_clients(configs.iter().map(|config| {
+            LocalUnixMetadataCommandNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_object_generation_metadata_clients(configs.iter().map(|config| {
+            LocalUnixObjectGenerationMetadataNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_object_version_metadata_clients(configs.iter().map(|config| {
+            LocalUnixObjectVersionMetadataNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_direct_put_metadata_clients(configs.iter().map(|config| {
+            LocalUnixDirectPutMetadataNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_object_listing_metadata_clients(configs.iter().map(|config| {
+            LocalUnixObjectListingMetadataNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_object_mutation_metadata_clients(configs.iter().map(|config| {
+            LocalUnixObjectMutationMetadataNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_object_read_metadata_clients(configs.iter().map(|config| {
+            LocalUnixObjectReadMetadataNodeClientConfig::new(
+                config.node_id,
+                config.socket_path.clone(),
+            )
+        }))?;
+        self.install_unix_shard_clients(configs.into_iter().map(|config| {
+            LocalUnixShardNodeClientConfig::new(config.node_id, config.socket_path)
+        }))?;
+        Ok(())
+    }
+
+    fn validate_unix_storage_node_client_configs(
+        &self,
+        configs: &[LocalUnixStorageNodeClientConfig],
+    ) -> Result<(), ClusterBuildError> {
+        let mut seen = BTreeSet::<NodeId>::new();
+        for config in configs {
+            if !seen.insert(config.node_id) {
+                return Err(ClusterBuildError::DuplicateRemoteStorageNodeClientNodeId {
+                    id: config.node_id.as_u32(),
+                });
+            }
+            if !config.socket_path.is_absolute() {
+                return Err(
+                    ClusterBuildError::RemoteStorageNodeClientSocketPathNotAbsolute {
+                        path: config.socket_path.clone(),
+                    },
+                );
+            }
+            if !self.nodes.contains_key(&config.node_id) {
+                return Err(ClusterBuildError::RemoteStorageNodeClientNodeNotFound {
+                    id: config.node_id.as_u32(),
+                });
+            }
         }
         Ok(())
     }

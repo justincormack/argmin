@@ -5629,6 +5629,21 @@ bucket execution-generation batch reads, and bucket fast-path identity batch
 reads now route through the dedicated bucket metadata RPC boundary with
 response identity validation, so frontend maps no longer need frontend-local
 bucket PG reads for these public/cache-freshness paths.
+The early `frontend`/`combined` unsupported-role gate has been removed for the
+Phase 10.5 request path. Frontend roles now require
+`ARGMIN_STORAGE_NODE_SOCKETS` as a complete `node_id=/absolute/socket` map,
+build a frontend-placeholder `LocalClusterMap` at the configured cluster epoch,
+and install the full Unix storage-node client set for shard IO, shard acks,
+read handles, metadata commands, bucket metadata/coordination, object
+read/listing/mutation metadata, direct PUT metadata, and generation/version
+allocation. Combined mode binds its configured storage-node listener first,
+requires its own socket-map entry to match `ARGMIN_STORAGE_NODE_SOCKET_PATH`,
+then starts the HTTP/coordinator frontend over the same socket client boundary.
+The placeholder frontend map intentionally skips local metadata-command replay
+validation because the storage-node-owned PG is the command-stream authority.
+Remote frontend and combined coordinators do not start background sweepers yet:
+reclaim, lifecycle, and shard-scavenger workers remain disabled until Phase
+10.6 routes every worker metadata surface through the same RPC boundary.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5772,6 +5787,13 @@ Required tests:
    `apply_metadata_command_and_record`, abandoned-record insert, exact
    pending-slot removal, bucket reservation/proof release, and cleanup
    mutations; same identity succeeds and mismatched identity fails closed
+11. `frontend` and `combined` roles parse and start from a complete static
+   `ARGMIN_STORAGE_NODE_SOCKETS` map; missing, relative, byte-duplicate,
+   canonical-equivalent duplicate, incomplete, or combined-self-mismatched
+   socket entries fail at config/build time, and the frontend placeholder map
+   uses the configured cluster epoch without validating local placeholder PG
+   replay state. Remote frontend startup must keep background sweepers disabled
+   until Phase 10.6 completes worker routing.
 
 ### Phase 10.6: Background Workers Across RPC
 

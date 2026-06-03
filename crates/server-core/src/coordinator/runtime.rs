@@ -204,7 +204,6 @@ impl LifecycleSweeper {
         Ok(sweeper)
     }
 
-    #[cfg(test)]
     pub(super) fn disabled() -> Arc<Self> {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(true)),
@@ -276,7 +275,6 @@ impl ShardScavengerSweeper {
         Ok(sweeper)
     }
 
-    #[cfg(test)]
     pub(super) fn disabled() -> Arc<Self> {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(true)),

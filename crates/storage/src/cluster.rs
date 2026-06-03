@@ -13,7 +13,7 @@ pub use local::{
     LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixObjectGenerationMetadataNodeClientConfig,
     LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
-    LocalUnixShardNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};

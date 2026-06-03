@@ -1,5 +1,6 @@
 use ec::EcConfig;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessRole {
@@ -18,9 +19,15 @@ impl ProcessRole {
         matches!(self, Self::LegacyLocal | Self::Frontend | Self::Combined)
     }
 
-    pub(crate) fn requires_remote_frontend_routing(self) -> bool {
+    pub(crate) fn uses_remote_frontend_routing(self) -> bool {
         matches!(self, Self::Frontend | Self::Combined)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredStorageNodeSocket {
+    pub(crate) node_id: u32,
+    pub(crate) socket_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +60,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_id: Option<u32>,
     pub(crate) storage_node_data_dir: Option<String>,
     pub(crate) storage_node_socket_path: Option<String>,
+    pub(crate) storage_node_sockets: Vec<ConfiguredStorageNodeSocket>,
     pub(crate) storage_cluster_epoch: u64,
     pub(crate) storage_pg_ids: Vec<u32>,
     pub(crate) ec_k: u8,
@@ -86,6 +94,7 @@ impl ServerConfig {
     ///   `ARGMIN_PG_COUNT` (16)
     ///   `ARGMIN_STORAGE_CLUSTER_EPOCH` (1)
     ///   `ARGMIN_STORAGE_PG_IDS` (all PGs in `0..ARGMIN_PG_COUNT`)
+    ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for frontend/combined)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
@@ -117,9 +126,6 @@ impl ServerConfig {
             Some(value) => parse_process_role(&value)?,
             None => ProcessRole::LegacyLocal,
         };
-        if process_role.requires_remote_frontend_routing() {
-            return Err(unsupported_remote_frontend_role_message(process_role));
-        }
         let (
             account_id,
             access_key_id,
@@ -231,6 +237,11 @@ impl ServerConfig {
         if local_node_count == 0 {
             return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
         }
+        let storage_node_sockets = parse_storage_node_sockets(
+            get("ARGMIN_STORAGE_NODE_SOCKETS"),
+            local_node_count,
+            process_role.uses_remote_frontend_routing(),
+        )?;
         if process_role.has_storage_node() {
             let storage_node_id = storage_node_id.ok_or_else(|| {
                 "ARGMIN_STORAGE_NODE_ID is required for storage roles".to_string()
@@ -244,6 +255,27 @@ impl ServerConfig {
                 return Err(
                     "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string(),
                 );
+            }
+            if process_role.uses_remote_frontend_routing() {
+                let storage_node_socket_path = storage_node_socket_path
+                    .as_deref()
+                    .expect("storage role socket path was validated");
+                let configured_self_socket_path = storage_node_sockets
+                    .iter()
+                    .find(|entry| entry.node_id == storage_node_id)
+                    .map(|entry| entry.socket_path.as_str())
+                    .expect("remote frontend socket map must contain every node");
+                let configured_self_socket_path = canonical_storage_node_socket_path(
+                    storage_node_id,
+                    configured_self_socket_path,
+                )?;
+                let storage_node_socket_path =
+                    canonical_storage_node_socket_path(storage_node_id, storage_node_socket_path)?;
+                if configured_self_socket_path != storage_node_socket_path {
+                    return Err(format!(
+                        "ARGMIN_STORAGE_NODE_SOCKETS entry for node {storage_node_id} must match ARGMIN_STORAGE_NODE_SOCKET_PATH"
+                    ));
+                }
             }
         }
         let local_node_count_usize = usize::try_from(local_node_count)
@@ -299,6 +331,7 @@ impl ServerConfig {
             storage_node_id,
             storage_node_data_dir,
             storage_node_socket_path,
+            storage_node_sockets,
             storage_cluster_epoch,
             storage_pg_ids,
             ec_k,
@@ -374,20 +407,103 @@ fn parse_storage_pg_ids(value: Option<String>, pg_count: u32) -> Result<Vec<u32>
     Ok(pg_ids)
 }
 
-fn process_role_name(role: ProcessRole) -> &'static str {
-    match role {
-        ProcessRole::LegacyLocal => "legacy-local",
-        ProcessRole::Frontend => "frontend",
-        ProcessRole::StorageNode => "storage-node",
-        ProcessRole::Combined => "combined",
+fn parse_storage_node_sockets(
+    value: Option<String>,
+    local_node_count: u32,
+    require_complete: bool,
+) -> Result<Vec<ConfiguredStorageNodeSocket>, String> {
+    let Some(value) = value else {
+        if require_complete {
+            return Err(
+                "ARGMIN_STORAGE_NODE_SOCKETS is required for frontend and combined roles"
+                    .to_string(),
+            );
+        }
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Err("ARGMIN_STORAGE_NODE_SOCKETS must not be empty".to_string());
     }
+
+    let mut by_node = HashMap::<u32, String>::new();
+    let mut socket_paths = HashSet::<PathBuf>::new();
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("ARGMIN_STORAGE_NODE_SOCKETS contains an empty entry".to_string());
+        }
+        let (raw_node_id, raw_socket_path) = trimmed.split_once('=').ok_or_else(|| {
+            format!(
+                "ARGMIN_STORAGE_NODE_SOCKETS entry {trimmed:?} must be node_id=/absolute/socket"
+            )
+        })?;
+        let node_id: u32 = raw_node_id.trim().parse().map_err(|e| {
+            format!("invalid ARGMIN_STORAGE_NODE_SOCKETS node id {raw_node_id:?}: {e}")
+        })?;
+        if node_id >= local_node_count {
+            return Err(format!(
+                "ARGMIN_STORAGE_NODE_SOCKETS node id {node_id} must be less than ARGMIN_LOCAL_NODE_COUNT ({local_node_count})"
+            ));
+        }
+        let socket_path = raw_socket_path.trim();
+        if socket_path.is_empty() {
+            return Err(format!(
+                "ARGMIN_STORAGE_NODE_SOCKETS entry for node {node_id} has an empty socket path"
+            ));
+        }
+        if !Path::new(socket_path).is_absolute() {
+            return Err(format!(
+                "ARGMIN_STORAGE_NODE_SOCKETS entry for node {node_id} must use an absolute socket path"
+            ));
+        }
+        let canonical_socket_path = canonical_storage_node_socket_path(node_id, socket_path)?;
+        if by_node.insert(node_id, socket_path.to_string()).is_some() {
+            return Err(format!(
+                "ARGMIN_STORAGE_NODE_SOCKETS contains duplicate node id {node_id}"
+            ));
+        }
+        if !socket_paths.insert(canonical_socket_path) {
+            return Err(format!(
+                "ARGMIN_STORAGE_NODE_SOCKETS contains duplicate socket path {socket_path:?}"
+            ));
+        }
+    }
+
+    if require_complete {
+        for node_id in 0..local_node_count {
+            if !by_node.contains_key(&node_id) {
+                return Err(format!(
+                    "ARGMIN_STORAGE_NODE_SOCKETS must include node id {node_id}"
+                ));
+            }
+        }
+    }
+
+    let mut entries: Vec<ConfiguredStorageNodeSocket> = by_node
+        .into_iter()
+        .map(|(node_id, socket_path)| ConfiguredStorageNodeSocket {
+            node_id,
+            socket_path,
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.node_id);
+    Ok(entries)
 }
 
-pub(crate) fn unsupported_remote_frontend_role_message(role: ProcessRole) -> String {
-    format!(
-        "ARGMIN_PROCESS_ROLE={} is parsed but remote frontend routing is not wired until Phase 10.4/10.5",
-        process_role_name(role)
-    )
+fn canonical_storage_node_socket_path(node_id: u32, socket_path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(socket_path);
+    let parent = path.parent().ok_or_else(|| {
+        format!("ARGMIN_STORAGE_NODE_SOCKETS entry for node {node_id} is missing a parent")
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        format!("ARGMIN_STORAGE_NODE_SOCKETS entry for node {node_id} is missing a file name")
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        format!(
+            "ARGMIN_STORAGE_NODE_SOCKETS parent for node {node_id} could not be canonicalized: {e}"
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
 }
 
 fn validate_account_id(name: &str, value: &str) -> Result<(), String> {
@@ -596,6 +712,7 @@ mod tests {
         assert_eq!(cfg.storage_node_id, None);
         assert_eq!(cfg.storage_node_data_dir, None);
         assert_eq!(cfg.storage_node_socket_path, None);
+        assert!(cfg.storage_node_sockets.is_empty());
         assert_eq!(cfg.storage_cluster_epoch, 1);
         assert_eq!(cfg.storage_pg_ids, (0..16).collect::<Vec<_>>());
         assert_eq!(cfg.ec_k, 4);
@@ -715,7 +832,7 @@ mod tests {
         let cfg = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "storage-node"),
             ("ARGMIN_STORAGE_NODE_ID", "0"),
-            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin/node-0.sock"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin-node-0.sock"),
         ]))
         .unwrap();
 
@@ -728,31 +845,175 @@ mod tests {
     }
 
     #[test]
-    fn process_role_frontend_fails_before_frontend_config_validation() {
+    fn process_role_frontend_still_requires_frontend_config() {
         let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "frontend")]))
             .unwrap_err();
 
-        assert!(err.contains("remote frontend routing is not wired"));
+        assert!(err.contains("ARGMIN_ACCOUNT_ID"));
     }
 
     #[test]
-    fn process_role_combined_fails_before_storage_config_validation() {
-        let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "combined")]))
-            .unwrap_err();
+    fn process_role_frontend_requires_complete_storage_node_socket_map() {
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PROCESS_ROLE", "frontend")]))
+                .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_SOCKETS"));
 
-        assert!(err.contains("remote frontend routing is not wired"));
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "2"),
+            ("ARGMIN_STORAGE_NODE_SOCKETS", "0=/tmp/argmin-node-0.sock"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must include node id 1"));
     }
 
     #[test]
-    fn process_role_combined_fails_even_with_complete_local_config() {
+    fn process_role_frontend_parses_storage_node_socket_map() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "2"),
+            ("ARGMIN_EC_K", "1"),
+            ("ARGMIN_EC_M", "1"),
+            (
+                "ARGMIN_STORAGE_NODE_SOCKETS",
+                "1=/tmp/argmin-node-1.sock,0=/tmp/argmin-node-0.sock",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::Frontend);
+        assert_eq!(
+            cfg.storage_node_sockets,
+            vec![
+                ConfiguredStorageNodeSocket {
+                    node_id: 0,
+                    socket_path: "/tmp/argmin-node-0.sock".to_string(),
+                },
+                ConfiguredStorageNodeSocket {
+                    node_id: 1,
+                    socket_path: "/tmp/argmin-node-1.sock".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn process_role_frontend_rejects_relative_duplicate_or_out_of_range_socket_map() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "1"),
+            ("ARGMIN_STORAGE_NODE_SOCKETS", "0=relative.sock"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("absolute socket path"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "2"),
+            ("ARGMIN_EC_K", "1"),
+            ("ARGMIN_EC_M", "1"),
+            (
+                "ARGMIN_STORAGE_NODE_SOCKETS",
+                "0=/tmp/argmin-node.sock,0=/tmp/argmin-other.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("duplicate node id 0"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "2"),
+            ("ARGMIN_EC_K", "1"),
+            ("ARGMIN_EC_M", "1"),
+            (
+                "ARGMIN_STORAGE_NODE_SOCKETS",
+                "0=/tmp/argmin-node.sock,1=/tmp/argmin-node.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("duplicate socket path"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "2"),
+            ("ARGMIN_EC_K", "1"),
+            ("ARGMIN_EC_M", "1"),
+            (
+                "ARGMIN_STORAGE_NODE_SOCKETS",
+                "0=/tmp/argmin-node.sock,1=/tmp/../tmp/argmin-node.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("duplicate socket path"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "1"),
+            ("ARGMIN_STORAGE_NODE_SOCKETS", "1=/tmp/argmin-node-1.sock"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("less than ARGMIN_LOCAL_NODE_COUNT"));
+    }
+
+    #[test]
+    fn process_role_combined_requires_own_socket_to_match_socket_map() {
         let err = ServerConfig::from_lookup(make_required_env(&[
             ("ARGMIN_PROCESS_ROLE", "combined"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "1"),
             ("ARGMIN_STORAGE_NODE_ID", "0"),
-            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin/node-0.sock"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin-node-0.sock"),
+            (
+                "ARGMIN_STORAGE_NODE_SOCKETS",
+                "0=/tmp/argmin-other-node-0.sock",
+            ),
         ]))
         .unwrap_err();
 
-        assert!(err.contains("remote frontend routing is not wired"));
+        assert!(err.contains("must match ARGMIN_STORAGE_NODE_SOCKET_PATH"));
+    }
+
+    #[test]
+    fn process_role_combined_allows_canonical_self_socket_match() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "combined"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "1"),
+            ("ARGMIN_EC_K", "1"),
+            ("ARGMIN_EC_M", "0"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+            (
+                "ARGMIN_STORAGE_NODE_SOCKET_PATH",
+                "/tmp/../tmp/argmin-node-0.sock",
+            ),
+            ("ARGMIN_STORAGE_NODE_SOCKETS", "0=/tmp/argmin-node-0.sock"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::Combined);
+    }
+
+    #[test]
+    fn process_role_combined_parses_frontend_and_storage_config() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "combined"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "1"),
+            ("ARGMIN_EC_K", "1"),
+            ("ARGMIN_EC_M", "0"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin-node-0.sock"),
+            ("ARGMIN_STORAGE_NODE_SOCKETS", "0=/tmp/argmin-node-0.sock"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::Combined);
+        assert_eq!(cfg.storage_node_id, Some(0));
+        assert_eq!(
+            cfg.storage_node_sockets,
+            vec![ConfiguredStorageNodeSocket {
+                node_id: 0,
+                socket_path: "/tmp/argmin-node-0.sock".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -14,14 +14,14 @@ use server_core::sse::{
 use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
 };
-use storage::{CanonicalUserId, ClusterEpoch, EcShape, NodeId, PgState, StorageCluster};
+use storage::{
+    CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap, LocalNodeStoreConfig,
+    LocalUnixStorageNodeClientConfig, NodeId, PgState, StorageCluster,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use config::{
-    unsupported_remote_frontend_role_message, ConfiguredCredential, ConfiguredCredentialProfile,
-    ProcessRole, ServerConfig,
-};
+use config::{ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig};
 use server_http::http::HttpFrontend;
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -131,21 +131,44 @@ async fn main() {
         }
     };
 
-    if config.process_role == ProcessRole::StorageNode {
-        run_storage_node_process(&config, &ec_config);
+    match config.process_role {
+        ProcessRole::StorageNode => run_storage_node_process(&config, &ec_config),
+        ProcessRole::Combined => {
+            let _storage_node_thread = start_storage_node_process(&config, &ec_config);
+            run_remote_frontend(config, host_id, ec_config).await;
+        }
+        ProcessRole::Frontend => {
+            run_remote_frontend(config, host_id, ec_config).await;
+        }
+        ProcessRole::LegacyLocal => {
+            run_legacy_local_frontend(config, host_id, ec_config).await;
+        }
     }
-    if config.process_role.requires_remote_frontend_routing() {
-        eprintln!(
-            "{}",
-            unsupported_remote_frontend_role_message(config.process_role)
-        );
-        std::process::exit(1);
-    }
-
-    run_legacy_local_frontend(config, host_id, ec_config).await;
 }
 
 fn run_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> ! {
+    let server = bind_storage_node_process(config, ec_config);
+    if let Err(error) = server.serve_forever() {
+        eprintln!("storage-node server failed: {error}");
+        std::process::exit(1);
+    }
+    unreachable!("storage-node serve loop should not return successfully")
+}
+
+fn start_storage_node_process(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> std::thread::JoinHandle<()> {
+    let server = bind_storage_node_process(config, ec_config);
+    std::thread::spawn(move || {
+        if let Err(error) = server.serve_forever() {
+            eprintln!("storage-node server failed: {error}");
+            std::process::exit(1);
+        }
+    })
+}
+
+fn bind_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> StorageNodeServer {
     let storage_config = build_storage_node_process_config(config, ec_config).unwrap_or_else(|e| {
         eprintln!("storage-node configuration error: {e}");
         std::process::exit(1);
@@ -164,11 +187,7 @@ fn run_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> ! {
             .as_deref()
             .expect("storage role must have socket path")
     );
-    if let Err(error) = server.serve_forever() {
-        eprintln!("storage-node server failed: {error}");
-        std::process::exit(1);
-    }
-    unreachable!("storage-node serve loop should not return successfully")
+    server
 }
 
 fn build_storage_node_process_config(
@@ -218,6 +237,75 @@ fn build_storage_node_process_config(
 async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+
+    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let storage_cluster = StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open local storage cluster: {e}");
+            std::process::exit(1);
+        });
+
+    run_frontend_server(config, host_id, storage_cluster, true).await;
+}
+
+async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
+    let storage_cluster = build_remote_frontend_storage_cluster(&config, &ec_config)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open remote frontend storage cluster: {e}");
+            std::process::exit(1);
+        });
+    run_frontend_server(config, host_id, storage_cluster, false).await;
+}
+
+fn build_remote_frontend_storage_cluster(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<Arc<StorageCluster>, String> {
+    let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
+        .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+    let local_configs: Vec<LocalNodeStoreConfig> = (0..config.local_node_count)
+        .map(|raw_node_id| {
+            let node_id = NodeId::new(raw_node_id);
+            LocalNodeStoreConfig::new(
+                node_id,
+                Path::new(&config.data_dir)
+                    .join(format!("frontend-placeholder-node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect();
+    let mut local_map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        NodeId::new(0),
+        local_configs,
+        &config.storage_pg_ids,
+        ec_shape,
+        cluster_epoch,
+    )
+    .map_err(|e| e.to_string())?;
+    local_map
+        .install_unix_storage_node_clients(config.storage_node_sockets.iter().map(|entry| {
+            LocalUnixStorageNodeClientConfig::new(
+                NodeId::new(entry.node_id),
+                entry.socket_path.clone(),
+            )
+        }))
+        .map_err(|e| e.to_string())?;
+    StorageCluster::from_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
+}
+
+async fn run_frontend_server(
+    config: ServerConfig,
+    host_id: String,
+    storage_cluster: Arc<StorageCluster>,
+    start_background_sweepers: bool,
+) {
     let sse_c_validator = config
         .sse_c_validator_key_b64
         .as_deref()
@@ -235,28 +323,24 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
                 std::process::exit(1);
             });
 
-    let ec_shape = storage::EcShape {
-        k: ec_config.data_shards,
-        m: ec_config.parity_shards,
-    };
-
-    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
-    let storage_cluster = StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to open local storage cluster: {e}");
-            std::process::exit(1);
-        });
-
-    // Build frontend pool sharing the same storage cluster
-    // (PG access serialized by mutex).
+    // Build frontend pool sharing the same storage cluster handle.
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let coordinator = Coordinator::new_with_managed_key_provider_for_storage_cluster(
-            Arc::clone(&storage_cluster),
-            config.region.clone(),
-            sse_c_validator.clone(),
-            managed_key_provider.clone(),
-        );
+        let coordinator = if start_background_sweepers {
+            Coordinator::new_with_managed_key_provider_for_storage_cluster(
+                Arc::clone(&storage_cluster),
+                config.region.clone(),
+                sse_c_validator.clone(),
+                managed_key_provider.clone(),
+            )
+        } else {
+            Coordinator::new_with_managed_key_provider_for_storage_cluster_without_background_sweepers(
+                Arc::clone(&storage_cluster),
+                config.region.clone(),
+                sse_c_validator.clone(),
+                managed_key_provider.clone(),
+            )
+        };
         let coordinator = match coordinator {
             Ok(c) => c,
             Err(e) => {
@@ -356,6 +440,7 @@ mod tests {
             storage_node_id: Some(2),
             storage_node_data_dir: Some("/tmp/argmin-test/node-0002".to_string()),
             storage_node_socket_path: Some("/tmp/argmin-test/node-0002.sock".to_string()),
+            storage_node_sockets: Vec::new(),
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
             ec_k: 4,
@@ -399,5 +484,44 @@ mod tests {
                 (5, ClusterEpoch::new(9).unwrap()),
             ]
         );
+    }
+
+    #[test]
+    fn remote_frontend_storage_cluster_uses_configured_epoch_and_socket_clients() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-remote-frontend-cluster-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.data_dir = tmp.join("frontend").display().to_string();
+        config.local_node_count = 1;
+        config.pg_count = 2;
+        config.storage_pg_ids = vec![0, 1];
+        config.storage_cluster_epoch = 9;
+        config.storage_node_id = None;
+        config.storage_node_data_dir = None;
+        config.storage_node_socket_path = None;
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 0,
+            socket_path: tmp
+                .join("sockets")
+                .join("node-0.sock")
+                .display()
+                .to_string(),
+        }];
+
+        let cluster = build_remote_frontend_storage_cluster(&config, &ec_config).unwrap();
+
+        assert_eq!(cluster.cluster_epoch(), ClusterEpoch::new(9).unwrap());
+        assert_eq!(cluster.local_node_count(), 1);
+        for pg_id in [0, 1] {
+            let route = cluster.local_pg_route(storage::PgId::new(pg_id)).unwrap();
+            assert_eq!(route.cluster_epoch(), ClusterEpoch::new(9).unwrap());
+            assert_eq!(route.primary_node_id(), NodeId::new(0));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

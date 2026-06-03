@@ -418,6 +418,15 @@ pub enum ClusterBuildError {
     #[error("duplicate local node id {id}")]
     DuplicateNodeId { id: u32 },
 
+    #[error("duplicate remote storage-node client node id {id}")]
+    DuplicateRemoteStorageNodeClientNodeId { id: u32 },
+
+    #[error("remote storage-node client node {id} is not present in the local cluster map")]
+    RemoteStorageNodeClientNodeNotFound { id: u32 },
+
+    #[error("remote storage-node client socket path {path:?} must be absolute")]
+    RemoteStorageNodeClientSocketPathNotAbsolute { path: PathBuf },
+
     #[error("duplicate remote shard client node id {id}")]
     DuplicateRemoteShardClientNodeId { id: u32 },
 

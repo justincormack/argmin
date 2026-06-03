@@ -280,6 +280,31 @@ impl Coordinator {
         )
     }
 
+    /// Create a new coordinator over a cluster-shaped storage handle without
+    /// starting background sweepers.
+    ///
+    /// Remote frontend roles use this until Phase 10.6 routes background
+    /// worker metadata surfaces through the storage-node RPC boundary.
+    pub fn new_with_managed_key_provider_for_storage_cluster_without_background_sweepers(
+        storage_cluster: Arc<StorageCluster>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: StaticManagedKeyProvider,
+    ) -> Result<Self, ServerError> {
+        Self::new_with_shared_caches_and_background_sweeper_factories(
+            Arc::clone(&storage_cluster),
+            shared_caches_for_storage_cluster(&storage_cluster),
+            region,
+            sse_c_validator,
+            Some(managed_key_provider),
+            (
+                false,
+                |_, _| Ok(LifecycleSweeper::disabled()),
+                |_| Ok(ShardScavengerSweeper::disabled()),
+            ),
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn new_with_lifecycle_sweeper_factory_for_storage_cluster<F>(
         storage_cluster: Arc<StorageCluster>,
