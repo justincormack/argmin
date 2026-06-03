@@ -1,0 +1,256 @@
+Multipart RPC validation misses part data placement
+Link: https://chatgpt.com/codex/cloud/security/findings/66c44e69f0808191bcc69d619895edfe?sev=
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 25a204e
+Author: justin@specialbusservice.com
+Created: 02/06/2026, 21:04:19
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed by `abb8982 Validate multipart completion part placement`.
+
+What this commit fixed:
+- Made completed multipart object-part placement an explicit validation authority by adding `expected_object_parts` to `BuildCompleteMultipartObjectCommandReq`.
+- Derived the expected completed `ObjectPartRecord` values from topology at the cluster call site before invoking the object-mutation metadata client.
+- Derived the same expected object-part placement in the storage-node server before delegating the RPC request to the local storage-node client.
+- Tightened `UnixStorageNodeClient::validate_complete_multipart_command_response` to require returned `commit.parts` to exactly match the expected object parts, including `data_pg_id`.
+- Kept the local builder honest by rejecting requests whose supplied expected object parts do not match the storage-node topology-derived parts.
+- Added a regression that mutates only `ObjectPartRecord.data_pg_id` in an otherwise valid complete-multipart response and verifies the Unix client fails closed.
+
+What was already fixed or not changed by this commit:
+- The existing validator already checked route identity, command payload kind, bucket/key/upload/generation identity, version id, object metadata, selected/omitted cleanup completeness, terminal stream cleanup, bucket write reservation proof, and stale null-version payload identity. Those checks remain in place.
+- `CommitMultipartObjectCommand::matches_request` still compares the uploaded multipart part identity fields available from `MultipartPartRecord`; it intentionally does not own topology placement validation because `data_pg_id` is not present in the selected upload part row.
+- PgStore still persists `ObjectPartRecord.data_pg_id` into `object_parts`; the fix is to reject malformed remote command-build responses before publishing/applying them.
+
+Verification:
+- `cargo fmt`
+- `cargo check -p storage`
+- `cargo nextest run -p storage unix_object_mutation_client_rejects_malformed_complete_multipart_response`
+- `cargo clippy -p storage --all-targets --all-features -- -D warnings`
+- `./scripts/check-storage-cluster-boundaries`
+- `cargo nextest run -p storage`: 931/931 tests passed
+- `./scripts/ci`: 5003/5003 tests passed
+
+# Summary
+A security-relevant bug was introduced: the commit adds a remote multipart completion command builder and response validation, but the validation is incomplete because it omits the topology-derived data_pg_id field for completed multipart object parts.
+The new Unix/RPC path for building CompleteMultipartUpload metadata commands validates most fields of the remote MetadataCommandEnvelope before publishing it. However, the validation relies on CommitMultipartObjectCommand::matches_request plus a bucket/key/version_id identity check for each returned ObjectPartRecord. Neither check verifies ObjectPartRecord.data_pg_id, even though the local builder derives data_pg_id from the cluster topology and PgStore persists that value into the object manifest. A faulty or malicious remote object-metadata primary can therefore return a command whose part metadata matches the requested uploaded parts but points the completed object's manifest at the wrong data placement group. Once the coordinator accepts and applies that command, later reads may fetch missing or incorrect shards, causing object corruption or unavailability. This does not bypass S3 authentication directly, but it weakens the intended validation at the new remote storage-node trust boundary.
+
+# Validation
+## Rubric
+- [x] Confirm the new remote complete-multipart command-build path accepts a remote MetadataCommandEnvelope only after validate_complete_multipart_command_response.
+- [x] Confirm the validator and CommitMultipartObjectCommand::matches_request do not compare ObjectPartRecord.data_pg_id.
+- [x] Confirm data_pg_id is security-relevant/deterministic by finding the trusted local builder derives it from topology.
+- [x] Confirm accepted command.parts are applied and persisted to the object_parts manifest including data_pg_id.
+- [x] Dynamically demonstrate that a response with only data_pg_id changed is accepted by the validator, and trace that path in a debugger.
+## Report
+Validated the finding against commit 25a204e4. I built the storage crate test binary with debug symbols and injected a targeted PoC into the existing complete-multipart response validation unit test. The PoC clones an otherwise-valid CommitMultipartObject response, changes only commit.parts[0].data_pg_id to 424242, then calls UnixStorageNodeClient::validate_complete_multipart_command_response. The command was accepted: cargo test output included `AutoValidator PoC: validation result for mismatched data_pg_id=424242: Ok(())` and the test passed. Crash attempt: no crash occurred or was expected because this is a trust-boundary logic-validation bug, not memory corruption. Valgrind attempt: valgrind was not installed in the container. Debugger validation: LLDB stopped inside validate_complete_multipart_command_response at crates/storage/src/node_client.rs:6360, the loop that checks only part.bucket, part.key, and part.version_id. The first valid call showed `part->data_pg_id = 0`; the second PoC call showed `part->data_pg_id = 424242`, with the backtrace returning to the PoC validation call at node_client.rs:12465. Code evidence: the remote complete-multipart RPC path uses object_metadata_command_build_request and validate_complete_multipart_command_response before accepting the command at crates/storage/src/node_client.rs:5020-5048. The validator delegates to CommitMultipartObjectCommand::matches_request at node_client.rs:6333-6353, then only checks bucket/key/version_id for each ObjectPartRecord at node_client.rs:6359-6369. matches_request compares part_number, size, etag, etag_kind, part_okh, part_vid, ec_k, ec_m, and checksum, but omits ObjectPartRecord.data_pg_id at crates/storage/src/metadata_command.rs:630-658. The trusted local builder derives data_pg_id from topology at crates/storage/src/node_client.rs:9180-9207. Accepted CommitMultipartObject commands are applied through PgStore::apply_commit_multipart_object_command, which passes command.parts into put_multipart_object_explicit_in_open_txn at crates/storage/src/pg_store.rs:7236-7281; that function inserts part.data_pg_id into object_parts at pg_store.rs:10347-10381, and object part reads select data_pg_id back from object_parts at pg_store.rs:15543-15553. This confirms that a malicious/faulty remote metadata primary can supply a completed multipart manifest with an arbitrary data_pg_id that survives validation and is persisted.
+
+# Evidence
+crates/storage/src/metadata_command.rs (L630 to 658)
+  Note: CommitMultipartObjectCommand::matches_request compares part number, size, etag, shard identifiers, EC shape, and checksum, but also omits ObjectPartRecord.data_pg_id.
+```
+impl CommitMultipartObjectCommand {
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        generation_id: GenerationId,
+        parts: &[MultipartPartRecord],
+    ) -> bool {
+        self.object.bucket == *bucket
+            && self.object.key == *key
+            && self.upload_id == *upload_id
+            && self.object.generation_id == generation_id
+            && self
+                .parts
+                .iter()
+                .zip(parts.iter())
+                .all(|(stored, requested)| {
+                    stored.part_number == requested.part_number
+                        && stored.size == requested.size
+                        && stored.etag == requested.etag
+                        && stored.etag_kind == requested.etag_kind
+                        && stored.part_okh == requested.part_okh
+                        && stored.part_vid == requested.part_vid
+                        && stored.ec_k == requested.ec_k
+                        && stored.ec_m == requested.ec_m
+                        && stored.checksum == requested.checksum
+                })
+            && self.parts.len() == parts.len()
+```
+
+crates/storage/src/node_client.rs (L5020 to 5048)
+  Note: The newly added Unix/RPC multipart completion path accepts a remote command after running validate_complete_multipart_command_response.
+```
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let rpc_request = StorageRpcCompleteMultipartCommandBuildRequest {
+            object: self.object_request(
+                request.pg_id,
+                &request.request.bucket,
+                &request.request.key,
+            ),
+            request: request.request.clone(),
+            version_id: request.version_id,
+            completion_order: request.completion_order,
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_complete_multipart_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "encode complete multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        match self.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild,
+            payload,
+            "decode complete multipart command build response",
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            |command| self.validate_complete_multipart_command_response(command, &request),
+        )? {
+```
+
+crates/storage/src/node_client.rs (L6359 to 6369)
+  Note: The response validation only checks each returned ObjectPartRecord's bucket, key, and version_id; it does not validate data_pg_id.
+```
+        for part in &commit.parts {
+            if part.bucket != request.request.bucket
+                || part.key != request.request.key
+                || part.version_id != request.version_id
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    context,
+                    "response object part identity does not match request".to_string(),
+                )));
+            }
+        }
+```
+
+crates/storage/src/node_client.rs (L9180 to 9207)
+  Note: The trusted local builder derives data_pg_id from topology for each multipart part, showing this field is expected to be deterministic and should be validated for remote responses.
+```
+        let object_parts = complete
+            .part_records
+            .iter()
+            .map(|part| {
+                let data_pg_id = self
+                    .storage_node
+                    .pg_topology()
+                    .object_generation_multipart_part_data_pg(
+                        &complete.bucket,
+                        &complete.key,
+                        complete.generation_id,
+                        part.part_number,
+                    )
+                    .get();
+                ObjectPartRecord {
+                    bucket: complete.bucket.clone(),
+                    key: complete.key.clone(),
+                    version_id: request.version_id,
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag: part.etag.clone(),
+                    etag_kind: part.etag_kind,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec_k: part.ec_k,
+                    ec_m: part.ec_m,
+                    data_pg_id,
+                    checksum: part.checksum.clone(),
+```
+
+crates/storage/src/pg_store.rs (L10347 to 10380)
+  Note: PgStore persists the unvalidated data_pg_id into the object_parts manifest, so an accepted malicious remote command affects future object reads.
+```
+                "INSERT INTO object_parts \
+                 (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m, data_pg_id, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put explicit multipart object (prepare insert parts)",
+                source: e,
+            })?;
+        let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
+        ordered_parts.sort_by_key(|part| part.part_number);
+        let mut object_offset_start = 0u64;
+        for part in ordered_parts {
+            if part.bucket != obj.bucket || part.key != obj.key || part.version_id != obj.version_id
+            {
+                return Err(MetadataError::Db {
+                    context: "put explicit multipart object (part identity mismatch)",
+                    source: rusqlite::Error::InvalidQuery,
+                });
+            }
+            stmt.execute(params![
+                &part.bucket,
+                &part.key,
+                part.version_id.to_u64() as i64,
+                part.part_number,
+                object_offset_start as i64,
+                part.size as i64,
+                &part.etag,
+                part.etag_kind as u8,
+                part.part_okh.as_slice(),
+                part.part_vid.get() as i64,
+                part.ec_k,
+                part.ec_m,
+                part.data_pg_id,
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The original medium rating is technically plausible for a future multihost deployment because the bug is real and can corrupt multipart manifest placement metadata. Static evidence shows the validator omits data_pg_id and PgStore persists the unvalidated field. However, probability is low in the current project context: README documents legacy-local as the default, frontend/combined remote routing is intentionally unsupported, config rejects roles requiring remote frontend routing, and the storage-node RPC is a local Unix socket with private-directory enforcement. The issue is therefore downgraded from medium to low for the current commit and threat model, while retaining a medium impact if the internal remote-storage trust boundary is enabled.
+## Likelihood
+low - Exploitation requires an internal malicious/faulty storage-node RPC peer or a future/unsupported remote frontend configuration. The current documented server rejects remote frontend routing and uses local storage nodes in the frontend path; the storage-node socket is local and directory-private. This is unlikely for the current threat model.
+## Impact
+medium - If a remote metadata primary can exploit the validation gap, it can persist incorrect data placement metadata for completed multipart objects. That can make affected objects unavailable or cause integrity errors on later reads. It does not bypass S3 authentication, expose credentials, or execute code, and impact is limited to objects completed through the compromised internal path.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin.
+- No cloud APIs or live deployment state were queried.
+- The relevant attacker is an internal/malicious or compromised storage-node RPC peer, not an unauthenticated S3 HTTP client.
+- Current documented production mode is legacy-local single-process; remote frontend routing is not wired in this commit.
+- A deployment or library integration that routes object mutation metadata operations to UnixStorageNodeClient
+- A malicious, faulty, or compromised remote object-metadata primary/storage-node RPC responder
+- A multipart upload completion whose otherwise-valid CommitMultipartObject response can be altered only in ObjectPartRecord.data_pg_id
+- Coordinator acceptance and application of the returned metadata command
+## Path
+malicious RPC peer -> command build response -> incomplete validation -> accepted CommitMultipartObject -> object_parts.data_pg_id persisted -> reads route to wrong data PG
+## Path evidence
+- `crates/storage/src/node_client.rs:5042-5048` - Remote ObjectMultipartCompleteCommandBuild response is accepted after validate_complete_multipart_command_response.
+- `crates/storage/src/node_client.rs:6298-6369` - Response validation checks route, object fields, matches_request, and only bucket/key/version_id for each part; it does not validate ObjectPartRecord.data_pg_id.
+- `crates/storage/src/metadata_command.rs:630-659` - CommitMultipartObjectCommand::matches_request compares part number, size, etag, shard identifiers, EC shape, and checksum, but not data_pg_id.
+- `crates/storage/src/node_client.rs:9180-9208` - Trusted local builder derives data_pg_id from cluster topology, showing it is deterministic and security-relevant placement metadata.
+- `crates/storage/src/pg_store.rs:7236-7280` - Accepted CommitMultipartObject commands are applied and pass command.parts into multipart object persistence.
+- `crates/storage/src/pg_store.rs:10347-10381` - PgStore inserts part.data_pg_id into the object_parts manifest.
+- `crates/storage/src/pg_store.rs:15543-15555` - Object part reads load data_pg_id from object_parts, so the accepted bad value affects future reads.
+- `README.md:33-43` - Documented exposure is legacy-local by default; storage-node is Phase 10.3 and frontend/combined remote routing is intentionally unsupported.
+- `crates/argmin-s3/src/config.rs:116-122` - Config rejects process roles requiring remote frontend routing.
+- `crates/argmin-s3/src/main.rs:243-248` - Current frontend opens local storage nodes directly rather than installing Unix remote metadata clients.
+- `crates/storage/src/storage_node_server.rs:292-308` - Storage-node RPC binds a UnixListener, not a TCP listener.
+- `crates/storage/src/storage_node_server.rs:4134-4157` - Storage-node socket parent directory must be private, limiting reachability to local/internal actors.
+## Narrative
+The finding is a real validation bug: the remote multipart command builder accepts a MetadataCommandEnvelope after validate_complete_multipart_command_response, but that validator never compares each ObjectPartRecord.data_pg_id. The local trusted builder derives data_pg_id from topology, and PgStore later persists the value into object_parts and reads it back for object reads. Thus a malicious or faulty remote metadata primary can cause bad multipart placement metadata if the remote Unix/RPC path is used. The severity is reduced because the documented production server is legacy-local, frontend/combined remote routing is rejected, and the storage-node RPC surface is a local Unix socket in a private directory; this is not reachable by ordinary unauthenticated or authenticated S3 HTTP clients in the current main deployment.
+## Controls
+- S3 HTTP requests use SigV4 authentication before core operations
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000
+- Direct TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Storage-node RPC uses Unix domain sockets rather than public TCP
+- Storage-node socket directory must not allow group/other access
+- Frontend/combined remote routing is rejected in current config
+- Read path performs shard ack and checksum/integrity checks, which may turn wrong placement into read failure rather than silent success
+## Blindspots
+- Static-only review did not execute a full multihost deployment.
+- Repository may contain test-only or future Phase 10 harnesses that wire Unix metadata clients outside the production argmin-s3 main path.
+- No deployment manifests were found to prove whether operators expose or proxy the Unix storage-node socket.
+- Impact depends on read-path behavior for wrong data_pg_id in real deployments; checksum verification likely converts many cases to availability/integrity errors rather than silent cross-object data substitution.
