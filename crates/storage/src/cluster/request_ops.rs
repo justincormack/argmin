@@ -7462,12 +7462,40 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
+            let expected_object_parts: Vec<ObjectPartRecord> = req
+                .part_records
+                .iter()
+                .map(|part| ObjectPartRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag: part.etag.clone(),
+                    etag_kind: part.etag_kind,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec_k: part.ec_k,
+                    ec_m: part.ec_m,
+                    data_pg_id: self
+                        .local_map
+                        .object_generation_multipart_part_data_pg(
+                            &bucket,
+                            &key,
+                            req.generation_id,
+                            part.part_number,
+                        )
+                        .get(),
+                    checksum: part.checksum.clone(),
+                })
+                .collect();
             let command = match mutation_client.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
                     pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &req,
                     version_id,
+                    expected_object_parts: &expected_object_parts,
                     completion_order,
                     bucket_write_reservation: &bucket_write_reservation,
                 },

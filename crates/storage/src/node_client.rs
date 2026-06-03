@@ -1589,6 +1589,7 @@ pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CompleteMultipartCommitRequest,
     pub(crate) version_id: VersionId,
+    pub(crate) expected_object_parts: &'a [ObjectPartRecord],
     pub(crate) completion_order: u64,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
@@ -9308,6 +9309,12 @@ impl UnixStorageNodeClient {
                 )));
             }
         }
+        if commit.parts != request.expected_object_parts {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                context,
+                "response object part placement does not match expected topology".to_string(),
+            )));
+        }
         for segment in commit
             .selected_streaming_segments
             .iter()
@@ -12167,6 +12174,12 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 }
             })
             .collect();
+        if object_parts != request.expected_object_parts {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "complete multipart expected object parts do not match topology"
+                    .to_string(),
+            });
+        }
 
         let (mut selected_streaming_segments, cleanup) =
             snapshot_complete_multipart_cleanup_from_pg(
@@ -16595,6 +16608,21 @@ mod tests {
         };
         let version_id = VersionId::from_u64(9);
         let parts_count = std::num::NonZeroU32::new(1).unwrap();
+        let expected_object_parts = vec![ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            part_number: part.part_number,
+            size: part.size,
+            etag: part.etag.clone(),
+            etag_kind: part.etag_kind,
+            part_okh: part.part_okh,
+            part_vid: part.part_vid,
+            ec_k: part.ec_k,
+            ec_m: part.ec_m,
+            data_pg_id: 0,
+            checksum: part.checksum.clone(),
+        }];
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::new(1).unwrap(),
@@ -16625,21 +16653,7 @@ mod tests {
                     object_lock: request.object_lock,
                     encryption: request.encryption.clone(),
                 },
-                parts: vec![ObjectPartRecord {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    version_id,
-                    part_number: part.part_number,
-                    size: part.size,
-                    etag: part.etag.clone(),
-                    etag_kind: part.etag_kind,
-                    part_okh: part.part_okh,
-                    part_vid: part.part_vid,
-                    ec_k: part.ec_k,
-                    ec_m: part.ec_m,
-                    data_pg_id: 0,
-                    checksum: part.checksum.clone(),
-                }],
+                parts: expected_object_parts.clone(),
                 selected_streaming_segments: Vec::new(),
                 omitted_parts: Vec::new(),
                 omitted_streaming_segments: Vec::new(),
@@ -16658,6 +16672,7 @@ mod tests {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &request,
             version_id,
+            expected_object_parts: &expected_object_parts,
             completion_order: 2,
             bucket_write_reservation: &proof,
         };
@@ -16670,6 +16685,23 @@ mod tests {
             panic!("expected complete multipart command");
         };
         bad_commit.parts[0].key = crate::tests::object_key("wrong-complete-mpu-key");
+        let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
+        let err = client
+            .validate_complete_multipart_command_response(&bad_command, &build)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate complete multipart command build response",
+                ..
+            })
+        ));
+
+        let mut bad_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitMultipartObject(bad_commit) = &mut bad_payload else {
+            panic!("expected complete multipart command");
+        };
+        bad_commit.parts[0].data_pg_id = 424_242;
         let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
         let err = client
             .validate_complete_multipart_command_response(&bad_command, &build)
@@ -16702,6 +16734,7 @@ mod tests {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &missing_cleanup_request,
             version_id,
+            expected_object_parts: &expected_object_parts,
             completion_order: 2,
             bucket_write_reservation: &proof,
         };
@@ -16743,11 +16776,16 @@ mod tests {
             stale_source_generation,
             ObjectLayout::Standard,
         ));
+        let mut null_expected_object_parts = expected_object_parts.clone();
+        for part in &mut null_expected_object_parts {
+            part.version_id = VersionId::Null;
+        }
         let null_build = BuildCompleteMultipartObjectCommandReq {
             pg_id: PgId::new(0),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &null_request,
             version_id: VersionId::Null,
+            expected_object_parts: &null_expected_object_parts,
             completion_order: 2,
             bucket_write_reservation: &proof,
         };
