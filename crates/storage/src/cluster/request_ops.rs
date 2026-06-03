@@ -1493,7 +1493,7 @@ impl super::StorageCluster {
                 continue;
             };
             let Ok(generations) = node
-                .storage_client()
+                .bucket_metadata_client()
                 .load_bucket_execution_generations(pg_id, &buckets)
             else {
                 continue;
@@ -1512,7 +1512,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let mut identities = node
-            .storage_client()
+            .bucket_metadata_client()
             .load_bucket_fast_path_identities(pg_id, std::slice::from_ref(bucket))?;
         Ok(identities.remove(bucket))
     }
@@ -3013,16 +3013,42 @@ impl super::StorageCluster {
         let mut buckets = Vec::new();
         for pg_id in self.metadata_pg_ids() {
             let pg_id = PgId::new(pg_id);
-            let mut page = self
+            let node = self
                 .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-                .storage_client()
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            let mut page = node
+                .bucket_metadata_client()
                 .list_buckets(pg_id, owner_canonical_id)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+            self.validate_bucket_list_page_for_pg(pg_id, node.node_id(), &page)?;
             buckets.append(&mut page);
         }
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(buckets)
+    }
+
+    pub(crate) fn validate_bucket_list_page_for_pg(
+        &self,
+        pg_id: PgId,
+        node_id: NodeId,
+        page: &[BucketInfo],
+    ) -> Result<(), ObjectPgActionError> {
+        for bucket in page {
+            let expected_pg_id = self.bucket_metadata_pg_id(&bucket.name);
+            if expected_pg_id != pg_id.get() {
+                return Err(ObjectPgActionError::Store(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "validate bucket list response",
+                    message: format!(
+                        "bucket {} belongs to bucket PG {}, not response PG {}",
+                        bucket.name.as_str(),
+                        expected_pg_id,
+                        pg_id.get()
+                    ),
+                }));
+            }
+        }
+        Ok(())
     }
 
     pub fn prune_completed_multipart_uploads_for_bucket_with_limit(

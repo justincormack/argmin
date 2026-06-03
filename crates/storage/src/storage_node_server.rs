@@ -26,10 +26,10 @@ use crate::node_client::{
 };
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
-    decode_authorized_abort_multipart_command_build_request,
+    decode_authorized_abort_multipart_command_build_request, decode_bucket_batch_request,
     decode_bucket_delete_finalize_claim_acquire_request,
     decode_bucket_delete_finalize_claim_record_request,
-    decode_bucket_delete_finalize_roots_request,
+    decode_bucket_delete_finalize_roots_request, decode_bucket_list_request,
     decode_bucket_metadata_control_command_build_request,
     decode_bucket_metadata_control_pending_match_request, decode_bucket_pg_request,
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
@@ -69,10 +69,11 @@ use crate::storage_rpc::{
     encode_abort_multipart_cleanup_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
     encode_bucket_delete_finalize_roots_response, encode_bucket_delete_finalized_response,
-    encode_bucket_info_outcome_response, encode_bucket_metadata_control_command_build_response,
-    encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
-    encode_bucket_subresource_get_response, encode_bucket_write_drain_begin_response,
-    encode_bucket_write_drain_optional_record_response,
+    encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
+    encode_bucket_info_outcome_response, encode_bucket_list_response,
+    encode_bucket_metadata_control_command_build_response, encode_bucket_snapshot_pair_response,
+    encode_bucket_snapshot_response, encode_bucket_subresource_get_response,
+    encode_bucket_write_drain_begin_response, encode_bucket_write_drain_optional_record_response,
     encode_bucket_write_reservation_record_response,
     encode_bucket_write_reservations_list_response,
     encode_completed_multipart_order_command_build_response,
@@ -105,13 +106,15 @@ use crate::storage_rpc::{
     encode_stream_upload_segments_response, encode_stream_upload_session_response,
     read_storage_rpc_request_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupResponse, StorageRpcAbortMultipartCommandBuildRequest,
-    StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
+    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketDeleteFinalizedOutcome,
-    StorageRpcBucketDeleteFinalizedResponse, StorageRpcBucketInfoOutcome,
-    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketMetadataControlCommandBuildRequest,
+    StorageRpcBucketDeleteFinalizedResponse, StorageRpcBucketExecutionGenerationsResponse,
+    StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketInfoOutcome,
+    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListRequest, StorageRpcBucketListResponse,
+    StorageRpcBucketMetadataControlCommandBuildRequest,
     StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcBucketMetadataControlMutation,
     StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
     StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
@@ -1328,6 +1331,31 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketSubresourceGet => {
                 match decode_bucket_subresource_get_request(&frame.payload) {
                     Ok(request) => self.bucket_subresource_get_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketList => match decode_bucket_list_request(&frame.payload) {
+                Ok(request) => self.bucket_list_response(request),
+                Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: error.to_string(),
+                }),
+            },
+            StorageRpcMessageKind::BucketExecutionGenerations => {
+                match decode_bucket_batch_request(&frame.payload) {
+                    Ok(request) => self.bucket_execution_generations_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketFastPathIdentities => {
+                match decode_bucket_batch_request(&frame.payload) {
+                    Ok(request) => self.bucket_fast_path_identities_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4041,6 +4069,83 @@ impl StorageNodeConnectionHandler {
         }
     }
 
+    fn bucket_list_response(
+        &self,
+        request: StorageRpcBucketListRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(request.pg_id, "bucket list") {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketMetadataNodeClient::list_buckets(
+            &local_client,
+            request.pg_id,
+            &request.owner_canonical_id,
+        ) {
+            Ok(buckets) => {
+                let payload =
+                    encode_bucket_list_response(&StorageRpcBucketListResponse { buckets })?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_execution_generations_response(
+        &self,
+        request: StorageRpcBucketBatchRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_bucket_batch_route(&request, "bucket execution generations")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketMetadataNodeClient::load_bucket_execution_generations(
+            &local_client,
+            request.pg_id,
+            &request.buckets,
+        ) {
+            Ok(generations) => {
+                let payload = encode_bucket_execution_generations_response(
+                    &StorageRpcBucketExecutionGenerationsResponse { generations },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_fast_path_identities_response(
+        &self,
+        request: StorageRpcBucketBatchRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_bucket_batch_route(&request, "bucket fast-path identities")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketMetadataNodeClient::load_bucket_fast_path_identities(
+            &local_client,
+            request.pg_id,
+            &request.buckets,
+        ) {
+            Ok(identities) => {
+                let payload = encode_bucket_fast_path_identities_response(
+                    &StorageRpcBucketFastPathIdentitiesResponse { identities },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
     fn shard_write_response(
         &self,
         request: StorageRpcShardWriteRequest,
@@ -5214,6 +5319,19 @@ impl StorageNodeConnectionHandler {
     ) -> Result<(), StorageRpcErrorResponse> {
         self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
         self.validate_primary_pg_for_bucket(request.pg_id, &request.bucket, operation)
+    }
+
+    fn validate_bucket_batch_route(
+        &self,
+        request: &StorageRpcBucketBatchRequest,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        self.validate_primary_pg(request.pg_id, operation)?;
+        for bucket in &request.buckets {
+            self.validate_pg_for_bucket(request.pg_id, bucket, operation)?;
+        }
+        Ok(())
     }
 
     fn unsupported_operation_response(

@@ -9,18 +9,19 @@ use crate::{
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
         AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
-        BucketEncryptionConfig, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
-        BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
-        BucketState, BucketSubresourceAux, BucketSubresourceKind, BucketWriteDrainRecord,
-        BucketWriteDrainState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
-        ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
-        CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
-        CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
-        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
-        GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
-        LifecycleSweepRootSource, ListMultipartUploadsReq, ListMultipartUploadsResp,
-        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
-        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        BucketEncryptionConfig, BucketFastPathIdentity, BucketInfo, BucketObjectOwnership,
+        BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
+        BucketSnapshotTagsRequest, BucketState, BucketSubresourceAux, BucketSubresourceKind,
+        BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord,
+        ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
+        CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+        CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
+        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
+        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
+        LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
+        ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
+        ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsResp,
+        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionPreflight,
         MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
         MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
@@ -43,6 +44,7 @@ use s3_types::{
     AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
     ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod,
 };
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
@@ -102,9 +104,19 @@ const STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN: usize = 4
     + 4
     + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
 const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
+const STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN: usize = 64 * 1024;
 const STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN: usize =
     4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+const STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS: u32 = 100_000;
+const STORAGE_RPC_MAX_BUCKET_LIST_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN;
+const STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize * (4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN);
 const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 4;
 const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN: usize =
@@ -381,6 +393,9 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectListPage = 97,
     ObjectVersionListPage = 98,
     ObjectMultipartUploadListPage = 99,
+    BucketList = 100,
+    BucketExecutionGenerations = 101,
+    BucketFastPathIdentities = 102,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +555,9 @@ impl StorageRpcMessageKind {
             Self::ObjectListPage => "object list page",
             Self::ObjectVersionListPage => "object version list page",
             Self::ObjectMultipartUploadListPage => "object multipart upload list page",
+            Self::BucketList => "bucket list",
+            Self::BucketExecutionGenerations => "bucket execution generations",
+            Self::BucketFastPathIdentities => "bucket fast path identities",
         }
     }
 
@@ -644,6 +662,9 @@ impl StorageRpcMessageKind {
             97 => Ok(Self::ObjectListPage),
             98 => Ok(Self::ObjectVersionListPage),
             99 => Ok(Self::ObjectMultipartUploadListPage),
+            100 => Ok(Self::BucketList),
+            101 => Ok(Self::BucketExecutionGenerations),
+            102 => Ok(Self::BucketFastPathIdentities),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -766,6 +787,37 @@ pub(crate) struct StorageRpcBucketPgRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketListRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) owner_canonical_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcBucketListResponse {
+    pub(crate) buckets: Vec<BucketInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketBatchRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) buckets: Vec<BucketName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketExecutionGenerationsResponse {
+    pub(crate) generations: HashMap<BucketName, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketFastPathIdentitiesResponse {
+    pub(crate) identities: HashMap<BucketName, BucketFastPathIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2674,6 +2726,11 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectMultipartUploadListPage => {
             STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::BucketList => STORAGE_RPC_MAX_BUCKET_LIST_REQUEST_PAYLOAD_LEN,
+        StorageRpcMessageKind::BucketExecutionGenerations
+        | StorageRpcMessageKind::BucketFastPathIdentities => {
+            STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN
+        }
         _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
@@ -2863,6 +2920,217 @@ pub(crate) fn decode_bucket_request(
         pg_id,
         bucket,
     })
+}
+
+pub(crate) fn encode_bucket_list_request(
+    request: &StorageRpcBucketListRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.owner_canonical_id.len() > STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: request.owner_canonical_id.len(),
+            limit: STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN,
+        });
+    }
+    let mut out = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    })?;
+    put_string(&mut out, &request.owner_canonical_id);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_list_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketListRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let owner_canonical_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN,
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN + 1,
+            limit: STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN,
+        },
+    )?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketListRequest {
+        node_id: route.node_id,
+        cluster_epoch: route.cluster_epoch,
+        pg_id: route.pg_id,
+        owner_canonical_id,
+    })
+}
+
+pub(crate) fn encode_bucket_list_response(
+    response: &StorageRpcBucketListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_metadata_item_count(response.buckets.len())?;
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.buckets.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.buckets.len(),
+                limit: STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize,
+            }
+        })?,
+    );
+    for bucket in &response.buckets {
+        put_bucket_info(&mut out, bucket);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_limited_bounded_remaining_count(
+        1,
+        "bucket list count exceeds payload",
+        STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS,
+    )?;
+    let mut buckets = Vec::new();
+    for _ in 0..count {
+        buckets.push(decoder.read_bucket_info()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketListResponse { buckets })
+}
+
+pub(crate) fn encode_bucket_batch_request(
+    request: &StorageRpcBucketBatchRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_metadata_item_count(request.buckets.len())?;
+    let mut out = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    })?;
+    put_u32(
+        &mut out,
+        u32::try_from(request.buckets.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: request.buckets.len(),
+                limit: STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize,
+            }
+        })?,
+    );
+    for bucket in &request.buckets {
+        put_string(&mut out, bucket.as_str());
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_batch_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketBatchRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let count = decoder.read_limited_bounded_remaining_count(
+        1,
+        "bucket batch count exceeds payload",
+        STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS,
+    )?;
+    let mut buckets = Vec::new();
+    for _ in 0..count {
+        buckets.push(decoder.read_bucket_name()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketBatchRequest {
+        node_id: route.node_id,
+        cluster_epoch: route.cluster_epoch,
+        pg_id: route.pg_id,
+        buckets,
+    })
+}
+
+pub(crate) fn encode_bucket_execution_generations_response(
+    response: &StorageRpcBucketExecutionGenerationsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_metadata_item_count(response.generations.len())?;
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.generations.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.generations.len(),
+                limit: STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize,
+            }
+        })?,
+    );
+    for (bucket, generation) in &response.generations {
+        put_string(&mut out, bucket.as_str());
+        put_u64(&mut out, *generation);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_execution_generations_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketExecutionGenerationsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_limited_bounded_remaining_count(
+        1,
+        "bucket execution generation count exceeds payload",
+        STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS,
+    )?;
+    let mut generations = HashMap::new();
+    for _ in 0..count {
+        let bucket = decoder.read_bucket_name()?;
+        let generation = decoder.read_u64()?;
+        if generations.insert(bucket, generation).is_some() {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "duplicate bucket execution generation",
+            ));
+        }
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketExecutionGenerationsResponse { generations })
+}
+
+pub(crate) fn encode_bucket_fast_path_identities_response(
+    response: &StorageRpcBucketFastPathIdentitiesResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_metadata_item_count(response.identities.len())?;
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.identities.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.identities.len(),
+                limit: STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize,
+            }
+        })?,
+    );
+    for (bucket, identity) in &response.identities {
+        put_string(&mut out, bucket.as_str());
+        put_bucket_fast_path_identity(&mut out, *identity);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_fast_path_identities_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketFastPathIdentitiesResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_limited_bounded_remaining_count(
+        1,
+        "bucket fast-path identity count exceeds payload",
+        STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS,
+    )?;
+    let mut identities = HashMap::new();
+    for _ in 0..count {
+        let bucket = decoder.read_bucket_name()?;
+        let identity = decoder.read_bucket_fast_path_identity()?;
+        if identities.insert(bucket, identity).is_some() {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "duplicate bucket fast-path identity",
+            ));
+        }
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketFastPathIdentitiesResponse { identities })
 }
 
 pub(crate) fn encode_bucket_snapshot_request(request: &StorageRpcBucketSnapshotRequest) -> Vec<u8> {
@@ -5372,6 +5640,16 @@ fn validate_list_page_item_count(value: usize) -> Result<(), StorageRpcPayloadEr
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: value,
             limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    Ok(())
+}
+
+fn validate_bucket_metadata_item_count(value: usize) -> Result<(), StorageRpcPayloadError> {
+    if value > STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: value,
+            limit: STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize,
         });
     }
     Ok(())
@@ -8856,6 +9134,15 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
+    fn read_bucket_fast_path_identity(
+        &mut self,
+    ) -> Result<BucketFastPathIdentity, StorageRpcPayloadError> {
+        Ok(BucketFastPathIdentity {
+            bucket_execution_generation: self.read_u64()?,
+            bucket_incarnation_generation: self.read_u64()?,
+        })
+    }
+
     fn read_bucket_snapshot_request(
         &mut self,
     ) -> Result<BucketSnapshotRequest, StorageRpcPayloadError> {
@@ -10764,6 +11051,11 @@ fn put_bucket_info(out: &mut Vec<u8>, info: &BucketInfo) {
     put_bool(out, info.bucket_abac_enabled);
     put_u8(out, info.encryption.default_encryption as u8);
     put_bool(out, info.encryption.sse_c_blocked);
+}
+
+fn put_bucket_fast_path_identity(out: &mut Vec<u8>, identity: BucketFastPathIdentity) {
+    put_u64(out, identity.bucket_execution_generation);
+    put_u64(out, identity.bucket_incarnation_generation);
 }
 
 fn put_bucket_snapshot_request(out: &mut Vec<u8>, request: BucketSnapshotRequest) {
@@ -13051,6 +13343,21 @@ mod tests {
                 STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::BucketList,
+                STORAGE_RPC_MAX_BUCKET_LIST_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_LIST_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketExecutionGenerations,
+                STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketFastPathIdentities,
+                STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::LifecycleSweepBucketsList,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
@@ -13458,6 +13765,99 @@ mod tests {
             Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
                 if len == too_many as usize
                     && limit == STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize
+        ));
+    }
+
+    #[test]
+    fn bucket_metadata_read_requests_and_responses_round_trip() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let list_request = StorageRpcBucketListRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            owner_canonical_id: CanonicalUserId::from_principal("owner").to_string(),
+        };
+        let bytes = encode_bucket_list_request(&list_request).unwrap();
+        let decoded = decode_bucket_list_request(&bytes).unwrap();
+        assert_eq!(decoded, list_request);
+
+        let info = test_bucket_info("bucket");
+        let bytes = encode_bucket_list_response(&StorageRpcBucketListResponse {
+            buckets: vec![info.clone()],
+        })
+        .unwrap();
+        let decoded = decode_bucket_list_response(&bytes).unwrap();
+        assert_eq!(decoded.buckets.len(), 1);
+        assert_eq!(decoded.buckets[0].name, info.name);
+        assert_eq!(
+            decoded.buckets[0].owner_canonical_id,
+            info.owner_canonical_id
+        );
+        assert_eq!(
+            decoded.buckets[0].bucket_execution_generation,
+            info.bucket_execution_generation
+        );
+
+        let batch_request = StorageRpcBucketBatchRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            buckets: vec![bucket.clone()],
+        };
+        let bytes = encode_bucket_batch_request(&batch_request).unwrap();
+        let decoded = decode_bucket_batch_request(&bytes).unwrap();
+        assert_eq!(decoded, batch_request);
+
+        let generations = StorageRpcBucketExecutionGenerationsResponse {
+            generations: HashMap::from([(bucket.clone(), 11)]),
+        };
+        let bytes = encode_bucket_execution_generations_response(&generations).unwrap();
+        let decoded = decode_bucket_execution_generations_response(&bytes).unwrap();
+        assert_eq!(decoded, generations);
+
+        let identities = StorageRpcBucketFastPathIdentitiesResponse {
+            identities: HashMap::from([(
+                bucket,
+                BucketFastPathIdentity {
+                    bucket_execution_generation: 11,
+                    bucket_incarnation_generation: 17,
+                },
+            )]),
+        };
+        let bytes = encode_bucket_fast_path_identities_response(&identities).unwrap();
+        let decoded = decode_bucket_fast_path_identities_response(&bytes).unwrap();
+        assert_eq!(decoded, identities);
+    }
+
+    #[test]
+    fn bucket_metadata_read_responses_reject_oversized_counts_before_allocating() {
+        let too_many = STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS + 1;
+
+        let mut list_bytes = Vec::new();
+        put_u32(&mut list_bytes, too_many);
+        assert!(matches!(
+            decode_bucket_list_response(&list_bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
+                if len == too_many as usize
+                    && limit == STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize
+        ));
+
+        let mut generation_bytes = Vec::new();
+        put_u32(&mut generation_bytes, too_many);
+        assert!(matches!(
+            decode_bucket_execution_generations_response(&generation_bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
+                if len == too_many as usize
+                    && limit == STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize
+        ));
+
+        let mut identity_bytes = Vec::new();
+        put_u32(&mut identity_bytes, too_many);
+        assert!(matches!(
+            decode_bucket_fast_path_identities_response(&identity_bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
+                if len == too_many as usize
+                    && limit == STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize
         ));
     }
 

@@ -28,10 +28,11 @@ use crate::storage_rpc::{
     decode_abort_multipart_cleanup_response,
     decode_bucket_delete_finalize_claim_optional_record_response,
     decode_bucket_delete_finalize_roots_response, decode_bucket_delete_finalized_response,
-    decode_bucket_info_outcome_response, decode_bucket_metadata_control_command_build_response,
-    decode_bucket_snapshot_pair_response, decode_bucket_snapshot_response,
-    decode_bucket_subresource_get_response, decode_bucket_write_drain_begin_response,
-    decode_bucket_write_drain_optional_record_response,
+    decode_bucket_execution_generations_response, decode_bucket_fast_path_identities_response,
+    decode_bucket_info_outcome_response, decode_bucket_list_response,
+    decode_bucket_metadata_control_command_build_response, decode_bucket_snapshot_pair_response,
+    decode_bucket_snapshot_response, decode_bucket_subresource_get_response,
+    decode_bucket_write_drain_begin_response, decode_bucket_write_drain_optional_record_response,
     decode_bucket_write_reservation_record_response,
     decode_completed_multipart_order_command_build_response,
     decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
@@ -62,10 +63,10 @@ use crate::storage_rpc::{
     decode_stream_upload_match_response, decode_stream_upload_segments_response,
     decode_stream_upload_session_response, encode_abort_multipart_cleanup_request,
     encode_abort_multipart_command_build_request,
-    encode_authorized_abort_multipart_command_build_request,
+    encode_authorized_abort_multipart_command_build_request, encode_bucket_batch_request,
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
-    encode_bucket_delete_finalize_roots_request,
+    encode_bucket_delete_finalize_roots_request, encode_bucket_list_request,
     encode_bucket_metadata_control_command_build_request,
     encode_bucket_metadata_control_pending_match_request, encode_bucket_pg_request,
     encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
@@ -104,20 +105,20 @@ use crate::storage_rpc::{
     encode_stream_upload_match_request, encode_stream_upload_session_request,
     read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
-    StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
+    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizedOutcome, StorageRpcBucketDeleteFinalizedResponse,
-    StorageRpcBucketInfoOutcome, StorageRpcBucketMetadataControlCommandBuildRequest,
-    StorageRpcBucketMetadataControlMutation, StorageRpcBucketMetadataControlPendingMatchRequest,
-    StorageRpcBucketPgRequest, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
-    StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
-    StorageRpcBucketSnapshotRequest, StorageRpcBucketSubresourceGetRequest,
-    StorageRpcBucketWriteDrainBeginOutcome, StorageRpcBucketWriteDrainBeginRequest,
-    StorageRpcBucketWriteDrainClearExpiredRequest, StorageRpcBucketWriteDrainRecordRequest,
-    StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
-    StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
-    StorageRpcCompleteMultipartCommandBuildRequest,
+    StorageRpcBucketInfoOutcome, StorageRpcBucketListRequest,
+    StorageRpcBucketMetadataControlCommandBuildRequest, StorageRpcBucketMetadataControlMutation,
+    StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
+    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
+    StorageRpcBucketSubresourceGetRequest, StorageRpcBucketWriteDrainBeginOutcome,
+    StorageRpcBucketWriteDrainBeginRequest, StorageRpcBucketWriteDrainClearExpiredRequest,
+    StorageRpcBucketWriteDrainRecordRequest, StorageRpcBucketWriteReservationAcquireOutcome,
+    StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
+    StorageRpcBucketWriteReservationRecordRequest, StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
     StorageRpcCreateBucketConfig, StorageRpcCreateMultipartUploadCommandBuildRequest,
@@ -1027,6 +1028,24 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError>;
+
+    fn list_buckets(
+        &self,
+        pg_id: PgId,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
+
+    fn load_bucket_execution_generations(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError>;
+
+    fn load_bucket_fast_path_identities(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
@@ -2008,12 +2027,6 @@ pub(crate) trait StorageNodeClient:
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError>;
 
-    fn list_buckets(
-        &self,
-        pg_id: PgId,
-        owner_canonical_id: &str,
-    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
-
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: PgId,
@@ -2292,18 +2305,6 @@ pub(crate) trait StorageNodeClient:
         &self,
         request: BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
-    fn load_bucket_execution_generations(
-        &self,
-        pg_id: PgId,
-        buckets: &[BucketName],
-    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError>;
-
-    fn load_bucket_fast_path_identities(
-        &self,
-        pg_id: PgId,
-        buckets: &[BucketName],
-    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError>;
 
     fn get_bucket_payload_reclaim_root(
         &self,
@@ -4273,6 +4274,33 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::get_bucket_subresource(self, pg_id, bucket, kind)
     }
+
+    fn list_buckets(
+        &self,
+        pg_id: PgId,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?)
+    }
+
+    fn load_bucket_execution_generations(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.load_bucket_execution_generations(buckets)?)
+    }
+
+    fn load_bucket_fast_path_identities(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.load_bucket_fast_path_identities(buckets)?)
+    }
 }
 
 impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
@@ -5346,6 +5374,119 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             )
         })?;
         Ok(response.body)
+    }
+
+    fn list_buckets(
+        &self,
+        pg_id: PgId,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketListRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            owner_canonical_id: owner_canonical_id.to_string(),
+        };
+        let payload = encode_bucket_list_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode bucket list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketList, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_list_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode bucket list response", error.to_string()),
+            )
+        })?;
+        for bucket in &response.buckets {
+            if bucket.owner_canonical_id.as_str() != owner_canonical_id {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket list response",
+                    format!(
+                        "bucket {} owner does not match requested owner",
+                        bucket.name.as_str()
+                    ),
+                )));
+            }
+        }
+        Ok(response.buckets)
+    }
+
+    fn load_bucket_execution_generations(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketBatchRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            buckets: buckets.to_vec(),
+        };
+        let payload = encode_bucket_batch_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode bucket execution generations request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketExecutionGenerations, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_execution_generations_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket execution generations response",
+                    error.to_string(),
+                ))
+            })?;
+        for bucket in response.generations.keys() {
+            if !buckets.iter().any(|requested| requested == bucket) {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket execution generations response",
+                    format!("unexpected bucket {}", bucket.as_str()),
+                )));
+            }
+        }
+        Ok(response.generations)
+    }
+
+    fn load_bucket_fast_path_identities(
+        &self,
+        pg_id: PgId,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketBatchRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            buckets: buckets.to_vec(),
+        };
+        let payload = encode_bucket_batch_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode bucket fast-path identities request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketFastPathIdentities, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_fast_path_identities_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket fast-path identities response",
+                error.to_string(),
+            ))
+        })?;
+        for bucket in response.identities.keys() {
+            if !buckets.iter().any(|requested| requested == bucket) {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket fast-path identities response",
+                    format!("unexpected bucket {}", bucket.as_str()),
+                )));
+            }
+        }
+        Ok(response.identities)
     }
 }
 
@@ -10591,15 +10732,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::get_bucket_subresource(&*pg, bucket, kind)?.map(|stored| stored.body))
     }
 
-    fn list_buckets(
-        &self,
-        pg_id: PgId,
-        owner_canonical_id: &str,
-    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?)
-    }
-
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: PgId,
@@ -11957,24 +12089,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 stale_payload,
             })),
         ))
-    }
-
-    fn load_bucket_execution_generations(
-        &self,
-        pg_id: PgId,
-        buckets: &[BucketName],
-    ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.load_bucket_execution_generations(buckets)?)
-    }
-
-    fn load_bucket_fast_path_identities(
-        &self,
-        pg_id: PgId,
-        buckets: &[BucketName],
-    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.load_bucket_fast_path_identities(buckets)?)
     }
 
     fn get_bucket_payload_reclaim_root(

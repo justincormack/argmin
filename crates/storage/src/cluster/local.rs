@@ -7054,6 +7054,191 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-bucket-metadata-read-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("bucket-metadata-read-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let bucket = crate::tests::bucket_name("remote-bucket-metadata-read");
+        let filtered_bucket = crate::tests::bucket_name("remote-bucket-metadata-other-owner");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let other_owner = crate::CanonicalUserId::from_principal("other-owner");
+        let (expected_generation, expected_identity) = {
+            let remote = SharedStorageNode::open_with_default_ec_shape(
+                &server_config.data_dir,
+                &server_config.pg_ids,
+                server_config.default_ec_shape,
+            )
+            .unwrap();
+            let remote_pg = remote.get_pg(0).unwrap();
+            crate::PgMetadataStore::create_bucket(
+                &*remote_pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            crate::PgMetadataStore::create_bucket(
+                &*remote_pg,
+                &filtered_bucket,
+                "other-owner",
+                &other_owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let generation = remote_pg
+                .load_bucket_execution_generations(std::slice::from_ref(&bucket))
+                .unwrap()
+                .remove(&bucket)
+                .unwrap();
+            let identity = remote_pg
+                .load_bucket_fast_path_identities(std::slice::from_ref(&bucket))
+                .unwrap()
+                .remove(&bucket)
+                .unwrap();
+            (generation, identity)
+        };
+        let server = StorageNodeServer::bind(server_config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let frontend_data_dir = tmp.path().join("frontend-bucket-metadata-read-routing");
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                frontend_data_dir.join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        map.install_unix_bucket_metadata_clients([LocalUnixBucketMetadataNodeClientConfig::new(
+            node_id,
+            socket_path,
+        )])
+        .unwrap();
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());
+
+        let buckets = cluster.list_buckets_for_owner(owner.as_str()).unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].name, bucket);
+
+        let generation_batches = cluster
+            .load_available_bucket_execution_generation_batches(std::slice::from_ref(&bucket));
+        assert_eq!(generation_batches.len(), 1);
+        assert_eq!(
+            generation_batches[0].1.get(&bucket),
+            Some(&expected_generation)
+        );
+
+        let identity = cluster.load_bucket_fast_path_identity(&bucket).unwrap();
+        assert_eq!(identity, Some(expected_identity));
+    }
+
+    #[test]
+    fn bucket_list_page_validation_rejects_wrong_pg_bucket() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0, 1],
+            ec_shape,
+        )
+        .unwrap();
+        let correct_bucket = (0..100)
+            .map(|index| crate::tests::bucket_name(format!("list-page-correct-pg-{index}")))
+            .find(|bucket| map.bucket_pg_for(bucket) == 0)
+            .expect("two-PG topology must place a test bucket on PG 0");
+        let wrong_bucket = (0..100)
+            .map(|index| crate::tests::bucket_name(format!("list-page-wrong-pg-{index}")))
+            .find(|bucket| map.bucket_pg_for(bucket) == 1)
+            .expect("two-PG topology must place a test bucket on PG 1");
+        let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let correct_info = test_bucket_list_info(correct_bucket, &owner);
+        let wrong_info = test_bucket_list_info(wrong_bucket, &owner);
+
+        cluster
+            .validate_bucket_list_page_for_pg(PgId::new(0), node_id, &[correct_info])
+            .unwrap();
+
+        let error = cluster
+            .validate_bucket_list_page_for_pg(PgId::new(0), node_id, &[wrong_info])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate bucket list response",
+                ..
+            })
+        ));
+    }
+
+    fn test_bucket_list_info(
+        bucket: BucketName,
+        owner: &crate::CanonicalUserId,
+    ) -> crate::types::BucketInfo {
+        crate::types::BucketInfo {
+            name: bucket,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: owner.clone(),
+            created_at: 123,
+            region: 0,
+            state: crate::types::BucketState::Active,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            bucket_abac_enabled: false,
+            encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
+        }
+    }
+
+    #[test]
     fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);
