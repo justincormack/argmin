@@ -5645,6 +5645,17 @@ Remote frontend and combined coordinators do not start background sweepers yet:
 reclaim, lifecycle, and shard-scavenger workers remain disabled until Phase
 10.6 routes every worker metadata surface through the same RPC boundary.
 
+Phase 10.5 is complete for the frontend/combined request-path RPC routing that
+the current cluster-map shape can express. There are three explicit
+transitional gaps left after this closeout. First, remote frontend construction
+still opens local placeholder node/PG directories to satisfy `LocalClusterMap`
+topology; those placeholder PGs must not be request metadata authority, and
+removing them in favor of a topology-only frontend map is deferred to the Phase
+10.7 multi-process harness/topology work. Second, background worker metadata
+access is intentionally deferred to Phase 10.6. Third, full multihost
+end-to-end process harness coverage is deferred to Phase 10.7 rather than
+adding a narrow smoke test here.
+
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
 request; the embedded `MetadataCommandEnvelope` remains the durable mutation
@@ -5758,16 +5769,18 @@ Required tests:
 
 1. create bucket through remote PG-primary state
 2. direct PUT metadata reserve/commit through remote PG-primary and replicas
-3. pending command survives node process restart and is converged by a later
-   request
+3. pending command survives storage reopen/restart-shaped recovery and is
+   converged by a later request; the full OS storage-node process restart
+   version belongs to the Phase 10.7 harness
 4. command-log conflict and digest mismatch fail closed across RPC
 5. corrupted command bytes in transport are rejected before apply
 6. command bytes with matching transport checksum but stale embedded command
    checksum are rejected
-7. two independent frontend handles converge/reissue the same PG while one
-   command is mid-fanout; the storage-node-owned serialization boundary must
-   preserve primary-last ordering and prevent duplicate or divergent command
-   application
+7. two independent frontend handles/maps converge/reissue the same PG while one
+   command is mid-fanout in focused storage/RPC tests; the storage-node-owned
+   serialization boundary must preserve primary-last ordering and prevent
+   duplicate or divergent command application, and the separate-OS-process
+   version belongs to the Phase 10.7 harness
 8. non-command metadata RPCs used by create-bucket/direct PUT run remotely:
    bucket raw/info and bucket snapshot reads, object read snapshot and
    tag/legal-hold/retention subject reads, generation/version/order allocation,
@@ -5787,13 +5800,15 @@ Required tests:
    `apply_metadata_command_and_record`, abandoned-record insert, exact
    pending-slot removal, bucket reservation/proof release, and cleanup
    mutations; same identity succeeds and mismatched identity fails closed
-11. `frontend` and `combined` roles parse and start from a complete static
+11. `frontend` and `combined` roles parse and build from a complete static
    `ARGMIN_STORAGE_NODE_SOCKETS` map; missing, relative, byte-duplicate,
    canonical-equivalent duplicate, incomplete, or combined-self-mismatched
    socket entries fail at config/build time, and the frontend placeholder map
    uses the configured cluster epoch without validating local placeholder PG
    replay state. Remote frontend startup must keep background sweepers disabled
-   until Phase 10.6 completes worker routing.
+   until Phase 10.6 completes worker routing. Full separate-process
+   frontend/combined startup and HTTP S3 coverage belongs to the Phase 10.7
+   harness.
 
 ### Phase 10.6: Background Workers Across RPC
 
@@ -5837,6 +5852,9 @@ Required harness behavior:
 3. captures node logs on failure
 4. shuts down processes cleanly
 5. can intentionally kill/restart a node process for targeted tests
+6. builds frontend-only topology without opening placeholder PG directories,
+   closing the Phase 10.5 transitional exception to the Phase 10.3
+   frontend-only invariant
 
 Required test coverage:
 
