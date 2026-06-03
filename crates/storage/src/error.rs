@@ -445,6 +445,15 @@ pub enum ClusterBuildError {
     #[error("remote bucket metadata client socket path {path:?} must be absolute")]
     RemoteBucketMetadataClientSocketPathNotAbsolute { path: PathBuf },
 
+    #[error(
+        "remote bucket metadata client node {id} socket path {bucket_metadata_socket_path:?} does not match remote bucket write reservation client socket path {bucket_write_reservation_socket_path:?}"
+    )]
+    RemoteBucketMetadataClientMismatchedBucketWriteReservationClient {
+        id: u32,
+        bucket_metadata_socket_path: PathBuf,
+        bucket_write_reservation_socket_path: PathBuf,
+    },
+
     #[error("duplicate remote bucket write reservation client node id {id}")]
     DuplicateRemoteBucketWriteReservationClientNodeId { id: u32 },
 
@@ -455,6 +464,20 @@ pub enum ClusterBuildError {
 
     #[error("remote bucket write reservation client socket path {path:?} must be absolute")]
     RemoteBucketWriteReservationClientSocketPathNotAbsolute { path: PathBuf },
+
+    #[error(
+        "remote bucket write reservation client node {id} requires a matching remote bucket metadata client"
+    )]
+    RemoteBucketWriteReservationClientMissingBucketMetadataClient { id: u32 },
+
+    #[error(
+        "remote bucket write reservation client node {id} socket path {bucket_write_reservation_socket_path:?} does not match remote bucket metadata client socket path {bucket_metadata_socket_path:?}"
+    )]
+    RemoteBucketWriteReservationClientMismatchedBucketMetadataClient {
+        id: u32,
+        bucket_metadata_socket_path: PathBuf,
+        bucket_write_reservation_socket_path: PathBuf,
+    },
 
     #[error("duplicate remote object-generation metadata client node id {id}")]
     DuplicateRemoteObjectGenerationMetadataClientNodeId { id: u32 },

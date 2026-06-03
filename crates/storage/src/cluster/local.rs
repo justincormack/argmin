@@ -289,7 +289,9 @@ pub struct LocalNodeStore {
     storage_node: Arc<SharedStorageNode>,
     storage_client: Arc<dyn StorageNodeClient>,
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
+    bucket_metadata_unix_socket_path: Option<PathBuf>,
     bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient>,
+    bucket_write_reservation_unix_socket_path: Option<PathBuf>,
     object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient>,
     object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient>,
     direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient>,
@@ -335,7 +337,9 @@ impl LocalNodeStore {
             storage_node,
             storage_client,
             bucket_metadata_client,
+            bucket_metadata_unix_socket_path: None,
             bucket_write_reservation_client,
+            bucket_write_reservation_unix_socket_path: None,
             object_generation_metadata_client,
             object_version_metadata_client,
             direct_put_metadata_client,
@@ -1082,6 +1086,24 @@ impl LocalClusterMap {
                     id: config.node_id.as_u32(),
                 });
             }
+            let node = self
+                .nodes
+                .get(&config.node_id)
+                .expect("validated remote bucket metadata client node must exist");
+            if let Some(bucket_write_reservation_socket_path) =
+                node.bucket_write_reservation_unix_socket_path.as_deref()
+            {
+                if bucket_write_reservation_socket_path != config.socket_path.as_path() {
+                    return Err(
+                        ClusterBuildError::RemoteBucketMetadataClientMismatchedBucketWriteReservationClient {
+                            id: config.node_id.as_u32(),
+                            bucket_metadata_socket_path: config.socket_path.clone(),
+                            bucket_write_reservation_socket_path:
+                                bucket_write_reservation_socket_path.to_path_buf(),
+                        },
+                    );
+                }
+            }
         }
         for config in configs {
             let node = self
@@ -1091,10 +1113,11 @@ impl LocalClusterMap {
             let client = Arc::new(UnixStorageNodeClient::new(
                 config.node_id,
                 self.epoch,
-                config.socket_path,
+                config.socket_path.clone(),
             ));
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client;
             node.bucket_metadata_client = bucket_metadata_client;
+            node.bucket_metadata_unix_socket_path = Some(config.socket_path);
         }
         Ok(())
     }
@@ -1128,6 +1151,30 @@ impl LocalClusterMap {
                     },
                 );
             }
+            let node = self
+                .nodes
+                .get(&config.node_id)
+                .expect("validated remote bucket write reservation client node must exist");
+            match node.bucket_metadata_unix_socket_path.as_deref() {
+                Some(bucket_metadata_socket_path)
+                    if bucket_metadata_socket_path == config.socket_path.as_path() => {}
+                Some(bucket_metadata_socket_path) => {
+                    return Err(
+                        ClusterBuildError::RemoteBucketWriteReservationClientMismatchedBucketMetadataClient {
+                            id: config.node_id.as_u32(),
+                            bucket_metadata_socket_path: bucket_metadata_socket_path.to_path_buf(),
+                            bucket_write_reservation_socket_path: config.socket_path.clone(),
+                        },
+                    );
+                }
+                None => {
+                    return Err(
+                        ClusterBuildError::RemoteBucketWriteReservationClientMissingBucketMetadataClient {
+                            id: config.node_id.as_u32(),
+                        },
+                    );
+                }
+            }
         }
         for config in configs {
             let node = self
@@ -1137,10 +1184,11 @@ impl LocalClusterMap {
             let client = Arc::new(UnixStorageNodeClient::new(
                 config.node_id,
                 self.epoch,
-                config.socket_path,
+                config.socket_path.clone(),
             ));
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> = client;
             node.bucket_write_reservation_client = bucket_write_reservation_client;
+            node.bucket_write_reservation_unix_socket_path = Some(config.socket_path);
         }
         Ok(())
     }
@@ -8154,6 +8202,96 @@ mod tests {
             ClusterBuildError::RemoteBucketWriteReservationClientSocketPathNotAbsolute { path }
                 if path == Path::new("relative-bucket-write-node-1.sock")
         ));
+    }
+
+    #[test]
+    fn unix_bucket_write_reservation_client_install_requires_matching_bucket_metadata_client() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let mut map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path().join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        let bucket_write_socket_path = tmp.path().join("bucket-write-node-1.sock");
+
+        let err = map
+            .install_unix_bucket_write_reservation_clients([
+                LocalUnixBucketWriteReservationNodeClientConfig::new(
+                    node_id,
+                    bucket_write_socket_path.clone(),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteBucketWriteReservationClientMissingBucketMetadataClient { id }
+                if id == node_id.as_u32()
+        ));
+
+        let bucket_metadata_socket_path = tmp.path().join("bucket-metadata-node-1.sock");
+        map.install_unix_bucket_metadata_clients([LocalUnixBucketMetadataNodeClientConfig::new(
+            node_id,
+            bucket_metadata_socket_path.clone(),
+        )])
+        .unwrap();
+        let err = map
+            .install_unix_bucket_write_reservation_clients([
+                LocalUnixBucketWriteReservationNodeClientConfig::new(
+                    node_id,
+                    bucket_write_socket_path.clone(),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteBucketWriteReservationClientMismatchedBucketMetadataClient {
+                id,
+                bucket_metadata_socket_path: actual_bucket_metadata_socket_path,
+                bucket_write_reservation_socket_path: actual_bucket_write_socket_path,
+            } if id == node_id.as_u32()
+                && actual_bucket_metadata_socket_path == bucket_metadata_socket_path
+                && actual_bucket_write_socket_path == bucket_write_socket_path
+        ));
+
+        map.install_unix_bucket_write_reservation_clients([
+            LocalUnixBucketWriteReservationNodeClientConfig::new(
+                node_id,
+                bucket_metadata_socket_path.clone(),
+            ),
+        ])
+        .unwrap();
+
+        let replacement_bucket_metadata_socket_path =
+            tmp.path().join("replacement-bucket-metadata-node-1.sock");
+        let err = map
+            .install_unix_bucket_metadata_clients([LocalUnixBucketMetadataNodeClientConfig::new(
+                node_id,
+                replacement_bucket_metadata_socket_path.clone(),
+            )])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RemoteBucketMetadataClientMismatchedBucketWriteReservationClient {
+                id,
+                bucket_metadata_socket_path: actual_bucket_metadata_socket_path,
+                bucket_write_reservation_socket_path: actual_bucket_write_socket_path,
+            } if id == node_id.as_u32()
+                && actual_bucket_metadata_socket_path == replacement_bucket_metadata_socket_path
+                && actual_bucket_write_socket_path == bucket_metadata_socket_path
+        ));
+
+        map.install_unix_bucket_metadata_clients([LocalUnixBucketMetadataNodeClientConfig::new(
+            node_id,
+            bucket_metadata_socket_path,
+        )])
+        .unwrap();
     }
 
     #[test]
