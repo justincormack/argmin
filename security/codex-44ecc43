@@ -1,0 +1,240 @@
+Remote write reservations use local bucket snapshots
+Link: https://chatgpt.com/codex/cloud/security/findings/d99582768dd08191a3fd8031ab630c36?sev=
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 44ecc43
+Author: justin@specialbusservice.com
+Created: 01/06/2026, 22:18:28
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed.
+
+Already fixed before this review:
+- `68093cd Add remote bucket snapshot metadata RPC` changed `DurableBucketWriteReservation` to store `node.bucket_metadata_client()` instead of the broad/local `node.storage_client()`. That removed the original direct split where reservation acquisition used the remote bucket-write-reservation client but bucket snapshots were loaded through the local storage client.
+
+Fixed by:
+- `3f23a44 Require paired bucket write routing`
+
+What `3f23a44` fixed:
+- `LocalNodeStore` now records both the installed Unix bucket metadata socket path and the installed Unix bucket-write-reservation socket path.
+- `LocalClusterMap::install_unix_bucket_write_reservation_clients` now rejects a remote write-reservation client unless the same node already has a matching remote bucket metadata client on the same socket.
+- `LocalClusterMap::install_unix_bucket_metadata_clients` now rejects rerouting bucket metadata to a different socket after a matching remote write-reservation client has already been installed.
+- Added a regression covering missing metadata routing, mismatched write-reservation routing, and the reverse-order reinstall case: metadata socket A, write-reservation socket A, then attempted metadata socket B.
+
+Verification for `3f23a44`:
+- `./scripts/ci` passed, including `cargo nextest run --workspace`: 5002/5002 tests passed.
+
+# Summary
+Introduced. The commit changed reservation acquisition/validation/release to use a new remotely installable bucket-write-reservation client, but did not ensure the bucket snapshot used for write authorization is loaded from the same authoritative backend. This creates a split-brain authorization path for bucket writes when the new remote client is installed.
+The commit introduces a separately routable `bucket_write_reservation_client`. `acquire_durable_bucket_write_reservation` now acquires the reservation through that new client, which may point at a remote storage-node Unix RPC endpoint, but the returned `DurableBucketWriteReservation` still stores `node.storage_client()`. Later, write paths load the bucket snapshot from `reservation.node.load_bucket_snapshot`, so authorization and bucket policy/ACL evaluation can be performed against the frontend's local metadata rather than the remote metadata that owns the reservation and ultimately validates the write proof. In a split frontend/storage-node deployment, stale or shadow local bucket metadata can therefore authorize a write/delete that the authoritative remote bucket metadata would deny. The resulting command carries a valid remote bucket-write proof, and later validation only checks the reservation proof, not the ACL/policy snapshot used for authorization.
+
+# Validation
+## Rubric
+- [x] Confirm remote bucket-write-reservation client can be installed separately from the storage client.
+- [x] Confirm reservation acquisition uses `bucket_write_reservation_client` but stores `node.storage_client()` in the returned reservation.
+- [x] Confirm bucket-write authorization snapshot is loaded from `reservation.node`, allowing local/frontend metadata to drive authorization.
+- [x] Confirm subsequent command validation checks only the reservation proof and does not reauthorize against the authoritative remote bucket snapshot.
+- [x] Reproduce a split deployment where remote metadata denies/varies from local metadata, yet `with_bucket_write_snapshot_for_command` supplies the local snapshot together with a valid remote reservation proof.
+## Report
+Validated the finding as a real split-brain authorization flaw. I first built and ran the targeted storage test harness. A direct crash was not expected because this is an authorization logic bug, not memory corruption; the targeted PoC test completed successfully and demonstrated the bad state. Valgrind was attempted but is not installed in the container (`bash: command not found: valgrind`). I then used LLDB non-interactively to trace the vulnerable call chain.
+
+Key code evidence: `crates/storage/src/cluster/local.rs:973-1015` installs a Unix RPC client only into `bucket_write_reservation_client`, leaving `storage_client` unchanged. `crates/storage/src/cluster/request_ops.rs:1623-1637` acquires the reservation through `node.bucket_write_reservation_client()` but constructs `DurableBucketWriteReservation { node: Arc::clone(node.storage_client()), ... }`. `crates/storage/src/cluster/request_ops.rs:1553-1559` then loads the bucket snapshot through `reservation.node.load_bucket_snapshot(...)`, i.e. the local storage client. `crates/server-core/src/coordinator/authz.rs:1607-1624` uses that supplied snapshot to load the bucket handle and perform bucket-write authorization. Later, `crates/storage/src/cluster.rs:1791-1809` validates only the bucket-write reservation proof through the reservation client and does not re-evaluate authorization against the authoritative remote bucket snapshot.
+
+Dynamic PoC: I added a focused unit test `frontend_unix_bucket_write_snapshot_uses_frontend_metadata_after_remote_reservation` in `crates/storage/src/cluster/local.rs`. The test creates a remote storage-node bucket with owner `remote-owner` and `public_write=false`, and a frontend-local bucket with the same name but owner `frontend-owner` and `public_write=true`. It installs only the remote Unix bucket-write-reservation client, then calls `StorageCluster::with_bucket_write_snapshot_for_command`. The closure receives a valid proof for the bucket while observing the frontend-local snapshot (`frontend-owner`, `public_write=true`); the test separately loads the authoritative remote snapshot and confirms it is still `remote-owner`, `public_write=false`.
+
+Reproduction output: `cargo test -p storage frontend_unix_bucket_write_snapshot_uses_frontend_metadata_after_remote_reservation -- --nocapture` finished with `test ... ok`, proving the split path is reachable using the real storage cluster/server code. LLDB trace stopped first at `request_ops.rs:1623` in `acquire_durable_bucket_write_reservation` called from `with_bucket_write_snapshot_for_command`, then after continuing stopped at `request_ops.rs:1553`, the snapshot-loading path through `reservation.node`. This confirms the reservation acquisition and snapshot authorization paths diverge exactly as suspected.
+
+# Evidence
+crates/server-core/src/coordinator/authz.rs (L1607 to 1624)
+  Note: Server-core authorizes bucket writes by loading a bucket handle from the snapshot supplied by storage, so a stale local snapshot can drive ACL/policy authorization.
+```
+        self.storage_node
+            .with_bucket_write_snapshot_for_command(
+                req.bucket_name_typed(),
+                request.resolve_to_storage_request(),
+                |snapshot, proof| {
+                    let bucket = match self
+                        .bucket_handle_loader()
+                        .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
+                    {
+                        Ok(bucket) => bucket,
+                        Err(error) => {
+                            return Ok(storage::BucketWriteSnapshotAction::release(Err(error)));
+                        }
+                    };
+                    #[cfg(test)]
+                    maybe_run_bucket_write_handle_loaded_hook(req.bucket_name_typed().as_str());
+                    Ok(action(bucket, proof))
+                },
+```
+
+crates/storage/src/cluster.rs (L1791 to 1810)
+  Note: Later validation of metadata commands checks only that the bucket-write reservation proof is valid via the reservation client; it does not re-evaluate authorization against the authoritative bucket snapshot.
+```
+    pub(super) fn validate_metadata_command_bucket_write_reservation(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
+            return Ok(());
+        };
+        if proof.cluster_epoch != command.id().cluster_epoch() {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        }
+        let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.bucket_write_reservation_client()
+            .validate_bucket_write_reservation_proof(PgId::new(pg_id), proof)
+    }
+```
+
+crates/storage/src/cluster/local.rs (L1003 to 1015)
+  Note: The new installer replaces only the bucket-write-reservation client with a Unix RPC client; it does not replace the storage client used for bucket snapshot loading.
+```
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote bucket write reservation client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::new(
+                config.node_id,
+                self.epoch,
+                config.socket_path,
+            ));
+            let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> = client;
+            node.bucket_write_reservation_client = bucket_write_reservation_client;
+        }
+```
+
+crates/storage/src/cluster/local.rs (L208 to 233)
+  Note: LocalNodeStore now has separate `storage_client` and `bucket_write_reservation_client` fields, allowing reservations to be routed differently from snapshot loads.
+```
+impl LocalNodeStore {
+    fn new(node_id: NodeId, data_dir: PathBuf, storage_node: Arc<SharedStorageNode>) -> Self {
+        let local_client = Arc::new(LocalStorageNodeClient::new(
+            node_id,
+            Arc::clone(&storage_node),
+        ));
+        let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
+        let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = local_client.clone();
+        let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
+            local_client.clone();
+        let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
+            local_client.clone();
+        let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> =
+            local_client.clone();
+        let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = local_client.clone();
+        let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
+        let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
+        let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = local_client.clone();
+        let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = local_client;
+        Self {
+            node_id,
+            data_dir,
+            storage_node,
+            storage_client,
+            bucket_metadata_client,
+            bucket_write_reservation_client,
+```
+
+crates/storage/src/cluster/request_ops.rs (L1553 to 1559)
+  Note: Bucket-write command authorization loads the bucket snapshot from `reservation.node`, so it can use local/stale metadata even though the reservation proof came from a remote storage node.
+```
+            let result = (|| {
+                let snapshot = reservation.node.load_bucket_snapshot(
+                    PgId::new(reservation.pg_id),
+                    bucket,
+                    request,
+                )?;
+                action(snapshot, proof)
+```
+
+crates/storage/src/cluster/request_ops.rs (L1598 to 1604)
+  Note: The non-command bucket write snapshot path has the same split: it loads the snapshot through `reservation.node` after a potentially remote reservation acquisition.
+```
+            let result = (|| {
+                let snapshot = reservation.node.load_bucket_snapshot(
+                    PgId::new(reservation.pg_id),
+                    bucket,
+                    request,
+                )?;
+                action(snapshot)
+```
+
+crates/storage/src/cluster/request_ops.rs (L1623 to 1638)
+  Note: The reservation is acquired through the new `bucket_write_reservation_client`, which may be remote, but the returned reservation still stores `node.storage_client()`, which is the local storage client used later for snapshots.
+```
+        let record = node
+            .bucket_write_reservation_client()
+            .acquire_durable_bucket_write_reservation(
+                PgId::new(pg_id),
+                bucket,
+                &reservation_id,
+                &owner_token,
+                self.operation_epoch(),
+                operation_kind,
+                crate::clock::current_time_millis(),
+                None,
+                target_context,
+            )?;
+        Ok(super::DurableBucketWriteReservation {
+            node: Arc::clone(node.storage_client()),
+            pg_id,
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from high to ignore for current product reachability. The code evidence and validation PoC support a real split-brain authorization bug inside unfinished multihost storage routing: remote reservation acquisition can diverge from local snapshot authorization. But high severity requires a realistic attacker path through an in-scope surface. The argmin-s3 binary currently refuses ProcessRole::Frontend and ProcessRole::Combined in config/main, and the project plan explicitly states bucket snapshot loads still need remote routing before those roles can be enabled. The documented/default runtime is legacy-local S3 HTTP on 127.0.0.1:9000 unless reconfigured, and in that mode the reservation and snapshot clients are local to the same storage authority. Thus the assigned high impact is credible only for a future or manually embedded unsupported split deployment, not the current repository product.
+## Likelihood
+ignore - Exploitation is unlikely to unachievable in the supported product because argmin-s3 rejects frontend/combined roles and the multihost plan says remote bucket snapshot loading is not complete. The executable PoC demonstrates the storage abstraction bug using constructed cluster maps, not an attacker-reachable normal deployment path.
+## Impact
+ignore - If the unfinished split mode were enabled, impact could be high because stale local bucket ACL/policy metadata could authorize unauthorized writes/deletes against authoritative remote storage. In the current stock product, that mode is blocked and legacy-local mode does not create the split authority needed for the bug, so there is no demonstrated in-scope security impact.
+## Assumptions
+- The in-scope deployable product is the argmin-s3 binary and repository-provided runtime configuration.
+- External embedders manually constructing StorageCluster/LocalClusterMap with unfinished remote client routing are not treated as the normal product attack surface unless the repository wires that mode into argmin-s3.
+- No deployment manifests were present in the repository checkout, so public exposure is inferred only from code defaults and configuration knobs.
+- A split frontend/storage-node deployment where bucket-write reservations route to a remote Unix storage-node client while bucket snapshot loads still use frontend-local metadata
+- Divergent or stale frontend-local bucket metadata that permits a write/delete denied by the authoritative remote bucket metadata
+- An attacker-reachable frontend capable of accepting S3 write/delete requests in that split mode
+- Bypassing or removing the current argmin-s3 startup guard that rejects frontend and combined roles
+## Path
+argmin-s3 startup guard blocks frontend/combined today
+If guard removed: S3 write/delete -> server-core authz -> remote reservation proof -> local stale bucket snapshot -> command validation of proof only -> unauthorized data mutation
+## Path evidence
+- `crates/storage/src/cluster/local.rs:973-1015` - Installs a Unix RPC client only into bucket_write_reservation_client, allowing reservation routing to diverge from the storage_client used for snapshot loads.
+- `crates/storage/src/cluster/request_ops.rs:1623-1638` - Acquires the durable bucket-write reservation through bucket_write_reservation_client but stores Arc::clone(node.storage_client()) in DurableBucketWriteReservation.
+- `crates/storage/src/cluster/request_ops.rs:1553-1559` - Bucket-write command path loads the bucket snapshot through reservation.node, which is the stored storage_client and can be local/stale in a split map.
+- `crates/storage/src/cluster/request_ops.rs:1598-1604` - Non-command bucket write snapshot path has the same local snapshot load after potentially remote reservation acquisition.
+- `crates/server-core/src/coordinator/authz.rs:1607-1626` - server-core authorization consumes the snapshot provided by storage to load the bucket handle and run bucket-write authorization.
+- `crates/argmin-s3/src/config.rs:21-23` - ProcessRole::Frontend and ProcessRole::Combined are classified as requiring remote frontend routing.
+- `crates/argmin-s3/src/config.rs:116-122` - Configuration loading rejects roles that require remote frontend routing before runtime setup.
+- `crates/argmin-s3/src/main.rs:134-145` - Main binary runs storage-node mode separately, exits for roles requiring remote frontend routing, and otherwise runs only the legacy local frontend.
+- `crates/argmin-s3/src/config.rs:161` - Default S3 listener is 127.0.0.1:9000; public exposure requires explicit deployment configuration.
+- `crates/argmin-s3/src/main.rs:274-333` - The product binds the configured TCP listener and serves HTTP/TLS only in the supported frontend path.
+- `plans/multihost-transition-plan.md:5523-5527` - Project plan states full frontend and combined process roles remain explicitly unsupported until metadata PG-primary and replica operations route over RPC.
+- `plans/multihost-transition-plan.md:5555-5559` - Project plan explicitly notes remaining non-command surfaces still need bucket snapshot loads to run through a remote bucket metadata snapshot API before frontend/combined roles can be enabled.
+## Narrative
+The reported split-brain bug is technically valid in the storage abstraction: a remote bucket-write reservation client can be installed separately, reservations are acquired through that client, but the reservation object stores node.storage_client(), and subsequent snapshot-based authorization uses that stored local client. server-core then authorizes from the supplied snapshot, and later metadata-command validation checks the reservation proof rather than reloading the authoritative ACL/policy snapshot. However, this does not currently justify high severity for the stock product: argmin-s3 rejects frontend/combined roles that would create a split frontend/storage-node deployment, and repository planning notes explicitly say bucket snapshot loads are still unfinished and must be remote before enabling those roles. Therefore this is a real latent correctness/security bug in unfinished multihost work, but not presently reachable from the main S3 HTTP attack surface.
+## Controls
+- SigV4 authentication for normal non-OPTIONS S3 requests
+- server-core bucket ACL/policy authorization
+- default listener is localhost-only at 127.0.0.1:9000
+- frontend and combined split-mode process roles are explicitly rejected
+- storage-node RPC is via Unix socket rather than an exposed TCP port
+- configurable max_connections and max_inflight_requests
+## Blindspots
+- Static review did not prove whether any downstream user embeds the storage crate and manually enables remote bucket-write reservation clients in production.
+- No deployment manifests, service definitions, or load balancer configuration were present, so real-world exposure beyond the default localhost listener is unknown.
+- The validation PoC was described as an executable unit test using real storage code, but the reviewed checkout did not include the injected PoC test artifact in the main repository tree.
+- Future commits enabling frontend/combined roles could make this same bug in-scope and materially higher severity if not fixed first.
