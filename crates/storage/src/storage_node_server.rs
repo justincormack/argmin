@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
-use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
+use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient,
@@ -28,11 +28,14 @@ use crate::storage_rpc::{
     decode_authorized_abort_multipart_command_build_request,
     decode_bucket_delete_finalize_claim_acquire_request,
     decode_bucket_delete_finalize_claim_record_request,
-    decode_bucket_delete_finalize_roots_request, decode_bucket_request,
+    decode_bucket_delete_finalize_roots_request,
+    decode_bucket_metadata_control_command_build_request,
+    decode_bucket_metadata_control_pending_match_request, decode_bucket_request,
     decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
-    decode_bucket_write_drain_begin_request, decode_bucket_write_drain_clear_expired_request,
-    decode_bucket_write_drain_record_request, decode_bucket_write_reservation_acquire_request,
-    decode_bucket_write_reservation_proof_request, decode_bucket_write_reservation_record_request,
+    decode_bucket_subresource_get_request, decode_bucket_write_drain_begin_request,
+    decode_bucket_write_drain_clear_expired_request, decode_bucket_write_drain_record_request,
+    decode_bucket_write_reservation_acquire_request, decode_bucket_write_reservation_proof_request,
+    decode_bucket_write_reservation_record_request,
     decode_complete_multipart_command_build_request,
     decode_completed_multipart_order_command_build_request,
     decode_create_bucket_command_build_request,
@@ -61,8 +64,9 @@ use crate::storage_rpc::{
     encode_abort_multipart_cleanup_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
     encode_bucket_delete_finalize_roots_response, encode_bucket_delete_finalized_response,
-    encode_bucket_info_outcome_response, encode_bucket_snapshot_pair_response,
-    encode_bucket_snapshot_response, encode_bucket_write_drain_begin_response,
+    encode_bucket_info_outcome_response, encode_bucket_metadata_control_command_build_response,
+    encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
+    encode_bucket_subresource_get_response, encode_bucket_write_drain_begin_response,
     encode_bucket_write_drain_optional_record_response,
     encode_bucket_write_reservation_record_response,
     encode_bucket_write_reservations_list_response,
@@ -99,12 +103,15 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketDeleteFinalizedOutcome,
     StorageRpcBucketDeleteFinalizedResponse, StorageRpcBucketInfoOutcome,
-    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
-    StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
-    StorageRpcBucketSnapshotPairResponse, StorageRpcBucketSnapshotRequest,
-    StorageRpcBucketSnapshotResponse, StorageRpcBucketWriteDrainBeginOutcome,
-    StorageRpcBucketWriteDrainBeginRequest, StorageRpcBucketWriteDrainBeginResponse,
-    StorageRpcBucketWriteDrainClearExpiredRequest,
+    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketMetadataControlCommandBuildRequest,
+    StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcBucketMetadataControlMutation,
+    StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketRequest,
+    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotPairResponse,
+    StorageRpcBucketSnapshotRequest, StorageRpcBucketSnapshotResponse,
+    StorageRpcBucketSubresourceGetRequest, StorageRpcBucketSubresourceGetResponse,
+    StorageRpcBucketWriteDrainBeginOutcome, StorageRpcBucketWriteDrainBeginRequest,
+    StorageRpcBucketWriteDrainBeginResponse, StorageRpcBucketWriteDrainClearExpiredRequest,
     StorageRpcBucketWriteDrainOptionalRecordResponse, StorageRpcBucketWriteDrainRecordRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
@@ -1197,6 +1204,33 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketCreateCommandBuild => {
                 match decode_create_bucket_command_build_request(&frame.payload) {
                     Ok(request) => self.bucket_create_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketMetadataControlPendingMatch => {
+                match decode_bucket_metadata_control_pending_match_request(&frame.payload) {
+                    Ok(request) => self.bucket_metadata_control_pending_match_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketMetadataControlCommandBuild => {
+                match decode_bucket_metadata_control_command_build_request(&frame.payload) {
+                    Ok(request) => self.bucket_metadata_control_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketSubresourceGet => {
+                match decode_bucket_subresource_get_request(&frame.payload) {
+                    Ok(request) => self.bucket_subresource_get_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3496,6 +3530,163 @@ impl StorageNodeConnectionHandler {
         }
     }
 
+    fn bucket_metadata_control_pending_match_response(
+        &self,
+        request: StorageRpcBucketMetadataControlPendingMatchRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_bucket_metadata_control_route(
+            &request.bucket,
+            "bucket metadata control pending match",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let result = match (&request.mutation, request.command.payload()) {
+            (
+                StorageRpcBucketMetadataControlMutation::Versioning(state),
+                MetadataCommandPayload::PutBucketVersioning(command),
+            ) => BucketMetadataNodeClient::pending_put_bucket_versioning_command_matches_current(
+                &local_client,
+                request.bucket.pg_id,
+                &request.bucket.bucket,
+                command,
+                *state,
+            ),
+            (
+                StorageRpcBucketMetadataControlMutation::Acl {
+                    acl_grants,
+                    public_read,
+                    public_write,
+                },
+                MetadataCommandPayload::PutBucketAcl(command),
+            ) => BucketMetadataNodeClient::pending_put_bucket_acl_command_matches_current(
+                &local_client,
+                request.bucket.pg_id,
+                &request.bucket.bucket,
+                command,
+                acl_grants,
+                *public_read,
+                *public_write,
+            ),
+            (
+                StorageRpcBucketMetadataControlMutation::Property(mutation),
+                MetadataCommandPayload::PutBucketProperty(command),
+            ) => BucketMetadataNodeClient::pending_put_bucket_property_command_matches_current(
+                &local_client,
+                request.bucket.pg_id,
+                &request.bucket.bucket,
+                command,
+                mutation,
+            ),
+            _ => {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "pending command payload does not match bucket control mutation"
+                        .to_string(),
+                });
+            }
+        };
+        match result {
+            Ok(value) => {
+                let payload = encode_metadata_command_bool_response(
+                    &crate::storage_rpc::StorageRpcMetadataCommandBoolResponse { value },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_metadata_control_command_build_response(
+        &self,
+        request: StorageRpcBucketMetadataControlCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_bucket_metadata_control_route(
+            &request.bucket,
+            "bucket metadata control command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let result = match &request.mutation {
+            StorageRpcBucketMetadataControlMutation::Versioning(state) => {
+                BucketMetadataNodeClient::build_put_bucket_versioning_command(
+                    &local_client,
+                    request.bucket.pg_id,
+                    &request.bucket.bucket,
+                    request.command_id,
+                    *state,
+                )
+            }
+            StorageRpcBucketMetadataControlMutation::Acl {
+                acl_grants,
+                public_read,
+                public_write,
+            } => BucketMetadataNodeClient::build_put_bucket_acl_command(
+                &local_client,
+                request.bucket.pg_id,
+                &request.bucket.bucket,
+                request.command_id,
+                acl_grants,
+                *public_read,
+                *public_write,
+            ),
+            StorageRpcBucketMetadataControlMutation::Property(mutation) => {
+                BucketMetadataNodeClient::build_put_bucket_property_command(
+                    &local_client,
+                    request.bucket.pg_id,
+                    &request.bucket.bucket,
+                    request.command_id,
+                    mutation,
+                )
+            }
+            StorageRpcBucketMetadataControlMutation::Subresource(mutation) => {
+                BucketMetadataNodeClient::build_put_bucket_subresource_command(
+                    &local_client,
+                    request.bucket.pg_id,
+                    &request.bucket.bucket,
+                    request.command_id,
+                    mutation,
+                )
+            }
+        };
+        match result {
+            Ok(command) => {
+                let payload = encode_bucket_metadata_control_command_build_response(
+                    &StorageRpcBucketMetadataControlCommandBuildResponse { command },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_subresource_get_response(
+        &self,
+        request: StorageRpcBucketSubresourceGetRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_bucket_metadata_control_route(&request.bucket, "bucket subresource get")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketMetadataNodeClient::get_bucket_subresource(
+            &local_client,
+            request.bucket.pg_id,
+            &request.bucket.bucket,
+            request.kind,
+        ) {
+            Ok(body) => {
+                let payload = encode_bucket_subresource_get_response(
+                    &StorageRpcBucketSubresourceGetResponse { body },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
     fn shard_write_response(
         &self,
         request: StorageRpcShardWriteRequest,
@@ -4641,6 +4832,15 @@ impl StorageNodeConnectionHandler {
             });
         }
         Ok(())
+    }
+
+    fn validate_bucket_metadata_control_route(
+        &self,
+        request: &StorageRpcBucketRequest,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        self.validate_primary_pg_for_bucket(request.pg_id, &request.bucket, operation)
     }
 
     fn unsupported_operation_response(

@@ -1,29 +1,29 @@
 use crate::{
     cluster::ShardLocation,
     metadata_command::{
-        decode_metadata_command_envelope, BucketWriteReservationProof,
-        CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
-        MetadataCommandAcceptance, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-        PutObjectMetadataMutation,
+        decode_metadata_command_envelope, BucketPropertyMutation, BucketSubresourceMutation,
+        BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandReplicaState,
+        ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
         AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
-        BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
-        BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-        BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord,
-        ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
-        CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
-        CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
-        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
-        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, ListPartsResp,
-        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
-        ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionPreflight,
-        MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
-        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-        MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption,
-        ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState,
-        ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+        BucketEncryptionConfig, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
+        BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
+        BucketState, BucketSubresourceAux, BucketSubresourceKind, BucketWriteDrainRecord,
+        BucketWriteDrainState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
+        ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
+        CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
+        CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
+        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
+        GenerationId, ListPartsResp, ListedMultipartParts, LiveObjectRecord,
+        LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
+        MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
+        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+        MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord,
+        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
+        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
         ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
         ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
         OwnerIdentity, PgId, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
@@ -247,6 +247,9 @@ const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
         + 11;
 const STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -338,6 +341,9 @@ pub(crate) enum StorageRpcMessageKind {
     BucketDeleteFinalizeRoots = 85,
     BucketDeleteFinalizeClaimAcquire = 86,
     BucketDeleteFinalizeClaimRelease = 87,
+    BucketMetadataControlPendingMatch = 88,
+    BucketMetadataControlCommandBuild = 89,
+    BucketSubresourceGet = 90,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +491,9 @@ impl StorageRpcMessageKind {
             Self::BucketDeleteFinalizeRoots => "bucket delete finalize roots",
             Self::BucketDeleteFinalizeClaimAcquire => "bucket delete finalize claim acquire",
             Self::BucketDeleteFinalizeClaimRelease => "bucket delete finalize claim release",
+            Self::BucketMetadataControlPendingMatch => "bucket metadata control pending match",
+            Self::BucketMetadataControlCommandBuild => "bucket metadata control command build",
+            Self::BucketSubresourceGet => "bucket subresource get",
         }
     }
 
@@ -577,6 +586,9 @@ impl StorageRpcMessageKind {
             85 => Ok(Self::BucketDeleteFinalizeRoots),
             86 => Ok(Self::BucketDeleteFinalizeClaimAcquire),
             87 => Ok(Self::BucketDeleteFinalizeClaimRelease),
+            88 => Ok(Self::BucketMetadataControlPendingMatch),
+            89 => Ok(Self::BucketMetadataControlCommandBuild),
+            90 => Ok(Self::BucketSubresourceGet),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1719,6 +1731,48 @@ pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcBucketMetadataControlMutation {
+    Versioning(BucketVersioningState),
+    Acl {
+        acl_grants: AclGrants,
+        public_read: bool,
+        public_write: bool,
+    },
+    Property(BucketPropertyMutation),
+    Subresource(BucketSubresourceMutation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketMetadataControlPendingMatchRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) mutation: StorageRpcBucketMetadataControlMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketMetadataControlCommandBuildRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) command_id: crate::metadata_command::MetadataCommandId,
+    pub(crate) mutation: StorageRpcBucketMetadataControlMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketMetadataControlCommandBuildResponse {
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketSubresourceGetRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) kind: BucketSubresourceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketSubresourceGetResponse {
+    pub(crate) body: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingSlotRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -2438,6 +2492,13 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
             STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketMetadataControlPendingMatch
+        | StorageRpcMessageKind::BucketMetadataControlCommandBuild => {
+            STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketSubresourceGet => {
+            STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -4720,6 +4781,101 @@ pub(crate) fn decode_completed_multipart_order_command_build_request(
     })
 }
 
+pub(crate) fn encode_bucket_metadata_control_pending_match_request(
+    request: &StorageRpcBucketMetadataControlPendingMatchRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.command.id().cluster_epoch() != request.bucket.cluster_epoch
+        || request.command.id().pg_id() != request.bucket.pg_id
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "pending command route must match request route",
+        ));
+    }
+    let mut out = encode_bucket_request(&request.bucket);
+    put_bytes(&mut out, &request.command.command_bytes());
+    put_bucket_metadata_control_mutation(&mut out, &request.mutation);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_metadata_control_pending_match_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let command_bytes = decoder.read_bytes()?.to_vec();
+    let command = decode_metadata_command_envelope(&command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let mutation = decoder.read_bucket_metadata_control_mutation()?;
+    decoder.finish()?;
+    if command.id().cluster_epoch() != bucket.cluster_epoch || command.id().pg_id() != bucket.pg_id
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "pending command route must match request route",
+        ));
+    }
+    Ok(StorageRpcBucketMetadataControlPendingMatchRequest {
+        bucket,
+        command,
+        mutation,
+    })
+}
+
+pub(crate) fn encode_bucket_metadata_control_command_build_request(
+    request: &StorageRpcBucketMetadataControlCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.command_id.cluster_epoch() != request.bucket.cluster_epoch
+        || request.command_id.pg_id() != request.bucket.pg_id
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "command id route must match request route",
+        ));
+    }
+    let mut out = encode_bucket_request(&request.bucket);
+    put_u64(&mut out, request.command_id.log_index().get());
+    put_bucket_metadata_control_mutation(&mut out, &request.mutation);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_metadata_control_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketMetadataControlCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let log_index = crate::metadata_command::MetadataCommandLogIndex::new(decoder.read_u64()?)
+        .ok_or(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "metadata command log index must not be zero",
+        ))?;
+    let mutation = decoder.read_bucket_metadata_control_mutation()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketMetadataControlCommandBuildRequest {
+        command_id: crate::metadata_command::MetadataCommandId::new(
+            bucket.cluster_epoch,
+            bucket.pg_id,
+            log_index,
+        ),
+        bucket,
+        mutation,
+    })
+}
+
+pub(crate) fn encode_bucket_subresource_get_request(
+    request: &StorageRpcBucketSubresourceGetRequest,
+) -> Vec<u8> {
+    let mut out = encode_bucket_request(&request.bucket);
+    put_bucket_subresource_kind(&mut out, request.kind);
+    out
+}
+
+pub(crate) fn decode_bucket_subresource_get_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketSubresourceGetRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let kind = decoder.read_bucket_subresource_kind()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketSubresourceGetRequest { bucket, kind })
+}
+
 pub(crate) fn encode_bucket_info_outcome_response(
     response: &StorageRpcBucketInfoOutcomeResponse,
 ) -> Vec<u8> {
@@ -4891,6 +5047,42 @@ pub(crate) fn decode_completed_multipart_order_command_build_response(
         completion_order,
         command,
     })
+}
+
+pub(crate) fn encode_bucket_metadata_control_command_build_response(
+    response: &StorageRpcBucketMetadataControlCommandBuildResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bytes(&mut out, &response.command.command_bytes());
+    out
+}
+
+pub(crate) fn decode_bucket_metadata_control_command_build_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let command_bytes = decoder.read_bytes()?.to_vec();
+    decoder.finish()?;
+    let command = decode_metadata_command_envelope(&command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    Ok(StorageRpcBucketMetadataControlCommandBuildResponse { command })
+}
+
+pub(crate) fn encode_bucket_subresource_get_response(
+    response: &StorageRpcBucketSubresourceGetResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_optional_string(&mut out, response.body.as_deref());
+    out
+}
+
+pub(crate) fn decode_bucket_subresource_get_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketSubresourceGetResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let body = decoder.read_optional_string()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketSubresourceGetResponse { body })
 }
 
 pub(crate) fn encode_metadata_command_pending_slot_request(
@@ -9046,6 +9238,130 @@ impl<'a> StorageRpcDecoder<'a> {
         )
     }
 
+    fn read_bucket_metadata_control_mutation(
+        &mut self,
+    ) -> Result<StorageRpcBucketMetadataControlMutation, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(StorageRpcBucketMetadataControlMutation::Versioning(
+                self.read_bucket_versioning_state()?,
+            )),
+            1 => Ok(StorageRpcBucketMetadataControlMutation::Acl {
+                acl_grants: self.read_acl_grants()?,
+                public_read: self.read_bool()?,
+                public_write: self.read_bool()?,
+            }),
+            2 => Ok(StorageRpcBucketMetadataControlMutation::Property(
+                self.read_bucket_property_mutation()?,
+            )),
+            3 => Ok(StorageRpcBucketMetadataControlMutation::Subresource(
+                self.read_bucket_subresource_mutation()?,
+            )),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid bucket metadata control mutation tag",
+            )),
+        }
+    }
+
+    fn read_bucket_property_mutation(
+        &mut self,
+    ) -> Result<BucketPropertyMutation, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(BucketPropertyMutation::ObjectLock(
+                self.read_bucket_object_lock_config()?,
+            )),
+            1 => Ok(BucketPropertyMutation::Encryption(
+                self.read_bucket_encryption_config()?,
+            )),
+            2 => Ok(BucketPropertyMutation::PublicAccessBlock(
+                self.read_optional_public_access_block_config()?,
+            )),
+            3 => Ok(BucketPropertyMutation::OwnershipControls(
+                self.read_optional_bucket_ownership_controls()?,
+            )),
+            4 => Ok(BucketPropertyMutation::AbacEnabled(self.read_bool()?)),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid bucket property mutation tag",
+            )),
+        }
+    }
+
+    fn read_bucket_encryption_config(
+        &mut self,
+    ) -> Result<BucketEncryptionConfig, StorageRpcPayloadError> {
+        let default_encryption = match self.read_u8()? {
+            0 => None,
+            1 => Some(ManagedEncryptionAlgorithm::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "invalid managed encryption algorithm",
+                ),
+            )?),
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "invalid bucket encryption tag",
+                ))
+            }
+        };
+        Ok(BucketEncryptionConfig {
+            default_encryption,
+            sse_c_blocked: self.read_bool()?,
+        })
+    }
+
+    fn read_bucket_subresource_mutation(
+        &mut self,
+    ) -> Result<BucketSubresourceMutation, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            1 => {
+                let kind = self.read_bucket_subresource_kind()?;
+                let body = self.read_string_with_limit(
+                    STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
+                    StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                        "bucket subresource body is too large",
+                    ),
+                )?;
+                let aux = self.read_bucket_subresource_aux(kind)?;
+                Ok(BucketSubresourceMutation::Put { kind, body, aux })
+            }
+            2 => Ok(BucketSubresourceMutation::Delete {
+                kind: self.read_bucket_subresource_kind()?,
+            }),
+            _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid bucket subresource mutation tag",
+            )),
+        }
+    }
+
+    fn read_bucket_subresource_kind(
+        &mut self,
+    ) -> Result<BucketSubresourceKind, StorageRpcPayloadError> {
+        BucketSubresourceKind::from_u8(self.read_u8()?).ok_or(
+            StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid bucket subresource kind"),
+        )
+    }
+
+    fn read_bucket_subresource_aux(
+        &mut self,
+        kind: BucketSubresourceKind,
+    ) -> Result<BucketSubresourceAux, StorageRpcPayloadError> {
+        let aux = match self.read_u8()? {
+            0 => BucketSubresourceAux::None,
+            1 if kind == BucketSubresourceKind::Policy => {
+                BucketSubresourceAux::policy(self.read_bool()?)
+            }
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "invalid bucket subresource aux",
+                ))
+            }
+        };
+        if !kind.supports_aux(aux) {
+            return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "bucket subresource kind does not support aux",
+            ));
+        }
+        Ok(aux)
+    }
+
     fn read_storage_class(&mut self) -> Result<StorageClass, StorageRpcPayloadError> {
         StorageClass::from_u8(self.read_u8()?).ok_or(
             StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid storage class"),
@@ -9470,6 +9786,101 @@ fn put_bucket_snapshot_pair(out: &mut Vec<u8>, pair: &BucketSnapshotPair) {
             put_u8(out, 1);
             put_bucket_snapshot(out, source);
             put_bucket_snapshot(out, destination);
+        }
+    }
+}
+
+fn put_bucket_metadata_control_mutation(
+    out: &mut Vec<u8>,
+    mutation: &StorageRpcBucketMetadataControlMutation,
+) {
+    match mutation {
+        StorageRpcBucketMetadataControlMutation::Versioning(state) => {
+            put_u8(out, 0);
+            put_u8(out, *state as u8);
+        }
+        StorageRpcBucketMetadataControlMutation::Acl {
+            acl_grants,
+            public_read,
+            public_write,
+        } => {
+            put_u8(out, 1);
+            put_string(out, &acl_grants.serialized());
+            put_bool(out, *public_read);
+            put_bool(out, *public_write);
+        }
+        StorageRpcBucketMetadataControlMutation::Property(mutation) => {
+            put_u8(out, 2);
+            put_bucket_property_mutation(out, mutation);
+        }
+        StorageRpcBucketMetadataControlMutation::Subresource(mutation) => {
+            put_u8(out, 3);
+            put_bucket_subresource_mutation(out, mutation);
+        }
+    }
+}
+
+fn put_bucket_property_mutation(out: &mut Vec<u8>, mutation: &BucketPropertyMutation) {
+    match mutation {
+        BucketPropertyMutation::ObjectLock(config) => {
+            put_u8(out, 0);
+            put_bucket_object_lock_config(out, config);
+        }
+        BucketPropertyMutation::Encryption(config) => {
+            put_u8(out, 1);
+            put_bucket_encryption_config(out, *config);
+        }
+        BucketPropertyMutation::PublicAccessBlock(config) => {
+            put_u8(out, 2);
+            put_optional_public_access_block_config(out, *config);
+        }
+        BucketPropertyMutation::OwnershipControls(config) => {
+            put_u8(out, 3);
+            put_optional_bucket_ownership_controls(out, *config);
+        }
+        BucketPropertyMutation::AbacEnabled(enabled) => {
+            put_u8(out, 4);
+            put_bool(out, *enabled);
+        }
+    }
+}
+
+fn put_bucket_encryption_config(out: &mut Vec<u8>, config: BucketEncryptionConfig) {
+    match config.default_encryption {
+        None => put_u8(out, 0),
+        Some(algorithm) => {
+            put_u8(out, 1);
+            put_u8(out, algorithm as u8);
+        }
+    }
+    put_bool(out, config.sse_c_blocked);
+}
+
+fn put_bucket_subresource_mutation(out: &mut Vec<u8>, mutation: &BucketSubresourceMutation) {
+    match mutation {
+        BucketSubresourceMutation::Put { kind, body, aux } => {
+            put_u8(out, 1);
+            put_bucket_subresource_kind(out, *kind);
+            put_string(out, body);
+            put_bucket_subresource_aux(out, *aux);
+        }
+        BucketSubresourceMutation::Delete { kind } => {
+            put_u8(out, 2);
+            put_bucket_subresource_kind(out, *kind);
+        }
+    }
+}
+
+fn put_bucket_subresource_kind(out: &mut Vec<u8>, kind: BucketSubresourceKind) {
+    put_u8(out, kind as u8);
+}
+
+fn put_bucket_subresource_aux(out: &mut Vec<u8>, aux: BucketSubresourceAux) {
+    match aux {
+        BucketSubresourceAux::None => put_u8(out, 0),
+        BucketSubresourceAux::Policy { is_public } => {
+            put_u8(out, 1);
+            put_bool(out, is_public);
         }
     }
 }
@@ -11607,6 +12018,21 @@ mod tests {
                 StorageRpcMessageKind::BucketSnapshotPairLoad,
                 STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketMetadataControlPendingMatch,
+                STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketMetadataControlCommandBuild,
+                STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketSubresourceGet,
+                STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN,
             ),
         ] {
             let mut bytes = Vec::new();

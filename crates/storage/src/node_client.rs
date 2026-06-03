@@ -28,8 +28,9 @@ use crate::storage_rpc::{
     decode_abort_multipart_cleanup_response,
     decode_bucket_delete_finalize_claim_optional_record_response,
     decode_bucket_delete_finalize_roots_response, decode_bucket_delete_finalized_response,
-    decode_bucket_info_outcome_response, decode_bucket_snapshot_pair_response,
-    decode_bucket_snapshot_response, decode_bucket_write_drain_begin_response,
+    decode_bucket_info_outcome_response, decode_bucket_metadata_control_command_build_response,
+    decode_bucket_snapshot_pair_response, decode_bucket_snapshot_response,
+    decode_bucket_subresource_get_response, decode_bucket_write_drain_begin_response,
     decode_bucket_write_drain_optional_record_response,
     decode_bucket_write_reservation_record_response,
     decode_completed_multipart_order_command_build_response,
@@ -60,11 +61,14 @@ use crate::storage_rpc::{
     encode_authorized_abort_multipart_command_build_request,
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
-    encode_bucket_delete_finalize_roots_request, encode_bucket_request,
+    encode_bucket_delete_finalize_roots_request,
+    encode_bucket_metadata_control_command_build_request,
+    encode_bucket_metadata_control_pending_match_request, encode_bucket_request,
     encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
-    encode_bucket_write_drain_begin_request, encode_bucket_write_drain_clear_expired_request,
-    encode_bucket_write_drain_record_request, encode_bucket_write_reservation_acquire_request,
-    encode_bucket_write_reservation_proof_request, encode_bucket_write_reservation_record_request,
+    encode_bucket_subresource_get_request, encode_bucket_write_drain_begin_request,
+    encode_bucket_write_drain_clear_expired_request, encode_bucket_write_drain_record_request,
+    encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
+    encode_bucket_write_reservation_record_request,
     encode_complete_multipart_command_build_request,
     encode_completed_multipart_order_command_build_request,
     encode_create_bucket_command_build_request,
@@ -96,9 +100,11 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizedOutcome, StorageRpcBucketDeleteFinalizedResponse,
-    StorageRpcBucketInfoOutcome, StorageRpcBucketPgRequest, StorageRpcBucketRequest,
-    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
-    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
+    StorageRpcBucketInfoOutcome, StorageRpcBucketMetadataControlCommandBuildRequest,
+    StorageRpcBucketMetadataControlMutation, StorageRpcBucketMetadataControlPendingMatchRequest,
+    StorageRpcBucketPgRequest, StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome,
+    StorageRpcBucketSnapshotPairOutcome, StorageRpcBucketSnapshotPairRequest,
+    StorageRpcBucketSnapshotRequest, StorageRpcBucketSubresourceGetRequest,
     StorageRpcBucketWriteDrainBeginOutcome, StorageRpcBucketWriteDrainBeginRequest,
     StorageRpcBucketWriteDrainClearExpiredRequest, StorageRpcBucketWriteDrainRecordRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
@@ -852,6 +858,29 @@ fn pending_bucket_command_matches_current(
     Ok(build_expected(current)?.command_metadata_eq(target))
 }
 
+fn bucket_property_command_matches_mutation(
+    command: &PutBucketPropertyCommand,
+    bucket: &BucketName,
+    mutation: &BucketPropertyMutation,
+) -> bool {
+    if command.bucket.name != *bucket || command.effect != mutation.effect() {
+        return false;
+    }
+    match mutation {
+        BucketPropertyMutation::ObjectLock(config) => command.bucket.object_lock == *config,
+        BucketPropertyMutation::Encryption(config) => command.bucket.encryption == *config,
+        BucketPropertyMutation::PublicAccessBlock(config) => {
+            command.bucket.public_access_block == *config
+        }
+        BucketPropertyMutation::OwnershipControls(config) => {
+            command.bucket.ownership_controls == *config
+        }
+        BucketPropertyMutation::AbacEnabled(enabled) => {
+            command.bucket.bucket_abac_enabled == *enabled
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MarkBucketDeletingCommandBuild {
     AlreadyDeleting,
@@ -906,6 +935,73 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
+
+    fn pending_put_bucket_versioning_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketVersioningCommand,
+        state: BucketVersioningState,
+    ) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn build_put_bucket_versioning_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        state: BucketVersioningState,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
+
+    fn pending_put_bucket_acl_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketAclCommand,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn build_put_bucket_acl_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
+
+    fn pending_put_bucket_property_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketPropertyCommand,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn build_put_bucket_property_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
+
+    fn build_put_bucket_subresource_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &BucketSubresourceMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
+
+    fn get_bucket_subresource(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
@@ -3218,6 +3314,90 @@ impl UnixStorageNodeClient {
         }
     }
 
+    fn bucket_metadata_control_pending_match(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        mutation: StorageRpcBucketMetadataControlMutation,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketMetadataControlPendingMatchRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            command: command.clone(),
+            mutation,
+        };
+        let payload =
+            encode_bucket_metadata_control_pending_match_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket metadata control pending match request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketMetadataControlPendingMatch,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_metadata_command_bool_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket metadata control pending match response",
+                error.to_string(),
+            ))
+        })?;
+        Ok(response.value)
+    }
+
+    fn bucket_metadata_control_command_build(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: StorageRpcBucketMetadataControlMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketMetadataControlCommandBuildRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            command_id,
+            mutation,
+        };
+        let payload =
+            encode_bucket_metadata_control_command_build_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket metadata control command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketMetadataControlCommandBuild,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_metadata_control_command_build_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket metadata control command build response",
+                    error.to_string(),
+                ))
+            })?;
+        self.validate_bucket_metadata_control_command_build_response(
+            response.command,
+            bucket,
+            command_id,
+            &request.mutation,
+        )
+    }
+
     fn rpc_request(
         &self,
         kind: StorageRpcMessageKind,
@@ -3909,6 +4089,115 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::build_advance_completed_multipart_upload_sequence_command(
             self, pg_id, bucket, command_id,
         )
+    }
+
+    fn pending_put_bucket_versioning_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketVersioningCommand,
+        state: BucketVersioningState,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::pending_put_bucket_versioning_command_matches_current(
+            self, pg_id, bucket, command, state,
+        )
+    }
+
+    fn build_put_bucket_versioning_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        state: BucketVersioningState,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::build_put_bucket_versioning_command(
+            self, pg_id, bucket, command_id, state,
+        )
+    }
+
+    fn pending_put_bucket_acl_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketAclCommand,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::pending_put_bucket_acl_command_matches_current(
+            self,
+            pg_id,
+            bucket,
+            command,
+            acl_grants,
+            public_read,
+            public_write,
+        )
+    }
+
+    fn build_put_bucket_acl_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::build_put_bucket_acl_command(
+            self,
+            pg_id,
+            bucket,
+            command_id,
+            acl_grants,
+            public_read,
+            public_write,
+        )
+    }
+
+    fn pending_put_bucket_property_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketPropertyCommand,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::pending_put_bucket_property_command_matches_current(
+            self, pg_id, bucket, command, mutation,
+        )
+    }
+
+    fn build_put_bucket_property_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::build_put_bucket_property_command(
+            self, pg_id, bucket, command_id, mutation,
+        )
+    }
+
+    fn build_put_bucket_subresource_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &BucketSubresourceMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::build_put_bucket_subresource_command(
+            self, pg_id, bucket, command_id, mutation,
+        )
+    }
+
+    fn get_bucket_subresource(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_bucket_subresource(self, pg_id, bucket, kind)
     }
 }
 
@@ -4709,6 +4998,174 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             bucket,
             command_id,
         )
+    }
+
+    fn pending_put_bucket_versioning_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketVersioningCommand,
+        state: BucketVersioningState,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                self.cluster_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(1).expect("nonzero log index"),
+            ),
+            MetadataCommandPayload::PutBucketVersioning(command.clone()),
+        );
+        self.bucket_metadata_control_pending_match(
+            pg_id,
+            bucket,
+            &command,
+            StorageRpcBucketMetadataControlMutation::Versioning(state),
+        )
+    }
+
+    fn build_put_bucket_versioning_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        state: BucketVersioningState,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.bucket_metadata_control_command_build(
+            pg_id,
+            bucket,
+            command_id,
+            StorageRpcBucketMetadataControlMutation::Versioning(state),
+        )
+    }
+
+    fn pending_put_bucket_acl_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketAclCommand,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                self.cluster_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(1).expect("nonzero log index"),
+            ),
+            MetadataCommandPayload::PutBucketAcl(command.clone()),
+        );
+        self.bucket_metadata_control_pending_match(
+            pg_id,
+            bucket,
+            &command,
+            StorageRpcBucketMetadataControlMutation::Acl {
+                acl_grants: acl_grants.clone(),
+                public_read,
+                public_write,
+            },
+        )
+    }
+
+    fn build_put_bucket_acl_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.bucket_metadata_control_command_build(
+            pg_id,
+            bucket,
+            command_id,
+            StorageRpcBucketMetadataControlMutation::Acl {
+                acl_grants: acl_grants.clone(),
+                public_read,
+                public_write,
+            },
+        )
+    }
+
+    fn pending_put_bucket_property_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &PutBucketPropertyCommand,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                self.cluster_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(1).expect("nonzero log index"),
+            ),
+            MetadataCommandPayload::PutBucketProperty(command.clone()),
+        );
+        self.bucket_metadata_control_pending_match(
+            pg_id,
+            bucket,
+            &command,
+            StorageRpcBucketMetadataControlMutation::Property(mutation.clone()),
+        )
+    }
+
+    fn build_put_bucket_property_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.bucket_metadata_control_command_build(
+            pg_id,
+            bucket,
+            command_id,
+            StorageRpcBucketMetadataControlMutation::Property(mutation.clone()),
+        )
+    }
+
+    fn build_put_bucket_subresource_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &BucketSubresourceMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.bucket_metadata_control_command_build(
+            pg_id,
+            bucket,
+            command_id,
+            StorageRpcBucketMetadataControlMutation::Subresource(mutation.clone()),
+        )
+    }
+
+    fn get_bucket_subresource(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketSubresourceGetRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            kind,
+        };
+        let payload = encode_bucket_subresource_get_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketSubresourceGet, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_subresource_get_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode bucket subresource get response", error.to_string()),
+            )
+        })?;
+        Ok(response.body)
     }
 }
 
@@ -8697,6 +9154,56 @@ impl UnixStorageNodeClient {
             }
         }
         Ok((completion_order, command))
+    }
+
+    fn validate_bucket_metadata_control_command_build_response(
+        &self,
+        command: MetadataCommandEnvelope,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+        mutation: &StorageRpcBucketMetadataControlMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        if command.id() != command_id {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket metadata control command build response",
+                "response command id does not match request".to_string(),
+            )));
+        }
+        let matches = match (command.payload(), mutation) {
+            (
+                MetadataCommandPayload::PutBucketVersioning(versioning),
+                StorageRpcBucketMetadataControlMutation::Versioning(state),
+            ) => versioning.bucket.name == *bucket && versioning.bucket.versioning == *state,
+            (
+                MetadataCommandPayload::PutBucketAcl(acl),
+                StorageRpcBucketMetadataControlMutation::Acl {
+                    acl_grants,
+                    public_read,
+                    public_write,
+                },
+            ) => {
+                acl.bucket.name == *bucket
+                    && acl.bucket.acl_grants == *acl_grants
+                    && acl.bucket.public_read == *public_read
+                    && acl.bucket.public_write == *public_write
+            }
+            (
+                MetadataCommandPayload::PutBucketProperty(property),
+                StorageRpcBucketMetadataControlMutation::Property(mutation),
+            ) => bucket_property_command_matches_mutation(property, bucket, mutation),
+            (
+                MetadataCommandPayload::PutBucketSubresource(subresource),
+                StorageRpcBucketMetadataControlMutation::Subresource(mutation),
+            ) => subresource.matches_mutation(bucket, mutation),
+            _ => false,
+        };
+        if !matches {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket metadata control command build response",
+                "response command payload does not match request".to_string(),
+            )));
+        }
+        Ok(command)
     }
 
     fn validate_bucket_snapshot_pair_response(
@@ -12780,6 +13287,157 @@ mod tests {
             other => panic!("unexpected command payload: {other:?}"),
         }
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_bucket_metadata_client_routes_bucket_control_operations() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bucket-control-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Policy,
+                    body: "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+                    aux: crate::types::BucketSubresourceAux::policy(false),
+                },
+            )
+            .unwrap();
+        }
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..6)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let command_id = |log_index| {
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            )
+        };
+
+        let versioning = BucketMetadataNodeClient::build_put_bucket_versioning_command(
+            &client,
+            PgId::new(0),
+            &bucket,
+            command_id(1),
+            BucketVersioningState::Enabled,
+        )
+        .unwrap();
+        let MetadataCommandPayload::PutBucketVersioning(versioning_command) = versioning.payload()
+        else {
+            panic!("unexpected versioning command payload");
+        };
+        assert!(
+            BucketMetadataNodeClient::pending_put_bucket_versioning_command_matches_current(
+                &client,
+                PgId::new(0),
+                &bucket,
+                versioning_command,
+                BucketVersioningState::Enabled,
+            )
+            .unwrap()
+        );
+
+        let acl = BucketMetadataNodeClient::build_put_bucket_acl_command(
+            &client,
+            PgId::new(0),
+            &bucket,
+            command_id(2),
+            &crate::AclGrants::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        match acl.payload() {
+            MetadataCommandPayload::PutBucketAcl(command) => {
+                assert_eq!(command.bucket.name, bucket);
+                assert!(command.bucket.public_read);
+                assert!(!command.bucket.public_write);
+            }
+            other => panic!("unexpected ACL command payload: {other:?}"),
+        }
+
+        let property = BucketMetadataNodeClient::build_put_bucket_property_command(
+            &client,
+            PgId::new(0),
+            &bucket,
+            command_id(3),
+            &BucketPropertyMutation::AbacEnabled(true),
+        )
+        .unwrap();
+        match property.payload() {
+            MetadataCommandPayload::PutBucketProperty(command) => {
+                assert_eq!(command.bucket.name, bucket);
+                assert!(command.bucket.bucket_abac_enabled);
+            }
+            other => panic!("unexpected property command payload: {other:?}"),
+        }
+
+        let subresource = BucketSubresourceMutation::Put {
+            kind: BucketSubresourceKind::Lifecycle,
+            body: "<LifecycleConfiguration/>".to_string(),
+            aux: crate::types::BucketSubresourceAux::None,
+        };
+        let subresource_command = BucketMetadataNodeClient::build_put_bucket_subresource_command(
+            &client,
+            PgId::new(0),
+            &bucket,
+            command_id(4),
+            &subresource,
+        )
+        .unwrap();
+        match subresource_command.payload() {
+            MetadataCommandPayload::PutBucketSubresource(command) => {
+                assert!(command.matches_mutation(&bucket, &subresource));
+            }
+            other => panic!("unexpected subresource command payload: {other:?}"),
+        }
+
+        let policy = BucketMetadataNodeClient::get_bucket_subresource(
+            &client,
+            PgId::new(0),
+            &bucket,
+            BucketSubresourceKind::Policy,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.as_deref(),
+            Some("{\"Version\":\"2012-10-17\",\"Statement\":[]}")
+        );
+
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]

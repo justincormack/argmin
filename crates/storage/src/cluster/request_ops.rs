@@ -2535,7 +2535,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
+            .bucket_metadata_client()
             .get_bucket_subresource(pg_id, bucket, kind)
     }
 
@@ -2579,7 +2579,7 @@ impl super::StorageCluster {
                     {
                         let same_request = versioning.bucket.versioning == state;
                         if !primary_store
-                            .storage_client()
+                            .bucket_metadata_client()
                             .pending_put_bucket_versioning_command_matches_current(
                                 pg_id, bucket, versioning, state,
                             )?
@@ -2612,7 +2612,7 @@ impl super::StorageCluster {
                     continue;
                 };
                 let command = primary_store
-                    .storage_client()
+                    .bucket_metadata_client()
                     .build_put_bucket_versioning_command(pg_id, bucket, command_id, state)?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
@@ -2744,7 +2744,7 @@ impl super::StorageCluster {
                             && acl.bucket.public_read == public_read
                             && acl.bucket.public_write == public_write;
                         if !primary_store
-                            .storage_client()
+                            .bucket_metadata_client()
                             .pending_put_bucket_acl_command_matches_current(
                                 pg_id,
                                 bucket,
@@ -2782,7 +2782,7 @@ impl super::StorageCluster {
                     continue;
                 };
                 let command = primary_store
-                    .storage_client()
+                    .bucket_metadata_client()
                     .build_put_bucket_acl_command(
                         pg_id,
                         bucket,
@@ -2844,7 +2844,7 @@ impl super::StorageCluster {
                             && property.effect == mutation.effect() =>
                     {
                         if !primary_store
-                            .storage_client()
+                            .bucket_metadata_client()
                             .pending_put_bucket_property_command_matches_current(
                                 pg_id, bucket, property, &mutation,
                             )?
@@ -2872,7 +2872,7 @@ impl super::StorageCluster {
                     continue;
                 };
                 let command = primary_store
-                    .storage_client()
+                    .bucket_metadata_client()
                     .build_put_bucket_property_command(pg_id, bucket, command_id, &mutation)?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
@@ -2982,7 +2982,7 @@ impl super::StorageCluster {
                     continue;
                 };
                 let command = primary_store
-                    .storage_client()
+                    .bucket_metadata_client()
                     .build_put_bucket_subresource_command(pg_id, bucket, command_id, &mutation)?;
                 if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
                     continue;
@@ -4235,7 +4235,7 @@ impl super::StorageCluster {
         let bucket_primary_node_id = bucket_store.node_id();
         let bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         let bucket_info = match bucket_store
-            .storage_client()
+            .bucket_metadata_client()
             .head_bucket_info(pg_id, bucket)
         {
             Ok(info) => info,
@@ -4250,7 +4250,7 @@ impl super::StorageCluster {
         };
         let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
             bucket_store
-                .storage_client()
+                .bucket_metadata_client()
                 .get_bucket_subresource(pg_id, bucket, BucketSubresourceKind::Lifecycle)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         } else {
