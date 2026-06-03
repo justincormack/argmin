@@ -4647,10 +4647,17 @@ impl StorageCluster {
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
         let mut sessions = Vec::new();
         for &pg_id in self.local_map.pg_ids() {
-            let Ok(storage_client) = self.metadata_pg_primary_client(PgId::new(pg_id)) else {
+            let pg_id = PgId::new(pg_id);
+            let Ok(node) = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            else {
                 continue;
             };
-            let Ok(mut local) = storage_client.list_all_stream_uploads(PgId::new(pg_id)) else {
+            let Ok(mut local) = node
+                .object_mutation_metadata_client()
+                .list_all_stream_uploads(pg_id)
+            else {
                 continue;
             };
             sessions.append(&mut local);

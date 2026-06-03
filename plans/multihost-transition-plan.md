@@ -5691,7 +5691,11 @@ Implementation slices:
    stream commit/part command identity before publication. Multipart completion
    and abort command builders now also use the object-mutation metadata RPC
    boundary, preserving stale-completion retry outcomes and validating returned
-   completion/abort command identity before publication. Multipart upload
+   completion/abort command identity before publication. Stream upload
+   session loads, staged-segment listing, PG-wide stream-upload listing for
+   bucket delete/best-effort cleanup, completed-MPU tombstone listing for
+   bucket-delete cleanup, and stream-segment append preparation now use the same
+   object-mutation metadata RPC boundary. Multipart upload
    read/list/management helpers now use the same object-mutation metadata RPC
    boundary and validate returned upload, completion snapshot, part list, and
    management lookup identities. Bucket property/subresource command

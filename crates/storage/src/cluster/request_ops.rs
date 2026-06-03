@@ -2332,8 +2332,13 @@ impl super::StorageCluster {
 
             if include_stream_uploads {
                 let pg_id = PgId::new(pg_id);
-                let storage_client = self.metadata_pg_primary_client(pg_id)?;
-                let sessions = match storage_client.list_all_stream_uploads(pg_id) {
+                let node = self
+                    .local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+                let sessions = match node
+                    .object_mutation_metadata_client()
+                    .list_all_stream_uploads(pg_id)
+                {
                     Ok(sessions) => sessions,
                     Err(error) => {
                         return Err(bucket_snapshot_error_to_bucket_write_drain_error(
@@ -2400,7 +2405,7 @@ impl super::StorageCluster {
                 .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
             for node in nodes {
                 let page = node
-                    .storage_client()
+                    .object_mutation_metadata_client()
                     .list_completed_multipart_upload_records_for_bucket(pg_id, bucket)
                     .map_err(|error| match error {
                         BucketSnapshotLoadError::Store(error) => E::from(error),

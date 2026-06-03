@@ -399,6 +399,8 @@ pub(crate) enum StorageRpcMessageKind {
     BucketFastPathIdentities = 102,
     BucketMarkDeletingCommandBuild = 103,
     BucketWriteDrainExists = 104,
+    ObjectStreamUploadsList = 105,
+    ObjectCompletedMultipartUploadsList = 106,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +565,8 @@ impl StorageRpcMessageKind {
             Self::BucketExecutionGenerations => "bucket execution generations",
             Self::BucketFastPathIdentities => "bucket fast path identities",
             Self::BucketMarkDeletingCommandBuild => "bucket mark deleting command build",
+            Self::ObjectStreamUploadsList => "object stream uploads list",
+            Self::ObjectCompletedMultipartUploadsList => "object completed multipart uploads list",
         }
     }
 
@@ -672,6 +676,8 @@ impl StorageRpcMessageKind {
             102 => Ok(Self::BucketFastPathIdentities),
             103 => Ok(Self::BucketMarkDeletingCommandBuild),
             104 => Ok(Self::BucketWriteDrainExists),
+            105 => Ok(Self::ObjectStreamUploadsList),
+            106 => Ok(Self::ObjectCompletedMultipartUploadsList),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1254,6 +1260,16 @@ pub(crate) enum StorageRpcStreamUploadSegmentsOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcStreamUploadSegmentsResponse {
     pub(crate) outcome: StorageRpcStreamUploadSegmentsOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadsListResponse {
+    pub(crate) uploads: Vec<StreamUploadRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCompletedMultipartUploadsListResponse {
+    pub(crate) records: Vec<CompletedMultipartUploadRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2639,6 +2655,12 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
             STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamUploadsList => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
+            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad => {
             STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN
@@ -4099,6 +4121,86 @@ pub(crate) fn decode_stream_upload_session_response(
     };
     decoder.finish()?;
     Ok(StorageRpcStreamUploadSessionResponse { outcome })
+}
+
+pub(crate) fn encode_stream_uploads_list_response(
+    response: &StorageRpcStreamUploadsListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let count = u32::try_from(response.uploads.len()).map_err(|_| {
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: response.uploads.len(),
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        }
+    })?;
+    if count > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count as usize,
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(&mut out, count);
+    for upload in &response.uploads {
+        put_stream_upload_record(&mut out, upload);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_uploads_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadsListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let upload_count = decoder.read_limited_bounded_remaining_count(
+        STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN,
+        "too many stream uploads",
+        STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+    )?;
+    let mut uploads = Vec::new();
+    for _ in 0..upload_count {
+        uploads.push(decoder.read_stream_upload_record()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadsListResponse { uploads })
+}
+
+pub(crate) fn encode_completed_multipart_uploads_list_response(
+    response: &StorageRpcCompletedMultipartUploadsListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let count = u32::try_from(response.records.len()).map_err(|_| {
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: response.records.len(),
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        }
+    })?;
+    if count > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count as usize,
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(&mut out, count);
+    for record in &response.records {
+        put_completed_multipart_upload_record(&mut out, record);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_completed_multipart_uploads_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcCompletedMultipartUploadsListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_limited_bounded_remaining_count(
+        1,
+        "completed multipart upload record count exceeds payload",
+        STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+    )?;
+    let mut records = Vec::new();
+    for _ in 0..count {
+        records.push(decoder.read_completed_multipart_upload_record()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcCompletedMultipartUploadsListResponse { records })
 }
 
 pub(crate) fn encode_stream_upload_segments_response(
@@ -14438,6 +14540,20 @@ mod tests {
             Err(StorageRpcPayloadError::PayloadTooLarge {
                 len: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS + 1,
                 limit: STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS,
+            })
+        );
+    }
+
+    #[test]
+    fn stream_uploads_list_response_rejects_unbounded_item_count() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1);
+
+        assert_eq!(
+            decode_stream_uploads_list_response(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: (STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1) as usize,
+                limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
             })
         );
     }

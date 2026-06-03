@@ -36,9 +36,9 @@ use crate::storage_rpc::{
     decode_bucket_write_drain_begin_response, decode_bucket_write_drain_optional_record_response,
     decode_bucket_write_reservation_record_response,
     decode_completed_multipart_order_command_build_response,
-    decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
-    decode_direct_put_commit_snapshot_response, decode_lifecycle_sweep_buckets_response,
-    decode_lifecycle_sweep_claim_optional_record_response,
+    decode_completed_multipart_uploads_list_response, decode_create_bucket_command_build_response,
+    decode_direct_put_command_build_response, decode_direct_put_commit_snapshot_response,
+    decode_lifecycle_sweep_buckets_response, decode_lifecycle_sweep_claim_optional_record_response,
     decode_lifecycle_sweep_claim_record_response, decode_lifecycle_sweep_roots_response,
     decode_list_multipart_uploads_response, decode_list_object_versions_response,
     decode_list_objects_response, decode_metadata_command_acceptance_response,
@@ -62,8 +62,8 @@ use crate::storage_rpc::{
     decode_storage_rpc_response_payload, decode_stream_part_finalize_snapshot_response,
     decode_stream_put_finalize_snapshot_response, decode_stream_segment_append_prepare_response,
     decode_stream_upload_match_response, decode_stream_upload_segments_response,
-    decode_stream_upload_session_response, encode_abort_multipart_cleanup_request,
-    encode_abort_multipart_command_build_request,
+    decode_stream_upload_session_response, decode_stream_uploads_list_response,
+    encode_abort_multipart_cleanup_request, encode_abort_multipart_command_build_request,
     encode_authorized_abort_multipart_command_build_request, encode_bucket_batch_request,
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
@@ -1422,6 +1422,17 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
+
+    fn list_all_stream_uploads(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError>;
+
+    fn list_completed_multipart_upload_records_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
 
     fn prepare_stream_segment_append(
         &self,
@@ -4881,6 +4892,23 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn list_all_stream_uploads(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
+        <Self as StorageNodeClient>::list_all_stream_uploads(self, pg_id)
+    }
+
+    fn list_completed_multipart_upload_records_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::list_completed_multipart_upload_records_for_bucket(
+            self, pg_id, bucket,
+        )
+    }
+
     fn prepare_stream_segment_append(
         &self,
         pg_id: PgId,
@@ -7391,6 +7419,60 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 .into())
             }
         }
+    }
+
+    fn list_all_stream_uploads(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadsList, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_uploads_list_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode stream uploads list response", error.to_string()),
+            )
+        })?;
+        Ok(response.uploads)
+    }
+
+    fn list_completed_multipart_upload_records_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectCompletedMultipartUploadsList,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_completed_multipart_uploads_list_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode completed multipart upload list response",
+                    error.to_string(),
+                ))
+            })?;
+        if response
+            .records
+            .iter()
+            .any(|record| &record.bucket != bucket)
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate completed multipart upload list response",
+                "record bucket does not match request".to_string(),
+            )));
+        }
+        Ok(response.records)
     }
 
     fn prepare_stream_segment_append(
@@ -15223,6 +15305,22 @@ mod tests {
         let config = test_config(&tmp);
         let bucket = crate::tests::bucket_name("object-mutation-rpc-bucket");
         let key = crate::tests::object_key("object-mutation-rpc-key");
+        let listed_stream_request = CreateStreamUploadReq {
+            session_id: crate::tests::stream_session_id("mut-rpc-listed"),
+            bucket: bucket.clone(),
+            key: crate::tests::object_key("object-mutation-listed-stream-key"),
+            target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
+        };
+        let completed_upload = CompletedMultipartUploadRecord {
+            upload_id: crate::tests::multipart_upload_id("mutCompletedRpc"),
+            bucket: bucket.clone(),
+            key: crate::tests::object_key("object-mutation-completed-key"),
+            completion_order: 7,
+            completed_at: 11,
+            initiator: None,
+            owner: OwnerIdentity::from_principal("owner"),
+        };
         let generation_id = GenerationId::new(19).unwrap();
         let segment = ObjectSegmentRecord {
             bucket: bucket.clone(),
@@ -15278,10 +15376,31 @@ mod tests {
                 std::slice::from_ref(&segment),
             )
             .unwrap();
+            PgMetadataStore::create_stream_upload(&*pg, &listed_stream_request).unwrap();
+            pg.connection()
+                .execute(
+                    "INSERT INTO completed_multipart_uploads \
+                     (upload_id, bucket, key, completion_order, completed_at, \
+                      owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        completed_upload.upload_id.as_str(),
+                        completed_upload.bucket.as_str(),
+                        completed_upload.key.as_str(),
+                        completed_upload.completion_order as i64,
+                        completed_upload.completed_at as i64,
+                        completed_upload.owner.principal.as_str(),
+                        completed_upload.owner.canonical_id.as_str(),
+                        Option::<&str>::None,
+                        Option::<&str>::None,
+                    ],
+                )
+                .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..8)
+        let server_threads: Vec<_> = (0..10)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -15345,6 +15464,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current.stored.as_ref(), Some(&stored));
+        let stream_uploads =
+            ObjectMutationMetadataNodeClient::list_all_stream_uploads(&client, PgId::new(0))
+                .unwrap();
+        assert!(stream_uploads.iter().any(|upload| upload.session_id
+            == listed_stream_request.session_id
+            && upload.bucket == listed_stream_request.bucket
+            && upload.key == listed_stream_request.key));
+        let completed_uploads =
+            ObjectMutationMetadataNodeClient::list_completed_multipart_upload_records_for_bucket(
+                &client,
+                PgId::new(0),
+                &bucket,
+            )
+            .unwrap();
+        assert_eq!(completed_uploads, vec![completed_upload.clone()]);
         let delete_command = ObjectMutationMetadataNodeClient::build_delete_current_object_command(
             &client,
             BuildDeleteCurrentObjectCommandReq {
@@ -15557,6 +15691,34 @@ mod tests {
         for thread in server_threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn unix_stream_uploads_list_requires_pg_primary() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let err = ObjectMutationMetadataNodeClient::list_all_stream_uploads(&client, PgId::new(0))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "object stream uploads list",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
     }
 
     #[test]
