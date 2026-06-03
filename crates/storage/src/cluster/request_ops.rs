@@ -1392,7 +1392,10 @@ impl super::StorageCluster {
 
         for node in nodes {
             let node_id = node.node_id();
-            match node.storage_client().delete_finalized_bucket(pg_id, bucket) {
+            match node
+                .bucket_write_reservation_client()
+                .delete_finalized_bucket(pg_id, bucket)
+            {
                 Ok(()) => {
                     let _ = observability::event(
                         super::TRACE_TARGET,
@@ -1691,15 +1694,17 @@ impl super::StorageCluster {
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             let drain_id = self.next_bucket_write_drain_id()?;
             let owner_token = self.bucket_write_owner_token();
-            match node.storage_client().begin_durable_bucket_write_drain(
-                PgId::new(pg_id),
-                bucket,
-                &drain_id,
-                &owner_token,
-                self.operation_epoch(),
-                crate::clock::current_time_millis(),
-                None,
-            ) {
+            match node
+                .bucket_write_reservation_client()
+                .begin_durable_bucket_write_drain(
+                    PgId::new(pg_id),
+                    bucket,
+                    &drain_id,
+                    &owner_token,
+                    self.operation_epoch(),
+                    crate::clock::current_time_millis(),
+                    None,
+                ) {
                 Ok(record) => {
                     return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
                         super::DurableBucketWriteDrain { pg_id, record },
@@ -1709,7 +1714,7 @@ impl super::StorageCluster {
                     MetadataError::BucketWriteDrainConflict { .. },
                 )) => {
                     if let Some(expired) = node
-                        .storage_client()
+                        .bucket_write_reservation_client()
                         .clear_expired_durable_bucket_write_drain(
                             PgId::new(pg_id),
                             bucket,
@@ -1763,7 +1768,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(drain.pg_id))?;
-        node.storage_client()
+        node.bucket_write_reservation_client()
             .clear_durable_bucket_write_drain(PgId::new(drain.pg_id), &drain.record)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         self.notify_bucket_coordination_change_on_bucket_metadata_primary(&drain.record.bucket)?;
@@ -1794,7 +1799,7 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             let reservations = node
-                .storage_client()
+                .bucket_write_reservation_client()
                 .durable_bucket_write_reservations(PgId::new(pg_id), bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if reservations.is_empty() {
@@ -2150,7 +2155,7 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
             bucket_node
-                .storage_client()
+                .bucket_write_reservation_client()
                 .acquire_bucket_delete_finalize_claim(
                     PgId::new(bucket_pg_id),
                     bucket,
@@ -2178,7 +2183,7 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
             bucket_node
-                .storage_client()
+                .bucket_write_reservation_client()
                 .release_bucket_delete_finalize_claim(PgId::new(bucket_pg_id), &claim)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             Ok(())
@@ -6024,11 +6029,13 @@ impl super::StorageCluster {
                     continue;
                 }
             };
-            let roots = match node.storage_client().get_bucket_delete_finalize_roots(
-                PgId::new(pg_id),
-                crate::clock::current_time_millis(),
-                BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
-            ) {
+            let roots = match node
+                .bucket_write_reservation_client()
+                .get_bucket_delete_finalize_roots(
+                    PgId::new(pg_id),
+                    crate::clock::current_time_millis(),
+                    BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
+                ) {
                 Ok(roots) => roots,
                 Err(error) => {
                     scan.errors += 1;

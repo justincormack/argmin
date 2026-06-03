@@ -25,8 +25,12 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
 use crate::storage_rpc::{
-    decode_abort_multipart_cleanup_response, decode_bucket_info_outcome_response,
-    decode_bucket_snapshot_pair_response, decode_bucket_snapshot_response,
+    decode_abort_multipart_cleanup_response,
+    decode_bucket_delete_finalize_claim_optional_record_response,
+    decode_bucket_delete_finalize_roots_response, decode_bucket_delete_finalized_response,
+    decode_bucket_info_outcome_response, decode_bucket_snapshot_pair_response,
+    decode_bucket_snapshot_response, decode_bucket_write_drain_begin_response,
+    decode_bucket_write_drain_optional_record_response,
     decode_bucket_write_reservation_record_response,
     decode_completed_multipart_order_command_build_response,
     decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
@@ -53,10 +57,14 @@ use crate::storage_rpc::{
     decode_stream_upload_match_response, decode_stream_upload_segments_response,
     decode_stream_upload_session_response, encode_abort_multipart_cleanup_request,
     encode_abort_multipart_command_build_request,
-    encode_authorized_abort_multipart_command_build_request, encode_bucket_request,
+    encode_authorized_abort_multipart_command_build_request,
+    encode_bucket_delete_finalize_claim_acquire_request,
+    encode_bucket_delete_finalize_claim_record_request,
+    encode_bucket_delete_finalize_roots_request, encode_bucket_request,
     encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
-    encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
-    encode_bucket_write_reservation_record_request,
+    encode_bucket_write_drain_begin_request, encode_bucket_write_drain_clear_expired_request,
+    encode_bucket_write_drain_record_request, encode_bucket_write_reservation_acquire_request,
+    encode_bucket_write_reservation_proof_request, encode_bucket_write_reservation_record_request,
     encode_complete_multipart_command_build_request,
     encode_completed_multipart_order_command_build_request,
     encode_create_bucket_command_build_request,
@@ -84,9 +92,15 @@ use crate::storage_rpc::{
     encode_stream_upload_match_request, encode_stream_upload_session_request,
     read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
-    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketInfoOutcome,
-    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
+    StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
+    StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
+    StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
+    StorageRpcBucketDeleteFinalizedOutcome, StorageRpcBucketDeleteFinalizedResponse,
+    StorageRpcBucketInfoOutcome, StorageRpcBucketPgRequest, StorageRpcBucketRequest,
+    StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
+    StorageRpcBucketWriteDrainBeginOutcome, StorageRpcBucketWriteDrainBeginRequest,
+    StorageRpcBucketWriteDrainClearExpiredRequest, StorageRpcBucketWriteDrainRecordRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
     StorageRpcCompleteMultipartCommandBuildRequest,
@@ -925,6 +939,70 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
+
+    fn durable_bucket_write_reservations(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
+
+    fn delete_finalized_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError>;
+
+    fn get_bucket_delete_finalize_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 }
 
@@ -3886,6 +3964,106 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
             self, pg_id, proof,
         )
     }
+
+    fn begin_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::begin_durable_bucket_write_drain(
+            self,
+            pg_id,
+            bucket,
+            drain_id,
+            owner_token,
+            cluster_epoch,
+            created_at,
+            lease_deadline,
+        )
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::clear_durable_bucket_write_drain(self, pg_id, record)
+    }
+
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::clear_expired_durable_bucket_write_drain(
+            self, pg_id, bucket, now,
+        )
+    }
+
+    fn durable_bucket_write_reservations(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::durable_bucket_write_reservations(self, pg_id, bucket)
+    }
+
+    fn delete_finalized_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        <Self as StorageNodeClient>::delete_finalized_bucket(self, pg_id, bucket)
+    }
+
+    fn get_bucket_delete_finalize_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_bucket_delete_finalize_roots(self, pg_id, now, limit)
+    }
+
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::acquire_bucket_delete_finalize_claim(
+            self,
+            pg_id,
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::release_bucket_delete_finalize_claim(self, pg_id, claim)
+    }
 }
 
 impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
@@ -4684,6 +4862,336 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             .map_err(BucketSnapshotLoadError::Store)?;
         self.validate_proof_release_response(&response)?;
         Ok(())
+    }
+
+    fn begin_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteDrainBeginRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            drain_id: drain_id.to_string(),
+            owner_token: owner_token.to_string(),
+            created_at,
+            lease_deadline,
+        };
+        let payload =
+            encode_bucket_write_drain_begin_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write drain begin request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteDrainBegin, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_write_drain_begin_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket write drain begin response",
+                error.to_string(),
+            ))
+        })?;
+        let record = match response.outcome {
+            StorageRpcBucketWriteDrainBeginOutcome::Acquired(record) => record,
+            StorageRpcBucketWriteDrainBeginOutcome::Conflict => {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketWriteDrainConflict {
+                        drain_id: drain_id.to_string(),
+                    },
+                ));
+            }
+        };
+        if record.bucket != *bucket
+            || record.drain_id != drain_id
+            || record.owner_token != owner_token
+            || record.cluster_epoch != cluster_epoch
+            || record.created_at != created_at
+            || record.lease_deadline != lease_deadline
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket write drain begin response",
+                "drain response identity does not match request".to_string(),
+            )));
+        }
+        Ok(record)
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteDrainRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: record.clone(),
+        };
+        let payload =
+            encode_bucket_write_drain_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write drain clear request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteDrainClear, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket write drain clear response",
+            &response,
+        )
+    }
+
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteDrainClearExpiredRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            now,
+        };
+        let payload =
+            encode_bucket_write_drain_clear_expired_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write drain clear expired request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteDrainClearExpired, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_write_drain_optional_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket write drain clear expired response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != *bucket {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket write drain clear expired response",
+                    "expired drain bucket does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(response.record)
+    }
+
+    fn durable_bucket_write_reservations(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteReservationsList, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = crate::storage_rpc::decode_bucket_write_reservations_list_response(
+            &response,
+        )
+        .map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket write reservations list response",
+                error.to_string(),
+            ))
+        })?;
+        if response
+            .records
+            .iter()
+            .any(|record| record.bucket != *bucket)
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket write reservations list response",
+                "reservation bucket does not match request".to_string(),
+            )));
+        }
+        Ok(response.records)
+    }
+
+    fn delete_finalized_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketDeleteFinalized, payload)
+            .map_err(BucketWriteDrainError::Store)?;
+        let response =
+            decode_bucket_delete_finalized_response(&response).map_err(|error| {
+                BucketWriteDrainError::Store(self.rpc_payload_error(
+                    "decode bucket delete finalized response",
+                    error.to_string(),
+                ))
+            })?;
+        self.validate_bucket_delete_finalized_response(response, bucket)
+    }
+
+    fn get_bucket_delete_finalize_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteFinalizeRootsRequest {
+            route: StorageRpcBucketPgRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+            },
+            now,
+            limit,
+        };
+        let payload = encode_bucket_delete_finalize_roots_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode bucket delete finalize roots request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketDeleteFinalizeRoots, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_delete_finalize_roots_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket delete finalize roots response",
+                    error.to_string(),
+                ))
+            })?;
+        if response.roots.len() > limit {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket delete finalize roots response",
+                "root count exceeds request limit".to_string(),
+            )));
+        }
+        Ok(response.roots)
+    }
+
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteFinalizeClaimAcquireRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            bucket_incarnation_generation,
+            claim_id: claim_id.to_string(),
+            owner_token: owner_token.to_string(),
+            claimed_at,
+            lease_deadline,
+            now,
+        };
+        let payload =
+            encode_bucket_delete_finalize_claim_acquire_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket delete finalize claim acquire request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_delete_finalize_claim_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket delete finalize claim acquire response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != *bucket
+                || record.bucket_incarnation_generation != bucket_incarnation_generation
+                || record.claim_id != claim_id
+                || record.owner_token != owner_token
+                || record.cluster_epoch != cluster_epoch
+                || record.pg_id != pg_id.get()
+                || record.claimed_at != claimed_at
+                || record.lease_deadline != lease_deadline
+            {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket delete finalize claim acquire response",
+                    "claim response identity does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(response.record)
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteFinalizeClaimRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: claim.clone(),
+        };
+        let payload =
+            encode_bucket_delete_finalize_claim_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket delete finalize claim release request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket delete finalize claim release response",
+            &response,
+        )
     }
 }
 
@@ -8082,6 +8590,27 @@ impl UnixStorageNodeClient {
                 context,
                 "bucket write reservation response payload must be empty".to_string(),
             )))
+        }
+    }
+
+    fn validate_bucket_delete_finalized_response(
+        &self,
+        response: StorageRpcBucketDeleteFinalizedResponse,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        match response.outcome {
+            StorageRpcBucketDeleteFinalizedOutcome::Deleted => Ok(()),
+            StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { name } if name == *bucket => {
+                Err(BucketWriteDrainError::Metadata(
+                    MetadataError::BucketNotFound { name },
+                ))
+            }
+            StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { .. } => {
+                Err(BucketWriteDrainError::Store(self.rpc_payload_error(
+                    "validate bucket delete finalized response",
+                    "bucket not found response name does not match request".to_string(),
+                )))
+            }
         }
     }
 
@@ -11834,6 +12363,197 @@ mod tests {
             BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)
         ));
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bucket-drain-finalize-rpc");
+        let finalize_bucket = crate::tests::bucket_name("bucket-finalize-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let finalize_bucket_incarnation_generation = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "reservation-for-drain-list",
+                "reservation-owner-for-drain-list",
+                ClusterEpoch::new(1).unwrap(),
+                "put-object",
+                10,
+                Some(20),
+                Some("key=a"),
+            )
+            .unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &finalize_bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::mark_bucket_deleting(&*pg, &finalize_bucket).unwrap();
+            PgMetadataStore::head_bucket_raw(&*pg, &finalize_bucket)
+                .unwrap()
+                .bucket_incarnation_generation
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_threads: Vec<_> = (0..9)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one().unwrap())
+            })
+            .collect();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let reservations = BucketWriteReservationNodeClient::durable_bucket_write_reservations(
+            &client,
+            PgId::new(0),
+            &bucket,
+        )
+        .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].reservation_id, "reservation-for-drain-list");
+
+        let drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
+            &client,
+            PgId::new(0),
+            &bucket,
+            "drain-rpc-1",
+            "drain-owner-rpc-1",
+            ClusterEpoch::new(1).unwrap(),
+            30,
+            Some(40),
+        )
+        .unwrap();
+        assert_eq!(drain.bucket, bucket);
+        assert_eq!(drain.drain_id, "drain-rpc-1");
+        BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+            &client,
+            PgId::new(0),
+            &drain,
+        )
+        .unwrap();
+
+        BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
+            &client,
+            PgId::new(0),
+            &bucket,
+            "expired-drain-rpc-1",
+            "expired-drain-owner-rpc-1",
+            ClusterEpoch::new(1).unwrap(),
+            50,
+            Some(55),
+        )
+        .unwrap();
+        let expired = BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
+            &client,
+            PgId::new(0),
+            &bucket,
+            60,
+        )
+        .unwrap()
+        .expect("expired drain should clear");
+        assert_eq!(expired.drain_id, "expired-drain-rpc-1");
+
+        let claim = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
+            &client,
+            PgId::new(0),
+            &finalize_bucket,
+            finalize_bucket_incarnation_generation,
+            "finalize-claim-rpc-1",
+            "finalize-claim-owner-rpc-1",
+            ClusterEpoch::new(1).unwrap(),
+            70,
+            Some(80),
+            70,
+        )
+        .unwrap()
+        .expect("finalize claim should acquire");
+        assert_eq!(claim.bucket, finalize_bucket);
+        assert_eq!(claim.claim_id, "finalize-claim-rpc-1");
+        BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+            &client,
+            PgId::new(0),
+            &claim,
+        )
+        .unwrap();
+
+        let roots = BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
+            &client,
+            PgId::new(0),
+            90,
+            16,
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].bucket, finalize_bucket);
+
+        BucketWriteReservationNodeClient::delete_finalized_bucket(
+            &client,
+            PgId::new(0),
+            &finalize_bucket,
+        )
+        .unwrap();
+
+        for thread in server_threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn unix_bucket_delete_finalized_response_rejects_wrong_not_found_bucket() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("delete-finalized-not-found-expected");
+        let wrong_bucket = crate::tests::bucket_name("delete-finalized-not-found-wrong");
+
+        let err = client
+            .validate_bucket_delete_finalized_response(
+                StorageRpcBucketDeleteFinalizedResponse {
+                    outcome: StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound {
+                        name: wrong_bucket,
+                    },
+                },
+                &bucket,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketWriteDrainError::Store(StoreError::StorageRpc {
+                operation: "validate bucket delete finalized response",
+                ..
+            })
+        ));
     }
 
     #[test]

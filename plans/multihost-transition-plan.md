@@ -5602,10 +5602,13 @@ post-commit object through the broad storage client, and the residual
 live-object helper routes through the object-read metadata RPC boundary.
 Bucket-head reads used by bucket property/subresource writers, delete begin,
 finalization checks, drain waits, and reclaim-incarnation lookup now use the
-dedicated bucket metadata RPC boundary. Remaining non-command surfaces still
-need operation-shaped builders for bucket properties/subresources, lifecycle
-MPU abort, and durable bucket drain/finalize mutation scans before
-frontend/combined roles can be enabled.
+dedicated bucket metadata RPC boundary. Durable bucket write-drain acquire,
+clear, clear-expired, reservation listing, bucket-delete finalizer claim
+acquire/release, finalize-root scans, and finalized-bucket deletion now route
+through the bucket write coordination RPC boundary. Remaining non-command
+surfaces still need operation-shaped builders for bucket
+properties/subresources and lifecycle MPU abort before frontend/combined roles
+can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the

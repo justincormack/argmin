@@ -8,20 +8,22 @@ use crate::{
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan},
     types::{
-        AbortMultipartUploadCleanup, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
-        BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
-        BucketState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType,
-        ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
-        CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
-        CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
-        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
-        GenerationId, ListPartsResp, ListedMultipartParts, LiveObjectRecord,
-        LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
-        MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
-        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-        MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord,
-        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
-        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+        AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
+        BucketInfo, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
+        BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
+        BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord,
+        ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
+        CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+        CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
+        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
+        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, ListPartsResp,
+        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionPreflight,
+        MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
+        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+        MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption,
+        ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState,
+        ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
         ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
         ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
         OwnerIdentity, PgId, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
@@ -175,6 +177,62 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
+const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+    + 8
+    + 8
+    + 1
+    + 8
+    + 9;
+const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 9;
+const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN;
+const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATIONS_LIST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4;
+const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS: usize = 1024;
+const STORAGE_RPC_BUCKET_DELETE_FINALIZE_ROOT_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_LEN + 8;
+const STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 4
+        + 8
+        + 9
+        + 8
+        + 5
+        + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
+const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 9
+        + 8;
+const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 8
@@ -272,6 +330,14 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectStreamUploadSessionLoad = 77,
     ObjectStreamUploadSegmentsLoad = 78,
     ObjectStreamSegmentAppendPrepare = 79,
+    BucketWriteDrainBegin = 80,
+    BucketWriteDrainClear = 81,
+    BucketWriteDrainClearExpired = 82,
+    BucketWriteReservationsList = 83,
+    BucketDeleteFinalized = 84,
+    BucketDeleteFinalizeRoots = 85,
+    BucketDeleteFinalizeClaimAcquire = 86,
+    BucketDeleteFinalizeClaimRelease = 87,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +477,14 @@ impl StorageRpcMessageKind {
             Self::ObjectStreamUploadSessionLoad => "object stream upload session load",
             Self::ObjectStreamUploadSegmentsLoad => "object stream upload segments load",
             Self::ObjectStreamSegmentAppendPrepare => "object stream segment append prepare",
+            Self::BucketWriteDrainBegin => "bucket write drain begin",
+            Self::BucketWriteDrainClear => "bucket write drain clear",
+            Self::BucketWriteDrainClearExpired => "bucket write drain clear expired",
+            Self::BucketWriteReservationsList => "bucket write reservations list",
+            Self::BucketDeleteFinalized => "bucket delete finalized",
+            Self::BucketDeleteFinalizeRoots => "bucket delete finalize roots",
+            Self::BucketDeleteFinalizeClaimAcquire => "bucket delete finalize claim acquire",
+            Self::BucketDeleteFinalizeClaimRelease => "bucket delete finalize claim release",
         }
     }
 
@@ -495,6 +569,14 @@ impl StorageRpcMessageKind {
             77 => Ok(Self::ObjectStreamUploadSessionLoad),
             78 => Ok(Self::ObjectStreamUploadSegmentsLoad),
             79 => Ok(Self::ObjectStreamSegmentAppendPrepare),
+            80 => Ok(Self::BucketWriteDrainBegin),
+            81 => Ok(Self::BucketWriteDrainClear),
+            82 => Ok(Self::BucketWriteDrainClearExpired),
+            83 => Ok(Self::BucketWriteReservationsList),
+            84 => Ok(Self::BucketDeleteFinalized),
+            85 => Ok(Self::BucketDeleteFinalizeRoots),
+            86 => Ok(Self::BucketDeleteFinalizeClaimAcquire),
+            87 => Ok(Self::BucketDeleteFinalizeClaimRelease),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -610,6 +692,104 @@ pub(crate) struct StorageRpcBucketRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) bucket: BucketName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketPgRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteDrainBeginRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) drain_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) created_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcBucketWriteDrainBeginOutcome {
+    Acquired(BucketWriteDrainRecord),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteDrainBeginResponse {
+    pub(crate) outcome: StorageRpcBucketWriteDrainBeginOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteDrainRecordRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) record: BucketWriteDrainRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteDrainClearExpiredRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteDrainOptionalRecordResponse {
+    pub(crate) record: Option<BucketWriteDrainRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteReservationsListResponse {
+    pub(crate) records: Vec<BucketWriteReservationRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcBucketDeleteFinalizedOutcome {
+    Deleted,
+    BucketNotFound { name: BucketName },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizedResponse {
+    pub(crate) outcome: StorageRpcBucketDeleteFinalizedOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeRootsRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) now: u64,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeRootsResponse {
+    pub(crate) roots: Vec<BucketDeleteFinalizeRoot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeClaimAcquireRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse {
+    pub(crate) record: Option<BucketDeleteFinalizeClaimRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeClaimRecordRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) record: BucketDeleteFinalizeClaimRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2236,6 +2416,28 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketWriteReservationRelease => {
             STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteDrainBegin => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteDrainClear => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteDrainClearExpired => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteReservationsList
+        | StorageRpcMessageKind::BucketDeleteFinalized => {
+            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeRoots => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -6244,6 +6446,477 @@ pub(crate) fn decode_bucket_write_reservation_record_response(
     Ok(StorageRpcBucketWriteReservationRecordResponse { outcome })
 }
 
+pub(crate) fn encode_bucket_write_drain_begin_request(
+    request: &StorageRpcBucketWriteDrainBeginRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_drain_identity(&request.drain_id, &request.owner_token)?;
+    let mut out = encode_bucket_request(&request.bucket);
+    put_string(&mut out, &request.drain_id);
+    put_string(&mut out, &request.owner_token);
+    put_u64(&mut out, request.created_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_drain_begin_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteDrainBeginRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let drain_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "drain id exceeds maximum length",
+        ),
+    )?;
+    let owner_token = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token exceeds maximum length",
+        ),
+    )?;
+    let created_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    decoder.finish()?;
+    validate_bucket_write_drain_identity(&drain_id, &owner_token)?;
+    Ok(StorageRpcBucketWriteDrainBeginRequest {
+        bucket,
+        drain_id,
+        owner_token,
+        created_at,
+        lease_deadline,
+    })
+}
+
+pub(crate) fn encode_bucket_write_drain_begin_response(
+    response: &StorageRpcBucketWriteDrainBeginResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcBucketWriteDrainBeginOutcome::Acquired(record) => {
+            validate_bucket_write_drain_record(record)?;
+            put_u8(&mut out, 0);
+            put_bucket_write_drain_record(&mut out, record);
+        }
+        StorageRpcBucketWriteDrainBeginOutcome::Conflict => put_u8(&mut out, 1),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_drain_begin_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteDrainBeginResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => {
+            let record = decoder.read_bucket_write_drain_record()?;
+            validate_bucket_write_drain_record(&record)?;
+            StorageRpcBucketWriteDrainBeginOutcome::Acquired(record)
+        }
+        1 => StorageRpcBucketWriteDrainBeginOutcome::Conflict,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown bucket write drain begin outcome tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketWriteDrainBeginResponse { outcome })
+}
+
+pub(crate) fn encode_bucket_write_drain_record_request(
+    request: &StorageRpcBucketWriteDrainRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match drain epoch",
+        ));
+    }
+    validate_bucket_write_drain_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_write_drain_record(&mut out, &request.record);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_drain_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteDrainRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let record = decoder.read_bucket_write_drain_record()?;
+    decoder.finish()?;
+    if cluster_epoch != record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match drain epoch",
+        ));
+    }
+    validate_bucket_write_drain_record(&record)?;
+    Ok(StorageRpcBucketWriteDrainRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        record,
+    })
+}
+
+pub(crate) fn encode_bucket_write_drain_clear_expired_request(
+    request: &StorageRpcBucketWriteDrainClearExpiredRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_request(&request.bucket);
+    put_u64(&mut out, request.now);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_drain_clear_expired_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteDrainClearExpiredRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let now = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketWriteDrainClearExpiredRequest { bucket, now })
+}
+
+pub(crate) fn encode_bucket_write_drain_optional_record_response(
+    response: &StorageRpcBucketWriteDrainOptionalRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.record {
+        Some(record) => {
+            validate_bucket_write_drain_record(record)?;
+            put_u8(&mut out, 1);
+            put_bucket_write_drain_record(&mut out, record);
+        }
+        None => put_u8(&mut out, 0),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_drain_optional_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteDrainOptionalRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let record = decoder.read_bucket_write_drain_record()?;
+            validate_bucket_write_drain_record(&record)?;
+            Some(record)
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown optional bucket write drain record tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketWriteDrainOptionalRecordResponse { record })
+}
+
+pub(crate) fn encode_bucket_write_reservations_list_response(
+    response: &StorageRpcBucketWriteReservationsListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.records.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.records.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for record in &response.records {
+        validate_bucket_write_reservation_record(record)?;
+        put_bucket_write_reservation_record(&mut out, record);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_reservations_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteReservationsListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_bounded_remaining_count(
+        STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN.min(1),
+        "bucket write reservation count exceeds payload",
+    )?;
+    let mut records = Vec::new();
+    for _ in 0..count {
+        let record = decoder.read_bucket_write_reservation_record()?;
+        validate_bucket_write_reservation_record(&record)?;
+        records.push(record);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketWriteReservationsListResponse { records })
+}
+
+pub(crate) fn encode_bucket_delete_finalized_response(
+    response: &StorageRpcBucketDeleteFinalizedResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcBucketDeleteFinalizedOutcome::Deleted => put_u8(&mut out, 0),
+        StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { name } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, name.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_finalized_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizedResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcBucketDeleteFinalizedOutcome::Deleted,
+        1 => StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound {
+            name: decoder.read_bucket_name()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown bucket delete finalized outcome tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketDeleteFinalizedResponse { outcome })
+}
+
+pub(crate) fn encode_bucket_pg_request(
+    request: &StorageRpcBucketPgRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_pg_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketPgRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let request = decoder.read_bucket_pg_request()?;
+    decoder.finish()?;
+    Ok(request)
+}
+
+pub(crate) fn encode_bucket_delete_finalize_roots_request(
+    request: &StorageRpcBucketDeleteFinalizeRootsRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.limit > STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: request.limit,
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS,
+        });
+    }
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_u64(&mut out, request.now);
+    put_u32(
+        &mut out,
+        u32::try_from(request.limit).map_err(|_| StorageRpcPayloadError::PayloadTooLarge {
+            len: request.limit,
+            limit: u32::MAX as usize,
+        })?,
+    );
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_finalize_roots_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeRootsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let now = decoder.read_u64()?;
+    let limit = decoder.read_u32()? as usize;
+    decoder.finish()?;
+    if limit > STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: limit,
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS,
+        });
+    }
+    Ok(StorageRpcBucketDeleteFinalizeRootsRequest { route, now, limit })
+}
+
+pub(crate) fn encode_bucket_delete_finalize_roots_response(
+    response: &StorageRpcBucketDeleteFinalizeRootsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if response.roots.len() > STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: response.roots.len(),
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.roots.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.roots.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for root in &response.roots {
+        put_bucket_delete_finalize_root(&mut out, root);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_finalize_roots_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_bounded_remaining_count(
+        STORAGE_RPC_BUCKET_DELETE_FINALIZE_ROOT_MAX_LEN.min(1),
+        "bucket delete finalize root count exceeds payload",
+    )?;
+    if count > STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS,
+        });
+    }
+    let mut roots = Vec::new();
+    for _ in 0..count {
+        roots.push(decoder.read_bucket_delete_finalize_root()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketDeleteFinalizeRootsResponse { roots })
+}
+
+pub(crate) fn encode_bucket_delete_finalize_claim_acquire_request(
+    request: &StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_drain_identity(&request.claim_id, &request.owner_token)?;
+    let mut out = encode_bucket_request(&request.bucket);
+    put_u64(&mut out, request.bucket_incarnation_generation);
+    put_string(&mut out, &request.claim_id);
+    put_string(&mut out, &request.owner_token);
+    put_u64(&mut out, request.claimed_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    put_u64(&mut out, request.now);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_finalize_claim_acquire_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeClaimAcquireRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let bucket_incarnation_generation = decoder.read_u64()?;
+    let claim_id = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "claim id exceeds maximum length",
+        ),
+    )?;
+    let owner_token = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token exceeds maximum length",
+        ),
+    )?;
+    let claimed_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    let now = decoder.read_u64()?;
+    decoder.finish()?;
+    validate_bucket_write_drain_identity(&claim_id, &owner_token)?;
+    Ok(StorageRpcBucketDeleteFinalizeClaimAcquireRequest {
+        bucket,
+        bucket_incarnation_generation,
+        claim_id,
+        owner_token,
+        claimed_at,
+        lease_deadline,
+        now,
+    })
+}
+
+pub(crate) fn encode_bucket_delete_finalize_claim_optional_record_response(
+    response: &StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.record {
+        Some(record) => {
+            validate_bucket_delete_finalize_claim_record(record)?;
+            put_u8(&mut out, 1);
+            put_bucket_delete_finalize_claim_record(&mut out, record);
+        }
+        None => put_u8(&mut out, 0),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_finalize_claim_optional_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let record = decoder.read_bucket_delete_finalize_claim_record()?;
+            validate_bucket_delete_finalize_claim_record(&record)?;
+            Some(record)
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown optional bucket delete finalize claim record tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse { record })
+}
+
+pub(crate) fn encode_bucket_delete_finalize_claim_record_request(
+    request: &StorageRpcBucketDeleteFinalizeClaimRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_bucket_delete_finalize_claim_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_delete_finalize_claim_record(&mut out, &request.record);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_finalize_claim_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let record = decoder.read_bucket_delete_finalize_claim_record()?;
+    decoder.finish()?;
+    if cluster_epoch != record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match claim epoch",
+        ));
+    }
+    validate_bucket_delete_finalize_claim_record(&record)?;
+    Ok(StorageRpcBucketDeleteFinalizeClaimRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        record,
+    })
+}
+
 pub(crate) fn encode_optional_checksum_metadata(checksum: Option<&ChecksumBytes>) -> Vec<u8> {
     let mut out = Vec::new();
     match checksum {
@@ -6457,6 +7130,53 @@ fn validate_bucket_write_reservation_record(
         &record.operation_kind,
         record.target_context.as_deref(),
     )
+}
+
+fn validate_bucket_write_drain_record(
+    record: &BucketWriteDrainRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_bucket_write_drain_identity(&record.drain_id, &record.owner_token)
+}
+
+fn validate_bucket_delete_finalize_claim_record(
+    record: &BucketDeleteFinalizeClaimRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_bucket_write_drain_identity(&record.claim_id, &record.owner_token)?;
+    if record.last_error.as_ref().is_some_and(|last_error| {
+        last_error.len() > STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN
+    }) {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "last error exceeds maximum length",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bucket_write_drain_identity(
+    drain_id: &str,
+    owner_token: &str,
+) -> Result<(), StorageRpcPayloadError> {
+    if drain_id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "drain id must not be empty",
+        ));
+    }
+    if drain_id.len() > STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "drain id exceeds maximum length",
+        ));
+    }
+    if owner_token.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token must not be empty",
+        ));
+    }
+    if owner_token.len() > STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "owner token exceeds maximum length",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bucket_write_reservation_identity(
@@ -6779,6 +7499,118 @@ impl<'a> StorageRpcDecoder<'a> {
             created_at: proof.created_at,
             lease_deadline: proof.lease_deadline,
             target_context: proof.target_context,
+        })
+    }
+
+    fn read_bucket_write_drain_record(
+        &mut self,
+    ) -> Result<BucketWriteDrainRecord, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name().map_err(|_| {
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof("invalid bucket name")
+        })?;
+        let drain_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "drain id exceeds maximum length",
+            ),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "owner token exceeds maximum length",
+            ),
+        )?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let bucket_execution_generation = self.read_u64()?;
+        let state = match self.read_u8()? {
+            0 => BucketWriteDrainState::Draining,
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                    "invalid bucket write drain state",
+                ));
+            }
+        };
+        let created_at = self.read_u64()?;
+        let lease_deadline = self.read_optional_u64()?;
+        Ok(BucketWriteDrainRecord {
+            bucket,
+            drain_id,
+            owner_token,
+            cluster_epoch,
+            bucket_execution_generation,
+            state,
+            created_at,
+            lease_deadline,
+        })
+    }
+
+    fn read_bucket_delete_finalize_root(
+        &mut self,
+    ) -> Result<BucketDeleteFinalizeRoot, StorageRpcPayloadError> {
+        Ok(BucketDeleteFinalizeRoot {
+            bucket: self.read_bucket_name()?,
+            bucket_incarnation_generation: self.read_u64()?,
+        })
+    }
+
+    fn read_bucket_delete_finalize_claim_record(
+        &mut self,
+    ) -> Result<BucketDeleteFinalizeClaimRecord, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let claim_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "claim id exceeds maximum length",
+            ),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "owner token exceeds maximum length",
+            ),
+        )?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let pg_id = self.read_u32()?;
+        let claimed_at = self.read_u64()?;
+        let lease_deadline = self.read_optional_u64()?;
+        let attempt_count = self.read_u64()?;
+        let last_error = self.read_optional_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "last error exceeds maximum length",
+            ),
+        )?;
+        Ok(BucketDeleteFinalizeClaimRecord {
+            bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            pg_id,
+            claimed_at,
+            lease_deadline,
+            attempt_count,
+            last_error,
+        })
+    }
+
+    fn read_bucket_request(&mut self) -> Result<StorageRpcBucketRequest, StorageRpcPayloadError> {
+        Ok(StorageRpcBucketRequest {
+            node_id: NodeId::new(self.read_u32()?),
+            cluster_epoch: self.read_cluster_epoch()?,
+            pg_id: PgId::new(self.read_u32()?),
+            bucket: self.read_bucket_name()?,
+        })
+    }
+
+    fn read_bucket_pg_request(
+        &mut self,
+    ) -> Result<StorageRpcBucketPgRequest, StorageRpcPayloadError> {
+        Ok(StorageRpcBucketPgRequest {
+            node_id: NodeId::new(self.read_u32()?),
+            cluster_epoch: self.read_cluster_epoch()?,
+            pg_id: PgId::new(self.read_u32()?),
         })
     }
 
@@ -8526,6 +9358,43 @@ fn put_bucket_write_reservation_record(out: &mut Vec<u8>, record: &BucketWriteRe
     put_u64(out, record.created_at);
     put_optional_u64(out, record.lease_deadline);
     put_optional_string(out, record.target_context.as_deref());
+}
+
+fn put_bucket_write_drain_record(out: &mut Vec<u8>, record: &BucketWriteDrainRecord) {
+    put_string(out, record.bucket.as_str());
+    put_string(out, &record.drain_id);
+    put_string(out, &record.owner_token);
+    put_u64(out, record.cluster_epoch.get());
+    put_u64(out, record.bucket_execution_generation);
+    put_u8(
+        out,
+        match record.state {
+            BucketWriteDrainState::Draining => 0,
+        },
+    );
+    put_u64(out, record.created_at);
+    put_optional_u64(out, record.lease_deadline);
+}
+
+fn put_bucket_delete_finalize_root(out: &mut Vec<u8>, root: &BucketDeleteFinalizeRoot) {
+    put_string(out, root.bucket.as_str());
+    put_u64(out, root.bucket_incarnation_generation);
+}
+
+fn put_bucket_delete_finalize_claim_record(
+    out: &mut Vec<u8>,
+    record: &BucketDeleteFinalizeClaimRecord,
+) {
+    put_string(out, record.bucket.as_str());
+    put_u64(out, record.bucket_incarnation_generation);
+    put_string(out, &record.claim_id);
+    put_string(out, &record.owner_token);
+    put_u64(out, record.cluster_epoch.get());
+    put_u32(out, record.pg_id);
+    put_u64(out, record.claimed_at);
+    put_optional_u64(out, record.lease_deadline);
+    put_u64(out, record.attempt_count);
+    put_optional_string(out, record.last_error.as_deref());
 }
 
 fn put_create_bucket_config(out: &mut Vec<u8>, config: &StorageRpcCreateBucketConfig) {
