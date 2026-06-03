@@ -46,6 +46,7 @@ impl SharedStorageNode {
         )?)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_existing_live_object_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,

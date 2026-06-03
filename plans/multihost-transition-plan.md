@@ -5595,9 +5595,16 @@ lookups run against the storage-node-owned object PG. Stream upload session
 loads, staged-segment listing, and stream segment append preparation now also
 route through the object-mutation metadata RPC boundary; Unix clients preserve
 typed stream-session-not-found outcomes and validate returned session/segment
-identity before the frontend writes staged payload shards. Remaining non-command
-surfaces still need operation-shaped builders for bucket properties/subresources,
-lifecycle MPU abort, and durable pending/drain/coordination checks before
+identity before the frontend writes staged payload shards. Direct PUT and
+stream PUT finalization outcomes now derive live-object tags, size, and
+last-modified data from the installed/applied command instead of reloading the
+post-commit object through the broad storage client, and the residual
+live-object helper routes through the object-read metadata RPC boundary.
+Bucket-head reads used by bucket property/subresource writers, delete begin,
+finalization checks, drain waits, and reclaim-incarnation lookup now use the
+dedicated bucket metadata RPC boundary. Remaining non-command surfaces still
+need operation-shaped builders for bucket properties/subresources, lifecycle
+MPU abort, and durable bucket drain/finalize mutation scans before
 frontend/combined roles can be enabled.
 
 Metadata command bytes should be reused directly inside RPC messages for

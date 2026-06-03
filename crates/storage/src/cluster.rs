@@ -42,7 +42,7 @@ use crate::types::{
     MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PrepareStreamUploadSegmentAppendReq,
     SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
     ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, StoredObject, StreamUploadCommandRecord, StreamUploadRecord,
+    ShardScavengerPayloadReference, StreamUploadCommandRecord, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, VersionId, WriteAck,
     WrittenShardAck,
 };
@@ -1921,14 +1921,6 @@ impl StorageCluster {
         )
     }
 
-    fn object_metadata_primary_client(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<&Arc<dyn StorageNodeClient>, StoreError> {
-        self.metadata_pg_primary_client(PgId::new(self.object_metadata_pg_id(bucket, key)))
-    }
-
     fn object_mutation_metadata_primary_client(
         &self,
         bucket: &BucketName,
@@ -3552,24 +3544,14 @@ impl StorageCluster {
             self.metadata_primary_test_hook_node().test_hook_scope_id(),
         )?;
 
-        let storage_client = self.object_metadata_primary_client(&req.bucket, &req.key)?;
-        let stored = storage_client.load_existing_live_object(pg_id, &req.bucket, &req.key)?;
-        let Some(StoredObject::Live(live_record)) = stored else {
-            return Err(MetadataError::Db {
-                context: "stored object missing live record after direct put",
-                source: rusqlite::Error::QueryReturnedNoRows,
-            }
-            .into());
-        };
-
         match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
                 Ok(Ok(FinalizeDirectPutObjectOutcome {
                     version_id: commit.object.version_id,
                     encryption: commit.object.encryption.clone(),
-                    live_tags: live_record.tags.clone(),
-                    live_size: live_record.size,
-                    live_last_modified: live_record.last_modified,
+                    live_tags: commit.object.tags.clone(),
+                    live_size: commit.object.size,
+                    live_last_modified: commit.last_modified_millis,
                     stale_generation_id: commit.stale_payload.as_ref().map(
                         |payload| match payload {
                             ObjectPayloadReclaimCommand::Segments(reclaim) => reclaim.generation_id,

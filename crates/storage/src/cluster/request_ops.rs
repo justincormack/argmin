@@ -1663,7 +1663,10 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        match node.storage_client().head_bucket_info(pg_id, bucket) {
+        match node
+            .bucket_metadata_client()
+            .head_bucket_info(pg_id, bucket)
+        {
             Ok(_) => {}
             Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
                 return Err(MetadataError::BucketNotFound {
@@ -1726,8 +1729,8 @@ impl super::StorageCluster {
                         continue;
                     }
                     match node
-                        .storage_client()
-                        .head_bucket_record_raw(PgId::new(pg_id), bucket)
+                        .bucket_metadata_client()
+                        .head_bucket_raw(PgId::new(pg_id), bucket)
                     {
                         Ok(current) if current.state == BucketState::Deleting => {
                             return Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting);
@@ -1903,8 +1906,8 @@ impl super::StorageCluster {
         );
         {
             let current = node_store
-                .storage_client()
-                .head_bucket_record_raw(pg_id, bucket)
+                .bucket_metadata_client()
+                .head_bucket_raw(pg_id, bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if current.state == BucketState::Deleting {
                 self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
@@ -2109,7 +2112,7 @@ impl super::StorageCluster {
         let bucket_incarnation_generation = {
             let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
             let info = match bucket_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(PgId::new(bucket_pg_id), bucket)
             {
                 Ok(info) => info,
@@ -2543,7 +2546,7 @@ impl super::StorageCluster {
         let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             let info = primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
             if state == BucketVersioningState::Disabled
                 && info.versioning != BucketVersioningState::Disabled
@@ -2622,7 +2625,7 @@ impl super::StorageCluster {
             }
 
             let info = primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
@@ -2717,7 +2720,7 @@ impl super::StorageCluster {
         let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
         }
 
@@ -2799,7 +2802,7 @@ impl super::StorageCluster {
             }
 
             let info = primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
@@ -2817,7 +2820,7 @@ impl super::StorageCluster {
         let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
         }
 
@@ -2882,7 +2885,7 @@ impl super::StorageCluster {
             }
 
             let info = primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
@@ -2938,7 +2941,7 @@ impl super::StorageCluster {
         let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
         }
         loop {
@@ -2992,7 +2995,7 @@ impl super::StorageCluster {
             }
 
             let info = primary_store
-                .storage_client()
+                .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
             return Ok(info);
         }
@@ -3781,10 +3784,19 @@ impl super::StorageCluster {
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        self.local_map
+        match self
+            .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
-            .load_existing_live_object(pg_id, bucket, key)
+            .object_read_metadata_client()
+            .load_object_read_auth_subject(pg_id, bucket, key, None)
+        {
+            Ok(subject) => match subject.stored {
+                StoredObject::Live(_) => Ok(Some(subject.stored)),
+                StoredObject::DeleteMarker(_) => Ok(None),
+            },
+            Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn load_object_read_snapshot_if<T, E>(
@@ -5755,8 +5767,8 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), bucket_pg_id)?;
             match bucket_store
-                .storage_client()
-                .head_bucket_record_raw(bucket_pg_id, bucket)
+                .bucket_metadata_client()
+                .head_bucket_raw(bucket_pg_id, bucket)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
             {
                 Ok(bucket) => bucket.bucket_incarnation_generation,
@@ -6579,15 +6591,6 @@ impl super::StorageCluster {
             )?;
         }
 
-        let storage_client = self.object_metadata_primary_client(bucket, key)?;
-        let stored = storage_client.load_existing_live_object(pg_id, bucket, key)?;
-        let Some(StoredObject::Live(live_record)) = stored else {
-            return Err(MetadataError::Db {
-                context: "stored object missing live record after stream put",
-                source: rusqlite::Error::QueryReturnedNoRows,
-            }
-            .into());
-        };
         let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
             unreachable!("stream put commit pending command kind changed");
         };
@@ -6595,9 +6598,9 @@ impl super::StorageCluster {
             value: prepared.value,
             version_id: commit.object.version_id,
             encryption: commit.object.encryption.clone(),
-            live_tags: live_record.tags.clone(),
-            live_size: live_record.size,
-            live_last_modified: live_record.last_modified,
+            live_tags: commit.object.tags.clone(),
+            live_size: commit.object.size,
+            live_last_modified: commit.last_modified_millis,
             stale_generation_id: super::object_payload_reclaim_generation(&commit.stale_payload),
         }))
     }

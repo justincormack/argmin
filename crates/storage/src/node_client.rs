@@ -1640,12 +1640,6 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
-    fn head_bucket_record_raw(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<BucketRecord, BucketSnapshotLoadError>;
-
     fn delete_finalized_bucket(
         &self,
         pg_id: PgId,
@@ -1753,13 +1747,6 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
-
-    fn load_existing_live_object(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError>;
 
     fn load_put_object_metadata_snapshot(
         &self,
@@ -8654,15 +8641,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::head_bucket(&*pg, bucket)?)
     }
 
-    fn head_bucket_record_raw(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<BucketRecord, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?)
-    }
-
     fn delete_finalized_bucket(
         &self,
         pg_id: PgId,
@@ -8948,18 +8926,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?)
-    }
-
-    fn load_existing_live_object(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(SharedStorageNode::load_existing_live_object_from_object_pg(
-            &pg, bucket, key,
-        )?)
     }
 
     fn load_put_object_metadata_snapshot(
