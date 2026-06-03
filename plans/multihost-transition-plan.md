@@ -5611,7 +5611,10 @@ that same bucket write coordination RPC boundary, so lifecycle sweeper
 coordination runs against the storage-node-owned bucket PG. Bucket versioning,
 ACL, property, and subresource command matching/building now route through a
 bucket metadata control RPC, and subresource reads use the bucket metadata RPC
-boundary.
+boundary. Public object listing page reads (`ListObjects`, object versions,
+and multipart upload listing) now route through a dedicated object-listing
+metadata RPC boundary, and bucket-delete emptiness checks use the same listing
+client instead of the broad storage-client surface.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5732,10 +5735,10 @@ Required tests:
    bucket raw/info and bucket snapshot reads, object read snapshot and
    tag/legal-hold/retention subject reads, generation/version/order allocation,
    bucket-write reservation/proof release, stream-upload and multipart-upload
-   initiation command builders, durable pending/drain checks, and remaining
-   operation-shaped command builders. Proof release must reject the correct PG
-   on a non-primary node even when that node appears first in the acting-set
-   route list.
+   initiation command builders, public object/version/multipart-upload listing
+   pages, durable pending/drain checks, and remaining operation-shaped command
+   builders. Proof release must reject the correct PG on a non-primary node
+   even when that node appears first in the acting-set route list.
 9. two independent frontend maps over one storage-node must handle stale
    object-generation selection: the loser may read generation `N`, the winner
    publishes `ReserveObjectGeneration(N)`, and the loser must retry to `N+1`

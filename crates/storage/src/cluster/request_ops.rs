@@ -764,8 +764,8 @@ impl super::StorageCluster {
         let pg_id = PgId::new(pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
-            .list_objects(pg_id, req)
+            .object_listing_metadata_client()
+            .list_objects_page(pg_id, req)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -777,8 +777,8 @@ impl super::StorageCluster {
         let pg_id = PgId::new(pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
-            .list_object_versions(pg_id, req)
+            .object_listing_metadata_client()
+            .list_object_versions_page(pg_id, req)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -790,8 +790,8 @@ impl super::StorageCluster {
         let pg_id = PgId::new(pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_client()
-            .list_multipart_uploads(pg_id, req)
+            .object_listing_metadata_client()
+            .list_multipart_uploads_page(pg_id, req)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -2295,9 +2295,9 @@ impl super::StorageCluster {
         for pg_id in self.metadata_pg_ids() {
             {
                 let pg_id = PgId::new(pg_id);
-                let storage_client = self.metadata_pg_primary_client(pg_id)?;
-                let versions = storage_client
-                    .list_object_versions(
+                let listing_client = self.metadata_pg_primary_object_listing_client(pg_id)?;
+                let versions = listing_client
+                    .list_object_versions_page(
                         pg_id,
                         &ListObjectVersionsReq {
                             bucket: bucket.clone(),
@@ -2313,8 +2313,8 @@ impl super::StorageCluster {
                     return Ok(true);
                 }
 
-                let uploads = storage_client
-                    .list_multipart_uploads(
+                let uploads = listing_client
+                    .list_multipart_uploads_page(
                         pg_id,
                         &ListMultipartUploadsReq {
                             bucket: bucket.clone(),

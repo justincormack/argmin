@@ -338,6 +338,7 @@ migrated_shard_scavenger_metadata_bypasses=$(
     FNR == 1 {
         pending_test_cfg = 0
         pending_storage_client = 0
+        pending_object_listing_metadata_client = 0
         in_test_hook = 0
         in_test_module = 0
     }
@@ -539,18 +540,30 @@ migrated_bucket_listing_bypasses=$(
         if ($0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client[[:space:]]*$/) {
             pending_storage_client = 1
         }
-        if ($0 ~ /\.(list_objects|list_object_versions|list_multipart_uploads)\(/) {
-            if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
+        if ($0 ~ /\.object_listing_metadata_client\(\)/ \
+            || $0 ~ /object_listing_metadata_client[[:space:]]*$/ \
+            || $0 ~ /listing_client[[:space:]]*$/) {
+            pending_object_listing_metadata_client = 1
+        }
+        if ($0 ~ /\.(list_objects|list_object_versions|list_multipart_uploads|list_objects_page|list_object_versions_page|list_multipart_uploads_page)\(/) {
+            if ($0 ~ /self\.list_(objects|object_versions|multipart_uploads)_page\(/) {
+                next
+            }
+            if (pending_object_listing_metadata_client \
+                || $0 ~ /\.object_listing_metadata_client\(\)/ \
+                || $0 ~ /listing_client\./) {
+                pending_object_listing_metadata_client = 0
                 pending_storage_client = 0
                 next
             }
-            if ($0 ~ /self\.list_(objects|object_versions|multipart_uploads)_page\(/) {
-                next
+            if (pending_storage_client || $0 ~ /\.storage_client\(\)/ || $0 ~ /storage_client\./) {
+                pending_storage_client = 0
             }
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /;/) {
             pending_storage_client = 0
+            pending_object_listing_metadata_client = 0
         }
     }
     ' crates/storage/src/cluster.rs \

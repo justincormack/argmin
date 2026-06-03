@@ -12,7 +12,8 @@ pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixObjectGenerationMetadataNodeClientConfig,
-    LocalUnixObjectVersionMetadataNodeClientConfig, LocalUnixShardNodeClientConfig,
+    LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
+    LocalUnixShardNodeClientConfig,
 };
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
@@ -30,8 +31,8 @@ use crate::node::BucketLockGuard;
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
-    CreateStreamUploadPrecondition, MetadataCommandNodeClient, ShardAckNodeClient,
-    StorageNodeClient,
+    CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
+    ShardAckNodeClient, StorageNodeClient,
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
@@ -1709,6 +1710,16 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         Ok(node.shard_ack_client())
+    }
+
+    fn metadata_pg_primary_object_listing_client(
+        &self,
+        pg_id: PgId,
+    ) -> Result<&Arc<dyn ObjectListingMetadataNodeClient>, StoreError> {
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        Ok(node.object_listing_metadata_client())
     }
 
     fn bucket_metadata_pg_id(&self, bucket: &BucketName) -> u32 {

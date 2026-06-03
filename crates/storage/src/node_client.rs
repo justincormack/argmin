@@ -38,10 +38,11 @@ use crate::storage_rpc::{
     decode_direct_put_commit_snapshot_response, decode_lifecycle_sweep_buckets_response,
     decode_lifecycle_sweep_claim_optional_record_response,
     decode_lifecycle_sweep_claim_record_response, decode_lifecycle_sweep_roots_response,
-    decode_metadata_command_acceptance_response, decode_metadata_command_applied_hashes_response,
-    decode_metadata_command_bool_outcome_response, decode_metadata_command_bool_response,
-    decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
-    decode_metadata_command_pending_envelope_response,
+    decode_list_multipart_uploads_response, decode_list_object_versions_response,
+    decode_list_objects_response, decode_metadata_command_acceptance_response,
+    decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
+    decode_metadata_command_bool_response, decode_metadata_command_max_log_index_response,
+    decode_metadata_command_next_id_response, decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -82,8 +83,10 @@ use crate::storage_rpc::{
     encode_direct_put_commit_snapshot_request, encode_insert_delete_marker_command_build_request,
     encode_lifecycle_sweep_claim_acquire_request, encode_lifecycle_sweep_claim_error_request,
     encode_lifecycle_sweep_claim_heartbeat_request, encode_lifecycle_sweep_claim_record_request,
-    encode_lifecycle_sweep_roots_request, encode_metadata_command_matching_applied_request,
-    encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_replace_request,
+    encode_lifecycle_sweep_roots_request, encode_list_multipart_uploads_request,
+    encode_list_object_versions_request, encode_list_objects_request,
+    encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+    encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_multipart_completion_preflight_request,
     encode_multipart_completion_snapshot_request, encode_multipart_parts_list_request,
@@ -126,10 +129,12 @@ use crate::storage_rpc::{
     StorageRpcInsertDeleteMarkerStalePayload, StorageRpcLifecycleSweepClaimAcquireRequest,
     StorageRpcLifecycleSweepClaimErrorRequest, StorageRpcLifecycleSweepClaimHeartbeatRequest,
     StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcLifecycleSweepRootsRequest,
-    StorageRpcMessageKind, StorageRpcMetadataCommandAcceptanceOutcome,
-    StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandBoolOutcome,
-    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandPendingSlotInsertOutcome,
+    StorageRpcListMultipartUploadsRequest, StorageRpcListObjectVersionsRequest,
+    StorageRpcListObjectsRequest, StorageRpcMessageKind,
+    StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
+    StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
@@ -1209,6 +1214,26 @@ pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
+    fn list_objects_page(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, BucketSnapshotLoadError>;
+
+    fn list_object_versions_page(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError>;
+
+    fn list_multipart_uploads_page(
+        &self,
+        pg_id: PgId,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
@@ -2425,24 +2450,6 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
-
-    fn list_objects(
-        &self,
-        pg_id: PgId,
-        req: &ListObjectsReq,
-    ) -> Result<ListObjectsResp, BucketSnapshotLoadError>;
-
-    fn list_object_versions(
-        &self,
-        pg_id: PgId,
-        req: &ListObjectVersionsReq,
-    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError>;
-
-    fn list_multipart_uploads(
-        &self,
-        pg_id: PgId,
-        req: &ListMultipartUploadsReq,
-    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError>;
 
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
 
@@ -4947,6 +4954,35 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
+impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
+    fn list_objects_page(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_objects(req)?)
+    }
+
+    fn list_object_versions_page(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_object_versions(req)?)
+    }
+
+    fn list_multipart_uploads_page(
+        &self,
+        pg_id: PgId,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_multipart_uploads(req)?)
+    }
+}
+
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
     fn head_bucket_raw(
         &self,
@@ -5311,6 +5347,252 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         })?;
         Ok(response.body)
     }
+}
+
+impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
+    fn list_objects_page(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
+        let request = StorageRpcListObjectsRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            request: ListObjectsReq {
+                bucket: req.bucket.clone(),
+                prefix: req.prefix.clone(),
+                start_after: req.start_after.clone(),
+                start_at: req.start_at.clone(),
+                max_keys: req.max_keys,
+            },
+        };
+        let payload = encode_list_objects_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode object list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectListPage, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_list_objects_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode object list response", error.to_string()),
+            )
+        })?;
+        validate_list_objects_response(self, &response.response, req)?;
+        Ok(response.response)
+    }
+
+    fn list_object_versions_page(
+        &self,
+        pg_id: PgId,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
+        let request = StorageRpcListObjectVersionsRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            request: ListObjectVersionsReq {
+                bucket: req.bucket.clone(),
+                prefix: req.prefix.clone(),
+                key_marker: req.key_marker.clone(),
+                version_id_marker: req.version_id_marker,
+                start_at: req.start_at.clone(),
+                max_keys: req.max_keys,
+            },
+        };
+        let payload = encode_list_object_versions_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode object version list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectVersionListPage, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_list_object_versions_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode object version list response", error.to_string()),
+            )
+        })?;
+        validate_list_object_versions_response(self, &response.response, req)?;
+        Ok(response.response)
+    }
+
+    fn list_multipart_uploads_page(
+        &self,
+        pg_id: PgId,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
+        let request = StorageRpcListMultipartUploadsRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            request: ListMultipartUploadsReq {
+                bucket: req.bucket.clone(),
+                prefix: req.prefix.clone(),
+                key_marker: req.key_marker.clone(),
+                upload_id_marker: req.upload_id_marker.clone(),
+                max_uploads: req.max_uploads,
+            },
+        };
+        let payload = encode_list_multipart_uploads_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode multipart upload list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartUploadListPage,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_list_multipart_uploads_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("decode multipart upload list response", error.to_string()),
+            )
+        })?;
+        validate_list_multipart_uploads_response(self, &response.response, req)?;
+        Ok(response.response)
+    }
+}
+
+fn validate_list_objects_response(
+    client: &UnixStorageNodeClient,
+    response: &ListObjectsResp,
+    req: &ListObjectsReq,
+) -> Result<(), BucketSnapshotLoadError> {
+    if response.objects.len() > req.max_keys as usize {
+        return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            "validate object list response",
+            "object list response exceeds requested max keys".to_string(),
+        )));
+    }
+    for object in &response.objects {
+        if object.bucket() != &req.bucket {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate object list response",
+                "object list response bucket does not match request".to_string(),
+            )));
+        }
+    }
+    match (response.is_truncated, response.next_start_after.as_ref()) {
+        (false, None) => {}
+        (false, Some(_)) => {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate object list response",
+                "non-truncated object list response has next marker".to_string(),
+            )));
+        }
+        (true, Some(marker))
+            if response
+                .objects
+                .last()
+                .is_some_and(|object| marker == object.key()) => {}
+        (true, _) => {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate object list response",
+                "truncated object list response marker does not match last object".to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_list_object_versions_response(
+    client: &UnixStorageNodeClient,
+    response: &ListObjectVersionsResp,
+    req: &ListObjectVersionsReq,
+) -> Result<(), BucketSnapshotLoadError> {
+    if response.versions.len() > req.max_keys as usize {
+        return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            "validate object version list response",
+            "object version list response exceeds requested max keys".to_string(),
+        )));
+    }
+    for object in &response.versions {
+        if object.bucket() != &req.bucket {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate object version list response",
+                "object version list response bucket does not match request".to_string(),
+            )));
+        }
+    }
+    match (
+        response.is_truncated,
+        response.next_key_marker.as_ref(),
+        response.next_version_id_marker,
+    ) {
+        (false, None, None) => {}
+        (false, _, _) => {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate object version list response",
+                "non-truncated object version list response has next marker".to_string(),
+            )));
+        }
+        (true, Some(key_marker), Some(version_marker))
+            if response.versions.last().is_some_and(|object| {
+                key_marker == object.key() && version_marker == object.version_id()
+            }) => {}
+        (true, _, _) => {
+            return Err(BucketSnapshotLoadError::Store(
+                client.rpc_payload_error(
+                    "validate object version list response",
+                    "truncated object version list response marker does not match last version"
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_list_multipart_uploads_response(
+    client: &UnixStorageNodeClient,
+    response: &ListMultipartUploadsResp,
+    req: &ListMultipartUploadsReq,
+) -> Result<(), BucketSnapshotLoadError> {
+    if response.uploads.len() > req.max_uploads as usize {
+        return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            "validate multipart upload list response",
+            "multipart upload list response exceeds requested max uploads".to_string(),
+        )));
+    }
+    for upload in &response.uploads {
+        if upload.bucket != req.bucket {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate multipart upload list response",
+                "multipart upload list response bucket does not match request".to_string(),
+            )));
+        }
+    }
+    match (
+        response.is_truncated,
+        response.next_key_marker.as_ref(),
+        response.next_upload_id_marker.as_ref(),
+    ) {
+        (false, None, None) => {}
+        (false, _, _) => {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate multipart upload list response",
+                "non-truncated multipart upload list response has next marker".to_string(),
+            )));
+        }
+        (true, Some(key_marker), Some(upload_id_marker))
+            if response.uploads.last().is_some_and(|upload| {
+                key_marker == &upload.key && upload_id_marker == &upload.upload_id
+            }) => {}
+        (true, _, _) => {
+            return Err(BucketSnapshotLoadError::Store(
+                client.rpc_payload_error(
+                    "validate multipart upload list response",
+                    "truncated multipart upload list response marker does not match last upload"
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
@@ -9684,33 +9966,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?)
     }
 
-    fn list_objects(
-        &self,
-        pg_id: PgId,
-        req: &ListObjectsReq,
-    ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_objects(req)?)
-    }
-
-    fn list_object_versions(
-        &self,
-        pg_id: PgId,
-        req: &ListObjectVersionsReq,
-    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_object_versions(req)?)
-    }
-
-    fn list_multipart_uploads(
-        &self,
-        pg_id: PgId,
-        req: &ListMultipartUploadsReq,
-    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_multipart_uploads(req)?)
-    }
-
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let stat = pg.stat_shard(key)?;
@@ -12433,6 +12688,15 @@ mod tests {
             .unwrap();
     }
 
+    fn test_unix_storage_node_client() -> UnixStorageNodeClient {
+        let tmp = test_util::tempdir();
+        UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        )
+    }
+
     fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -12450,6 +12714,112 @@ mod tests {
                 ),
             ),
         )
+    }
+
+    #[test]
+    fn unix_object_list_response_requires_truncated_marker_identity() {
+        let client = test_unix_storage_node_client();
+        let bucket = crate::tests::bucket_name("list-marker-bucket");
+        let key = crate::tests::object_key("list-marker-key");
+        let object = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(10).unwrap(),
+            ObjectLayout::Standard,
+        );
+        let req = ListObjectsReq {
+            bucket,
+            prefix: None,
+            start_after: None,
+            start_at: None,
+            max_keys: 1,
+        };
+        let mut response = ListObjectsResp {
+            objects: vec![object],
+            is_truncated: true,
+            next_start_after: None,
+        };
+        assert!(validate_list_objects_response(&client, &response, &req).is_err());
+
+        response.next_start_after = Some(crate::tests::object_key("wrong-marker"));
+        assert!(validate_list_objects_response(&client, &response, &req).is_err());
+
+        response.next_start_after = Some(key);
+        validate_list_objects_response(&client, &response, &req).unwrap();
+    }
+
+    #[test]
+    fn unix_object_version_list_response_requires_truncated_marker_identity() {
+        let client = test_unix_storage_node_client();
+        let bucket = crate::tests::bucket_name("version-list-marker-bucket");
+        let key = crate::tests::object_key("version-list-marker-key");
+        let version_id = VersionId::from_u64(44);
+        let mut object = test_live_stored_object(
+            bucket.clone(),
+            key.clone(),
+            GenerationId::new(10).unwrap(),
+            ObjectLayout::Standard,
+        );
+        let StoredObject::Live(record) = &mut object else {
+            unreachable!("test helper always builds a live object");
+        };
+        record.version_id = version_id;
+        let req = ListObjectVersionsReq {
+            bucket,
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            start_at: None,
+            max_keys: 1,
+        };
+        let mut response = ListObjectVersionsResp {
+            versions: vec![object],
+            is_truncated: true,
+            next_key_marker: Some(key.clone()),
+            next_version_id_marker: None,
+        };
+        assert!(validate_list_object_versions_response(&client, &response, &req).is_err());
+
+        response.next_version_id_marker = Some(VersionId::from_u64(45));
+        assert!(validate_list_object_versions_response(&client, &response, &req).is_err());
+
+        response.next_version_id_marker = Some(version_id);
+        validate_list_object_versions_response(&client, &response, &req).unwrap();
+    }
+
+    #[test]
+    fn unix_multipart_upload_list_response_requires_truncated_marker_identity() {
+        let client = test_unix_storage_node_client();
+        let bucket = crate::tests::bucket_name("mpu-list-marker-bucket");
+        let key = crate::tests::object_key("mpu-list-marker-key");
+        let upload_id = UploadId::try_from("u".repeat(crate::UPLOAD_ID_LEN)).unwrap();
+        let upload = test_multipart_upload_record(
+            bucket.clone(),
+            key.clone(),
+            upload_id.clone(),
+            UploadState::InProgress,
+        );
+        let req = ListMultipartUploadsReq {
+            bucket,
+            prefix: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: 1,
+        };
+        let mut response = ListMultipartUploadsResp {
+            uploads: vec![upload],
+            is_truncated: true,
+            next_key_marker: Some(key.clone()),
+            next_upload_id_marker: None,
+        };
+        assert!(validate_list_multipart_uploads_response(&client, &response, &req).is_err());
+
+        response.next_upload_id_marker =
+            Some(UploadId::try_from("v".repeat(crate::UPLOAD_ID_LEN)).unwrap());
+        assert!(validate_list_multipart_uploads_response(&client, &response, &req).is_err());
+
+        response.next_upload_id_marker = Some(upload_id);
+        validate_list_multipart_uploads_response(&client, &response, &req).unwrap();
     }
 
     fn test_bucket_info(

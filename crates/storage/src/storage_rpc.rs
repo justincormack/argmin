@@ -18,13 +18,15 @@ use crate::{
         CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
         DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
         GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
-        LifecycleSweepRootSource, ListPartsResp, ListedMultipartParts, LiveObjectRecord,
-        LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
-        MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
-        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-        MultipartReclaimRecord, MultipartUploadManagementLookup, MultipartUploadRecord,
-        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
-        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
+        LifecycleSweepRootSource, ListMultipartUploadsReq, ListMultipartUploadsResp,
+        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
+        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionPreflight,
+        MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
+        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+        MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption,
+        ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState,
+        ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
         ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
         ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
         OwnerIdentity, PgId, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
@@ -108,6 +110,22 @@ const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN * 2;
 const STORAGE_RPC_MAX_OBJECT_KEY_LEN: usize = 1024;
+const STORAGE_RPC_MAX_LIST_PAGE_ITEMS: u32 = 100_000;
+const STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 3 * (1 + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN) + 4;
+const STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 3 * (1 + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN)
+        + 1
+        + 8
+        + 4;
+const STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 2 * (1 + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN)
+        + 1
+        + 4
+        + UPLOAD_ID_LEN
+        + 4;
 const STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN: usize =
     4 + 8 + 4 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN;
 const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
@@ -360,6 +378,9 @@ pub(crate) enum StorageRpcMessageKind {
     LifecycleSweepClaimHeartbeat = 94,
     LifecycleSweepClaimError = 95,
     LifecycleSweepClaimRelease = 96,
+    ObjectListPage = 97,
+    ObjectVersionListPage = 98,
+    ObjectMultipartUploadListPage = 99,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +537,9 @@ impl StorageRpcMessageKind {
             Self::LifecycleSweepClaimHeartbeat => "lifecycle sweep claim heartbeat",
             Self::LifecycleSweepClaimError => "lifecycle sweep claim error",
             Self::LifecycleSweepClaimRelease => "lifecycle sweep claim release",
+            Self::ObjectListPage => "object list page",
+            Self::ObjectVersionListPage => "object version list page",
+            Self::ObjectMultipartUploadListPage => "object multipart upload list page",
         }
     }
 
@@ -617,6 +641,9 @@ impl StorageRpcMessageKind {
             94 => Ok(Self::LifecycleSweepClaimHeartbeat),
             95 => Ok(Self::LifecycleSweepClaimError),
             96 => Ok(Self::LifecycleSweepClaimRelease),
+            97 => Ok(Self::ObjectListPage),
+            98 => Ok(Self::ObjectVersionListPage),
+            99 => Ok(Self::ObjectMultipartUploadListPage),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1819,6 +1846,39 @@ pub(crate) struct StorageRpcLifecycleSweepBucketsResponse {
     pub(crate) buckets: LifecycleSweepBuckets,
 }
 
+pub(crate) struct StorageRpcListObjectsRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) request: ListObjectsReq,
+}
+
+pub(crate) struct StorageRpcListObjectsResponse {
+    pub(crate) response: ListObjectsResp,
+}
+
+pub(crate) struct StorageRpcListObjectVersionsRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) request: ListObjectVersionsReq,
+}
+
+pub(crate) struct StorageRpcListObjectVersionsResponse {
+    pub(crate) response: ListObjectVersionsResp,
+}
+
+pub(crate) struct StorageRpcListMultipartUploadsRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) request: ListMultipartUploadsReq,
+}
+
+pub(crate) struct StorageRpcListMultipartUploadsResponse {
+    pub(crate) response: ListMultipartUploadsResp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcLifecycleSweepClaimAcquireRequest {
     pub(crate) bucket: StorageRpcBucketRequest,
@@ -2606,6 +2666,13 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::LifecycleSweepClaimRelease => {
             STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectListPage => STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN,
+        StorageRpcMessageKind::ObjectVersionListPage => {
+            STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectMultipartUploadListPage => {
+            STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN
         }
         _ => generic_max_payload_len,
     };
@@ -5288,6 +5355,311 @@ pub(crate) fn decode_lifecycle_sweep_roots_response(
     }
     decoder.finish()?;
     Ok(StorageRpcLifecycleSweepRootsResponse { roots })
+}
+
+fn validate_list_page_item_limit(value: u32) -> Result<(), StorageRpcPayloadError> {
+    if value > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: value as usize,
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    Ok(())
+}
+
+fn validate_list_page_item_count(value: usize) -> Result<(), StorageRpcPayloadError> {
+    if value > STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: value,
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_list_objects_request(
+    request: &StorageRpcListObjectsRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_list_page_item_limit(request.request.max_keys)?;
+    let mut out = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    })?;
+    put_string(&mut out, request.request.bucket.as_str());
+    put_optional_string(
+        &mut out,
+        request.request.prefix.as_ref().map(|key| key.as_str()),
+    );
+    put_optional_string(
+        &mut out,
+        request.request.start_after.as_ref().map(|key| key.as_str()),
+    );
+    put_optional_string(
+        &mut out,
+        request.request.start_at.as_ref().map(|key| key.as_str()),
+    );
+    put_u32(&mut out, request.request.max_keys);
+    Ok(out)
+}
+
+pub(crate) fn decode_list_objects_request(
+    bytes: &[u8],
+) -> Result<StorageRpcListObjectsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let request = ListObjectsReq {
+        bucket: decoder.read_bucket_name()?,
+        prefix: decoder.read_optional_object_key()?,
+        start_after: decoder.read_optional_object_key()?,
+        start_at: decoder.read_optional_object_key()?,
+        max_keys: decoder.read_u32()?,
+    };
+    decoder.finish()?;
+    validate_list_page_item_limit(request.max_keys)?;
+    Ok(StorageRpcListObjectsRequest {
+        node_id: route.node_id,
+        cluster_epoch: route.cluster_epoch,
+        pg_id: route.pg_id,
+        request,
+    })
+}
+
+pub(crate) fn encode_list_objects_response(
+    response: &StorageRpcListObjectsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_list_page_item_count(response.response.objects.len())?;
+    let mut out = Vec::new();
+    put_stored_object_list(&mut out, &response.response.objects);
+    put_bool(&mut out, response.response.is_truncated);
+    put_optional_string(
+        &mut out,
+        response
+            .response
+            .next_start_after
+            .as_ref()
+            .map(|key| key.as_str()),
+    );
+    Ok(out)
+}
+
+pub(crate) fn decode_list_objects_response(
+    bytes: &[u8],
+) -> Result<StorageRpcListObjectsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let objects = decoder.read_stored_object_list_with_limit(STORAGE_RPC_MAX_LIST_PAGE_ITEMS)?;
+    let is_truncated = decoder.read_bool()?;
+    let next_start_after = decoder.read_optional_object_key()?;
+    decoder.finish()?;
+    Ok(StorageRpcListObjectsResponse {
+        response: ListObjectsResp {
+            objects,
+            is_truncated,
+            next_start_after,
+        },
+    })
+}
+
+pub(crate) fn encode_list_object_versions_request(
+    request: &StorageRpcListObjectVersionsRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_list_page_item_limit(request.request.max_keys)?;
+    let mut out = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    })?;
+    put_string(&mut out, request.request.bucket.as_str());
+    put_optional_string(
+        &mut out,
+        request.request.prefix.as_ref().map(|key| key.as_str()),
+    );
+    put_optional_string(
+        &mut out,
+        request.request.key_marker.as_ref().map(|key| key.as_str()),
+    );
+    put_optional_version_id(&mut out, request.request.version_id_marker);
+    put_optional_string(
+        &mut out,
+        request.request.start_at.as_ref().map(|key| key.as_str()),
+    );
+    put_u32(&mut out, request.request.max_keys);
+    Ok(out)
+}
+
+pub(crate) fn decode_list_object_versions_request(
+    bytes: &[u8],
+) -> Result<StorageRpcListObjectVersionsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let request = ListObjectVersionsReq {
+        bucket: decoder.read_bucket_name()?,
+        prefix: decoder.read_optional_object_key()?,
+        key_marker: decoder.read_optional_object_key()?,
+        version_id_marker: decoder.read_optional_version_id()?,
+        start_at: decoder.read_optional_object_key()?,
+        max_keys: decoder.read_u32()?,
+    };
+    decoder.finish()?;
+    validate_list_page_item_limit(request.max_keys)?;
+    Ok(StorageRpcListObjectVersionsRequest {
+        node_id: route.node_id,
+        cluster_epoch: route.cluster_epoch,
+        pg_id: route.pg_id,
+        request,
+    })
+}
+
+pub(crate) fn encode_list_object_versions_response(
+    response: &StorageRpcListObjectVersionsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_list_page_item_count(response.response.versions.len())?;
+    let mut out = Vec::new();
+    put_stored_object_list(&mut out, &response.response.versions);
+    put_bool(&mut out, response.response.is_truncated);
+    put_optional_string(
+        &mut out,
+        response
+            .response
+            .next_key_marker
+            .as_ref()
+            .map(|key| key.as_str()),
+    );
+    put_optional_version_id(&mut out, response.response.next_version_id_marker);
+    Ok(out)
+}
+
+pub(crate) fn decode_list_object_versions_response(
+    bytes: &[u8],
+) -> Result<StorageRpcListObjectVersionsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let versions = decoder.read_stored_object_list_with_limit(STORAGE_RPC_MAX_LIST_PAGE_ITEMS)?;
+    let is_truncated = decoder.read_bool()?;
+    let next_key_marker = decoder.read_optional_object_key()?;
+    let next_version_id_marker = decoder.read_optional_version_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcListObjectVersionsResponse {
+        response: ListObjectVersionsResp {
+            versions,
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+        },
+    })
+}
+
+pub(crate) fn encode_list_multipart_uploads_request(
+    request: &StorageRpcListMultipartUploadsRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_list_page_item_limit(request.request.max_uploads)?;
+    let mut out = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    })?;
+    put_string(&mut out, request.request.bucket.as_str());
+    put_optional_string(
+        &mut out,
+        request.request.prefix.as_ref().map(|key| key.as_str()),
+    );
+    put_optional_string(
+        &mut out,
+        request.request.key_marker.as_ref().map(|key| key.as_str()),
+    );
+    match request.request.upload_id_marker.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(upload_id) => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
+    put_u32(&mut out, request.request.max_uploads);
+    Ok(out)
+}
+
+pub(crate) fn decode_list_multipart_uploads_request(
+    bytes: &[u8],
+) -> Result<StorageRpcListMultipartUploadsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let request = ListMultipartUploadsReq {
+        bucket: decoder.read_bucket_name()?,
+        prefix: decoder.read_optional_object_key()?,
+        key_marker: decoder.read_optional_object_key()?,
+        upload_id_marker: decoder.read_optional_upload_id()?,
+        max_uploads: decoder.read_u32()?,
+    };
+    decoder.finish()?;
+    validate_list_page_item_limit(request.max_uploads)?;
+    Ok(StorageRpcListMultipartUploadsRequest {
+        node_id: route.node_id,
+        cluster_epoch: route.cluster_epoch,
+        pg_id: route.pg_id,
+        request,
+    })
+}
+
+pub(crate) fn encode_list_multipart_uploads_response(
+    response: &StorageRpcListMultipartUploadsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_list_page_item_count(response.response.uploads.len())?;
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.response.uploads.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.response.uploads.len(),
+                limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+            }
+        })?,
+    );
+    for upload in &response.response.uploads {
+        put_multipart_upload_record(&mut out, upload);
+    }
+    put_bool(&mut out, response.response.is_truncated);
+    put_optional_string(
+        &mut out,
+        response
+            .response
+            .next_key_marker
+            .as_ref()
+            .map(|key| key.as_str()),
+    );
+    match response.response.next_upload_id_marker.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(upload_id) => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_list_multipart_uploads_response(
+    bytes: &[u8],
+) -> Result<StorageRpcListMultipartUploadsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let upload_count = decoder.read_limited_bounded_remaining_count(
+        4 + UPLOAD_ID_LEN + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN + 4,
+        "multipart upload list count exceeds payload",
+        STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+    )?;
+    let mut uploads = Vec::new();
+    for _ in 0..upload_count {
+        uploads.push(decoder.read_multipart_upload_record()?);
+    }
+    let is_truncated = decoder.read_bool()?;
+    let next_key_marker = decoder.read_optional_object_key()?;
+    let next_upload_id_marker = decoder.read_optional_upload_id()?;
+    decoder.finish()?;
+    Ok(StorageRpcListMultipartUploadsResponse {
+        response: ListMultipartUploadsResp {
+            uploads,
+            is_truncated,
+            next_key_marker,
+            next_upload_id_marker,
+        },
+    })
 }
 
 pub(crate) fn encode_lifecycle_sweep_buckets_response(
@@ -8005,6 +8377,16 @@ impl<'a> StorageRpcDecoder<'a> {
             .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid object key"))
     }
 
+    fn read_optional_object_key(&mut self) -> Result<Option<ObjectKey>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_object_key()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional object key tag",
+            )),
+        }
+    }
+
     fn read_rpc_object_request(
         &mut self,
     ) -> Result<StorageRpcObjectRequest, StorageRpcPayloadError> {
@@ -8705,6 +9087,28 @@ impl<'a> StorageRpcDecoder<'a> {
         Ok(count)
     }
 
+    fn read_limited_bounded_remaining_count(
+        &mut self,
+        min_item_len: usize,
+        message: &'static str,
+        limit: u32,
+    ) -> Result<usize, StorageRpcPayloadError> {
+        let count = self.read_u32()? as usize;
+        if count > limit as usize {
+            return Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: count,
+                limit: limit as usize,
+            });
+        }
+        let remaining = self.bytes.len().saturating_sub(self.cursor);
+        if count > remaining / min_item_len {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                message,
+            ));
+        }
+        Ok(count)
+    }
+
     fn read_fixed_16_bytes(
         &mut self,
         field: &'static str,
@@ -8812,6 +9216,22 @@ impl<'a> StorageRpcDecoder<'a> {
 
     fn read_stored_object_list(&mut self) -> Result<Vec<StoredObject>, StorageRpcPayloadError> {
         let count = self.read_bounded_remaining_count(1, "stored object list too large")?;
+        self.read_stored_object_list_items(count)
+    }
+
+    fn read_stored_object_list_with_limit(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<StoredObject>, StorageRpcPayloadError> {
+        let count =
+            self.read_limited_bounded_remaining_count(1, "stored object list too large", limit)?;
+        self.read_stored_object_list_items(count)
+    }
+
+    fn read_stored_object_list_items(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<StoredObject>, StorageRpcPayloadError> {
         let mut objects = Vec::new();
         for _ in 0..count {
             objects.push(self.read_stored_object()?);
@@ -9597,6 +10017,16 @@ impl<'a> StorageRpcDecoder<'a> {
             StorageRpcPayloadError::InvalidObjectMetadataRequest("upload id is too large"),
         )?)
         .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid upload id"))
+    }
+
+    fn read_optional_upload_id(&mut self) -> Result<Option<UploadId>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_upload_id()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional upload id tag",
+            )),
+        }
     }
 
     fn read_object_read_auth_subject(
@@ -12650,6 +13080,21 @@ mod tests {
                 STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN,
             ),
+            (
+                StorageRpcMessageKind::ObjectListPage,
+                STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectVersionListPage,
+                STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectMultipartUploadListPage,
+                STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN,
+            ),
         ] {
             let mut bytes = Vec::new();
             put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
@@ -12801,6 +13246,219 @@ mod tests {
         let decoded = decode_proof_release_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn object_listing_requests_and_responses_round_trip() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let prefix = ObjectKey::try_from("prefix/").unwrap();
+        let key_marker = ObjectKey::try_from("prefix/key").unwrap();
+        let upload_id = UploadId::try_from("u".repeat(UPLOAD_ID_LEN)).unwrap();
+
+        let objects = StorageRpcListObjectsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            request: ListObjectsReq {
+                bucket: bucket.clone(),
+                prefix: Some(prefix.clone()),
+                start_after: Some(key_marker.clone()),
+                start_at: None,
+                max_keys: 9,
+            },
+        };
+        let bytes = encode_list_objects_request(&objects).unwrap();
+        let decoded = decode_list_objects_request(&bytes).unwrap();
+        assert_eq!(decoded.node_id, objects.node_id);
+        assert_eq!(decoded.cluster_epoch, objects.cluster_epoch);
+        assert_eq!(decoded.pg_id, objects.pg_id);
+        assert_eq!(decoded.request.bucket, objects.request.bucket);
+        assert_eq!(decoded.request.prefix, objects.request.prefix);
+        assert_eq!(decoded.request.start_after, objects.request.start_after);
+        assert_eq!(decoded.request.start_at, objects.request.start_at);
+        assert_eq!(decoded.request.max_keys, objects.request.max_keys);
+
+        let response = StorageRpcListObjectsResponse {
+            response: ListObjectsResp {
+                objects: Vec::new(),
+                is_truncated: true,
+                next_start_after: Some(key_marker.clone()),
+            },
+        };
+        let bytes = encode_list_objects_response(&response).unwrap();
+        let decoded = decode_list_objects_response(&bytes).unwrap();
+        assert!(decoded.response.objects.is_empty());
+        assert!(decoded.response.is_truncated);
+        assert_eq!(decoded.response.next_start_after, Some(key_marker.clone()));
+
+        let versions = StorageRpcListObjectVersionsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            request: ListObjectVersionsReq {
+                bucket: bucket.clone(),
+                prefix: Some(prefix.clone()),
+                key_marker: Some(key_marker.clone()),
+                version_id_marker: Some(VersionId::from_u64(42)),
+                start_at: None,
+                max_keys: 10,
+            },
+        };
+        let bytes = encode_list_object_versions_request(&versions).unwrap();
+        let decoded = decode_list_object_versions_request(&bytes).unwrap();
+        assert_eq!(decoded.node_id, versions.node_id);
+        assert_eq!(decoded.cluster_epoch, versions.cluster_epoch);
+        assert_eq!(decoded.pg_id, versions.pg_id);
+        assert_eq!(decoded.request.bucket, versions.request.bucket);
+        assert_eq!(decoded.request.prefix, versions.request.prefix);
+        assert_eq!(decoded.request.key_marker, versions.request.key_marker);
+        assert_eq!(
+            decoded.request.version_id_marker,
+            versions.request.version_id_marker
+        );
+        assert_eq!(decoded.request.start_at, versions.request.start_at);
+        assert_eq!(decoded.request.max_keys, versions.request.max_keys);
+
+        let response = StorageRpcListObjectVersionsResponse {
+            response: ListObjectVersionsResp {
+                versions: Vec::new(),
+                is_truncated: true,
+                next_key_marker: Some(key_marker.clone()),
+                next_version_id_marker: Some(VersionId::from_u64(43)),
+            },
+        };
+        let bytes = encode_list_object_versions_response(&response).unwrap();
+        let decoded = decode_list_object_versions_response(&bytes).unwrap();
+        assert!(decoded.response.versions.is_empty());
+        assert!(decoded.response.is_truncated);
+        assert_eq!(decoded.response.next_key_marker, Some(key_marker.clone()));
+        assert_eq!(
+            decoded.response.next_version_id_marker,
+            Some(VersionId::from_u64(43))
+        );
+
+        let uploads = StorageRpcListMultipartUploadsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            request: ListMultipartUploadsReq {
+                bucket,
+                prefix: Some(prefix),
+                key_marker: Some(key_marker.clone()),
+                upload_id_marker: Some(upload_id.clone()),
+                max_uploads: 11,
+            },
+        };
+        let bytes = encode_list_multipart_uploads_request(&uploads).unwrap();
+        let decoded = decode_list_multipart_uploads_request(&bytes).unwrap();
+        assert_eq!(decoded.node_id, uploads.node_id);
+        assert_eq!(decoded.cluster_epoch, uploads.cluster_epoch);
+        assert_eq!(decoded.pg_id, uploads.pg_id);
+        assert_eq!(decoded.request.bucket, uploads.request.bucket);
+        assert_eq!(decoded.request.prefix, uploads.request.prefix);
+        assert_eq!(decoded.request.key_marker, uploads.request.key_marker);
+        assert_eq!(
+            decoded.request.upload_id_marker,
+            uploads.request.upload_id_marker
+        );
+        assert_eq!(decoded.request.max_uploads, uploads.request.max_uploads);
+
+        let response = StorageRpcListMultipartUploadsResponse {
+            response: ListMultipartUploadsResp {
+                uploads: Vec::new(),
+                is_truncated: true,
+                next_key_marker: Some(key_marker),
+                next_upload_id_marker: Some(upload_id),
+            },
+        };
+        let bytes = encode_list_multipart_uploads_response(&response).unwrap();
+        let decoded = decode_list_multipart_uploads_response(&bytes).unwrap();
+        assert!(decoded.response.uploads.is_empty());
+        assert!(decoded.response.is_truncated);
+        assert_eq!(
+            decoded.response.next_key_marker,
+            response.response.next_key_marker
+        );
+        assert_eq!(
+            decoded.response.next_upload_id_marker,
+            response.response.next_upload_id_marker
+        );
+    }
+
+    #[test]
+    fn object_listing_requests_reject_unbounded_page_limits() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let objects = StorageRpcListObjectsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            request: ListObjectsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                start_after: None,
+                start_at: None,
+                max_keys: STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1,
+            },
+        };
+        assert_eq!(
+            encode_list_objects_request(&objects),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: (STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1) as usize,
+                limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+            })
+        );
+
+        let mut bytes = encode_bucket_pg_request(&StorageRpcBucketPgRequest {
+            node_id: objects.node_id,
+            cluster_epoch: objects.cluster_epoch,
+            pg_id: objects.pg_id,
+        })
+        .unwrap();
+        put_string(&mut bytes, bucket.as_str());
+        put_optional_string(&mut bytes, None);
+        put_optional_string(&mut bytes, None);
+        put_optional_string(&mut bytes, None);
+        put_u32(&mut bytes, STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1);
+        assert!(matches!(
+            decode_list_objects_request(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len,
+                limit,
+            }) if len == (STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1) as usize
+                && limit == STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize
+        ));
+    }
+
+    #[test]
+    fn object_listing_responses_reject_oversized_counts_before_allocating() {
+        let too_many = STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1;
+
+        let mut object_bytes = Vec::new();
+        put_u32(&mut object_bytes, too_many);
+        assert!(matches!(
+            decode_list_objects_response(&object_bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
+                if len == too_many as usize
+                    && limit == STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize
+        ));
+
+        let mut version_bytes = Vec::new();
+        put_u32(&mut version_bytes, too_many);
+        assert!(matches!(
+            decode_list_object_versions_response(&version_bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
+                if len == too_many as usize
+                    && limit == STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize
+        ));
+
+        let mut upload_bytes = Vec::new();
+        put_u32(&mut upload_bytes, too_many);
+        assert!(matches!(
+            decode_list_multipart_uploads_response(&upload_bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge { len, limit })
+                if len == too_many as usize
+                    && limit == STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize
+        ));
     }
 
     #[test]
