@@ -20,9 +20,9 @@ use crate::node_client::{
     BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
     BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
     CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
-    LocalStorageNodeClient, ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
-    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
-    ObjectVersionMetadataNodeClient,
+    LocalStorageNodeClient, MarkBucketDeletingCommandBuild, ObjectGenerationMetadataNodeClient,
+    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
+    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
 };
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
@@ -30,6 +30,7 @@ use crate::storage_rpc::{
     decode_bucket_delete_finalize_claim_acquire_request,
     decode_bucket_delete_finalize_claim_record_request,
     decode_bucket_delete_finalize_roots_request, decode_bucket_list_request,
+    decode_bucket_mark_deleting_command_build_request,
     decode_bucket_metadata_control_command_build_request,
     decode_bucket_metadata_control_pending_match_request, decode_bucket_pg_request,
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
@@ -71,6 +72,7 @@ use crate::storage_rpc::{
     encode_bucket_delete_finalize_roots_response, encode_bucket_delete_finalized_response,
     encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
     encode_bucket_info_outcome_response, encode_bucket_list_response,
+    encode_bucket_mark_deleting_command_build_response,
     encode_bucket_metadata_control_command_build_response, encode_bucket_snapshot_pair_response,
     encode_bucket_snapshot_response, encode_bucket_subresource_get_response,
     encode_bucket_write_drain_begin_response, encode_bucket_write_drain_optional_record_response,
@@ -114,6 +116,9 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteFinalizedResponse, StorageRpcBucketExecutionGenerationsResponse,
     StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListRequest, StorageRpcBucketListResponse,
+    StorageRpcBucketMarkDeletingCommandBuildOutcome,
+    StorageRpcBucketMarkDeletingCommandBuildRequest,
+    StorageRpcBucketMarkDeletingCommandBuildResponse,
     StorageRpcBucketMetadataControlCommandBuildRequest,
     StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcBucketMetadataControlMutation,
     StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
@@ -196,7 +201,7 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
     STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
-use crate::types::{ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
+use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::{
     BucketName, BucketWriteDrainError, EcShape, NodeId, ObjectPgActionError, ShardLocation,
 };
@@ -587,6 +592,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketWriteDrainClearExpired => {
                 match decode_bucket_write_drain_clear_expired_request(&frame.payload) {
                     Ok(request) => self.bucket_write_drain_clear_expired_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketWriteDrainExists => {
+                match decode_bucket_request(&frame.payload) {
+                    Ok(request) => self.bucket_write_drain_exists_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1328,6 +1342,15 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::BucketMarkDeletingCommandBuild => {
+                match decode_bucket_mark_deleting_command_build_request(&frame.payload) {
+                    Ok(request) => self.bucket_mark_deleting_command_build_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::BucketSubresourceGet => {
                 match decode_bucket_subresource_get_request(&frame.payload) {
                     Ok(request) => self.bucket_subresource_get_response(request),
@@ -1699,6 +1722,39 @@ impl StorageNodeConnectionHandler {
                 let payload = encode_bucket_write_drain_optional_record_response(
                     &StorageRpcBucketWriteDrainOptionalRecordResponse { record },
                 )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_write_drain_exists_response(
+        &self,
+        request: StorageRpcBucketRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.bucket,
+            "bucket write drain exists",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
+        ) {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
@@ -3925,6 +3981,15 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let result = match (&request.mutation, request.command.payload()) {
             (
+                StorageRpcBucketMetadataControlMutation::MarkDeleting,
+                MetadataCommandPayload::MarkBucketDeleting(command),
+            ) => BucketMetadataNodeClient::pending_mark_bucket_deleting_command_matches_current(
+                &local_client,
+                request.bucket.pg_id,
+                &request.bucket.bucket,
+                command,
+            ),
+            (
                 StorageRpcBucketMetadataControlMutation::Versioning(state),
                 MetadataCommandPayload::PutBucketVersioning(command),
             ) => BucketMetadataNodeClient::pending_put_bucket_versioning_command_matches_current(
@@ -3991,6 +4056,12 @@ impl StorageNodeConnectionHandler {
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let result = match &request.mutation {
+            StorageRpcBucketMetadataControlMutation::MarkDeleting => {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "mark-deleting command build uses a dedicated RPC".to_string(),
+                });
+            }
             StorageRpcBucketMetadataControlMutation::Versioning(state) => {
                 BucketMetadataNodeClient::build_put_bucket_versioning_command(
                     &local_client,
@@ -4036,6 +4107,64 @@ impl StorageNodeConnectionHandler {
             Ok(command) => {
                 let payload = encode_bucket_metadata_control_command_build_response(
                     &StorageRpcBucketMetadataControlCommandBuildResponse { command },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_mark_deleting_command_build_response(
+        &self,
+        request: StorageRpcBucketMarkDeletingCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_bucket_metadata_control_route(
+            &request.bucket,
+            "bucket mark-deleting command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketMetadataNodeClient::build_mark_bucket_deleting_command(
+            &local_client,
+            request.bucket.pg_id,
+            &request.bucket.bucket,
+            request.command_id,
+        ) {
+            Ok(MarkBucketDeletingCommandBuild::AlreadyDeleting) => {
+                let info = match BucketMetadataNodeClient::head_bucket_raw(
+                    &local_client,
+                    request.bucket.pg_id,
+                    &request.bucket.bucket,
+                ) {
+                    Ok(info) if info.state == BucketState::Deleting => info,
+                    Ok(_) => {
+                        return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                            code: StorageRpcErrorCode::Internal,
+                            message: "mark-deleting builder reported non-deleting bucket as already deleting"
+                                .to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        return encode_storage_rpc_error_response(&bucket_snapshot_error_response(
+                            error,
+                        ));
+                    }
+                };
+                let payload = encode_bucket_mark_deleting_command_build_response(
+                    &StorageRpcBucketMarkDeletingCommandBuildResponse {
+                        outcome: StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(
+                            info,
+                        ),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Ok(MarkBucketDeletingCommandBuild::Command(command)) => {
+                let payload = encode_bucket_mark_deleting_command_build_response(
+                    &StorageRpcBucketMarkDeletingCommandBuildResponse {
+                        outcome: StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(command),
+                    },
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
@@ -5899,7 +6028,8 @@ mod tests {
         MetadataCommandPayload, ReserveObjectGenerationCommand,
     };
     use crate::storage_rpc::{
-        decode_health_response, decode_metadata_command_acceptance_response,
+        decode_bucket_mark_deleting_command_build_response, decode_health_response,
+        decode_metadata_command_acceptance_response,
         decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_response,
         decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
         decode_metadata_command_pending_envelope_response,
@@ -5908,14 +6038,17 @@ mod tests {
         decode_metadata_command_state_response, decode_read_handle_acquire_response,
         decode_read_handle_release_response, decode_scavenger_list_files_response,
         decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-        decode_storage_rpc_response_payload, encode_metadata_command_matching_applied_request,
-        encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_request,
-        encode_metadata_command_request, encode_metadata_command_state_request,
-        encode_read_handle_acquire_request, encode_read_handle_release_request,
-        encode_scavenger_list_files_request, encode_shard_ack_batch_request,
-        encode_shard_delete_request, encode_shard_read_range_request, encode_shard_read_request,
-        encode_shard_write_request, encode_storage_rpc_frame, read_storage_rpc_frame_from,
-        write_storage_rpc_frame_to, StorageRpcMetadataCommandAcceptanceOutcome,
+        decode_storage_rpc_response_payload, encode_bucket_mark_deleting_command_build_request,
+        encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+        encode_metadata_command_pending_slot_request, encode_metadata_command_request,
+        encode_metadata_command_state_request, encode_read_handle_acquire_request,
+        encode_read_handle_release_request, encode_scavenger_list_files_request,
+        encode_shard_ack_batch_request, encode_shard_delete_request,
+        encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
+        encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        StorageRpcBucketMarkDeletingCommandBuildOutcome,
+        StorageRpcBucketMarkDeletingCommandBuildRequest, StorageRpcBucketRequest,
+        StorageRpcMetadataCommandAcceptanceOutcome,
         StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdRequest,
         StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
@@ -7217,6 +7350,77 @@ mod tests {
                 log_index: 5,
             }
         );
+    }
+
+    #[test]
+    fn storage_node_server_build_mark_deleting_returns_already_deleting_bucket() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("mark-deleting-already-rpc");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            crate::PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            crate::PgMetadataStore::mark_bucket_deleting(&*pg, &bucket).unwrap();
+        }
+
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let command_id = MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        );
+        let request = StorageRpcBucketMarkDeletingCommandBuildRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                bucket: bucket.clone(),
+            },
+            command_id,
+        };
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::BucketMarkDeletingCommandBuild,
+            encode_bucket_mark_deleting_command_build_request(&request).unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_bucket_mark_deleting_command_build_response(&payload).unwrap();
+        match decoded.outcome {
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
+                assert_eq!(info.name, bucket);
+                assert_eq!(info.state, BucketState::Deleting);
+            }
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(_) => {
+                panic!("expected already-deleting mark bucket response")
+            }
+        }
     }
 
     #[test]

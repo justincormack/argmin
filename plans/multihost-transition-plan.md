@@ -5602,16 +5602,18 @@ post-commit object through the broad storage client, and the residual
 live-object helper routes through the object-read metadata RPC boundary.
 Bucket-head reads used by bucket property/subresource writers, delete begin,
 finalization checks, drain waits, and reclaim-incarnation lookup now use the
-dedicated bucket metadata RPC boundary. Durable bucket write-drain acquire,
-clear, clear-expired, reservation listing, bucket-delete finalizer claim
+dedicated bucket metadata RPC boundary. Durable bucket write-drain existence,
+acquire, clear, clear-expired, reservation listing, bucket-delete finalizer claim
 acquire/release, finalize-root scans, and finalized-bucket deletion now route
 through the bucket write coordination RPC boundary. Lifecycle sweep bucket/root
 discovery and durable lifecycle claim acquire/heartbeat/error/release now use
 that same bucket write coordination RPC boundary, so lifecycle sweeper
-coordination runs against the storage-node-owned bucket PG. Bucket versioning,
-ACL, property, and subresource command matching/building now route through a
-bucket metadata control RPC, and subresource reads use the bucket metadata RPC
-boundary. Public object listing page reads (`ListObjects`, object versions,
+coordination runs against the storage-node-owned bucket PG. Mark-bucket-deleting
+pending-command matching and command construction now route through the bucket
+metadata RPC boundary, preserving the distinct AlreadyDeleting outcome. Bucket
+versioning, ACL, property, and subresource command matching/building now route
+through a bucket metadata control RPC, and subresource reads use the bucket
+metadata RPC boundary. Public object listing page reads (`ListObjects`, object versions,
 and multipart upload listing) now route through a dedicated object-listing
 metadata RPC boundary, and bucket-delete emptiness checks use the same listing
 client instead of the broad storage-client surface. Owner bucket listing,

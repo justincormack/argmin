@@ -1002,7 +1002,7 @@ migrated_simple_object_read_bypasses=$(
             || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
             pending_bucket_metadata_client = 1
         }
-        if ($0 ~ /\.(pending_put_bucket_versioning_command_matches_current|build_put_bucket_versioning_command|pending_put_bucket_acl_command_matches_current|build_put_bucket_acl_command|pending_put_bucket_property_command_matches_current|build_put_bucket_property_command|build_put_bucket_subresource_command|get_bucket_subresource)\(/) {
+        if ($0 ~ /\.(pending_mark_bucket_deleting_command_matches_current|build_mark_bucket_deleting_command|pending_put_bucket_versioning_command_matches_current|build_put_bucket_versioning_command|pending_put_bucket_acl_command_matches_current|build_put_bucket_acl_command|pending_put_bucket_property_command_matches_current|build_put_bucket_property_command|build_put_bucket_subresource_command|get_bucket_subresource)\(/) {
             if (pending_bucket_metadata_client \
                 || $0 ~ /\.bucket_metadata_client\(\)/ \
                 || $0 ~ /bucket_metadata_client\./) {
@@ -1592,7 +1592,7 @@ lifecycle_sweep_coordination_broad_client_bypasses=$(
             || $0 ~ /bucket_write_reservation_client[[:space:]]*$/) {
             pending_bucket_write_client = 1
         }
-        if ($0 ~ /\.(list_lifecycle_sweep_buckets|get_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)\(/) {
+        if ($0 ~ /\.(durable_bucket_write_drain_exists|list_lifecycle_sweep_buckets|get_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)\(/) {
             if ($0 ~ /self\.list_lifecycle_sweep_buckets\(/) {
                 next
             }

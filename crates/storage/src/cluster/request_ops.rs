@@ -1314,7 +1314,7 @@ impl super::StorageCluster {
                 }
 
                 if primary
-                    .storage_client()
+                    .bucket_write_reservation_client()
                     .durable_bucket_write_drain_exists(pg_id, bucket)?
                 {
                     self.wait_for_durable_bucket_write_drain(bucket)?;
@@ -1953,7 +1953,7 @@ impl super::StorageCluster {
                         if mark.bucket_name() == bucket =>
                     {
                         if !node_store
-                            .storage_client()
+                            .bucket_metadata_client()
                             .pending_mark_bucket_deleting_command_matches_current(
                                 pg_id, bucket, mark,
                             )
@@ -2049,7 +2049,7 @@ impl super::StorageCluster {
                     Err(error) => return Err(BucketWriteDrainError::from(error)),
                 };
                 let command = match node_store
-                    .storage_client()
+                    .bucket_metadata_client()
                     .build_mark_bucket_deleting_command(pg_id, bucket, command_id)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {

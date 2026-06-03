@@ -30,6 +30,7 @@ use crate::storage_rpc::{
     decode_bucket_delete_finalize_roots_response, decode_bucket_delete_finalized_response,
     decode_bucket_execution_generations_response, decode_bucket_fast_path_identities_response,
     decode_bucket_info_outcome_response, decode_bucket_list_response,
+    decode_bucket_mark_deleting_command_build_response,
     decode_bucket_metadata_control_command_build_response, decode_bucket_snapshot_pair_response,
     decode_bucket_snapshot_response, decode_bucket_subresource_get_response,
     decode_bucket_write_drain_begin_response, decode_bucket_write_drain_optional_record_response,
@@ -67,6 +68,7 @@ use crate::storage_rpc::{
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
     encode_bucket_delete_finalize_roots_request, encode_bucket_list_request,
+    encode_bucket_mark_deleting_command_build_request,
     encode_bucket_metadata_control_command_build_request,
     encode_bucket_metadata_control_pending_match_request, encode_bucket_pg_request,
     encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
@@ -110,6 +112,8 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizedOutcome, StorageRpcBucketDeleteFinalizedResponse,
     StorageRpcBucketInfoOutcome, StorageRpcBucketListRequest,
+    StorageRpcBucketMarkDeletingCommandBuildOutcome,
+    StorageRpcBucketMarkDeletingCommandBuildRequest,
     StorageRpcBucketMetadataControlCommandBuildRequest, StorageRpcBucketMetadataControlMutation,
     StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
     StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
@@ -962,6 +966,20 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         command_id: MetadataCommandId,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
 
+    fn pending_mark_bucket_deleting_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MarkBucketDeletingCommand,
+    ) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn build_mark_bucket_deleting_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError>;
+
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
         pg_id: PgId,
@@ -1049,6 +1067,12 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 }
 
 pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
+    fn durable_bucket_write_drain_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError>;
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
@@ -1945,20 +1969,6 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
-
-    fn pending_mark_bucket_deleting_command_matches_current(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MarkBucketDeletingCommand,
-    ) -> Result<bool, BucketSnapshotLoadError>;
-
-    fn build_mark_bucket_deleting_command(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-    ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError>;
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
@@ -4166,6 +4176,44 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn pending_mark_bucket_deleting_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MarkBucketDeletingCommand,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        pending_bucket_command_matches_current(current, &command.bucket, |record| {
+            Ok(MarkBucketDeletingCommand::from_bucket(
+                record.with_execution_generation(command.bucket.bucket_execution_generation),
+            )
+            .bucket)
+        })
+    }
+
+    fn build_mark_bucket_deleting_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        if current.state == BucketState::Deleting {
+            return Ok(MarkBucketDeletingCommandBuild::AlreadyDeleting);
+        }
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        Ok(MarkBucketDeletingCommandBuild::Command(Box::new(
+            MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                    current.with_execution_generation(bucket_execution_generation),
+                )),
+            ),
+        )))
+    }
+
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
         pg_id: PgId,
@@ -4304,6 +4352,14 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 }
 
 impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
+    fn durable_bucket_write_drain_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::durable_bucket_write_drain_exists(self, pg_id, bucket)
+    }
+
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
@@ -5208,6 +5264,77 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         )
     }
 
+    fn pending_mark_bucket_deleting_command_matches_current(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MarkBucketDeletingCommand,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                self.cluster_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(1).expect("nonzero log index"),
+            ),
+            MetadataCommandPayload::MarkBucketDeleting(command.clone()),
+        );
+        self.bucket_metadata_control_pending_match(
+            pg_id,
+            bucket,
+            &command,
+            StorageRpcBucketMetadataControlMutation::MarkDeleting,
+        )
+    }
+
+    fn build_mark_bucket_deleting_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketMarkDeletingCommandBuildRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            command_id,
+        };
+        let payload =
+            encode_bucket_mark_deleting_command_build_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket mark-deleting command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketMarkDeletingCommandBuild,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_mark_deleting_command_build_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket mark-deleting command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
+                self.validate_mark_bucket_deleting_already_deleting_response(&info, bucket)?;
+                Ok(MarkBucketDeletingCommandBuild::AlreadyDeleting)
+            }
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(command) => {
+                let command = self.validate_mark_bucket_deleting_command_build_response(
+                    *command, bucket, command_id,
+                )?;
+                Ok(MarkBucketDeletingCommandBuild::Command(Box::new(command)))
+            }
+        }
+    }
+
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
         pg_id: PgId,
@@ -5737,6 +5864,30 @@ fn validate_list_multipart_uploads_response(
 }
 
 impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
+    fn durable_bucket_write_drain_exists(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteDrainExists, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_metadata_command_bool_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket write drain exists response",
+                error.to_string(),
+            ))
+        })?;
+        Ok(response.value)
+    }
+
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
@@ -10010,6 +10161,46 @@ impl UnixStorageNodeClient {
         Ok(command)
     }
 
+    fn validate_mark_bucket_deleting_command_build_response(
+        &self,
+        command: MetadataCommandEnvelope,
+        bucket: &BucketName,
+        command_id: MetadataCommandId,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        if command.id() != command_id {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket mark-deleting command build response",
+                "response command id does not match request".to_string(),
+            )));
+        }
+        let valid = matches!(
+            command.payload(),
+            MetadataCommandPayload::MarkBucketDeleting(mark)
+                if mark.bucket.name == *bucket && mark.bucket.state == BucketState::Deleting
+        );
+        if !valid {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket mark-deleting command build response",
+                "response command payload does not match request".to_string(),
+            )));
+        }
+        Ok(command)
+    }
+
+    fn validate_mark_bucket_deleting_already_deleting_response(
+        &self,
+        info: &BucketInfo,
+        bucket: &BucketName,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if info.name == *bucket && info.state == BucketState::Deleting {
+            return Ok(());
+        }
+        Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+            "validate bucket mark-deleting command build response",
+            "already-deleting response identity does not match request".to_string(),
+        )))
+    }
+
     fn validate_bucket_snapshot_pair_response(
         &self,
         pair: &BucketSnapshotPair,
@@ -10524,44 +10715,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 ),
             ),
         ))
-    }
-
-    fn pending_mark_bucket_deleting_command_matches_current(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MarkBucketDeletingCommand,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            Ok(MarkBucketDeletingCommand::from_bucket(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-            )
-            .bucket)
-        })
-    }
-
-    fn build_mark_bucket_deleting_command(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-    ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        if current.state == BucketState::Deleting {
-            return Ok(MarkBucketDeletingCommandBuild::AlreadyDeleting);
-        }
-        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
-        Ok(MarkBucketDeletingCommandBuild::Command(Box::new(
-            MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
-                    current.with_execution_generation(bucket_execution_generation),
-                )),
-            ),
-        )))
     }
 
     fn pending_put_bucket_versioning_command_matches_current(
@@ -13133,6 +13286,155 @@ mod tests {
     }
 
     #[test]
+    fn unix_mark_bucket_deleting_build_response_rejects_mismatched_identity() {
+        let tmp = test_util::tempdir();
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+        );
+        let bucket = crate::tests::bucket_name("mark-deleting-rpc-expected");
+        let wrong_bucket = crate::tests::bucket_name("mark-deleting-rpc-wrong");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let command_id = MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        );
+        let wrong_bucket_record = BucketRecord::from_create_config(
+            &crate::CreateBucketConfig {
+                name: wrong_bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            },
+            123,
+            1,
+        )
+        .unwrap();
+        let wrong_bucket_command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                wrong_bucket_record,
+            )),
+        );
+
+        let err = client
+            .validate_mark_bucket_deleting_command_build_response(
+                wrong_bucket_command,
+                &bucket,
+                command_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate bucket mark-deleting command build response",
+                ..
+            })
+        ));
+
+        let active_bucket_record = BucketRecord::from_create_config(
+            &crate::CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: crate::BucketVersioningState::Disabled,
+                object_lock: crate::BucketObjectLockConfig::default(),
+            },
+            123,
+            1,
+        )
+        .unwrap();
+        let active_state_command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand {
+                bucket: active_bucket_record,
+            }),
+        );
+        let err = client
+            .validate_mark_bucket_deleting_command_build_response(
+                active_state_command,
+                &bucket,
+                command_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate bucket mark-deleting command build response",
+                ..
+            })
+        ));
+
+        let create_bucket_config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+        let wrong_payload_command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&create_bucket_config, 123, 1).unwrap(),
+            ),
+        );
+
+        let err = client
+            .validate_mark_bucket_deleting_command_build_response(
+                wrong_payload_command,
+                &bucket,
+                command_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate bucket mark-deleting command build response",
+                ..
+            })
+        ));
+
+        let mut active_info = test_bucket_info(bucket.clone(), &owner, &acl_grants);
+        active_info.state = BucketState::Active;
+        let err = client
+            .validate_mark_bucket_deleting_already_deleting_response(&active_info, &bucket)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate bucket mark-deleting command build response",
+                ..
+            })
+        ));
+
+        let mut deleting_info = test_bucket_info(wrong_bucket, &owner, &acl_grants);
+        deleting_info.state = BucketState::Deleting;
+        let err = client
+            .validate_mark_bucket_deleting_already_deleting_response(&deleting_info, &bucket)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "validate bucket mark-deleting command build response",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn unix_object_read_snapshot_response_rejects_missing_multipart_parts() {
         let bucket = crate::tests::bucket_name("object-read-missing-part-rpc");
         let key = crate::tests::object_key("object-read-missing-part-rpc-key");
@@ -13791,7 +14093,7 @@ mod tests {
         };
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..9)
+        let server_threads: Vec<_> = (0..11)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -13825,12 +14127,28 @@ mod tests {
         .unwrap();
         assert_eq!(drain.bucket, bucket);
         assert_eq!(drain.drain_id, "drain-rpc-1");
+        assert!(
+            BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
+                &client,
+                PgId::new(0),
+                &bucket,
+            )
+            .unwrap()
+        );
         BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
             &client,
             PgId::new(0),
             &drain,
         )
         .unwrap();
+        assert!(
+            !BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
+                &client,
+                PgId::new(0),
+                &bucket,
+            )
+            .unwrap()
+        );
 
         BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
             &client,

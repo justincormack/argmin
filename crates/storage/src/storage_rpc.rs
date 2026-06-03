@@ -396,6 +396,8 @@ pub(crate) enum StorageRpcMessageKind {
     BucketList = 100,
     BucketExecutionGenerations = 101,
     BucketFastPathIdentities = 102,
+    BucketMarkDeletingCommandBuild = 103,
+    BucketWriteDrainExists = 104,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,6 +540,7 @@ impl StorageRpcMessageKind {
             Self::BucketWriteDrainBegin => "bucket write drain begin",
             Self::BucketWriteDrainClear => "bucket write drain clear",
             Self::BucketWriteDrainClearExpired => "bucket write drain clear expired",
+            Self::BucketWriteDrainExists => "bucket write drain exists",
             Self::BucketWriteReservationsList => "bucket write reservations list",
             Self::BucketDeleteFinalized => "bucket delete finalized",
             Self::BucketDeleteFinalizeRoots => "bucket delete finalize roots",
@@ -558,6 +561,7 @@ impl StorageRpcMessageKind {
             Self::BucketList => "bucket list",
             Self::BucketExecutionGenerations => "bucket execution generations",
             Self::BucketFastPathIdentities => "bucket fast path identities",
+            Self::BucketMarkDeletingCommandBuild => "bucket mark deleting command build",
         }
     }
 
@@ -665,6 +669,8 @@ impl StorageRpcMessageKind {
             100 => Ok(Self::BucketList),
             101 => Ok(Self::BucketExecutionGenerations),
             102 => Ok(Self::BucketFastPathIdentities),
+            103 => Ok(Self::BucketMarkDeletingCommandBuild),
+            104 => Ok(Self::BucketWriteDrainExists),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1839,6 +1845,7 @@ pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StorageRpcBucketMetadataControlMutation {
+    MarkDeleting,
     Versioning(BucketVersioningState),
     Acl {
         acl_grants: AclGrants,
@@ -1866,6 +1873,23 @@ pub(crate) struct StorageRpcBucketMetadataControlCommandBuildRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketMetadataControlCommandBuildResponse {
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketMarkDeletingCommandBuildRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) command_id: crate::metadata_command::MetadataCommandId,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum StorageRpcBucketMarkDeletingCommandBuildOutcome {
+    AlreadyDeleting(BucketInfo),
+    Command(Box<crate::metadata_command::MetadataCommandEnvelope>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageRpcBucketMarkDeletingCommandBuildResponse {
+    pub(crate) outcome: StorageRpcBucketMarkDeletingCommandBuildOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2681,7 +2705,8 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::BucketWriteDrainClearExpired => {
             STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::BucketWriteReservationsList
+        StorageRpcMessageKind::BucketWriteDrainExists
+        | StorageRpcMessageKind::BucketWriteReservationsList
         | StorageRpcMessageKind::BucketDeleteFinalized => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         }
@@ -2695,7 +2720,8 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketMetadataControlPendingMatch
-        | StorageRpcMessageKind::BucketMetadataControlCommandBuild => {
+        | StorageRpcMessageKind::BucketMetadataControlCommandBuild
+        | StorageRpcMessageKind::BucketMarkDeletingCommandBuild => {
             STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketSubresourceGet => {
@@ -5300,6 +5326,41 @@ pub(crate) fn decode_bucket_metadata_control_command_build_request(
     })
 }
 
+pub(crate) fn encode_bucket_mark_deleting_command_build_request(
+    request: &StorageRpcBucketMarkDeletingCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.command_id.cluster_epoch() != request.bucket.cluster_epoch
+        || request.command_id.pg_id() != request.bucket.pg_id
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "command id route must match request route",
+        ));
+    }
+    let mut out = encode_bucket_request(&request.bucket);
+    put_u64(&mut out, request.command_id.log_index().get());
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_mark_deleting_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketMarkDeletingCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let log_index = crate::metadata_command::MetadataCommandLogIndex::new(decoder.read_u64()?)
+        .ok_or(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+            "metadata command log index must not be zero",
+        ))?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketMarkDeletingCommandBuildRequest {
+        command_id: crate::metadata_command::MetadataCommandId::new(
+            bucket.cluster_epoch,
+            bucket.pg_id,
+            log_index,
+        ),
+        bucket,
+    })
+}
+
 pub(crate) fn encode_bucket_subresource_get_request(
     request: &StorageRpcBucketSubresourceGetRequest,
 ) -> Vec<u8> {
@@ -5508,6 +5569,47 @@ pub(crate) fn decode_bucket_metadata_control_command_build_response(
     let command = decode_metadata_command_envelope(&command_bytes)
         .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
     Ok(StorageRpcBucketMetadataControlCommandBuildResponse { command })
+}
+
+pub(crate) fn encode_bucket_mark_deleting_command_build_response(
+    response: &StorageRpcBucketMarkDeletingCommandBuildResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match &response.outcome {
+        StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
+            put_u8(&mut out, 0);
+            put_bucket_info(&mut out, info);
+        }
+        StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(command) => {
+            put_u8(&mut out, 1);
+            put_bytes(&mut out, &command.command_bytes());
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_bucket_mark_deleting_command_build_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketMarkDeletingCommandBuildResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(
+            decoder.read_bucket_info()?,
+        ),
+        1 => {
+            let command_bytes = decoder.read_bytes()?.to_vec();
+            let command = decode_metadata_command_envelope(&command_bytes)
+                .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(Box::new(command))
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid bucket mark-deleting command build outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketMarkDeletingCommandBuildResponse { outcome })
 }
 
 pub(crate) fn encode_bucket_subresource_get_response(
@@ -10531,6 +10633,7 @@ impl<'a> StorageRpcDecoder<'a> {
             3 => Ok(StorageRpcBucketMetadataControlMutation::Subresource(
                 self.read_bucket_subresource_mutation()?,
             )),
+            4 => Ok(StorageRpcBucketMetadataControlMutation::MarkDeleting),
             _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
                 "invalid bucket metadata control mutation tag",
             )),
@@ -11124,6 +11227,9 @@ fn put_bucket_metadata_control_mutation(
         StorageRpcBucketMetadataControlMutation::Subresource(mutation) => {
             put_u8(out, 3);
             put_bucket_subresource_mutation(out, mutation);
+        }
+        StorageRpcBucketMetadataControlMutation::MarkDeleting => {
+            put_u8(out, 4);
         }
     }
 }
@@ -12272,8 +12378,8 @@ mod tests {
     use crate::{
         metadata_command::{
             AdvanceCompletedMultipartUploadSequenceCommand, CreateBucketCommand,
-            MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-            MetadataCommandPayload,
+            MarkBucketDeletingCommand, MetadataCommandEnvelope, MetadataCommandId,
+            MetadataCommandLogIndex, MetadataCommandPayload,
         },
         types::{
             AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
@@ -13328,12 +13434,22 @@ mod tests {
                 STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::BucketWriteDrainExists,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::BucketMetadataControlPendingMatch,
                 STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::BucketMetadataControlCommandBuild,
+                STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketMarkDeletingCommandBuild,
                 STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
             ),
@@ -13827,6 +13943,97 @@ mod tests {
         let bytes = encode_bucket_fast_path_identities_response(&identities).unwrap();
         let decoded = decode_bucket_fast_path_identities_response(&bytes).unwrap();
         assert_eq!(decoded, identities);
+    }
+
+    #[test]
+    fn bucket_mark_deleting_command_build_request_and_response_round_trip() {
+        let bucket_request = StorageRpcBucketRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            bucket: BucketName::try_from("bucket").unwrap(),
+        };
+        let command_id = MetadataCommandId::new(
+            bucket_request.cluster_epoch,
+            bucket_request.pg_id,
+            MetadataCommandLogIndex::new(9).unwrap(),
+        );
+        let request = StorageRpcBucketMarkDeletingCommandBuildRequest {
+            bucket: bucket_request.clone(),
+            command_id,
+        };
+
+        let bytes = encode_bucket_mark_deleting_command_build_request(&request).unwrap();
+        let decoded = decode_bucket_mark_deleting_command_build_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+
+        let wrong_command_id = MetadataCommandId::new(
+            bucket_request.cluster_epoch,
+            PgId::new(4),
+            MetadataCommandLogIndex::new(9).unwrap(),
+        );
+        assert_eq!(
+            encode_bucket_mark_deleting_command_build_request(
+                &StorageRpcBucketMarkDeletingCommandBuildRequest {
+                    bucket: bucket_request.clone(),
+                    command_id: wrong_command_id,
+                }
+            ),
+            Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "command id route must match request route",
+            ))
+        );
+
+        let mut deleting_info = test_bucket_info("bucket");
+        deleting_info.state = BucketState::Deleting;
+        let already_deleting = StorageRpcBucketMarkDeletingCommandBuildResponse {
+            outcome: StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(
+                deleting_info,
+            ),
+        };
+        let bytes = encode_bucket_mark_deleting_command_build_response(&already_deleting);
+        let decoded = decode_bucket_mark_deleting_command_build_response(&bytes).unwrap();
+        match decoded.outcome {
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
+                assert_eq!(info.name.as_str(), "bucket");
+                assert_eq!(info.state, BucketState::Deleting);
+                assert_eq!(info.bucket_execution_generation, 17);
+            }
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(_) => {
+                panic!("expected already-deleting response")
+            }
+        }
+
+        let command = test_mark_bucket_deleting_command(command_id);
+        let command_response = StorageRpcBucketMarkDeletingCommandBuildResponse {
+            outcome: StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(Box::new(command)),
+        };
+        let bytes = encode_bucket_mark_deleting_command_build_response(&command_response);
+        let decoded = decode_bucket_mark_deleting_command_build_response(&bytes).unwrap();
+        match decoded.outcome {
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(command) => {
+                assert_eq!(command.id(), command_id);
+                assert!(matches!(
+                    command.payload(),
+                    MetadataCommandPayload::MarkBucketDeleting(mark)
+                        if mark.bucket.name.as_str() == "bucket"
+                            && mark.bucket.state == BucketState::Deleting
+                ));
+            }
+            StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(_) => {
+                panic!("expected command response")
+            }
+        }
+
+        let pending_match = StorageRpcBucketMetadataControlPendingMatchRequest {
+            bucket: bucket_request,
+            command: test_mark_bucket_deleting_command(command_id),
+            mutation: StorageRpcBucketMetadataControlMutation::MarkDeleting,
+        };
+        let bytes = encode_bucket_metadata_control_pending_match_request(&pending_match).unwrap();
+        let decoded = decode_bucket_metadata_control_pending_match_request(&bytes).unwrap();
+        assert_eq!(decoded, pending_match);
     }
 
     #[test]
@@ -14547,6 +14754,32 @@ mod tests {
             MetadataCommandLogIndex::new(9).unwrap(),
         );
         MetadataCommandEnvelope::new(id, MetadataCommandPayload::CreateBucket(command))
+    }
+
+    fn test_mark_bucket_deleting_command(command_id: MetadataCommandId) -> MetadataCommandEnvelope {
+        let owner = CanonicalUserId::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        let bucket = crate::metadata_command::BucketRecord::from_create_config(
+            &CreateBucketConfig {
+                name: "bucket",
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Enabled,
+                object_lock: BucketObjectLockConfig::default(),
+            },
+            123,
+            7,
+        )
+        .unwrap();
+        MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                bucket,
+            )),
+        )
     }
 
     fn test_bucket_info(name: &str) -> BucketInfo {
