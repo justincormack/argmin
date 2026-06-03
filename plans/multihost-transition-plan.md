@@ -5600,6 +5600,10 @@ stream PUT finalization outcomes now derive live-object tags, size, and
 last-modified data from the installed/applied command instead of reloading the
 post-commit object through the broad storage client, and the residual
 live-object helper routes through the object-read metadata RPC boundary.
+Bucket-delete payload reclaim root checks now route through the
+object-mutation metadata RPC boundary, so delete finalization waits on
+storage-node-owned object PG reclaim roots instead of frontend-local object PG
+state.
 Bucket-head reads used by bucket property/subresource writers, delete begin,
 finalization checks, drain waits, and reclaim-incarnation lookup now use the
 dedicated bucket metadata RPC boundary. Durable bucket write-drain existence,
@@ -5694,8 +5698,9 @@ Implementation slices:
    completion/abort command identity before publication. Stream upload
    session loads, staged-segment listing, PG-wide stream-upload listing for
    bucket delete/best-effort cleanup, completed-MPU tombstone listing for
-   bucket-delete cleanup, and stream-segment append preparation now use the same
-   object-mutation metadata RPC boundary. Multipart upload
+   bucket-delete cleanup, bucket-delete payload reclaim root checks, and
+   stream-segment append preparation now use the same object-mutation metadata
+   RPC boundary. Multipart upload
    read/list/management helpers now use the same object-mutation metadata RPC
    boundary and validate returned upload, completion snapshot, part list, and
    management lookup identities. Bucket property/subresource command
@@ -5747,10 +5752,10 @@ Required tests:
    bucket-write reservation/proof release, stream-upload and multipart-upload
    initiation command builders, public object/version/multipart-upload listing
    pages, owner bucket listing, bucket execution-generation and fast-path
-   identity batch reads, durable pending/drain checks, and remaining
-   operation-shaped command builders. Proof release must reject the correct PG
-   on a non-primary node even when that node appears first in the acting-set
-   route list.
+   identity batch reads, bucket-delete payload reclaim root scans, durable
+   pending/drain checks, and remaining operation-shaped command builders. Proof
+   release must reject the correct PG on a non-primary node even when that node
+   appears first in the acting-set route list.
 9. two independent frontend maps over one storage-node must handle stale
    object-generation selection: the loser may read generation `N`, the winner
    publishes `ReserveObjectGeneration(N)`, and the loser must retry to `N+1`

@@ -30,13 +30,14 @@ use crate::{
         ObjectPartRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
         ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention,
         ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-        OwnerIdentity, PgId, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
-        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
-        ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus, StoredObject,
-        StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
-        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-        VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
+        OwnerIdentity, PayloadReclaimRoot, PgId, PrepareStreamUploadSegmentAppendReq,
+        PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+        SerializedTagSet, SessionId, ShardIndex, ShardKey, StorageClass, StoredLegalHoldStatus,
+        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck, SESSION_ID_LEN,
+        SHARD_KEY_LEN, UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -404,6 +405,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectStreamUploadsList = 105,
     ObjectCompletedMultipartUploadsList = 106,
     ObjectPayloadReclaimExists = 107,
+    ObjectBucketPayloadReclaimRoot = 108,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +573,7 @@ impl StorageRpcMessageKind {
             Self::ObjectStreamUploadsList => "object stream uploads list",
             Self::ObjectCompletedMultipartUploadsList => "object completed multipart uploads list",
             Self::ObjectPayloadReclaimExists => "object payload reclaim exists",
+            Self::ObjectBucketPayloadReclaimRoot => "object bucket payload reclaim root",
         }
     }
 
@@ -683,6 +686,7 @@ impl StorageRpcMessageKind {
             105 => Ok(Self::ObjectStreamUploadsList),
             106 => Ok(Self::ObjectCompletedMultipartUploadsList),
             107 => Ok(Self::ObjectPayloadReclaimExists),
+            108 => Ok(Self::ObjectBucketPayloadReclaimRoot),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -948,6 +952,11 @@ pub(crate) struct StorageRpcObjectGenerationReservationRequest {
 pub(crate) struct StorageRpcObjectPayloadReclaimExistsRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) generation_id: GenerationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPayloadReclaimRootResponse {
+    pub(crate) root: Option<PayloadReclaimRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2673,6 +2682,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot => {
+            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectPayloadReclaimExists => {
             STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN
         }
@@ -3280,6 +3292,23 @@ pub(crate) fn decode_object_payload_reclaim_exists_request(
         object,
         generation_id,
     })
+}
+
+pub(crate) fn encode_payload_reclaim_root_response(
+    response: &StorageRpcPayloadReclaimRootResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_optional_payload_reclaim_root(&mut out, response.root.as_ref());
+    out
+}
+
+pub(crate) fn decode_payload_reclaim_root_response(
+    bytes: &[u8],
+) -> Result<StorageRpcPayloadReclaimRootResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let root = decoder.read_optional_payload_reclaim_root()?;
+    decoder.finish()?;
+    Ok(StorageRpcPayloadReclaimRootResponse { root })
 }
 
 pub(crate) fn encode_multipart_completion_stale_source_response(
@@ -8933,6 +8962,22 @@ impl<'a> StorageRpcDecoder<'a> {
         ))
     }
 
+    fn read_optional_payload_reclaim_root(
+        &mut self,
+    ) -> Result<Option<PayloadReclaimRoot>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(PayloadReclaimRoot {
+                bucket: self.read_bucket_name()?,
+                key: self.read_object_key()?,
+                generation_id: self.read_generation_id()?,
+            })),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional payload reclaim root tag",
+            )),
+        }
+    }
+
     fn read_object_payload_reclaim_kind(
         &mut self,
     ) -> Result<ObjectPayloadReclaimKind, StorageRpcPayloadError> {
@@ -11471,6 +11516,18 @@ fn put_optional_object_payload_reclaim(
     }
 }
 
+fn put_optional_payload_reclaim_root(out: &mut Vec<u8>, root: Option<&PayloadReclaimRoot>) {
+    match root {
+        Some(root) => {
+            put_u8(out, 1);
+            put_string(out, root.bucket.as_str());
+            put_string(out, root.key.as_str());
+            put_u64(out, root.generation_id.get());
+        }
+        None => put_u8(out, 0),
+    }
+}
+
 fn put_object_payload_reclaim(out: &mut Vec<u8>, reclaim: &ObjectPayloadReclaimCommand) {
     match reclaim {
         ObjectPayloadReclaimCommand::Segments(reclaim) => {
@@ -13486,6 +13543,11 @@ mod tests {
                 StorageRpcMessageKind::ObjectPayloadReclaimExists,
                 STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::DirectPutCommitSnapshotLoad,

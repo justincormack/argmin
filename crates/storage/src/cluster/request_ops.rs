@@ -2367,14 +2367,36 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             if let Some(root) = node
-                .storage_client()
+                .object_mutation_metadata_client()
                 .get_bucket_payload_reclaim_root(PgId::new(pg_id), bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
             {
+                self.validate_bucket_payload_reclaim_root_for_pg(
+                    PgId::new(pg_id),
+                    &root,
+                    node.node_id(),
+                )?;
                 roots.push(root);
             }
         }
         Ok(roots)
+    }
+
+    pub(crate) fn validate_bucket_payload_reclaim_root_for_pg(
+        &self,
+        requested_pg_id: PgId,
+        root: &PayloadReclaimRoot,
+        node_id: NodeId,
+    ) -> Result<(), BucketWriteDrainError> {
+        if self.object_metadata_pg_id(&root.bucket, &root.key) != requested_pg_id.get() {
+            return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
+                node_id: node_id.as_u32(),
+                operation: "object bucket payload reclaim root",
+                message: "payload reclaim root does not belong to requested object metadata PG"
+                    .to_string(),
+            }));
+        }
+        Ok(())
     }
 
     fn delete_completed_multipart_uploads_for_bucket(

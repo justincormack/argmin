@@ -101,16 +101,16 @@ use crate::storage_rpc::{
     encode_object_lifecycle_version_list_response, encode_object_metadata_command_build_response,
     encode_object_read_auth_subject_response, encode_object_read_snapshot_response,
     encode_object_tags_for_subject_response, encode_object_version_response,
-    encode_put_object_metadata_snapshot_response, encode_read_handle_acquire_response,
-    encode_read_handle_release_response, encode_scavenger_list_files_response,
-    encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
-    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
-    encode_stream_part_finalize_snapshot_response, encode_stream_put_finalize_snapshot_response,
-    encode_stream_segment_append_prepare_response, encode_stream_upload_match_response,
-    encode_stream_upload_segments_response, encode_stream_upload_session_response,
-    encode_stream_uploads_list_response, read_storage_rpc_request_frame_from,
-    write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
-    StorageRpcAbortMultipartCommandBuildRequest,
+    encode_payload_reclaim_root_response, encode_put_object_metadata_snapshot_response,
+    encode_read_handle_acquire_response, encode_read_handle_release_response,
+    encode_scavenger_list_files_response, encode_shard_read_range_response,
+    encode_shard_read_response, encode_shard_write_ack, encode_storage_rpc_error_response,
+    encode_storage_rpc_success_response, encode_stream_part_finalize_snapshot_response,
+    encode_stream_put_finalize_snapshot_response, encode_stream_segment_append_prepare_response,
+    encode_stream_upload_match_response, encode_stream_upload_segments_response,
+    encode_stream_upload_session_response, encode_stream_uploads_list_response,
+    read_storage_rpc_request_frame_from, write_storage_rpc_frame_to,
+    StorageRpcAbortMultipartCleanupResponse, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
@@ -188,14 +188,14 @@ use crate::storage_rpc::{
     StorageRpcObjectReadSnapshotRequest, StorageRpcObjectReadSnapshotResponse,
     StorageRpcObjectRequest, StorageRpcObjectTagsForSubjectOutcome,
     StorageRpcObjectTagsForSubjectRequest, StorageRpcObjectTagsForSubjectResponse,
-    StorageRpcObjectVersionResponse, StorageRpcProofReleaseRequest,
-    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
-    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcPutObjectMetadataSnapshotResponse,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
-    StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcObjectVersionResponse, StorageRpcPayloadReclaimRootResponse,
+    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
+    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
+    StorageRpcPutObjectMetadataSnapshotResponse, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
+    StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest,
+    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
@@ -901,6 +901,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
                 match decode_bucket_request(&frame.payload) {
                     Ok(request) => self.completed_multipart_uploads_list_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot => {
+                match decode_bucket_request(&frame.payload) {
+                    Ok(request) => self.bucket_payload_reclaim_root_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -2895,6 +2904,36 @@ impl StorageNodeConnectionHandler {
         let payload = encode_completed_multipart_uploads_list_response(
             &StorageRpcCompletedMultipartUploadsListResponse { records },
         )?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn bucket_payload_reclaim_root_response(
+        &self,
+        request: StorageRpcBucketRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.pg_id, "object bucket payload reclaim root")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let root = match ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        let payload =
+            encode_payload_reclaim_root_response(&StorageRpcPayloadReclaimRootResponse { root });
         Ok(encode_storage_rpc_success_response(&payload))
     }
 

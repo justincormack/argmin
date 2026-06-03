@@ -3830,6 +3830,55 @@ mod tests {
         panic!("test topology did not produce a bucket for PG {target_pg_id}");
     }
 
+    #[test]
+    fn bucket_payload_reclaim_root_validation_rejects_wrong_object_pg() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 0, "payload-root-validation-");
+        let key_pg0 = key_for_object_pg(topology, &bucket, 0, "object-pg0-");
+        let key_pg1 = key_for_object_pg(topology, &bucket, 1, "object-pg1-");
+        let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+        cluster
+            .validate_bucket_payload_reclaim_root_for_pg(
+                PgId::new(0),
+                &crate::PayloadReclaimRoot {
+                    bucket: bucket.clone(),
+                    key: key_pg0,
+                    generation_id: crate::GenerationId::MIN,
+                },
+                NodeId::new(7),
+            )
+            .unwrap();
+        let err = cluster
+            .validate_bucket_payload_reclaim_root_for_pg(
+                PgId::new(0),
+                &crate::PayloadReclaimRoot {
+                    bucket,
+                    key: key_pg1,
+                    generation_id: crate::GenerationId::MIN,
+                },
+                NodeId::new(7),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::BucketWriteDrainError::Store(StoreError::StorageRpc {
+                node_id: 7,
+                operation: "object bucket payload reclaim root",
+                ..
+            })
+        ));
+    }
+
     fn create_test_bucket(cluster: &crate::StorageCluster, bucket: &crate::BucketName) {
         let owner = crate::CanonicalUserId::from_principal("owner");
         let acl_grants = crate::AclGrants::default();

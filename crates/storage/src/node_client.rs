@@ -56,14 +56,15 @@ use crate::storage_rpc::{
     decode_object_lifecycle_version_list_response, decode_object_metadata_command_build_response,
     decode_object_read_auth_subject_response, decode_object_read_snapshot_response,
     decode_object_tags_for_subject_response, decode_object_version_response,
-    decode_put_object_metadata_snapshot_response, decode_read_handle_acquire_response,
-    decode_read_handle_release_response, decode_scavenger_list_files_response,
-    decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
-    decode_storage_rpc_response_payload, decode_stream_part_finalize_snapshot_response,
-    decode_stream_put_finalize_snapshot_response, decode_stream_segment_append_prepare_response,
-    decode_stream_upload_match_response, decode_stream_upload_segments_response,
-    decode_stream_upload_session_response, decode_stream_uploads_list_response,
-    encode_abort_multipart_cleanup_request, encode_abort_multipart_command_build_request,
+    decode_payload_reclaim_root_response, decode_put_object_metadata_snapshot_response,
+    decode_read_handle_acquire_response, decode_read_handle_release_response,
+    decode_scavenger_list_files_response, decode_shard_read_range_response,
+    decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
+    decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
+    decode_stream_segment_append_prepare_response, decode_stream_upload_match_response,
+    decode_stream_upload_segments_response, decode_stream_upload_session_response,
+    decode_stream_uploads_list_response, encode_abort_multipart_cleanup_request,
+    encode_abort_multipart_command_build_request,
     encode_authorized_abort_multipart_command_build_request, encode_bucket_batch_request,
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
@@ -155,17 +156,17 @@ use crate::storage_rpc::{
     StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadSnapshotOutcome,
     StorageRpcObjectReadSnapshotRequest, StorageRpcObjectRequest,
     StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
-    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
-    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-    StorageRpcScavengerListFilesRequest, StorageRpcShardAckBatchRequest, StorageRpcShardAckItem,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest, StorageRpcStreamPartCommitCommandBuildRequest,
-    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPutCommitCommandBuildRequest,
-    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamSegmentAppendPrepareOutcome,
-    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamUploadMatchRequest,
-    StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSessionOutcome,
-    StorageRpcStreamUploadSessionRequest,
+    StorageRpcPayloadReclaimRootResponse, StorageRpcProofReleaseRequest,
+    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
+    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardDeleteRequest,
+    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
+    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
+    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadSegmentsOutcome,
+    StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -1443,6 +1444,12 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError>;
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
     fn prepare_stream_segment_append(
         &self,
@@ -4929,6 +4936,14 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::payload_reclaim_exists(self, pg_id, bucket, key, generation_id)
     }
 
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_bucket_payload_reclaim_root(self, pg_id, bucket)
+    }
+
     fn prepare_stream_segment_append(
         &self,
         pg_id: PgId,
@@ -7517,6 +7532,34 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             ))
         })?;
         Ok(response.value)
+    }
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_payload_reclaim_root_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode object bucket payload reclaim root response",
+                error.to_string(),
+            ))
+        })?;
+        self.validate_bucket_payload_reclaim_root_response(&response, bucket)?;
+        Ok(response.root)
     }
 
     fn prepare_stream_segment_append(
@@ -10377,6 +10420,24 @@ impl UnixStorageNodeClient {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_bucket_payload_reclaim_root_response(
+        &self,
+        response: &StorageRpcPayloadReclaimRootResponse,
+        bucket: &BucketName,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if response
+            .root
+            .as_ref()
+            .is_some_and(|root| &root.bucket != bucket)
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate object bucket payload reclaim root response",
+                "payload reclaim root bucket does not match request".to_string(),
+            )));
         }
         Ok(())
     }
@@ -15462,7 +15523,7 @@ mod tests {
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..12)
+        let server_threads: Vec<_> = (0..13)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -15541,6 +15602,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(completed_uploads, vec![completed_upload.clone()]);
+        let reclaim_root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+            &client,
+            PgId::new(0),
+            &bucket,
+        )
+        .unwrap()
+        .expect("seeded reclaim root should exist");
+        assert_eq!(reclaim_root.bucket, bucket);
+        assert_eq!(reclaim_root.key, key);
+        assert_eq!(reclaim_root.generation_id, reclaim_generation_id);
+        client
+            .validate_bucket_payload_reclaim_root_response(
+                &StorageRpcPayloadReclaimRootResponse {
+                    root: Some(PayloadReclaimRoot {
+                        bucket: crate::tests::bucket_name("wrong-reclaim-root-bucket"),
+                        key: key.clone(),
+                        generation_id: reclaim_generation_id,
+                    }),
+                },
+                &bucket,
+            )
+            .unwrap_err();
         assert!(ObjectMutationMetadataNodeClient::payload_reclaim_exists(
             &client,
             PgId::new(0),
@@ -15829,6 +15912,39 @@ mod tests {
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "object payload reclaim exists",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unix_bucket_payload_reclaim_root_requires_pg_primary() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+        let bucket = crate::tests::bucket_name("bucket-reclaim-primary-rpc-bucket");
+
+        let err = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+            &client,
+            PgId::new(0),
+            &bucket,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "object bucket payload reclaim root",
                 ..
             })
         ));
