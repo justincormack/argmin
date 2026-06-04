@@ -7396,6 +7396,146 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-reclaim-finalize-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("reclaim-finalize-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let open_frontend = |name: &str| {
+            let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+                node_id,
+                [LocalNodeStoreConfig::new(
+                    node_id,
+                    tmp.path().join(name).join("node-0001"),
+                )],
+                &[0],
+                ec_shape,
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+            map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+                node_id,
+                socket_path.clone(),
+            )])
+            .unwrap();
+            let map = Arc::new(map);
+            let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            (map, cluster)
+        };
+
+        let (first_map, first_cluster) = open_frontend("frontend-reclaim-first");
+        let bucket = crate::tests::bucket_name("remote-reclaim-finalize");
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let committed =
+            write_committed_direct_segment_for(&first_cluster, &bucket, &key, b"remote reclaim");
+        first_cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(first_cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+        first_cluster.begin_bucket_delete(&bucket).unwrap();
+        drop(first_cluster);
+        drop(first_map);
+
+        let (reopened_map, reopened_cluster) = open_frontend("frontend-reclaim-reopened");
+        let reclaim_scan = reopened_cluster.enqueue_durable_object_payload_reclaim_roots();
+        assert_eq!(reclaim_scan.errors, 0);
+        assert_eq!(reclaim_scan.queued, 1);
+        assert!(matches!(
+            reopened_cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::ObjectPayload((
+                queued_bucket,
+                queued_key,
+                queued_generation_id,
+            ))) if queued_bucket == bucket
+                && queued_key == key
+                && queued_generation_id == committed.generation_id
+        ));
+        assert!(reopened_cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+            .unwrap());
+        assert!(!reopened_cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap());
+        let shard = committed
+            .written
+            .written_shards
+            .first()
+            .expect("single-shard test payload should write one shard");
+        let location = committed.locations[usize::from(shard.key.shard_index().get())];
+        let read_after_reclaim =
+            reopened_map.read_payload_shard(ClusterEpoch::INITIAL, location, &shard.key, shard.ack);
+        assert!(
+            matches!(read_after_reclaim, Err(ShardIoError::Store { .. })),
+            "remote shard read should fail after reclaim deletes the storage-node-owned file"
+        );
+
+        let finalize_scan = reopened_cluster.enqueue_durable_bucket_delete_finalize_roots();
+        assert_eq!(finalize_scan.errors, 0);
+        assert_eq!(finalize_scan.queued, 1);
+        assert!(matches!(
+            reopened_cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
+                if queued_bucket == bucket
+        ));
+        assert_eq!(
+            reopened_cluster
+                .try_finalize_bucket_delete(&bucket)
+                .unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+        assert!(matches!(
+            reopened_map
+                .node(node_id)
+                .unwrap()
+                .bucket_metadata_client()
+                .head_bucket_raw(PgId::new(0), &bucket),
+            Err(crate::BucketSnapshotLoadError::Metadata(
+                crate::MetadataError::BucketNotFound { .. }
+            ))
+        ));
+        assert!(crate::PgMetadataStore::head_bucket_raw(
+            &*reopened_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(0)
+                .unwrap(),
+            &bucket,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);

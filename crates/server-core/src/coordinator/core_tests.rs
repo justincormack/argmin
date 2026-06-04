@@ -82,7 +82,7 @@ fn rwlock_helpers_recover_after_panic() {
 }
 
 #[test]
-fn phase_10_6_remote_frontend_worker_mode_enables_only_shard_scavenger() {
+fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
 
@@ -99,7 +99,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_only_shard_scavenger() {
     assert_eq!(
         coord.background_worker_mode_for_test(),
         BackgroundWorkerMode {
-            object_reclaim_and_bucket_finalize: false,
+            object_reclaim_and_bucket_finalize: true,
             lifecycle: false,
             shard_scavenger: true,
         }

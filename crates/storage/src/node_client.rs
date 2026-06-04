@@ -140,12 +140,12 @@ use crate::storage_rpc::{
     StorageRpcDeleteCurrentObjectCommandBuildRequest,
     StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommitSnapshotRequest,
-    StorageRpcErrorResponse, StorageRpcFrame, StorageRpcInsertDeleteMarkerCommandBuildRequest,
-    StorageRpcInsertDeleteMarkerStalePayload, StorageRpcLifecycleSweepClaimAcquireRequest,
-    StorageRpcLifecycleSweepClaimErrorRequest, StorageRpcLifecycleSweepClaimHeartbeatRequest,
-    StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcLifecycleSweepRootsRequest,
-    StorageRpcListMultipartUploadsRequest, StorageRpcListObjectVersionsRequest,
-    StorageRpcListObjectsRequest, StorageRpcMessageKind,
+    StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame,
+    StorageRpcInsertDeleteMarkerCommandBuildRequest, StorageRpcInsertDeleteMarkerStalePayload,
+    StorageRpcLifecycleSweepClaimAcquireRequest, StorageRpcLifecycleSweepClaimErrorRequest,
+    StorageRpcLifecycleSweepClaimHeartbeatRequest, StorageRpcLifecycleSweepClaimRecordRequest,
+    StorageRpcLifecycleSweepRootsRequest, StorageRpcListMultipartUploadsRequest,
+    StorageRpcListObjectVersionsRequest, StorageRpcListObjectsRequest, StorageRpcMessageKind,
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
@@ -3768,6 +3768,17 @@ impl UnixStorageNodeClient {
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, StoreError> {
+        match self.rpc_request_result(kind, payload)? {
+            Ok(payload) => Ok(payload),
+            Err(error) => Err(self.rpc_response_error(kind, error)),
+        }
+    }
+
+    fn rpc_request_result(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let mut stream =
             UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
@@ -3794,12 +3805,9 @@ impl UnixStorageNodeClient {
                 ),
             ));
         }
-        match decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
+        decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
             self.rpc_payload_error("decode storage RPC response", error.to_string())
-        })? {
-            Ok(payload) => Ok(payload),
-            Err(error) => Err(self.rpc_response_error(kind, error)),
-        }
+        })
     }
 
     fn shard_location(
@@ -6845,12 +6853,25 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
+        let kind = StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease;
         let response = self
-            .rpc_request(
-                StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease,
-                payload,
-            )
+            .rpc_request_result(kind, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.code == StorageRpcErrorCode::ReclaimClaimNotFound => {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::ReclaimClaimNotFound {
+                        claim_id: error.message,
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.rpc_response_error(kind, error),
+                ));
+            }
+        };
         self.validate_empty_bucket_write_reservation_response(
             "decode bucket delete finalize claim release response",
             &response,

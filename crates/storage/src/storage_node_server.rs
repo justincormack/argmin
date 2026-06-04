@@ -6396,9 +6396,17 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
 }
 
 fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcErrorResponse {
-    StorageRpcErrorResponse {
-        code: StorageRpcErrorCode::Internal,
-        message: error.to_string(),
+    match error {
+        BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimNotFound { claim_id }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::ReclaimClaimNotFound,
+                message: claim_id,
+            }
+        }
+        error => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: error.to_string(),
+        },
     }
 }
 

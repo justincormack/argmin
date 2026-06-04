@@ -44,7 +44,7 @@ impl BackgroundWorkerMode {
 
     pub const fn remote_frontend_phase_10_6() -> Self {
         Self {
-            object_reclaim_and_bucket_finalize: false,
+            object_reclaim_and_bucket_finalize: true,
             lifecycle: false,
             shard_scavenger: true,
         }

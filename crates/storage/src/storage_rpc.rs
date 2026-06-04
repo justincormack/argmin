@@ -496,6 +496,7 @@ pub(crate) enum StorageRpcErrorCode {
     UnsupportedOperation = 9,
     Internal = 10,
     ResourceExhausted = 11,
+    ReclaimClaimNotFound = 12,
 }
 
 impl StorageRpcErrorCode {
@@ -512,6 +513,7 @@ impl StorageRpcErrorCode {
             9 => Ok(Self::UnsupportedOperation),
             10 => Ok(Self::Internal),
             11 => Ok(Self::ResourceExhausted),
+            12 => Ok(Self::ReclaimClaimNotFound),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
