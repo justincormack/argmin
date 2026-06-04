@@ -100,7 +100,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
         coord.background_worker_mode_for_test(),
         BackgroundWorkerMode {
             object_reclaim_and_bucket_finalize: true,
-            lifecycle: false,
+            lifecycle: true,
             shard_scavenger: true,
         }
     );

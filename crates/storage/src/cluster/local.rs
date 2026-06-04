@@ -7536,6 +7536,134 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-lifecycle-node-1");
+        let socket_path = tmp.path().join("sockets").join("lifecycle-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = StorageNodeServer::bind(server_config).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let open_frontend = |name: &str| {
+            let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+                node_id,
+                [LocalNodeStoreConfig::new(
+                    node_id,
+                    tmp.path().join(name).join("node-0001"),
+                )],
+                &[0],
+                ec_shape,
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+            map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+                node_id,
+                socket_path.clone(),
+            )])
+            .unwrap();
+            let map = Arc::new(map);
+            let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+            (map, cluster)
+        };
+
+        let (first_map, first_cluster) = open_frontend("frontend-lifecycle-first");
+        let bucket = crate::tests::bucket_name("remote-lifecycle-claims");
+        create_test_bucket(&first_cluster, &bucket);
+        put_test_lifecycle(&first_cluster, &bucket);
+        let bucket_incarnation_generation = first_cluster
+            .head_bucket_info(&bucket)
+            .unwrap()
+            .bucket_incarnation_generation;
+        assert!(crate::PgMetadataStore::head_bucket_raw(
+            &*first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(0)
+                .unwrap(),
+            &bucket,
+        )
+        .is_err());
+        drop(first_cluster);
+        drop(first_map);
+
+        let (reopened_map, reopened_cluster) = open_frontend("frontend-lifecycle-reopened");
+        let roots = reopened_cluster.list_lifecycle_sweep_roots(10).unwrap();
+        assert!(roots.iter().any(|root| {
+            root.bucket == bucket
+                && root.bucket_incarnation_generation == bucket_incarnation_generation
+                && root.source == crate::LifecycleSweepRootSource::LifecycleConfig
+        }));
+
+        let claim = reopened_cluster
+            .acquire_lifecycle_sweep_claim(&bucket, bucket_incarnation_generation, 20)
+            .unwrap()
+            .expect("remote lifecycle claim should acquire");
+        assert_eq!(claim.bucket, bucket);
+        assert_eq!(
+            claim.bucket_incarnation_generation,
+            bucket_incarnation_generation
+        );
+        assert_eq!(claim.pg_id, 0);
+        assert_eq!(claim.attempt_count, 1);
+
+        let heartbeat = reopened_cluster
+            .heartbeat_lifecycle_sweep_claim(&claim, 30)
+            .unwrap();
+        assert_eq!(heartbeat.heartbeat_at, 30);
+        assert_eq!(heartbeat.lease_deadline, Some(60_030));
+        reopened_cluster
+            .release_lifecycle_sweep_claim(&heartbeat)
+            .unwrap();
+
+        let stale_claim = reopened_cluster
+            .acquire_lifecycle_sweep_claim(&bucket, bucket_incarnation_generation, 100)
+            .unwrap()
+            .expect("remote lifecycle claim should reacquire after release");
+        assert_eq!(stale_claim.attempt_count, 1);
+        drop(reopened_cluster);
+        drop(reopened_map);
+
+        let (_final_map, final_cluster) = open_frontend("frontend-lifecycle-final");
+        let expired_roots = final_cluster.list_lifecycle_sweep_roots(60_101).unwrap();
+        assert!(
+            expired_roots.iter().any(|root| {
+                root.bucket == bucket
+                    && root.bucket_incarnation_generation == bucket_incarnation_generation
+                    && root.source == crate::LifecycleSweepRootSource::ExpiredClaim
+            }),
+            "expired durable lifecycle claim should be rediscovered through the Unix client"
+        );
+        let recovered = final_cluster
+            .acquire_lifecycle_sweep_claim(&bucket, bucket_incarnation_generation, 60_101)
+            .unwrap()
+            .expect("expired remote lifecycle claim should be recoverable");
+        assert_eq!(recovered.bucket, bucket);
+        assert_eq!(recovered.attempt_count, 2);
+        final_cluster
+            .release_lifecycle_sweep_claim(&recovered)
+            .unwrap();
+    }
+
+    #[test]
     fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);

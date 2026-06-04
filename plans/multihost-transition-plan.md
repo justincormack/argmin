@@ -5807,11 +5807,9 @@ Required tests:
    canonical-equivalent duplicate, incomplete, or combined-self-mismatched
    socket entries fail at config/build time, and the frontend placeholder map
    uses the configured cluster epoch without validating local placeholder PG
-  replay state. Remote frontend startup must keep lifecycle disabled until its
-  Phase 10.6 claim/release restart coverage is complete; object reclaim,
-  bucket finalization, and shard scavenger may start once their RPC boundaries
-  are routed and covered. Full separate-process frontend/combined startup and
-  HTTP S3 coverage belongs to the Phase 10.7 harness.
+  replay state. Remote frontend workers may start once each worker's RPC
+  boundary is routed and covered; full separate-process frontend/combined
+  startup and HTTP S3 coverage belongs to the Phase 10.7 harness.
 
 ### Phase 10.6: Background Workers Across RPC
 
@@ -5851,18 +5849,21 @@ Status:
   observations are stored on the storage-node-owned PG rather than the
   frontend placeholder PG.
 - Remote frontend/combined startup now uses an explicit background-worker mode.
-  Object reclaim, bucket finalization, and shard scavenger are enabled for
-  remote frontend mode; lifecycle remains disabled until its claim heartbeat,
-  release, and stale-claim recovery behavior has the same RPC restart coverage.
-  Focused coverage asserts this Phase 10.6 mode enables the routed workers
-  without enabling lifecycle.
+  Object reclaim, bucket finalization, lifecycle, and shard scavenger are
+  enabled for remote frontend mode once their focused RPC restart/resume
+  coverage is in place. Focused coverage asserts this Phase 10.6 mode enables
+  all routed workers.
 - Object reclaim and bucket finalization have focused Unix-storage-node
   coverage proving a restarted frontend placeholder map rediscovers durable
   storage-node-owned reclaim/finalize rows, reclaims the remote shard payload,
   and finalizes the bucket through the remote metadata boundary rather than the
   frontend placeholder PG.
-- Remaining Phase 10.6 work is lifecycle RPC restart/resume coverage before
-  turning the lifecycle worker back on in frontend/combined startup.
+- Lifecycle now has focused Unix-storage-node coverage proving a restarted
+  frontend placeholder map discovers storage-node-owned lifecycle roots,
+  acquires and heartbeats a remote claim, releases it, and later recovers an
+  expired stale claim through the same RPC boundary.
+- Phase 10.6 worker-routing scope is complete at the focused RPC level. The
+  full separate-process frontend/combined harness remains Phase 10.7 work.
 
 ### Phase 10.7: Multi-Process Harness
 
