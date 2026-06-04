@@ -1,0 +1,213 @@
+Remote frontend leaves deleted object data unreclaimed
+Link: https://chatgpt.com/codex/cloud/security/findings/7178f396a9d481918597a00b7c1a1297?sev=
+Criticality: informational (attack path: ignore)
+Status: stale
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 5e7f1f0
+Author: justin@specialbusservice.com
+Created: 03/06/2026, 22:04:19
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Stale on current `main`.
+
+The finding was valid for commit `5e7f1f0`, where `run_remote_frontend`
+constructed the frontend coordinator with background workers disabled. Current
+code no longer matches that premise:
+
+- `1595c5e` (`Enable remote shard scavenger worker mode`) introduced explicit
+  remote frontend background-worker mode wiring and focused coverage for the
+  mode.
+- `ec10f04` (`Enable remote reclaim workers`) enabled remote
+  object-payload reclaim and bucket-delete finalization workers after routing
+  their metadata surfaces over RPC.
+- `1e69c32` (`Enable remote lifecycle worker`) enabled remote lifecycle worker
+  operation after routing lifecycle root/claim handling through RPC.
+- `8de4825` (`Route stream session scavenging over storage RPC`) moved stale
+  stream-upload session scavenging to a bounded PG-wide RPC and removed the
+  remaining broad local scan from remote frontend worker scope.
+
+Current references:
+- `crates/argmin-s3/src/main.rs:267` calls `run_frontend_server` with
+  `BackgroundWorkerMode::remote_frontend_phase_10_6()` for remote frontend and
+  combined roles.
+- `crates/server-core/src/coordinator/infra.rs:45` defines
+  `remote_frontend_phase_10_6()` with object reclaim/bucket finalization,
+  lifecycle, and shard scavenger all enabled.
+- `crates/server-core/src/coordinator/infra.rs:343` uses that mode to spawn or
+  acquire the corresponding background workers.
+- `crates/server-core/src/coordinator/core_tests.rs:89` asserts the remote
+  frontend Phase 10.6 mode enables all routed workers.
+- `crates/storage/src/cluster/local.rs` contains focused Unix-storage-node
+  regressions for remote reclaim/finalization, lifecycle, shard-scavenger
+  metadata, and stale stream-session scavenging against storage-node-owned PGs
+  rather than frontend placeholder PGs.
+
+Residual note: the full separate-process frontend/storage-node harness is still
+Phase 10.7 work, and frontend-only topology still opens transitional placeholder
+PG directories until that harness/topology phase. Those are not the same issue
+as the stale finding here: remote frontend no longer leaves reclaim,
+finalization, lifecycle, or shard-scavenger background work disabled.
+
+# Summary
+Introduced: remote frontend and combined roles are now runnable, but their coordinator is explicitly constructed with reclaim/lifecycle/scavenger background work disabled. This leaves queued reclaim work undrained for those roles.
+This commit enables the previously unsupported remote frontend roles. In that path, run_remote_frontend passes start_background_sweepers=false into run_frontend_server. That selects the new Coordinator constructor named without_background_sweepers, which passes false for the reclaim worker and disabled lifecycle and shard-scavenger sweepers. The reclaim worker is the code that consumes ReclaimWorkItem::ObjectPayload and ReclaimWorkItem::BucketDelete and calls try_reclaim_object_payload_for / try_finalize_bucket_delete_for. With it disabled and no replacement worker started in the storage-node process, remote frontend deployments can accept S3 deletes, overwrites, multipart aborts, and bucket deletes that update metadata but never physically reclaim the old shard data or finalize queued bucket deletion work. An authenticated client can repeatedly upload and delete or overwrite objects to drive unbounded backend disk growth while the visible object set remains small, eventually causing storage exhaustion and denial of service. Combined role is also affected because it starts the same remote frontend path.
+
+# Validation
+## Rubric
+- [x] Confirm the commit enables Frontend/Combined remote frontend roles rather than rejecting them.
+- [x] Confirm the remote frontend role passes start_background_sweepers=false into frontend coordinator construction.
+- [x] Confirm that false disables ReclaimSweeper instead of spawning the argmin-reclaim worker.
+- [x] Confirm delete/overwrite/bucket-delete operations enqueue reclaim/finalize work that needs the reclaim worker.
+- [x] Dynamically reproduce queued, undrained reclaim work after an authenticated delete using the same no-background-sweeper constructor; attempt crash, valgrind/ASan, and debugger validation.
+## Report
+Validated the finding on commit 5e7f1f0fab7193b05a0927419f76d4209279ac98. Code inspection showed that the commit changed role dispatch so Frontend and Combined now enter run_remote_frontend (crates/argmin-s3/src/main.rs:134-142), whereas the previous commit exited as unsupported for remote frontend roles. run_remote_frontend calls run_frontend_server(..., false) (crates/argmin-s3/src/main.rs:255-262). That false selects Coordinator::new_with_managed_key_provider_for_storage_cluster_without_background_sweepers (crates/argmin-s3/src/main.rs:329-343), whose constructor passes false and disabled lifecycle/scavenger sweepers (crates/server-core/src/coordinator/infra.rs:288-305). infra.rs:404-410 uses that false to create ReclaimSweeper::disabled instead of ReclaimSweeper::spawn. The spawned reclaim worker is the only observed consumer of wait_for_reclaim_work that calls try_reclaim_object_payload_for and try_finalize_bucket_delete_for (crates/server-core/src/coordinator/runtime.rs:83-105); grep of argmin-s3/storage-node RPC/server files found no replacement consumer. Delete/overwrite/bucket-delete paths enqueue reclaim work at delete.rs:114-118, put.rs:280-285, and bucket.rs:368-370. I then added a targeted unit PoC using the same no-background-sweeper constructor used by the remote frontend path. It creates a bucket, puts an object, deletes it as an authenticated requester, then checks the underlying StorageCluster reclaim queue. The PoC observed storage::ReclaimWorkItem::ObjectPayload for bucket/key and intentionally panicked with 'queued reclaim work remained undrained after authenticated delete'. This demonstrates metadata-visible deletion while physical reclaim work remains queued with no background worker to drain it. cargo test produced a failing/panicking PoC. Valgrind was attempted but not installed. LLDB was run non-interactively with a breakpoint on rust_begin_unwind and captured the PoC panic backtrace at core_tests.rs:7933.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L134 to 142)
+  Note: Frontend and combined roles are now enabled and both enter the remote frontend path.
+```
+    match config.process_role {
+        ProcessRole::StorageNode => run_storage_node_process(&config, &ec_config),
+        ProcessRole::Combined => {
+            let _storage_node_thread = start_storage_node_process(&config, &ec_config);
+            run_remote_frontend(config, host_id, ec_config).await;
+        }
+        ProcessRole::Frontend => {
+            run_remote_frontend(config, host_id, ec_config).await;
+        }
+```
+
+crates/argmin-s3/src/main.rs (L255 to 262)
+  Note: run_remote_frontend calls run_frontend_server with start_background_sweepers set to false.
+```
+async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
+    let storage_cluster = build_remote_frontend_storage_cluster(&config, &ec_config)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open remote frontend storage cluster: {e}");
+            std::process::exit(1);
+        });
+    run_frontend_server(config, host_id, storage_cluster, false).await;
+}
+```
+
+crates/server-core/src/coordinator/infra.rs (L288 to 305)
+  Note: The remote frontend coordinator constructor disables the reclaim worker, lifecycle sweeper, and shard scavenger.
+```
+    pub fn new_with_managed_key_provider_for_storage_cluster_without_background_sweepers(
+        storage_cluster: Arc<StorageCluster>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: StaticManagedKeyProvider,
+    ) -> Result<Self, ServerError> {
+        Self::new_with_shared_caches_and_background_sweeper_factories(
+            Arc::clone(&storage_cluster),
+            shared_caches_for_storage_cluster(&storage_cluster),
+            region,
+            sse_c_validator,
+            Some(managed_key_provider),
+            (
+                false,
+                |_, _| Ok(LifecycleSweeper::disabled()),
+                |_| Ok(ShardScavengerSweeper::disabled()),
+            ),
+        )
+```
+
+crates/server-core/src/coordinator/infra.rs (L404 to 410)
+  Note: The false flag is used to construct ReclaimSweeper::disabled instead of spawning the worker.
+```
+        let (start_reclaim_worker, lifecycle_sweeper_factory, shard_scavenger_sweeper_factory) =
+            background_sweepers;
+        let reclaim_sweeper = if start_reclaim_worker {
+            ReclaimSweeper::spawn(Arc::clone(&storage_cluster), read_runtime.clone())?
+        } else {
+            ReclaimSweeper::disabled(Arc::clone(&storage_cluster))
+        };
+```
+
+crates/server-core/src/coordinator/runtime.rs (L83 to 105)
+  Note: When spawned, the reclaim worker drains object-payload and bucket-delete reclaim work; disabling it leaves this work unprocessed.
+```
+impl ReclaimSweeper {
+    pub(super) fn spawn(
+        storage_cluster: Arc<StorageCluster>,
+        runtime: ReadRuntime,
+    ) -> Result<Self, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_node = Arc::clone(&storage_cluster);
+        let handle = std::thread::Builder::new()
+            .name("argmin-reclaim".to_string())
+            .spawn(move || {
+                while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
+                    match work {
+                        ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
+                            let _ = runtime.try_reclaim_object_payload_for(
+                                &bucket,
+                                &key,
+                                generation_id,
+                            );
+                        }
+                        ReclaimWorkItem::BucketDelete(bucket) => {
+                            let _ = runtime.try_finalize_bucket_delete_for(&bucket);
+                        }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The bug is real and in-scope: product runtime code enables Frontend/Combined roles and intentionally constructs their coordinator without background sweepers, while normal S3 delete/overwrite/bucket-delete paths enqueue reclaim work that only the disabled worker normally processes. The impact is a credible availability DoS via disk exhaustion, and validation evidence included an executable PoC demonstrating undrained reclaim work after an authenticated delete using the same no-background-sweeper constructor. However, exploitation requires a remote frontend/combined deployment, a reachable listener, and valid S3 write/delete privileges; repository artifacts show the default listener is localhost and the default role is not the affected remote frontend path. There is no confidentiality, integrity, auth bypass, or RCE impact, so high/critical is not justified.
+## Likelihood
+high - Once a remote frontend/combined deployment is reachable and the attacker has ordinary S3 write/delete credentials, exploitation is simple and repeatable using normal S3 operations. Likelihood is not high because the default process role is legacy-local, the default listener is localhost, and exploitation requires valid credentials and a specific newly enabled role. | Remote network vector
+## Impact
+medium - Successful exploitation can exhaust backend storage and deny service to the argmin-s3 deployment. The visible object set can remain small because metadata deletes/overwrites succeed while physical shard payloads are not reclaimed. No code execution, credential disclosure, authorization bypass, or object data exfiltration is evidenced.
+## Assumptions
+- Deployment selects ARGMIN_PROCESS_ROLE=frontend or ARGMIN_PROCESS_ROLE=combined, not the default legacy-local role.
+- ARGMIN_STORAGE_NODE_SOCKETS is configured so the remote frontend role starts successfully.
+- The S3 HTTP listener is reachable by the attacker, either locally/internal or because ARGMIN_LISTEN_ADDR is bound or proxied to a reachable interface.
+- The attacker has valid S3 credentials with permission to upload/delete/overwrite objects or delete buckets in at least one bucket.
+- No external quota, disk cleanup job, or operational monitoring stops repeated upload/delete cycles before backend storage exhaustion.
+- Remote frontend or combined role enabled
+- Storage-node socket map configured
+- Reachable S3 HTTP endpoint
+- Authenticated S3 write/delete capability
+- Finite backend disk without compensating external cleanup/quota
+## Path
+Authenticated S3 client
+  -> HTTP Put/Delete/Overwrite
+  -> Frontend/Combined run_remote_frontend
+  -> run_frontend_server(..., false)
+  -> Coordinator without ReclaimSweeper
+  -> reclaim queue accumulates
+  -> backend disk exhaustion / DoS
+## Path evidence
+- `crates/argmin-s3/src/main.rs:134-142` - Frontend and Combined process roles are runnable and enter the remote frontend path.
+- `crates/argmin-s3/src/main.rs:255-262` - run_remote_frontend builds the remote storage cluster and calls run_frontend_server with start_background_sweepers=false.
+- `crates/argmin-s3/src/main.rs:329-343` - The false flag selects Coordinator::new_with_managed_key_provider_for_storage_cluster_without_background_sweepers.
+- `crates/server-core/src/coordinator/infra.rs:285-305` - The remote frontend coordinator constructor explicitly disables reclaim, lifecycle, and shard-scavenger background sweepers.
+- `crates/server-core/src/coordinator/infra.rs:404-410` - When start_reclaim_worker is false, ReclaimSweeper::disabled is constructed instead of spawning the reclaim worker.
+- `crates/server-core/src/coordinator/runtime.rs:83-107` - The spawned argmin-reclaim worker is the consumer of reclaim work and calls payload reclaim or bucket-delete finalization.
+- `crates/server-core/src/coordinator/runtime.rs:1023-1053` - The reclaim worker actions physically reclaim object payloads and finalize bucket deletes via storage_node calls.
+- `crates/server-core/src/coordinator/delete.rs:114-118` - Normal object delete enqueues object-payload reclaim work.
+- `crates/server-core/src/coordinator/put.rs:280-285` - Object overwrite enqueues reclaim work for the stale generation.
+- `crates/server-core/src/coordinator/bucket.rs:368-370` - Bucket deletion enqueues bucket-delete finalization work.
+- `crates/argmin-s3/src/config.rs:125-148` - Frontend roles require configured account/access/secret credentials and SSE wrapping key, showing the affected service is authenticated.
+- `crates/argmin-s3/src/config.rs:167` - The HTTP listener defaults to 127.0.0.1:9000 but is configurable through ARGMIN_LISTEN_ADDR.
+## Narrative
+The finding is real and reachable in the newly enabled remote frontend/combined runtime path. main.rs dispatches Frontend and Combined into run_remote_frontend, and run_remote_frontend calls run_frontend_server with false for start_background_sweepers. run_frontend_server then constructs the coordinator with the without_background_sweepers constructor. That constructor explicitly passes false for the reclaim worker and disabled lifecycle/scavenger factories; infra.rs uses false to create ReclaimSweeper::disabled instead of spawning the argmin-reclaim thread. The spawned thread is the code that consumes wait_for_reclaim_work and invokes try_reclaim_object_payload_for and try_finalize_bucket_delete_for. Meanwhile normal delete, overwrite, and bucket-delete operations enqueue reclaim/finalization work. An authenticated client can therefore cause old payloads and delete-finalization work to accumulate until storage is exhausted. Severity remains medium: the impact is high availability loss, but it requires a specific process role, reachable deployment, and valid S3 write/delete authorization, with no confidentiality or integrity bypass shown.
+## Controls
+- SigV4 authentication through authenticate_request
+- Coordinator authorization for object and bucket operations
+- Default listener is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Remote frontend/combined roles require a complete ARGMIN_STORAGE_NODE_SOCKETS map
+- TLS is optional only when ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are configured
+- Connection and in-flight request limits exist, but no repository evidence of disk quotas or reclaim backlog limits
+## Blindspots
+- Static repository artifacts do not include Kubernetes, cloud, load balancer, or production deployment manifests, so public exposure cannot be proven.
+- This attack-path stage did not run a full HTTP end-to-end exploit; it relies on static reachability plus earlier executable validation at the coordinator/storage level.
+- Operational controls such as external quotas, disk monitoring, or out-of-band cleanup jobs may exist outside the repository and could reduce practical impact.
+- README text appears stale about frontend/combined support, but code and the Phase 10.5 plan text show the roles are now runnable.

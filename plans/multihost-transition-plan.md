@@ -5811,7 +5811,7 @@ Required tests:
   boundary is routed and covered; full separate-process frontend/combined
   startup and HTTP S3 coverage belongs to the Phase 10.7 harness.
 
-### Phase 10.6: Background Workers Across RPC
+### Phase 10.6: Background Workers Across RPC (complete)
 
 Route background workers through the same node-client boundary:
 
@@ -5834,7 +5834,7 @@ Required tests:
 5. shard scavenger audit can scan remote storage nodes and reports
    location-keyed observations
 
-Status:
+Status: complete.
 
 - Started Phase 10.6 with the shard-scavenger audit boundary. Shard file scans
   were already remote-capable through `ShardScavengerNodeClient`; the same
@@ -5867,8 +5867,13 @@ Status:
   Focused coverage proves a frontend placeholder map lists and aborts
   storage-node-owned stale stream sessions without reading or writing
   placeholder PG state.
-- Phase 10.6 worker-routing scope is complete at the focused RPC level. The
-  full separate-process frontend/combined harness remains Phase 10.7 work.
+- Phase 10.6 is closed. Remote frontend/combined mode now starts the routed
+  reclaim/finalizer, lifecycle, shard-scavenger, and stale stream-session
+  scavenger workers, with focused Unix-storage-node coverage proving those
+  workers discover and mutate storage-node-owned PG state rather than frontend
+  placeholder PGs. The full separate-process frontend/combined harness and
+  removal of transitional frontend placeholder PG directories remain Phase 10.7
+  work.
 
 ### Phase 10.7: Multi-Process Harness
 
