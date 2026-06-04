@@ -72,7 +72,7 @@ use crate::storage_rpc::{
     decode_stream_put_commit_command_build_request, decode_stream_put_finalize_snapshot_request,
     decode_stream_segment_append_prepare_request, decode_stream_upload_match_request,
     decode_stream_upload_session_request, decode_stream_uploads_list_request,
-    encode_abort_multipart_cleanup_response,
+    decode_stream_uploads_pg_list_request, encode_abort_multipart_cleanup_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
     encode_bucket_delete_finalize_roots_response, encode_bucket_delete_finalized_response,
     encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
@@ -219,7 +219,8 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSegmentsResponse,
     StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
     StorageRpcStreamUploadSessionResponse, StorageRpcStreamUploadsListRequest,
-    StorageRpcStreamUploadsListResponse, STORAGE_RPC_FRAME_ENCODING_VERSION,
+    StorageRpcStreamUploadsListResponse, StorageRpcStreamUploadsPgListRequest,
+    STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
@@ -908,6 +909,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectStreamUploadsList => {
                 match decode_stream_uploads_list_request(&frame.payload) {
                     Ok(request) => self.stream_uploads_list_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamUploadsPgList => {
+                match decode_stream_uploads_pg_list_request(&frame.payload) {
+                    Ok(request) => self.stream_uploads_pg_list_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -2991,6 +3001,38 @@ impl StorageNodeConnectionHandler {
             &local_client,
             request.bucket.pg_id,
             &request.bucket.bucket,
+            request.session_id_marker.as_ref(),
+            request.limit,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload = encode_stream_uploads_list_response(&StorageRpcStreamUploadsListResponse {
+            uploads: page.uploads,
+            next_session_id_marker: page.next_session_id_marker,
+        })?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_uploads_pg_list_response(
+        &self,
+        request: StorageRpcStreamUploadsPgListRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(request.pg_id, "object stream uploads PG list")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let page = match ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
+            &local_client,
+            request.pg_id,
             request.session_id_marker.as_ref(),
             request.limit,
         ) {

@@ -7664,6 +7664,207 @@ mod tests {
     }
 
     #[test]
+    fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-stream-scavenge-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("stream-scavenge-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let bucket = crate::tests::bucket_name("remote-stream-scavenge");
+        let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+        let session_id = crate::SessionId::try_from("ab".repeat(16)).unwrap();
+        {
+            let remote = SharedStorageNode::open_with_default_ec_shape(
+                &server_config.data_dir,
+                &server_config.pg_ids,
+                server_config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = remote.get_pg(0).unwrap();
+            crate::PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &crate::CanonicalUserId::from_principal("owner"),
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            crate::PgMetadataStore::create_stream_upload(
+                &*pg,
+                &crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        let server = StorageNodeServer::bind(server_config).unwrap();
+        assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path()
+                    .join("frontend-stream-scavenge")
+                    .join("node-0001"),
+            )],
+            &[0],
+            ec_shape,
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path,
+        )])
+        .unwrap();
+        let map = Arc::new(map);
+        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        assert!(
+            crate::PgMetadataStore::list_all_stream_uploads(&*frontend_pg)
+                .unwrap()
+                .is_empty(),
+            "frontend placeholder PG must not be the stream-session scan authority"
+        );
+
+        let sessions = cluster.list_stream_upload_sessions_best_effort();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, session_id);
+        assert_eq!(sessions[0].bucket, bucket);
+        assert_eq!(sessions[0].key, key);
+
+        cluster
+            .abort_stream_upload_session(&bucket, &key, &session_id)
+            .unwrap();
+        assert!(cluster.list_stream_upload_sessions_best_effort().is_empty());
+        assert!(
+            crate::PgMetadataStore::list_all_stream_uploads(&*frontend_pg)
+                .unwrap()
+                .is_empty(),
+            "remote abort must not create placeholder stream-session state"
+        );
+    }
+
+    #[test]
+    fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(1);
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let remote_data_dir = tmp.path().join("remote-stream-wrong-pg-node-1");
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join("stream-wrong-pg-node-1.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let server_config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            data_dir: remote_data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![0, 1],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![
+                StorageNodePgRoute {
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: PgState::Active,
+                    primary_node_id: node_id,
+                    acting_set: vec![node_id],
+                },
+                StorageNodePgRoute {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: PgState::Active,
+                    primary_node_id: node_id,
+                    acting_set: vec![node_id],
+                },
+            ],
+        };
+        let topology = crate::PgTopology::new(&server_config.pg_ids).unwrap();
+        let bucket = crate::tests::bucket_name("remote-stream-wrong-pg");
+        let key = key_for_object_pg(&topology, &bucket, 1, "key-");
+        let session_id = crate::SessionId::try_from("cd".repeat(16)).unwrap();
+        {
+            let remote = SharedStorageNode::open_with_default_ec_shape(
+                &server_config.data_dir,
+                &server_config.pg_ids,
+                server_config.default_ec_shape,
+            )
+            .unwrap();
+            let wrong_pg = remote.get_pg(0).unwrap();
+            crate::PgMetadataStore::create_stream_upload(
+                &*wrong_pg,
+                &crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            wrong_pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        let server = StorageNodeServer::bind(server_config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+
+        let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+            node_id,
+            [LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path()
+                    .join("frontend-stream-wrong-pg")
+                    .join("node-0001"),
+            )],
+            &[0, 1],
+            ec_shape,
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path,
+        )])
+        .unwrap();
+        let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+        assert_eq!(cluster.object_metadata_pg_id(&bucket, &key), 1);
+        assert!(
+            cluster.list_stream_upload_sessions_best_effort().is_empty(),
+            "PG-wide stream-session scan must reject rows that belong to another object PG"
+        );
+    }
+
+    #[test]
     fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(1);

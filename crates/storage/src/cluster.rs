@@ -4646,6 +4646,7 @@ impl StorageCluster {
     }
 
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
+        const STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT: u32 = 1024;
         let mut sessions = Vec::new();
         for &pg_id in self.local_map.pg_ids() {
             let pg_id = PgId::new(pg_id);
@@ -4655,10 +4656,29 @@ impl StorageCluster {
             else {
                 continue;
             };
-            let Ok(mut local) = node.storage_client().list_all_stream_uploads(pg_id) else {
-                continue;
-            };
-            sessions.append(&mut local);
+            let mut marker = None;
+            loop {
+                let Ok(page) = node
+                    .object_mutation_metadata_client()
+                    .list_all_stream_uploads_page(
+                        pg_id,
+                        marker.as_ref(),
+                        STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT,
+                    )
+                else {
+                    break;
+                };
+                if page.uploads.iter().any(|upload| {
+                    self.object_metadata_pg_id(&upload.bucket, &upload.key) != pg_id.get()
+                }) {
+                    break;
+                }
+                sessions.extend(page.uploads);
+                let Some(next_marker) = page.next_session_id_marker else {
+                    break;
+                };
+                marker = Some(next_marker);
+            }
         }
         sessions
     }

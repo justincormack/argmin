@@ -829,6 +829,13 @@ pub(crate) trait PgMetadataStore {
     /// Used by the startup scavenger to find abandoned sessions.
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError>;
 
+    /// List one PG-scoped page of streaming upload sessions on this PG.
+    fn list_all_stream_uploads_page(
+        &self,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, MetadataError>;
+
     /// List one bucket-scoped page of streaming upload sessions on this PG.
     fn list_stream_uploads_for_bucket_page(
         &self,

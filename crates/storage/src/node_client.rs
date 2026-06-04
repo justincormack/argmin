@@ -114,7 +114,7 @@ use crate::storage_rpc::{
     encode_stream_put_commit_command_build_request, encode_stream_put_finalize_snapshot_request,
     encode_stream_segment_append_prepare_request, encode_stream_upload_match_request,
     encode_stream_upload_session_request, encode_stream_uploads_list_request,
-    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    encode_stream_uploads_pg_list_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
@@ -178,7 +178,7 @@ use crate::storage_rpc::{
     StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
     StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadSegmentsOutcome,
     StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
-    StorageRpcStreamUploadsListRequest,
+    StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsPgListRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -1467,6 +1467,13 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
 
+    fn list_all_stream_uploads_page(
+        &self,
+        pg_id: PgId,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
+
     fn list_completed_multipart_upload_records_for_bucket_page(
         &self,
         pg_id: PgId,
@@ -2387,15 +2394,17 @@ pub(crate) trait StorageNodeClient:
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
 
-    fn list_all_stream_uploads(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError>;
-
     fn list_stream_uploads_for_bucket_page(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
+
+    fn list_all_stream_uploads_page(
+        &self,
+        pg_id: PgId,
         session_id_marker: Option<&SessionId>,
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
@@ -5279,6 +5288,20 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn list_all_stream_uploads_page(
+        &self,
+        pg_id: PgId,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        <Self as StorageNodeClient>::list_all_stream_uploads_page(
+            self,
+            pg_id,
+            session_id_marker,
+            limit,
+        )
+    }
+
     fn list_completed_multipart_upload_records_for_bucket_page(
         &self,
         pg_id: PgId,
@@ -7968,6 +7991,74 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate stream uploads list response",
+                "next marker does not match the last returned upload".to_string(),
+            )));
+        }
+        Ok(StreamUploadRecordPage {
+            uploads: response.uploads,
+            next_session_id_marker: response.next_session_id_marker,
+        })
+    }
+
+    fn list_all_stream_uploads_page(
+        &self,
+        pg_id: PgId,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadsPgListRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            session_id_marker: session_id_marker.cloned(),
+            limit,
+        };
+        let payload = encode_stream_uploads_pg_list_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("encode stream uploads PG list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadsPgList, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_uploads_list_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode stream uploads PG list response", error.to_string()),
+            )
+        })?;
+        if response.uploads.len() > limit as usize {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads PG list response",
+                "response exceeded requested page limit".to_string(),
+            )));
+        }
+        if response
+            .uploads
+            .windows(2)
+            .any(|pair| pair[0].session_id.as_str() >= pair[1].session_id.as_str())
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads PG list response",
+                "uploads are not strictly ordered by session id".to_string(),
+            )));
+        }
+        if session_id_marker.is_some()
+            && response.uploads.iter().any(|upload| {
+                session_id_marker
+                    .is_some_and(|marker| upload.session_id.as_str() <= marker.as_str())
+            })
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads PG list response",
+                "upload is not after requested marker".to_string(),
+            )));
+        }
+        if response.next_session_id_marker.as_ref()
+            != response.uploads.last().map(|upload| &upload.session_id)
+            && response.next_session_id_marker.is_some()
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads PG list response",
                 "next marker does not match the last returned upload".to_string(),
             )));
         }
@@ -12545,12 +12636,14 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(pg.list_stream_segments(session_id)?)
     }
 
-    fn list_all_stream_uploads(
+    fn list_all_stream_uploads_page(
         &self,
         pg_id: PgId,
-    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_all_stream_uploads()?)
+        Ok(pg.list_all_stream_uploads_page(session_id_marker, limit)?)
     }
 
     fn list_stream_uploads_for_bucket_page(

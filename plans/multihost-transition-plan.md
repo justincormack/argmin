@@ -5862,6 +5862,11 @@ Status:
   frontend placeholder map discovers storage-node-owned lifecycle roots,
   acquires and heartbeats a remote claim, releases it, and later recovers an
   expired stale claim through the same RPC boundary.
+- Stale stream-upload session scavenging now uses a bounded PG-wide
+  object-mutation metadata RPC scan instead of the broad local storage client.
+  Focused coverage proves a frontend placeholder map lists and aborts
+  storage-node-owned stale stream sessions without reading or writing
+  placeholder PG state.
 - Phase 10.6 worker-routing scope is complete at the focused RPC level. The
   full separate-process frontend/combined harness remains Phase 10.7 work.
 

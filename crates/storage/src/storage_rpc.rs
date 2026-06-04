@@ -154,6 +154,8 @@ const STORAGE_RPC_MAX_LIST_PAGE_ITEMS: u32 = 100_000;
 const STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS: u32 = 1024;
 const STORAGE_RPC_MAX_STREAM_UPLOADS_LIST_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1 + 4 + SESSION_ID_LEN + 4;
+const STORAGE_RPC_MAX_STREAM_UPLOADS_PG_LIST_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1 + 4 + SESSION_ID_LEN + 4;
 const STORAGE_RPC_MAX_COMPLETED_MULTIPART_UPLOADS_LIST_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1 + 4 + UPLOAD_ID_LEN + 4;
 const STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN: usize =
@@ -480,6 +482,7 @@ pub(crate) enum StorageRpcMessageKind {
     ShardScavengerObservationRecord = 117,
     ShardScavengerObservations = 118,
     ShardScavengerObservationResolve = 119,
+    ObjectStreamUploadsPgList = 120,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,6 +657,7 @@ impl StorageRpcMessageKind {
             Self::BucketFastPathIdentities => "bucket fast path identities",
             Self::BucketMarkDeletingCommandBuild => "bucket mark deleting command build",
             Self::ObjectStreamUploadsList => "object stream uploads list",
+            Self::ObjectStreamUploadsPgList => "object stream uploads PG list",
             Self::ObjectCompletedMultipartUploadsList => "object completed multipart uploads list",
             Self::ObjectPayloadReclaimExists => "object payload reclaim exists",
             Self::ObjectBucketPayloadReclaimRoot => "object bucket payload reclaim root",
@@ -785,6 +789,7 @@ impl StorageRpcMessageKind {
             117 => Ok(Self::ShardScavengerObservationRecord),
             118 => Ok(Self::ShardScavengerObservations),
             119 => Ok(Self::ShardScavengerObservationResolve),
+            120 => Ok(Self::ObjectStreamUploadsPgList),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1414,6 +1419,15 @@ pub(crate) struct StorageRpcStreamUploadSegmentsResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcStreamUploadsListRequest {
     pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) session_id_marker: Option<SessionId>,
+    pub(crate) limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadsPgListRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
     pub(crate) session_id_marker: Option<SessionId>,
     pub(crate) limit: u32,
 }
@@ -2858,6 +2872,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectStreamUploadsList => {
             STORAGE_RPC_MAX_STREAM_UPLOADS_LIST_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectStreamUploadsPgList => {
+            STORAGE_RPC_MAX_STREAM_UPLOADS_PG_LIST_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
             STORAGE_RPC_MAX_COMPLETED_MULTIPART_UPLOADS_LIST_REQUEST_PAYLOAD_LEN
         }
@@ -3212,6 +3229,42 @@ pub(crate) fn decode_stream_uploads_list_request(
     decoder.finish()?;
     Ok(StorageRpcStreamUploadsListRequest {
         bucket,
+        session_id_marker,
+        limit,
+    })
+}
+
+pub(crate) fn encode_stream_uploads_pg_list_request(
+    request: &StorageRpcStreamUploadsPgListRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_cleanup_list_limit(request.limit)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_optional_string(
+        &mut out,
+        request.session_id_marker.as_ref().map(SessionId::as_str),
+    );
+    put_u32(&mut out, request.limit);
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_uploads_pg_list_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadsPgListRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let session_id_marker = decoder.read_optional_session_id()?;
+    let limit = decoder.read_u32()?;
+    validate_cleanup_list_limit(limit)?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadsPgListRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
         session_id_marker,
         limit,
     })
@@ -15745,6 +15798,23 @@ mod tests {
         };
         assert_eq!(
             encode_stream_uploads_list_request(&stream_request),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize,
+                limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
+            })
+        );
+
+        let stream_pg_request = StorageRpcStreamUploadsPgListRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            session_id_marker: Some(
+                SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+            ),
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1,
+        };
+        assert_eq!(
+            encode_stream_uploads_pg_list_request(&stream_pg_request),
             Err(StorageRpcPayloadError::PayloadTooLarge {
                 len: (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize,
                 limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
