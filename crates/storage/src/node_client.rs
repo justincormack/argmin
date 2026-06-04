@@ -82,7 +82,7 @@ use crate::storage_rpc::{
     encode_bucket_write_reservation_record_request,
     encode_complete_multipart_command_build_request,
     encode_completed_multipart_order_command_build_request,
-    encode_create_bucket_command_build_request,
+    encode_completed_multipart_uploads_list_request, encode_create_bucket_command_build_request,
     encode_create_multipart_upload_command_build_request,
     encode_create_stream_upload_command_build_request,
     encode_delete_current_object_command_build_request,
@@ -113,7 +113,8 @@ use crate::storage_rpc::{
     encode_stream_part_commit_command_build_request, encode_stream_part_finalize_snapshot_request,
     encode_stream_put_commit_command_build_request, encode_stream_put_finalize_snapshot_request,
     encode_stream_segment_append_prepare_request, encode_stream_upload_match_request,
-    encode_stream_upload_session_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    encode_stream_upload_session_request, encode_stream_uploads_list_request,
+    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
@@ -132,8 +133,9 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
     StorageRpcBucketWriteReservationRecordRequest, StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
-    StorageRpcCreateBucketCommandBuildOutcome, StorageRpcCreateBucketCommandBuildRequest,
-    StorageRpcCreateBucketConfig, StorageRpcCreateMultipartUploadCommandBuildRequest,
+    StorageRpcCompletedMultipartUploadsListRequest, StorageRpcCreateBucketCommandBuildOutcome,
+    StorageRpcCreateBucketCommandBuildRequest, StorageRpcCreateBucketConfig,
+    StorageRpcCreateMultipartUploadCommandBuildRequest,
     StorageRpcCreateStreamUploadCommandBuildRequest, StorageRpcCreateStreamUploadPrecondition,
     StorageRpcDeleteCurrentObjectCommandBuildRequest,
     StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcDirectPutCommandBuildOutcome,
@@ -176,6 +178,7 @@ use crate::storage_rpc::{
     StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
     StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadSegmentsOutcome,
     StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
+    StorageRpcStreamUploadsListRequest,
 };
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::{
@@ -184,7 +187,7 @@ use crate::types::{
     BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
     BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
-    CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
+    CompletedMultipartUploadRecordPage, CreateBucketConfig, CreateMultipartUploadReq,
     CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
     EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
     ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
@@ -200,9 +203,9 @@ use crate::types::{
     ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
     ShardScavengerObservationRecord, ShardScavengerPayloadReference, StoredObject,
     StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
-    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-    VersionId, WriteAck,
+    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadRecordPage,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
+    UploadId, UploadState, VersionId, WriteAck,
 };
 
 fn merge_bucket_snapshot_pair_request(
@@ -1456,16 +1459,21 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
 
-    fn list_all_stream_uploads(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError>;
-
-    fn list_completed_multipart_upload_records_for_bucket(
+    fn list_stream_uploads_for_bucket_page(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
+
+    fn list_completed_multipart_upload_records_for_bucket_page(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        upload_id_marker: Option<&UploadId>,
+        limit: u32,
+    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError>;
 
     fn payload_reclaim_exists(
         &self,
@@ -2384,6 +2392,14 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
     ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError>;
 
+    fn list_stream_uploads_for_bucket_page(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
+
     fn prepare_stream_segment_append(
         &self,
         pg_id: PgId,
@@ -2555,11 +2571,13 @@ pub(crate) trait StorageNodeClient:
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
-    fn list_completed_multipart_upload_records_for_bucket(
+    fn list_completed_multipart_upload_records_for_bucket_page(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError>;
+        upload_id_marker: Option<&UploadId>,
+        limit: u32,
+    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError>;
 
     fn try_acquire_object_payload_lease(
         &self,
@@ -5237,20 +5255,35 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
-    fn list_all_stream_uploads(
-        &self,
-        pg_id: PgId,
-    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::list_all_stream_uploads(self, pg_id)
-    }
-
-    fn list_completed_multipart_upload_records_for_bucket(
+    fn list_stream_uploads_for_bucket_page(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::list_completed_multipart_upload_records_for_bucket(
-            self, pg_id, bucket,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        <Self as StorageNodeClient>::list_stream_uploads_for_bucket_page(
+            self,
+            pg_id,
+            bucket,
+            session_id_marker,
+            limit,
+        )
+    }
+
+    fn list_completed_multipart_upload_records_for_bucket_page(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        upload_id_marker: Option<&UploadId>,
+        limit: u32,
+    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::list_completed_multipart_upload_records_for_bucket_page(
+            self,
+            pg_id,
+            bucket,
+            upload_id_marker,
+            limit,
         )
     }
 
@@ -7847,11 +7880,28 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }
     }
 
-    fn list_all_stream_uploads(
+    fn list_stream_uploads_for_bucket_page(
         &self,
         pg_id: PgId,
-    ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
-        let payload = self.encode_metadata_command_state_request(pg_id);
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadsListRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            session_id_marker: session_id_marker.cloned(),
+            limit,
+        };
+        let payload = encode_stream_uploads_list_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("encode stream uploads list request", error.to_string()),
+            )
+        })?;
         let response = self
             .rpc_request(StorageRpcMessageKind::ObjectStreamUploadsList, payload)
             .map_err(ObjectPgActionError::Store)?;
@@ -7860,21 +7910,76 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 self.rpc_payload_error("decode stream uploads list response", error.to_string()),
             )
         })?;
-        Ok(response.uploads)
+        if response.uploads.len() > limit as usize {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads list response",
+                "response exceeded requested page limit".to_string(),
+            )));
+        }
+        for upload in &response.uploads {
+            if &upload.bucket != bucket {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate stream uploads list response",
+                    "upload bucket does not match request".to_string(),
+                )));
+            }
+            if session_id_marker.is_some_and(|marker| upload.session_id.as_str() <= marker.as_str())
+            {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate stream uploads list response",
+                    "upload is not after requested marker".to_string(),
+                )));
+            }
+        }
+        if response
+            .uploads
+            .windows(2)
+            .any(|pair| pair[0].session_id.as_str() >= pair[1].session_id.as_str())
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads list response",
+                "uploads are not strictly ordered by session id".to_string(),
+            )));
+        }
+        if response.next_session_id_marker.as_ref()
+            != response.uploads.last().map(|upload| &upload.session_id)
+            && response.next_session_id_marker.is_some()
+        {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate stream uploads list response",
+                "next marker does not match the last returned upload".to_string(),
+            )));
+        }
+        Ok(StreamUploadRecordPage {
+            uploads: response.uploads,
+            next_session_id_marker: response.next_session_id_marker,
+        })
     }
 
-    fn list_completed_multipart_upload_records_for_bucket(
+    fn list_completed_multipart_upload_records_for_bucket_page(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
-        let request = StorageRpcBucketRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id,
-            bucket: bucket.clone(),
+        upload_id_marker: Option<&UploadId>,
+        limit: u32,
+    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError> {
+        let request = StorageRpcCompletedMultipartUploadsListRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            upload_id_marker: upload_id_marker.cloned(),
+            limit,
         };
-        let payload = encode_bucket_request(&request);
+        let payload =
+            encode_completed_multipart_uploads_list_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode completed multipart upload list request",
+                    error.to_string(),
+                ))
+            })?;
         let response = self
             .rpc_request(
                 StorageRpcMessageKind::ObjectCompletedMultipartUploadsList,
@@ -7888,17 +7993,49 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
+        if response.records.len() > limit as usize {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate completed multipart upload list response",
+                "response exceeded requested page limit".to_string(),
+            )));
+        }
+        for record in &response.records {
+            if &record.bucket != bucket {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate completed multipart upload list response",
+                    "record bucket does not match request".to_string(),
+                )));
+            }
+            if upload_id_marker.is_some_and(|marker| record.upload_id.as_str() <= marker.as_str()) {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate completed multipart upload list response",
+                    "record is not after requested marker".to_string(),
+                )));
+            }
+        }
         if response
             .records
-            .iter()
-            .any(|record| &record.bucket != bucket)
+            .windows(2)
+            .any(|pair| pair[0].upload_id.as_str() >= pair[1].upload_id.as_str())
         {
             return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
                 "validate completed multipart upload list response",
-                "record bucket does not match request".to_string(),
+                "records are not strictly ordered by upload id".to_string(),
             )));
         }
-        Ok(response.records)
+        if response.next_upload_id_marker.as_ref()
+            != response.records.last().map(|record| &record.upload_id)
+            && response.next_upload_id_marker.is_some()
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate completed multipart upload list response",
+                "next marker does not match the last returned record".to_string(),
+            )));
+        }
+        Ok(CompletedMultipartUploadRecordPage {
+            records: response.records,
+            next_upload_id_marker: response.next_upload_id_marker,
+        })
     }
 
     fn payload_reclaim_exists(
@@ -10999,13 +11136,19 @@ impl UnixStorageNodeClient {
 }
 
 impl StorageNodeClient for LocalStorageNodeClient {
-    fn list_completed_multipart_upload_records_for_bucket(
+    fn list_completed_multipart_upload_records_for_bucket_page(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-    ) -> Result<Vec<CompletedMultipartUploadRecord>, BucketSnapshotLoadError> {
+        upload_id_marker: Option<&UploadId>,
+        limit: u32,
+    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_completed_multipart_upload_records_for_bucket(bucket.as_str())?)
+        Ok(pg.list_completed_multipart_upload_records_for_bucket_page(
+            bucket,
+            upload_id_marker,
+            limit,
+        )?)
     }
 
     fn try_acquire_object_payload_lease(
@@ -12389,6 +12532,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(pg.list_all_stream_uploads()?)
     }
 
+    fn list_stream_uploads_for_bucket_page(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(pg.list_stream_uploads_for_bucket_page(bucket, session_id_marker, limit)?)
+    }
+
     fn prepare_stream_segment_append(
         &self,
         pg_id: PgId,
@@ -13399,6 +13553,7 @@ mod tests {
         DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedMetadataBlob,
         SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
     };
+    use crate::CompletedMultipartUploadRecord;
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
         StorageNodeProcessConfig {
@@ -16089,21 +16244,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current.stored.as_ref(), Some(&stored));
-        let stream_uploads =
-            ObjectMutationMetadataNodeClient::list_all_stream_uploads(&client, PgId::new(0))
-                .unwrap();
-        assert!(stream_uploads.iter().any(|upload| upload.session_id
+        let stream_uploads = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
+            &client,
+            PgId::new(0),
+            &bucket,
+            None,
+            10,
+        )
+        .unwrap();
+        assert!(stream_uploads.uploads.iter().any(|upload| upload.session_id
             == listed_stream_request.session_id
             && upload.bucket == listed_stream_request.bucket
             && upload.key == listed_stream_request.key));
         let completed_uploads =
-            ObjectMutationMetadataNodeClient::list_completed_multipart_upload_records_for_bucket(
+            ObjectMutationMetadataNodeClient::list_completed_multipart_upload_records_for_bucket_page(
                 &client,
                 PgId::new(0),
                 &bucket,
+                None,
+                10,
             )
             .unwrap();
-        assert_eq!(completed_uploads, vec![completed_upload.clone()]);
+        assert_eq!(completed_uploads.records, vec![completed_upload.clone()]);
         let reclaim_root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
             &client,
             PgId::new(0),
@@ -16418,8 +16580,15 @@ mod tests {
             config.socket_path.clone(),
         );
 
-        let err = ObjectMutationMetadataNodeClient::list_all_stream_uploads(&client, PgId::new(0))
-            .unwrap_err();
+        let bucket = crate::tests::bucket_name("stream-upload-list-primary");
+        let err = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
+            &client,
+            PgId::new(0),
+            &bucket,
+            None,
+            1,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,

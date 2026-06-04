@@ -151,6 +151,11 @@ const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN * 2;
 const STORAGE_RPC_MAX_OBJECT_KEY_LEN: usize = 1024;
 const STORAGE_RPC_MAX_LIST_PAGE_ITEMS: u32 = 100_000;
+const STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS: u32 = 1024;
+const STORAGE_RPC_MAX_STREAM_UPLOADS_LIST_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1 + 4 + SESSION_ID_LEN + 4;
+const STORAGE_RPC_MAX_COMPLETED_MULTIPART_UPLOADS_LIST_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1 + 4 + UPLOAD_ID_LEN + 4;
 const STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 3 * (1 + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN) + 4;
 const STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN: usize =
@@ -1405,13 +1410,29 @@ pub(crate) struct StorageRpcStreamUploadSegmentsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadsListRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) session_id_marker: Option<SessionId>,
+    pub(crate) limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcStreamUploadsListResponse {
     pub(crate) uploads: Vec<StreamUploadRecord>,
+    pub(crate) next_session_id_marker: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcCompletedMultipartUploadsListRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) upload_id_marker: Option<UploadId>,
+    pub(crate) limit: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcCompletedMultipartUploadsListResponse {
     pub(crate) records: Vec<CompletedMultipartUploadRecord>,
+    pub(crate) next_upload_id_marker: Option<UploadId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2833,10 +2854,10 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectStreamUploadsList => {
-            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+            STORAGE_RPC_MAX_STREAM_UPLOADS_LIST_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
-            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+            STORAGE_RPC_MAX_COMPLETED_MULTIPART_UPLOADS_LIST_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
@@ -3162,6 +3183,64 @@ pub(crate) fn decode_bucket_request(
         cluster_epoch,
         pg_id,
         bucket,
+    })
+}
+
+pub(crate) fn encode_stream_uploads_list_request(
+    request: &StorageRpcStreamUploadsListRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_cleanup_list_limit(request.limit)?;
+    let mut out = encode_bucket_request(&request.bucket);
+    put_optional_string(
+        &mut out,
+        request.session_id_marker.as_ref().map(SessionId::as_str),
+    );
+    put_u32(&mut out, request.limit);
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_uploads_list_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadsListRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let session_id_marker = decoder.read_optional_session_id()?;
+    let limit = decoder.read_u32()?;
+    validate_cleanup_list_limit(limit)?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadsListRequest {
+        bucket,
+        session_id_marker,
+        limit,
+    })
+}
+
+pub(crate) fn encode_completed_multipart_uploads_list_request(
+    request: &StorageRpcCompletedMultipartUploadsListRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_cleanup_list_limit(request.limit)?;
+    let mut out = encode_bucket_request(&request.bucket);
+    put_optional_string(
+        &mut out,
+        request.upload_id_marker.as_ref().map(UploadId::as_str),
+    );
+    put_u32(&mut out, request.limit);
+    Ok(out)
+}
+
+pub(crate) fn decode_completed_multipart_uploads_list_request(
+    bytes: &[u8],
+) -> Result<StorageRpcCompletedMultipartUploadsListRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let upload_id_marker = decoder.read_optional_upload_id()?;
+    let limit = decoder.read_u32()?;
+    validate_cleanup_list_limit(limit)?;
+    decoder.finish()?;
+    Ok(StorageRpcCompletedMultipartUploadsListRequest {
+        bucket,
+        upload_id_marker,
+        limit,
     })
 }
 
@@ -4527,13 +4606,13 @@ pub(crate) fn encode_stream_uploads_list_response(
     let count = u32::try_from(response.uploads.len()).map_err(|_| {
         StorageRpcPayloadError::PayloadTooLarge {
             len: response.uploads.len(),
-            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
         }
     })?;
-    if count > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+    if count > STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: count as usize,
-            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
         });
     }
     let mut out = Vec::new();
@@ -4541,6 +4620,13 @@ pub(crate) fn encode_stream_uploads_list_response(
     for upload in &response.uploads {
         put_stream_upload_record(&mut out, upload);
     }
+    put_optional_string(
+        &mut out,
+        response
+            .next_session_id_marker
+            .as_ref()
+            .map(SessionId::as_str),
+    );
     Ok(out)
 }
 
@@ -4551,14 +4637,18 @@ pub(crate) fn decode_stream_uploads_list_response(
     let upload_count = decoder.read_limited_bounded_remaining_count(
         STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN,
         "too many stream uploads",
-        STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+        STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS,
     )?;
     let mut uploads = Vec::new();
     for _ in 0..upload_count {
         uploads.push(decoder.read_stream_upload_record()?);
     }
+    let next_session_id_marker = decoder.read_optional_session_id()?;
     decoder.finish()?;
-    Ok(StorageRpcStreamUploadsListResponse { uploads })
+    Ok(StorageRpcStreamUploadsListResponse {
+        uploads,
+        next_session_id_marker,
+    })
 }
 
 pub(crate) fn encode_completed_multipart_uploads_list_response(
@@ -4567,13 +4657,13 @@ pub(crate) fn encode_completed_multipart_uploads_list_response(
     let count = u32::try_from(response.records.len()).map_err(|_| {
         StorageRpcPayloadError::PayloadTooLarge {
             len: response.records.len(),
-            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
         }
     })?;
-    if count > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+    if count > STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: count as usize,
-            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
         });
     }
     let mut out = Vec::new();
@@ -4581,6 +4671,13 @@ pub(crate) fn encode_completed_multipart_uploads_list_response(
     for record in &response.records {
         put_completed_multipart_upload_record(&mut out, record);
     }
+    put_optional_string(
+        &mut out,
+        response
+            .next_upload_id_marker
+            .as_ref()
+            .map(UploadId::as_str),
+    );
     Ok(out)
 }
 
@@ -4591,14 +4688,18 @@ pub(crate) fn decode_completed_multipart_uploads_list_response(
     let count = decoder.read_limited_bounded_remaining_count(
         1,
         "completed multipart upload record count exceeds payload",
-        STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+        STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS,
     )?;
     let mut records = Vec::new();
     for _ in 0..count {
         records.push(decoder.read_completed_multipart_upload_record()?);
     }
+    let next_upload_id_marker = decoder.read_optional_upload_id()?;
     decoder.finish()?;
-    Ok(StorageRpcCompletedMultipartUploadsListResponse { records })
+    Ok(StorageRpcCompletedMultipartUploadsListResponse {
+        records,
+        next_upload_id_marker,
+    })
 }
 
 pub(crate) fn encode_stream_upload_segments_response(
@@ -6226,6 +6327,21 @@ pub(crate) fn decode_lifecycle_sweep_roots_response(
     }
     decoder.finish()?;
     Ok(StorageRpcLifecycleSweepRootsResponse { roots })
+}
+
+fn validate_cleanup_list_limit(value: u32) -> Result<(), StorageRpcPayloadError> {
+    if value == 0 {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "cleanup list limit must be nonzero",
+        ));
+    }
+    if value > STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: value as usize,
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    Ok(())
 }
 
 fn validate_list_page_item_limit(value: u32) -> Result<(), StorageRpcPayloadError> {
@@ -9504,8 +9620,21 @@ impl<'a> StorageRpcDecoder<'a> {
     }
 
     fn read_session_id(&mut self) -> Result<SessionId, StorageRpcPayloadError> {
-        SessionId::try_from(self.read_string()?)
-            .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid session id"))
+        SessionId::try_from(self.read_string_with_limit(
+            SESSION_ID_LEN,
+            StorageRpcPayloadError::InvalidObjectMetadataRequest("session id is too large"),
+        )?)
+        .map_err(|_| StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid session id"))
+    }
+
+    fn read_optional_session_id(&mut self) -> Result<Option<SessionId>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_session_id()?)),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional session id tag",
+            )),
+        }
     }
 
     fn read_generation_id(&mut self) -> Result<GenerationId, StorageRpcPayloadError> {
@@ -15598,6 +15727,73 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_list_requests_reject_limit_over_protocol_max() {
+        let bucket = crate::tests::bucket_name("cleanup-list-limit");
+        let stream_request = StorageRpcStreamUploadsListRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: bucket.clone(),
+            },
+            session_id_marker: Some(
+                SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+            ),
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1,
+        };
+        assert_eq!(
+            encode_stream_uploads_list_request(&stream_request),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize,
+                limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
+            })
+        );
+
+        let completed_request = StorageRpcCompletedMultipartUploadsListRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket,
+            },
+            upload_id_marker: Some(crate::tests::multipart_upload_id("cleanup-list-marker")),
+            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1,
+        };
+        assert_eq!(
+            encode_completed_multipart_uploads_list_request(&completed_request),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize,
+                limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_list_responses_reject_count_over_protocol_max_before_items() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1);
+        assert!(matches!(
+            decode_stream_uploads_list_response(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len,
+                limit,
+            }) if len == (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize
+                && limit == STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize
+        ));
+
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1);
+        assert!(matches!(
+            decode_completed_multipart_uploads_list_response(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len,
+                limit,
+            }) if len == (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize
+                && limit == STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize
+        ));
+    }
+
+    #[test]
     fn lifecycle_sweep_roots_request_rejects_limit_over_protocol_max() {
         let request = StorageRpcLifecycleSweepRootsRequest {
             node_id: NodeId::new(7),
@@ -15637,13 +15833,13 @@ mod tests {
     #[test]
     fn stream_uploads_list_response_rejects_unbounded_item_count() {
         let mut bytes = Vec::new();
-        put_u32(&mut bytes, STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1);
+        put_u32(&mut bytes, STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1);
 
         assert_eq!(
             decode_stream_uploads_list_response(&bytes),
             Err(StorageRpcPayloadError::PayloadTooLarge {
-                len: (STORAGE_RPC_MAX_LIST_PAGE_ITEMS + 1) as usize,
-                limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+                len: (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize,
+                limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
             })
         );
     }

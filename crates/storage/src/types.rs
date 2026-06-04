@@ -3155,6 +3155,12 @@ pub struct CompletedMultipartUploadRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedMultipartUploadRecordPage {
+    pub records: Vec<CompletedMultipartUploadRecord>,
+    pub next_upload_id_marker: Option<UploadId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipartUploadManagementLookup {
     InProgress(Box<MultipartUploadRecord>),
     NonInProgress(Box<MultipartUploadRecord>),
@@ -3440,6 +3446,12 @@ pub struct StreamUploadRecord {
     pub created_at: u64,
     pub encryption: ObjectEncryption,
     pub next_segment_vid: GenerationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUploadRecordPage {
+    pub uploads: Vec<StreamUploadRecord>,
+    pub next_session_id_marker: Option<SessionId>,
 }
 
 /// Command-owned stream session fields used by `CreateStreamUpload`.

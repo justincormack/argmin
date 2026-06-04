@@ -2335,21 +2335,18 @@ impl super::StorageCluster {
                 let node = self
                     .local_map
                     .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-                let sessions = match node
+                let page = match node
                     .object_mutation_metadata_client()
-                    .list_all_stream_uploads(pg_id)
+                    .list_stream_uploads_for_bucket_page(pg_id, bucket, None, 1)
                 {
-                    Ok(sessions) => sessions,
+                    Ok(page) => page,
                     Err(error) => {
                         return Err(bucket_snapshot_error_to_bucket_write_drain_error(
                             super::object_pg_action_error_to_bucket_snapshot_error(error),
                         ));
                     }
                 };
-                if sessions
-                    .iter()
-                    .any(|session| session.bucket == bucket.as_str())
-                {
+                if !page.uploads.is_empty() {
                     return Ok(true);
                 }
             }
@@ -2419,44 +2416,34 @@ impl super::StorageCluster {
     where
         E: From<StoreError> + From<MetadataError>,
     {
-        let mut records = HashMap::<(u32, UploadId), CompletedMultipartUploadRecord>::new();
+        let mut records = Vec::<(PgId, CompletedMultipartUploadRecord)>::new();
         for raw_pg_id in self.metadata_pg_ids() {
             let pg_id = PgId::new(raw_pg_id);
-            let nodes = self
+            let node = self
                 .local_map
-                .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
-            for node in nodes {
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            let mut upload_id_marker = None;
+            loop {
                 let page = node
                     .object_mutation_metadata_client()
-                    .list_completed_multipart_upload_records_for_bucket(pg_id, bucket)
+                    .list_completed_multipart_upload_records_for_bucket_page(
+                        pg_id,
+                        bucket,
+                        upload_id_marker.as_ref(),
+                        INTERNAL_LIST_PAGE_SIZE,
+                    )
                     .map_err(|error| match error {
                         BucketSnapshotLoadError::Store(error) => E::from(error),
                         BucketSnapshotLoadError::Metadata(error) => E::from(error),
                     })?;
-                for record in page {
-                    let key = (pg_id.get(), record.upload_id.clone());
-                    match records.entry(key) {
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(record);
-                        }
-                        std::collections::hash_map::Entry::Occupied(entry)
-                            if entry.get() == &record => {}
-                        std::collections::hash_map::Entry::Occupied(_) => {
-                            return Err(MetadataError::Db {
-                                context:
-                                    "conflicting completed multipart upload tombstone replicas",
-                                source: rusqlite::Error::InvalidQuery,
-                            }
-                            .into());
-                        }
-                    }
+                records.extend(page.records.into_iter().map(|record| (pg_id, record)));
+                match page.next_upload_id_marker {
+                    Some(next) => upload_id_marker = Some(next),
+                    None => break,
                 }
             }
         }
-        Ok(records
-            .into_iter()
-            .map(|((pg_id, _), record)| (PgId::new(pg_id), record))
-            .collect())
+        Ok(records)
     }
 
     fn delete_completed_multipart_upload_record_with_command(

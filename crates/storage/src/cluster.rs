@@ -4655,10 +4655,7 @@ impl StorageCluster {
             else {
                 continue;
             };
-            let Ok(mut local) = node
-                .object_mutation_metadata_client()
-                .list_all_stream_uploads(pg_id)
-            else {
+            let Ok(mut local) = node.storage_client().list_all_stream_uploads(pg_id) else {
                 continue;
             };
             sessions.append(&mut local);

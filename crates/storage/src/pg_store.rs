@@ -9761,6 +9761,71 @@ impl PgStore {
         Ok(uploads)
     }
 
+    pub(crate) fn list_completed_multipart_upload_records_for_bucket_page(
+        &self,
+        bucket: &BucketName,
+        upload_id_marker: Option<&UploadId>,
+        limit: u32,
+    ) -> Result<CompletedMultipartUploadRecordPage, MetadataError> {
+        let fetch_limit = i64::from(limit) + 1;
+        let (sql, params_vec): (
+            &str,
+            Vec<Box<dyn rusqlite::types::ToSql>>,
+        ) = match upload_id_marker {
+            Some(marker) => (
+                "SELECT upload_id, bucket, key, completion_order, completed_at, \
+                        owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
+                 FROM completed_multipart_uploads \
+                 WHERE bucket = ?1 AND upload_id > ?2 \
+                 ORDER BY upload_id ASC LIMIT ?3",
+                vec![
+                    Box::new(bucket.clone()),
+                    Box::new(marker.clone()),
+                    Box::new(fetch_limit),
+                ],
+            ),
+            None => (
+                "SELECT upload_id, bucket, key, completion_order, completed_at, \
+                        owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
+                 FROM completed_multipart_uploads \
+                 WHERE bucket = ?1 \
+                 ORDER BY upload_id ASC LIMIT ?2",
+                vec![Box::new(bucket.clone()), Box::new(fetch_limit)],
+            ),
+        };
+        let params = rusqlite::params_from_iter(params_vec.iter());
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list completed multipart uploads for bucket page",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params, Self::completed_multipart_upload_record_from_row)
+            .map_err(|e| MetadataError::Db {
+                context: "query list completed multipart uploads for bucket page",
+                source: e,
+            })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|e| MetadataError::Db {
+                context: "row list completed multipart uploads for bucket page",
+                source: e,
+            })?);
+        }
+        let next_upload_id_marker = if records.len() > limit as usize {
+            records.pop();
+            records.last().map(|record| record.upload_id.clone())
+        } else {
+            None
+        };
+        Ok(CompletedMultipartUploadRecordPage {
+            records,
+            next_upload_id_marker,
+        })
+    }
+
     fn completed_multipart_upload_record_from_row(
         row: &rusqlite::Row<'_>,
     ) -> Result<CompletedMultipartUploadRecord, rusqlite::Error> {
@@ -16269,6 +16334,97 @@ impl PgMetadataStore for PgStore {
                 context: "list all stream uploads (collect)",
                 source: e,
             })
+    }
+
+    fn list_stream_uploads_for_bucket_page(
+        &self,
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, MetadataError> {
+        let fetch_limit = i64::from(limit) + 1;
+        let (sql, params_vec): (
+            &str,
+            Vec<Box<dyn rusqlite::types::ToSql>>,
+        ) = match session_id_marker {
+            Some(marker) => (
+                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
+                 WHERE bucket = ?1 AND session_id > ?2 \
+                 ORDER BY session_id ASC LIMIT ?3",
+                vec![
+                    Box::new(bucket.clone()),
+                    Box::new(marker.clone()),
+                    Box::new(fetch_limit),
+                ],
+            ),
+            None => (
+                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
+                 WHERE bucket = ?1 \
+                 ORDER BY session_id ASC LIMIT ?2",
+                vec![Box::new(bucket.clone()), Box::new(fetch_limit)],
+            ),
+        };
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for bucket page (prepare)",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+                let op_kind_raw: u8 = row.get(3)?;
+                let state_raw: u8 = row.get(6)?;
+                let upload_id: Option<UploadId> = row.get(4)?;
+                let part_number: Option<i64> = row.get(5)?;
+                Ok(StreamUploadRecord {
+                    session_id: row.get(0)?,
+                    bucket: row.get(1)?,
+                    key: row.get(2)?,
+                    target: PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 3)?,
+                    state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("invalid stream state: {state_raw}")),
+                        )
+                    })?,
+                    created_at: row.get::<_, i64>(7)? as u64,
+                    encryption: Self::parse_object_encryption(
+                        row.get::<_, u8>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
+                        8,
+                        9,
+                    )?,
+                    next_segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(10)?,
+                        10,
+                        "next_segment_vid",
+                    )?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for bucket page (query)",
+                source: e,
+            })?;
+        let mut uploads = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MetadataError::Db {
+                context: "list stream uploads for bucket page (collect)",
+                source: e,
+            })?;
+        let next_session_id_marker = if uploads.len() > limit as usize {
+            uploads.pop();
+            uploads.last().map(|upload| upload.session_id.clone())
+        } else {
+            None
+        };
+        Ok(StreamUploadRecordPage {
+            uploads,
+            next_session_id_marker,
+        })
     }
 
     #[cfg(test)]

@@ -648,6 +648,102 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
 }
 
 #[test]
+fn list_completed_multipart_upload_records_for_bucket_page_paginates() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("completed-page");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    for (suffix, completion_order) in [("a", 1), ("b", 2), ("c", 3)] {
+        let upload_id = multipart_upload_id(format!("completed-{suffix}"));
+        let key = object_key(format!("key-{suffix}"));
+        store
+            .create_multipart_upload(&CreateMultipartUploadReq {
+                upload_id: upload_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                tags: None,
+                metadata_blob: vec![].into(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: None,
+                owner: test_owner(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap();
+        let obj = CommitMultipartReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            size: 1024,
+            etag_crc64: [completion_order as u8, 0, 0, 0, 0, 0, 0, 0],
+            ec: EcShape { k: 4, m: 2 },
+            tags: None,
+            metadata_blob: Some(vec![].into()),
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        };
+        let parts = vec![ObjectPartRecord {
+            bucket: bucket.clone(),
+            key,
+            version_id: VersionId::Null,
+            part_number: 1,
+            size: 1024,
+            etag: vec![completion_order as u8],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [completion_order as u8; 16],
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            data_pg_id: 0,
+            checksum: None,
+        }];
+        store
+            .complete_multipart_commit(&upload_id, completion_order, &obj, &parts)
+            .unwrap();
+    }
+
+    let first = store
+        .list_completed_multipart_upload_records_for_bucket_page(&bucket, None, 2)
+        .unwrap();
+    assert_eq!(first.records.len(), 2);
+    assert_eq!(
+        first.next_upload_id_marker.as_ref(),
+        first.records.last().map(|record| &record.upload_id)
+    );
+
+    let second = store
+        .list_completed_multipart_upload_records_for_bucket_page(
+            &bucket,
+            first.next_upload_id_marker.as_ref(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert!(second.next_upload_id_marker.is_none());
+    assert!(
+        first.records[1].upload_id.as_str() < second.records[0].upload_id.as_str(),
+        "second page should start after first page marker"
+    );
+}
+
+#[test]
 fn delete_bucket_clears_object_version_counter_records() {
     let (_dir, store) = make_pg_store();
     let bucket = bucket_name("bucket");
@@ -8192,6 +8288,49 @@ fn list_all_stream_uploads_returns_sessions() {
     let s2 = stream_session_id("s2");
     assert!(ids.contains(&s1.as_str()));
     assert!(ids.contains(&s2.as_str()));
+}
+
+#[test]
+fn list_stream_uploads_for_bucket_page_paginates_and_scopes_bucket() {
+    let (_dir, store) = make_pg_store();
+    for (session, bucket, key) in [
+        ("s1", "bucket", "k1"),
+        ("s2", "bucket", "k2"),
+        ("s3", "bucket", "k3"),
+        ("other", "other-bucket", "k4"),
+    ] {
+        store
+            .create_stream_upload(&CreateStreamUploadReq {
+                session_id: stream_session_id(session),
+                bucket: bucket_name(bucket),
+                key: object_key(key),
+                target: StreamUploadTarget::PutObject,
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap();
+    }
+
+    let bucket = bucket_name("bucket");
+    let first = store
+        .list_stream_uploads_for_bucket_page(&bucket, None, 2)
+        .unwrap();
+    assert_eq!(first.uploads.len(), 2);
+    assert!(first.uploads.iter().all(|upload| upload.bucket == bucket));
+    assert_eq!(
+        first.next_session_id_marker.as_ref(),
+        first.uploads.last().map(|upload| &upload.session_id)
+    );
+
+    let second = store
+        .list_stream_uploads_for_bucket_page(&bucket, first.next_session_id_marker.as_ref(), 2)
+        .unwrap();
+    assert_eq!(second.uploads.len(), 1);
+    assert!(second.next_session_id_marker.is_none());
+    assert!(
+        first.uploads[1].session_id.as_str() < second.uploads[0].session_id.as_str(),
+        "second page should start after first page marker"
+    );
+    assert_eq!(second.uploads[0].bucket, bucket);
 }
 
 // ── delete_multipart_part_segments_by_upload_id ────────────────────────
