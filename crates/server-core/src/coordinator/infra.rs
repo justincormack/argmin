@@ -18,6 +18,39 @@ use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use storage::PgTopology;
 use storage::{BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundWorkerMode {
+    pub object_reclaim_and_bucket_finalize: bool,
+    pub lifecycle: bool,
+    pub shard_scavenger: bool,
+}
+
+impl BackgroundWorkerMode {
+    pub const fn all() -> Self {
+        Self {
+            object_reclaim_and_bucket_finalize: true,
+            lifecycle: true,
+            shard_scavenger: true,
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self {
+            object_reclaim_and_bucket_finalize: false,
+            lifecycle: false,
+            shard_scavenger: false,
+        }
+    }
+
+    pub const fn remote_frontend_phase_10_6() -> Self {
+        Self {
+            object_reclaim_and_bucket_finalize: false,
+            lifecycle: false,
+            shard_scavenger: true,
+        }
+    }
+}
+
 impl Coordinator {
     pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -283,14 +316,45 @@ impl Coordinator {
     /// Create a new coordinator over a cluster-shaped storage handle without
     /// starting background sweepers.
     ///
-    /// Remote frontend roles use this until Phase 10.6 routes background
-    /// worker metadata surfaces through the storage-node RPC boundary.
+    /// Tests use this when background work would make assertions
+    /// nondeterministic.
     pub fn new_with_managed_key_provider_for_storage_cluster_without_background_sweepers(
         storage_cluster: Arc<StorageCluster>,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: StaticManagedKeyProvider,
     ) -> Result<Self, ServerError> {
+        Self::new_with_managed_key_provider_for_storage_cluster_with_background_worker_mode(
+            storage_cluster,
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            BackgroundWorkerMode::none(),
+        )
+    }
+
+    pub fn new_with_managed_key_provider_for_storage_cluster_with_background_worker_mode(
+        storage_cluster: Arc<StorageCluster>,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: StaticManagedKeyProvider,
+        background_worker_mode: BackgroundWorkerMode,
+    ) -> Result<Self, ServerError> {
+        let lifecycle_sweeper_factory =
+            |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
+                if background_worker_mode.lifecycle {
+                    LifecycleSweeper::acquire_shared(storage_cluster, read_runtime)
+                } else {
+                    Ok(LifecycleSweeper::disabled())
+                }
+            };
+        let shard_scavenger_sweeper_factory = |storage_cluster: &Arc<StorageCluster>| {
+            if background_worker_mode.shard_scavenger {
+                ShardScavengerSweeper::acquire_shared(storage_cluster)
+            } else {
+                Ok(ShardScavengerSweeper::disabled())
+            }
+        };
         Self::new_with_shared_caches_and_background_sweeper_factories(
             Arc::clone(&storage_cluster),
             shared_caches_for_storage_cluster(&storage_cluster),
@@ -298,9 +362,9 @@ impl Coordinator {
             sse_c_validator,
             Some(managed_key_provider),
             (
-                false,
-                |_, _| Ok(LifecycleSweeper::disabled()),
-                |_| Ok(ShardScavengerSweeper::disabled()),
+                background_worker_mode.object_reclaim_and_bucket_finalize,
+                lifecycle_sweeper_factory,
+                shard_scavenger_sweeper_factory,
             ),
         )
     }
@@ -366,7 +430,7 @@ impl Coordinator {
             sse_c_validator,
             managed_key_provider,
             (
-                true,
+                BackgroundWorkerMode::all().object_reclaim_and_bucket_finalize,
                 lifecycle_sweeper_factory,
                 ShardScavengerSweeper::acquire_shared,
             ),
@@ -432,6 +496,18 @@ impl Coordinator {
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)]
+    pub(crate) fn background_worker_mode_for_test(&self) -> BackgroundWorkerMode {
+        use std::sync::atomic::Ordering;
+
+        BackgroundWorkerMode {
+            object_reclaim_and_bucket_finalize: !self._reclaim_sweeper.stop.load(Ordering::SeqCst),
+            lifecycle: !self._lifecycle_sweeper.stop.load(Ordering::SeqCst),
+            shard_scavenger: !self._shard_scavenger_sweeper.stop.load(Ordering::SeqCst),
         }
     }
 

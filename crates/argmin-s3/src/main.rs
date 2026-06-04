@@ -249,7 +249,13 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
             std::process::exit(1);
         });
 
-    run_frontend_server(config, host_id, storage_cluster, true).await;
+    run_frontend_server(
+        config,
+        host_id,
+        storage_cluster,
+        server_core::coordinator::BackgroundWorkerMode::all(),
+    )
+    .await;
 }
 
 async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
@@ -258,7 +264,13 @@ async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: E
             eprintln!("failed to open remote frontend storage cluster: {e}");
             std::process::exit(1);
         });
-    run_frontend_server(config, host_id, storage_cluster, false).await;
+    run_frontend_server(
+        config,
+        host_id,
+        storage_cluster,
+        server_core::coordinator::BackgroundWorkerMode::remote_frontend_phase_10_6(),
+    )
+    .await;
 }
 
 fn build_remote_frontend_storage_cluster(
@@ -304,7 +316,7 @@ async fn run_frontend_server(
     config: ServerConfig,
     host_id: String,
     storage_cluster: Arc<StorageCluster>,
-    start_background_sweepers: bool,
+    background_worker_mode: server_core::coordinator::BackgroundWorkerMode,
 ) {
     let sse_c_validator = config
         .sse_c_validator_key_b64
@@ -326,21 +338,14 @@ async fn run_frontend_server(
     // Build frontend pool sharing the same storage cluster handle.
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let coordinator = if start_background_sweepers {
-            Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        let coordinator =
+            Coordinator::new_with_managed_key_provider_for_storage_cluster_with_background_worker_mode(
                 Arc::clone(&storage_cluster),
                 config.region.clone(),
                 sse_c_validator.clone(),
                 managed_key_provider.clone(),
-            )
-        } else {
-            Coordinator::new_with_managed_key_provider_for_storage_cluster_without_background_sweepers(
-                Arc::clone(&storage_cluster),
-                config.region.clone(),
-                sse_c_validator.clone(),
-                managed_key_provider.clone(),
-            )
-        };
+                background_worker_mode,
+            );
         let coordinator = match coordinator {
             Ok(c) => c,
             Err(e) => {

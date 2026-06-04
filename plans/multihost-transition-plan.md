@@ -5641,9 +5641,11 @@ requires its own socket-map entry to match `ARGMIN_STORAGE_NODE_SOCKET_PATH`,
 then starts the HTTP/coordinator frontend over the same socket client boundary.
 The placeholder frontend map intentionally skips local metadata-command replay
 validation because the storage-node-owned PG is the command-stream authority.
-Remote frontend and combined coordinators do not start background sweepers yet:
-reclaim, lifecycle, and shard-scavenger workers remain disabled until Phase
-10.6 routes every worker metadata surface through the same RPC boundary.
+Remote frontend and combined coordinators keep object reclaim, bucket
+finalization, and lifecycle workers disabled until Phase 10.6 routes those
+worker metadata surfaces through the same RPC boundary and adds restart/resume
+coverage. Shard-scavenger startup is owned by Phase 10.6 once its dedicated RPC
+boundary is routed and tested.
 
 Phase 10.5 is complete for the frontend/combined request-path RPC routing that
 the current cluster-map shape can express. There are three explicit
@@ -5805,10 +5807,11 @@ Required tests:
    canonical-equivalent duplicate, incomplete, or combined-self-mismatched
    socket entries fail at config/build time, and the frontend placeholder map
    uses the configured cluster epoch without validating local placeholder PG
-   replay state. Remote frontend startup must keep background sweepers disabled
-   until Phase 10.6 completes worker routing. Full separate-process
-   frontend/combined startup and HTTP S3 coverage belongs to the Phase 10.7
-   harness.
+  replay state. Remote frontend startup must keep object reclaim/bucket
+  finalization and lifecycle workers disabled until those worker surfaces have
+  Phase 10.6 restart coverage; shard scavenger may start once its RPC boundary
+  is routed and covered. Full separate-process frontend/combined startup and
+  HTTP S3 coverage belongs to the Phase 10.7 harness.
 
 ### Phase 10.6: Background Workers Across RPC
 
@@ -5847,10 +5850,14 @@ Status:
   shard test proving shard files, ack rows, scavenger shard rows, and
   observations are stored on the storage-node-owned PG rather than the
   frontend placeholder PG.
-- Remaining Phase 10.6 work is to turn the background workers back on in
-  frontend/combined startup once object reclaim, bucket finalization, lifecycle,
-  and shard-scavenger worker scheduling/restart behavior have process-shaped
-  coverage.
+- Remote frontend/combined startup now uses an explicit background-worker mode
+  and enables only the shard-scavenger worker. Object reclaim, bucket
+  finalization, and lifecycle remain disabled in remote frontend mode until
+  their restart/resume coverage is in place. Focused coverage asserts this
+  Phase 10.6 mode enables shard scavenger without enabling the other workers.
+- Remaining Phase 10.6 work is to turn object reclaim/bucket finalization and
+  lifecycle workers back on in frontend/combined startup once their
+  worker scheduling/restart behavior has process-shaped coverage.
 
 ### Phase 10.7: Multi-Process Harness
 

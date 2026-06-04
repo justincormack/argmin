@@ -82,6 +82,31 @@ fn rwlock_helpers_recover_after_panic() {
 }
 
 #[test]
+fn phase_10_6_remote_frontend_worker_mode_enables_only_shard_scavenger() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_with_background_worker_mode(
+            storage_cluster,
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::remote_frontend_phase_10_6(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        coord.background_worker_mode_for_test(),
+        BackgroundWorkerMode {
+            object_reclaim_and_bucket_finalize: false,
+            lifecycle: false,
+            shard_scavenger: true,
+        }
+    );
+}
+
+#[test]
 fn put_object_effective_policy_context_derives_explicit_sse_s3() {
     let metadata = MetadataBlob::default();
     let system_metadata = SystemMetadata::default();
