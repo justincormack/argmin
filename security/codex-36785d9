@@ -1,0 +1,300 @@
+Unpaginated cleanup RPC can disable upload cleanup
+Link: https://chatgpt.com/codex/cloud/security/findings/2cee4f86e00481919af01944437650ac?sev=
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 36785d9
+Author: justin@specialbusservice.com
+Created: 03/06/2026, 19:55:45
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit `75cf693` (`Page cleanup metadata RPC lists`).
+
+What was fixed:
+- `ObjectStreamUploadsList` is now a bucket-scoped, paginated RPC instead of a PG-wide all-record response.
+- `ObjectCompletedMultipartUploadsList` is now paginated by upload-id marker and served only by the object-PG primary.
+- The RPC request codecs enforce a cleanup-specific page limit before server-side scans, and response decoders reject oversized item counts before allocating result vectors.
+- Unix clients validate response bucket identity, strict ordering, marker progression, and requested page size before returning cleanup pages.
+- Bucket visible-data checks now request a one-row bucket-scoped stream-upload page instead of materializing all stream uploads for a PG.
+- Completed multipart tombstone cleanup and pruning now page through each object-PG primary, avoiding the earlier replica/non-primary failure and avoiding unbounded response materialization.
+- Regression coverage was added for store pagination, bucket scoping, oversized cleanup-list requests, and malicious oversized response counts.
+- `scripts/check-storage-cluster-boundaries` now recognizes the paged mutation-client APIs and continues to reject broad-client regressions.
+
+Already-existing residual:
+- `list_stream_upload_sessions_best_effort` still has an explicit local broad `storage_client().list_all_stream_uploads` exception for stale stream-session scavenging. This remains a Phase 10.6 background-worker routing follow-up; remote background workers are still deferred/disabled, so it is not part of this fixed remote cleanup RPC attack path.
+
+Verification for the fix:
+- `cargo test -p storage stream_uploads_list -- --nocapture`
+- `cargo nextest run -p storage -E 'test(list_stream_uploads_for_bucket_page_paginates_and_scopes_bucket) | test(list_completed_multipart_upload_records_for_bucket_page_paginates) | test(cleanup_list_requests_reject_limit_over_protocol_max) | test(cleanup_list_responses_reject_count_over_protocol_max_before_items)'`
+- `./scripts/check-storage-cluster-boundaries`
+- `cargo clippy -p storage --all-targets --all-features -- -D warnings`
+- `cargo check --all-targets --all-features`
+
+# Summary
+Introduced an availability bug: unpaginated all-record cleanup listings are now sent over bounded RPC responses. Large attacker-controlled numbers of stream-upload sessions or completed multipart-upload tombstones can prevent cleanup and bucket deletion/pruning, allowing persistent resource exhaustion.
+The new RPC methods `ObjectStreamUploadsList` and `ObjectCompletedMultipartUploadsList` return all matching records in a single response. Their encoders reject responses above `STORAGE_RPC_MAX_LIST_PAGE_ITEMS` and also build the full payload in memory before the frame-size check. The caller paths use these RPCs for stale stream-upload scavenging, bucket visible-data checks, and completed-multipart tombstone cleanup. Once an attacker with upload permission creates enough abandoned stream uploads or completed multipart-upload tombstones in a PG/bucket, the RPC response can exceed the item or frame limits. For best-effort stream cleanup the error is swallowed and the PG is skipped; for bucket deletion/pruning the error propagates, blocking cleanup. Before this commit these paths used local storage-client calls without the new RPC response cap, so this failure mode is introduced by routing the cleanup metadata over RPC without pagination.
+
+# Validation
+## Rubric
+- [x] Confirm the commit routed stream-upload and completed-multipart cleanup metadata through new RPC methods rather than only local storage-client paths.
+- [x] Confirm the RPC server handlers collect all matching cleanup records and encode them as one response without pagination.
+- [x] Confirm the response encoders enforce `STORAGE_RPC_MAX_LIST_PAGE_ITEMS` and reject oversized all-record lists.
+- [x] Dynamically construct attacker-sized cleanup record sets and reproduce the exact `PayloadTooLarge` failure using the real target code.
+- [x] Confirm caller impact: best-effort stream cleanup skips failed PGs, while bucket visible-data checks and completed-multipart cleanup/pruning propagate the error.
+## Report
+Validated the finding. The commit introduces `STORAGE_RPC_MAX_LIST_PAGE_ITEMS = 100000` at `crates/storage/src/storage_rpc.rs:125`. Both new cleanup-list response encoders reject all-record responses above that cap: stream uploads at `storage_rpc.rs:4126-4146` and completed multipart tombstones at `storage_rpc.rs:4166-4186`. The RPC server handlers load all matching local records into a Vec and pass them into these encoders in one response: `storage_node_server.rs:2838-2862` and `storage_node_server.rs:2865-2888`. Encoder errors are converted to `StorageNodeServerError::ResponsePayload` by dispatch (`storage_node_server.rs:1408-1413`), so the RPC session fails instead of returning a paginated page. The Unix client methods depend on these RPCs at `node_client.rs:7424-7437` and `node_client.rs:7440-7464`. Cleanup/deletion callers then either skip the PG (`cluster.rs:4647-4665`) or propagate the error into bucket drain/prune paths (`cluster/request_ops.rs:2333-2348`, `2380-2414`, `3060-3067`).
+
+Dynamic PoC: I appended a temporary `#[cfg(test)]` module that constructs `100001` stream-upload records and `100001` completed-multipart records and calls the real encoders. Command: `CFLAGS='-O0 -g' CXXFLAGS='-O0 -g' cargo test -p storage autovalidator_cleanup_rpc_poc -- --nocapture`. Output showed both real encoders fail exactly at the cap: `stream upload list encoder error: storage RPC payload length 100001 exceeds limit 100000` and `completed multipart list encoder error: storage RPC payload length 100001 exceeds limit 100000`.
+
+Crash/valgrind/debugger attempts: this is a controlled availability failure, not a memory-safety crash, so the PoC exits successfully after reproducing the blocking error. `valgrind` was not installed. ASan was attempted with `RUSTFLAGS='-Z sanitizer=address'`, but stable Rust rejected the nightly-only `-Z` flag. LLDB was available and used non-interactively; breakpoints at `storage::storage_rpc::encode_stream_uploads_list_response` and `storage::storage_rpc::encode_completed_multipart_uploads_list_response` produced backtraces showing the PoC invoking the exact encoder functions at `storage_rpc.rs:4129` and `storage_rpc.rs:4169` before returning the oversized-list errors.
+
+# Evidence
+crates/storage/src/cluster.rs (L4647 to 4665)
+  Note: Best-effort stale stream cleanup now uses the RPC-backed object mutation client and silently skips a PG when the all-record listing fails.
+```
+    pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
+        let mut sessions = Vec::new();
+        for &pg_id in self.local_map.pg_ids() {
+            let pg_id = PgId::new(pg_id);
+            let Ok(node) = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            else {
+                continue;
+            };
+            let Ok(mut local) = node
+                .object_mutation_metadata_client()
+                .list_all_stream_uploads(pg_id)
+            else {
+                continue;
+            };
+            sessions.append(&mut local);
+        }
+        sessions
+```
+
+crates/storage/src/cluster/request_ops.rs (L2333 to 2348)
+  Note: Bucket visible-data checks now depend on the unpaginated stream-upload RPC and convert listing failure into a bucket-drain error.
+```
+            if include_stream_uploads {
+                let pg_id = PgId::new(pg_id);
+                let node = self
+                    .local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+                let sessions = match node
+                    .object_mutation_metadata_client()
+                    .list_all_stream_uploads(pg_id)
+                {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                            super::object_pg_action_error_to_bucket_snapshot_error(error),
+                        ));
+                    }
+                };
+```
+
+crates/storage/src/cluster/request_ops.rs (L2393 to 2414)
+  Note: Completed multipart tombstone cleanup now queries every acting node via the new unpaginated RPC; an oversized list prevents cleanup from proceeding.
+```
+    fn completed_multipart_upload_records_for_bucket<E>(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<(PgId, CompletedMultipartUploadRecord)>, E>
+    where
+        E: From<StoreError> + From<MetadataError>,
+    {
+        let mut records = HashMap::<(u32, UploadId), CompletedMultipartUploadRecord>::new();
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
+            let nodes = self
+                .local_map
+                .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
+            for node in nodes {
+                let page = node
+                    .object_mutation_metadata_client()
+                    .list_completed_multipart_upload_records_for_bucket(pg_id, bucket)
+                    .map_err(|error| match error {
+                        BucketSnapshotLoadError::Store(error) => E::from(error),
+                        BucketSnapshotLoadError::Metadata(error) => E::from(error),
+                    })?;
+                for record in page {
+```
+
+crates/storage/src/storage_node_server.rs (L2838 to 2888)
+  Note: The new RPC handlers load all stream uploads or completed multipart records and encode them in a single response; encode errors abort the RPC response.
+```
+    fn stream_uploads_list_response(
+        &self,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(request.pg_id, "object stream uploads list") {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let uploads = match ObjectMutationMetadataNodeClient::list_all_stream_uploads(
+            &local_client,
+            request.pg_id,
+        ) {
+            Ok(uploads) => uploads,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload =
+            encode_stream_uploads_list_response(&StorageRpcStreamUploadsListResponse { uploads })?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn completed_multipart_uploads_list_response(
+        &self,
+        request: StorageRpcBucketRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let records =
+            match ObjectMutationMetadataNodeClient::list_completed_multipart_upload_records_for_bucket(
+                &local_client,
+                request.pg_id,
+                &request.bucket,
+            ) {
+                Ok(records) => records,
+                Err(error) => return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            };
+        let payload = encode_completed_multipart_uploads_list_response(
+            &StorageRpcCompletedMultipartUploadsListResponse { records },
+        )?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+```
+
+crates/storage/src/storage_rpc.rs (L4126 to 4186)
+  Note: The new cleanup-list response encoders serialize the entire result set and reject more than STORAGE_RPC_MAX_LIST_PAGE_ITEMS instead of paginating.
+```
+pub(crate) fn encode_stream_uploads_list_response(
+    response: &StorageRpcStreamUploadsListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let count = u32::try_from(response.uploads.len()).map_err(|_| {
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: response.uploads.len(),
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        }
+    })?;
+    if count > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count as usize,
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(&mut out, count);
+    for upload in &response.uploads {
+        put_stream_upload_record(&mut out, upload);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_stream_uploads_list_response(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadsListResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let upload_count = decoder.read_limited_bounded_remaining_count(
+        STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN,
+        "too many stream uploads",
+        STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+    )?;
+    let mut uploads = Vec::new();
+    for _ in 0..upload_count {
+        uploads.push(decoder.read_stream_upload_record()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadsListResponse { uploads })
+}
+
+pub(crate) fn encode_completed_multipart_uploads_list_response(
+    response: &StorageRpcCompletedMultipartUploadsListResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let count = u32::try_from(response.records.len()).map_err(|_| {
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: response.records.len(),
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        }
+    })?;
+    if count > STORAGE_RPC_MAX_LIST_PAGE_ITEMS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count as usize,
+            limit: STORAGE_RPC_MAX_LIST_PAGE_ITEMS as usize,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(&mut out, count);
+    for record in &response.records {
+        put_completed_multipart_upload_record(&mut out, record);
+    }
+    Ok(out)
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from medium to ignore for the current threat model because the bug is real but not reachable from the main external S3 attack surface in this repository state. Evidence shows the RPC encoders cap unpaginated responses at 100000 items and cleanup callers can fail, but argmin-s3 rejects remote frontend/combined routing and default legacy-local storage uses LocalStorageNodeClient methods that directly query PgStore without invoking these RPC encoders. The storage-node server binds a Unix socket, making the vulnerable RPC internal/local rather than an exposed user-facing API. If future deployment wiring installs Unix object-mutation metadata clients behind a remotely reachable frontend, the issue should be restored as a medium availability vulnerability.
+## Likelihood
+low - The data accumulation is plausible for a writer and the encoder failure is deterministic, but the affected RPC-backed object-mutation metadata client is not wired into the main in-scope HTTP runtime in this commit; default local clients bypass the capped RPC. Exploitation would require non-default/internal deployment wiring or local Unix socket access.
+## Impact
+medium - If reachable through Unix RPC-backed cleanup paths, the impact is availability/resource-management degradation: stale stream cleanup can skip PGs and bucket deletion/pruning can be blocked. It does not provide confidentiality, integrity, authentication bypass, RCE, or direct data corruption.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin and does not assume any external deployment wiring not present in the checkout.
+- The main in-scope product is the argmin-s3 S3-compatible runtime described by the threat model.
+- Remote frontend-to-storage-node routing is considered not production-reachable because the application configuration rejects frontend/combined remote routing in this commit.
+- A deployment must use UnixStorageNodeClient-backed object-mutation metadata clients for cleanup/listing paths.
+- An attacker must have object upload permission, or the target bucket must allow public write.
+- The attacker must create more than 100000 stream-upload records in a PG or more than 100000 completed-multipart records for a bucket.
+- A stale stream cleanup, bucket deletion/drain, or completed multipart pruning path must run.
+## Path
+attacker upload access -> many upload/tombstone records -> cleanup list over RPC -> encoder cap >100000 -> cleanup/delete/prune fails
+                                  ^
+                                  |
+                   current main argmin-s3 runtime uses local clients / rejects remote frontend routing
+## Path evidence
+- `crates/storage/src/storage_rpc.rs:125` - Defines STORAGE_RPC_MAX_LIST_PAGE_ITEMS as 100000, the hard cap relevant to the oversized cleanup-list failure.
+- `crates/storage/src/storage_rpc.rs:4126-4146` - Stream-upload list response encoder rejects counts above STORAGE_RPC_MAX_LIST_PAGE_ITEMS and serializes the full list into one Vec.
+- `crates/storage/src/storage_rpc.rs:4166-4186` - Completed-multipart list response encoder has the same unpaginated hard-cap behavior.
+- `crates/storage/src/storage_node_server.rs:2838-2888` - Storage RPC handlers load all matching local records and pass them to the capped encoders in a single response.
+- `crates/storage/src/storage_node_server.rs:1411-1413` - Response payload encoding errors are converted into StorageNodeServerError::ResponsePayload, causing RPC failure rather than pagination.
+- `crates/storage/src/node_client.rs:7424-7464` - UnixStorageNodeClient object-mutation metadata methods consume the new RPC list responses.
+- `crates/storage/src/cluster.rs:4647-4665` - Best-effort stale stream cleanup silently skips a PG when list_all_stream_uploads fails.
+- `crates/storage/src/cluster/request_ops.rs:2333-2348` - Bucket visible-data checks propagate stream-upload listing failure into bucket drain/delete errors.
+- `crates/storage/src/cluster/request_ops.rs:2393-2414` - Completed multipart cleanup gathers all records from acting nodes; an RPC list failure aborts the operation.
+- `crates/storage/src/cluster/local.rs:309-327` - Default local node construction wires object_mutation_metadata_client to LocalStorageNodeClient, not UnixStorageNodeClient.
+- `crates/storage/src/node_client.rs:11777-11783` - LocalStorageNodeClient list_all_stream_uploads directly calls PgStore and does not go through the capped RPC encoder.
+- `crates/storage/src/node_client.rs:10381-10387` - LocalStorageNodeClient completed multipart record listing directly calls PgStore and does not go through the capped RPC encoder.
+- `crates/argmin-s3/src/config.rs:115-119` - Configuration rejects roles requiring remote frontend routing, limiting current HTTP reachability of Unix RPC-backed storage-node clients.
+- `crates/argmin-s3/src/main.rs:274-329` - Main S3 frontend binds a configurable TCP listener and serves HTTP/TLS, but this legacy-local path opens local storage rather than remote object-mutation RPC clients.
+- `crates/storage/src/storage_node_server.rs:363-380` - Storage-node RPC exposure is a UnixListener on a configured socket path, not a public TCP listener.
+## Narrative
+The core bug is real in the RPC code: both cleanup-list encoders reject responses over 100000 items, and the server handlers load all records and encode them as one response. Validation also demonstrated the real encoders fail at 100001 records. However, static reachability from the main S3 product is weak in this commit. The argmin-s3 default runtime opens local storage nodes, and LocalStorageNodeClient lists stream uploads/completed multipart records directly without the RPC cap. Remote frontend/combined roles are parsed but rejected, while the storage-node server listens on an internal Unix socket. Thus this is a valid availability bug in a not-yet-wired/internal RPC path, not a medium-severity externally reachable issue for the current threat model.
+## Controls
+- SigV4 authentication for normal S3 requests
+- Bucket ACL/policy authorization including public-read-write as an explicit configuration
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000
+- Optional TLS if ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are configured
+- Storage-node RPC uses Unix domain sockets
+- Remote frontend routing is explicitly unsupported in this commit
+- Connection and in-flight request caps exist, but no per-bucket upload/tombstone quota was found
+## Blindspots
+- Static-only analysis cannot prove how downstream users may manually wire LocalClusterMap::install_unix_object_mutation_metadata_clients outside the main binary.
+- No deployment manifests were present to confirm whether any real environment exposes storage-node Unix sockets broadly or enables unsupported remote frontend routing via patches.
+- The validation PoC exercised encoder behavior directly, not an end-to-end HTTP exploit path through the main argmin-s3 runtime.
