@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use auth::canonical::canonical_query_string;
 use aws_sdk_s3::client::customize::CustomizableOperation;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::delete_objects::builders::DeleteObjectsFluentBuilder;
 use aws_sdk_s3::operation::delete_objects::{DeleteObjectsError, DeleteObjectsOutput};
 use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::builders::PutBucketLifecycleConfigurationFluentBuilder;
@@ -26,6 +27,13 @@ use ring::hmac;
 use crate::CTX;
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BUCKET_NAMESPACE: LazyLock<u64> = LazyLock::new(|| {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    now ^ ((std::process::id() as u64) << 32)
+});
 
 const TEST_SSE_C_KEY_BYTES: [u8; 32] = *b"abcdefghijklmnopqrstuvwxyzABCDEF";
 
@@ -67,7 +75,7 @@ pub fn sse_c_header_values(key: &[u8; 32]) -> (String, String) {
 pub fn unique_bucket() -> String {
     let n = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    format!("{}-{}-{}-{}", bucket_prefix(), pid, n, timestamp_millis())
+    format!("{}{pid}-{:016x}-{n}", bucket_prefix(), *BUCKET_NAMESPACE)
 }
 
 /// Configure bucket-level Public Access Block to allow public ACL and policy tests.
@@ -93,13 +101,6 @@ pub async fn disable_bucket_public_access_block(client: &Client, bucket: &str) {
     wait_for_bucket_public_access_block_disabled(client, bucket).await;
 }
 
-fn timestamp_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 async fn create_test_bucket(client: &Client, bucket: &str) {
     let mut request = client.create_bucket().bucket(bucket);
     if CTX.region() != "us-east-1" {
@@ -109,7 +110,13 @@ async fn create_test_bucket(client: &Client, bucket: &str) {
                 .build(),
         );
     }
-    request.send().await.expect("create bucket");
+    match request.send().await {
+        Ok(_) => {}
+        Err(err) if is_create_bucket_lost_success_retry(&err) => {
+            verify_bucket_exists_after_create_conflict(client, bucket, "create bucket").await;
+        }
+        Err(err) => panic!("create bucket: {err:?}"),
+    }
 }
 
 async fn create_test_bucket_with_ownership(
@@ -120,7 +127,7 @@ async fn create_test_bucket_with_ownership(
     let mut request = client
         .create_bucket()
         .bucket(bucket)
-        .object_ownership(ownership);
+        .object_ownership(ownership.clone());
     if CTX.region() != "us-east-1" {
         request = request.create_bucket_configuration(
             CreateBucketConfiguration::builder()
@@ -128,7 +135,68 @@ async fn create_test_bucket_with_ownership(
                 .build(),
         );
     }
-    request.send().await.expect("create bucket with ownership");
+    match request.send().await {
+        Ok(_) => {}
+        Err(err) if is_create_bucket_lost_success_retry(&err) => {
+            verify_bucket_exists_after_create_conflict(
+                client,
+                bucket,
+                "create bucket with ownership",
+            )
+            .await;
+        }
+        Err(err) => panic!("create bucket with ownership: {err:?}"),
+    }
+    wait_for_bucket_ownership_controls(client, bucket, ownership).await;
+}
+
+fn is_create_bucket_lost_success_retry(
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
+) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("BucketAlreadyOwnedByYou")
+}
+
+async fn verify_bucket_exists_after_create_conflict(client: &Client, bucket: &str, context: &str) {
+    client
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap_or_else(|head_err| {
+            panic!("{context}: BucketAlreadyOwnedByYou but HeadBucket failed for {bucket}: {head_err:?}");
+        });
+}
+
+async fn wait_for_bucket_ownership_controls(
+    client: &Client,
+    bucket: &str,
+    expected: ObjectOwnership,
+) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = client
+            .get_bucket_ownership_controls()
+            .bucket(bucket)
+            .send()
+            .await;
+        if let Ok(resp) = result {
+            if resp.ownership_controls().map(|controls| {
+                controls
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.object_ownership() == &expected)
+            }) == Some(true)
+            {
+                return;
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!("ObjectOwnership={expected:?} did not converge for {bucket}");
+    }
 }
 
 /// Create a bucket through the default S3 ownership path.
