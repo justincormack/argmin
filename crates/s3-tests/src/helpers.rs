@@ -153,7 +153,15 @@ async fn create_test_bucket_with_ownership(
 fn is_create_bucket_lost_success_retry(
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
 ) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("BucketAlreadyOwnedByYou")
+    s3_error_code(err) == Some("BucketAlreadyOwnedByYou")
+}
+
+fn is_bucket_already_absent<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    s3_error_code(err) == Some("NoSuchBucket")
+}
+
+fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<&str> {
+    err.as_service_error().and_then(ProvideErrorMetadata::code)
 }
 
 async fn verify_bucket_exists_after_create_conflict(client: &Client, bucket: &str, context: &str) {
@@ -1125,12 +1133,11 @@ pub fn copy_source_with_version(bucket: &str, source_key: &str, version_id: &str
 /// delete markers rather than removing objects.
 pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
     loop {
-        let resp = client
-            .list_object_versions()
-            .bucket(bucket)
-            .send()
-            .await
-            .expect("list object versions");
+        let resp = match client.list_object_versions().bucket(bucket).send().await {
+            Ok(resp) => resp,
+            Err(err) if is_bucket_already_absent(&err) => return,
+            Err(err) => panic!("list object versions: {err:?}"),
+        };
 
         let mut objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = Vec::new();
 
@@ -1170,6 +1177,7 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
                         last_error = None;
                         break;
                     }
+                    Err(err) if is_bucket_already_absent(&err) => return,
                     Err(err) => {
                         last_error = Some(err);
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1182,12 +1190,11 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
         }
     }
 
-    client
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .expect("delete bucket");
+    match client.delete_bucket().bucket(bucket).send().await {
+        Ok(_) => {}
+        Err(err) if is_bucket_already_absent(&err) => {}
+        Err(err) => panic!("delete bucket: {err:?}"),
+    }
 }
 
 /// Assert that an S3 SDK error contains the expected error code string.
