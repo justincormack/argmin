@@ -549,7 +549,10 @@ impl LocalShardNodeClient<'_> {
         key: &ShardKey,
     ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, ShardIoError> {
         self.read_handle_client
-            .acquire_read_handles(&self.read_operation_id(key), vec![self.location])
+            .acquire_read_handles(
+                &self.read_operation_id(key),
+                vec![(self.location, key.clone())],
+            )
             .map_err(|source| self.store_error(source))
     }
 
@@ -2395,8 +2398,6 @@ impl LocalClusterMap {
             let node = self
                 .node(node_id)
                 .expect("read handle group node was validated before grouping");
-            let locations: Vec<ShardLocation> =
-                entries.iter().map(|(location, _)| *location).collect();
             let keys: Vec<ShardKey> = entries.iter().map(|(_, key)| key.clone()).collect();
             let first = entries
                 .first()
@@ -2405,7 +2406,7 @@ impl LocalClusterMap {
             let read_operation_id = client.read_operation_id_for_keys(&keys);
             match node
                 .shard_read_handle_client()
-                .acquire_read_handles(&read_operation_id, locations.clone())
+                .acquire_read_handles(&read_operation_id, entries.clone())
             {
                 Ok(lease) => handle_set.push(first.0, lease),
                 Err(source) => {
@@ -6867,8 +6868,10 @@ mod tests {
         fn acquire_read_handles(
             &self,
             _read_operation_id: &str,
-            locations: Vec<ShardLocation>,
+            entries: Vec<(ShardLocation, ShardKey)>,
         ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, StoreError> {
+            let locations: Vec<ShardLocation> =
+                entries.iter().map(|(location, _)| *location).collect();
             self.events
                 .acquires
                 .lock()
@@ -7260,12 +7263,10 @@ mod tests {
         };
         let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
         assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-        let server_threads: Vec<_> = (0..2)
-            .map(|_| {
-                let server = Arc::clone(&server);
-                thread::spawn(move || server.accept_one().unwrap())
-            })
-            .collect();
+        let server_thread = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        };
 
         let frontend_data_dir = tmp.path().join("frontend-only-metadata-routing");
         let mut map = LocalClusterMap::open_with_configs(
@@ -7291,9 +7292,7 @@ mod tests {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(node_id, &command)
             .unwrap();
-        for thread in server_threads {
-            thread.join().unwrap();
-        }
+        server_thread.join().unwrap();
 
         let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
         assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());
@@ -15084,6 +15083,7 @@ mod tests {
             .matching_reissued_pending_command_if_safe(
                 pg_id,
                 primary.node_id(),
+                primary.metadata_command_client().as_ref(),
                 0,
                 command.id().log_index().get(),
                 &command,
@@ -15120,6 +15120,7 @@ mod tests {
             .matching_reissued_pending_command_if_safe(
                 pg_id,
                 primary.node_id(),
+                primary.metadata_command_client().as_ref(),
                 0,
                 current.id().log_index().get(),
                 &stale,
@@ -15176,6 +15177,10 @@ mod tests {
             .matching_reissued_pending_command_if_safe(
                 pg_id,
                 NodeId::new(1),
+                map.node(NodeId::new(1))
+                    .unwrap()
+                    .metadata_command_client()
+                    .as_ref(),
                 0,
                 current.id().log_index().get(),
                 &current,
@@ -15232,6 +15237,10 @@ mod tests {
             .matching_reissued_pending_command_if_safe(
                 pg_id,
                 NodeId::new(1),
+                map.node(NodeId::new(1))
+                    .unwrap()
+                    .metadata_command_client()
+                    .as_ref(),
                 0,
                 current.id().log_index().get(),
                 &current,

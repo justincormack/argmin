@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
@@ -225,7 +225,8 @@ use crate::storage_rpc::{
 use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::{
-    BucketName, BucketWriteDrainError, EcShape, NodeId, ObjectPgActionError, ShardLocation,
+    BucketName, BucketWriteDrainError, EcShape, NodeId, ObjectPgActionError, ShardKey,
+    ShardLocation,
 };
 
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
@@ -376,6 +377,7 @@ pub struct StorageNodeServer {
     listener: UnixListener,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<Mutex<StorageNodeActiveSessionState>>,
+    metadata_command_locks: StorageNodeMetadataCommandLocks,
 }
 
 impl StorageNodeServer {
@@ -404,6 +406,7 @@ impl StorageNodeServer {
             listener,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(Mutex::new(StorageNodeActiveSessionState::default())),
+            metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
         })
     }
 
@@ -457,6 +460,7 @@ impl StorageNodeServer {
             config: self.config.clone(),
             node: Arc::clone(&self._node),
             read_handles: Arc::clone(&self.read_handles),
+            metadata_command_locks: self.metadata_command_locks.clone(),
         }
     }
 
@@ -483,14 +487,85 @@ impl StorageNodeServer {
     }
 }
 
+#[derive(Clone, Default)]
+struct StorageNodeMetadataCommandLocks {
+    state: Arc<StorageNodeMetadataCommandLockState>,
+}
+
+impl StorageNodeMetadataCommandLocks {
+    fn acquire(&self, pg_id: PgId) -> StorageNodeMetadataCommandGuard {
+        let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.contains(&pg_id) {
+            held = self
+                .state
+                .available
+                .wait(held)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        held.insert(pg_id);
+        StorageNodeMetadataCommandGuard {
+            locks: self.clone(),
+            pg_id,
+            released: false,
+        }
+    }
+
+    fn release(&self, pg_id: PgId) {
+        let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.remove(&pg_id) {
+            self.state.available.notify_all();
+        }
+    }
+}
+
+#[derive(Default)]
+struct StorageNodeMetadataCommandLockState {
+    held: Mutex<BTreeSet<PgId>>,
+    available: Condvar,
+}
+
+struct StorageNodeMetadataCommandGuard {
+    locks: StorageNodeMetadataCommandLocks,
+    pg_id: PgId,
+    released: bool,
+}
+
+impl StorageNodeMetadataCommandGuard {
+    fn release(&mut self) {
+        if !self.released {
+            self.locks.release(self.pg_id);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for StorageNodeMetadataCommandGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[derive(Clone)]
 struct StorageNodeConnectionHandler {
     config: StorageNodeProcessConfig,
     node: Arc<SharedStorageNode>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
+    metadata_command_locks: StorageNodeMetadataCommandLocks,
 }
 
 impl StorageNodeConnectionHandler {
+    fn metadata_command_pg_guard(
+        &self,
+        session: &StorageNodeSession<'_>,
+        pg_id: PgId,
+    ) -> Option<StorageNodeMetadataCommandGuard> {
+        if session.holds_metadata_command_pg_lock(pg_id) {
+            None
+        } else {
+            Some(self.metadata_command_locks.acquire(pg_id))
+        }
+    }
+
     fn handle_session(
         &self,
         stream: &mut UnixStream,
@@ -1292,7 +1367,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandReplicaState => {
                 match decode_metadata_command_state_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_replica_state_response(request),
+                    Ok(request) => self.metadata_command_replica_state_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1301,7 +1376,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandAcceptance => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_acceptance_response(request),
+                    Ok(request) => self.metadata_command_acceptance_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1310,7 +1385,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandAbandonAcceptance => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_abandon_acceptance_response(request),
+                    Ok(request) => {
+                        self.metadata_command_abandon_acceptance_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1319,7 +1396,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert => {
                 match decode_metadata_command_pending_slot_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_pending_slot_insert_response(request),
+                    Ok(request) => {
+                        self.metadata_command_pending_slot_insert_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1328,9 +1407,10 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert => {
                 match decode_metadata_command_pending_slot_request(&frame.payload) {
-                    Ok(request) => {
-                        self.metadata_command_bucket_control_pending_slot_insert_response(request)
-                    }
+                    Ok(request) => self
+                        .metadata_command_bucket_control_pending_slot_insert_response(
+                            session, request,
+                        ),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1339,7 +1419,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_pending_slot_remove_response(request),
+                    Ok(request) => {
+                        self.metadata_command_pending_slot_remove_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1348,7 +1430,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
                 match decode_metadata_command_pending_slot_replace_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_pending_slot_replace_response(request),
+                    Ok(request) => {
+                        self.metadata_command_pending_slot_replace_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1357,7 +1441,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandMaxLogIndex => {
                 match decode_metadata_command_state_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_max_log_index_response(request),
+                    Ok(request) => self.metadata_command_max_log_index_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1366,7 +1450,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandNextId => {
                 match decode_metadata_command_next_id_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_next_id_response(request),
+                    Ok(request) => self.metadata_command_next_id_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1375,7 +1459,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandPendingEnvelope => {
                 match decode_metadata_command_state_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_pending_envelope_response(request),
+                    Ok(request) => {
+                        self.metadata_command_pending_envelope_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1384,9 +1470,8 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandValidateReplayState => {
                 match decode_metadata_command_state_request(&frame.payload) {
-                    Ok(request) => {
-                        self.metadata_command_validate_replay_state_response(request, false)
-                    }
+                    Ok(request) => self
+                        .metadata_command_validate_replay_state_response(session, request, false),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1396,7 +1481,7 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending => {
                 match decode_metadata_command_state_request(&frame.payload) {
                     Ok(request) => {
-                        self.metadata_command_validate_replay_state_response(request, true)
+                        self.metadata_command_validate_replay_state_response(session, request, true)
                     }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -1406,7 +1491,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandAppliedLogHashes => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_applied_hashes_response(request),
+                    Ok(request) => self.metadata_command_applied_hashes_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1415,7 +1500,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
                 match decode_metadata_command_matching_applied_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_matching_applied_response(request),
+                    Ok(request) => {
+                        self.metadata_command_matching_applied_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1424,7 +1511,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandAbandoned => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_abandoned_response(request),
+                    Ok(request) => self.metadata_command_abandoned_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1433,7 +1520,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandRecordAbandoned => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_record_abandoned_response(request),
+                    Ok(request) => {
+                        self.metadata_command_record_abandoned_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1442,7 +1531,27 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::MetadataCommandApplyAndRecord => {
                 match decode_metadata_command_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_apply_and_record_response(request),
+                    Ok(request) => {
+                        self.metadata_command_apply_and_record_response(session, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_pg_lock_acquire_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandPgLockRelease => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_pg_lock_release_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1719,6 +1828,16 @@ impl StorageNodeConnectionHandler {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
                         outcome: StorageRpcBucketWriteReservationAcquireOutcome::Draining,
+                    },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })) => {
+                let payload = encode_bucket_write_reservation_record_response(
+                    &StorageRpcBucketWriteReservationRecordResponse {
+                        outcome: StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound {
+                            name,
+                        },
                     },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -2533,6 +2652,24 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
+            Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            })) => {
+                let payload = encode_direct_put_command_build_response(
+                    &StorageRpcDirectPutCommandBuildResponse {
+                        outcome: StorageRpcDirectPutCommandBuildOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
             Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
         }
     }
@@ -2608,9 +2745,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error));
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -2756,9 +2894,10 @@ impl StorageNodeConnectionHandler {
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
                 }
-                Err(error) => {
-                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
-                }
+                Err(error) => match object_metadata_command_build_error_outcome(error) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                },
             };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -2797,9 +2936,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error))
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -2846,9 +2986,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error))
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -3510,6 +3651,12 @@ impl StorageNodeConnectionHandler {
                     upload_id: authorized_upload.upload_id.clone(),
                 }
             }
+            Err(ObjectPgActionError::Metadata(MetadataError::PartNotFound {
+                part_number, ..
+            })) => StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+                upload_id: authorized_upload.upload_id.clone(),
+                part_number,
+            },
             Err(error) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
@@ -3693,9 +3840,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error))
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -3729,9 +3877,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error));
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -3807,9 +3956,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error));
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -3889,9 +4039,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error));
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -3959,9 +4110,10 @@ impl StorageNodeConnectionHandler {
                 Err(ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
                     StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
                 }
-                Err(error) => {
-                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
-                }
+                Err(error) => match object_metadata_command_build_error_outcome(error) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                },
             };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -4036,9 +4188,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => {
-                return encode_storage_rpc_error_response(&object_pg_error_response(error));
-            }
+            Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Ok(outcome) => outcome,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            },
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -4118,9 +4271,10 @@ impl StorageNodeConnectionHandler {
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
                 }
-                Err(error) => {
-                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
-                }
+                Err(error) => match object_metadata_command_build_error_outcome(error) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                },
             };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -4887,7 +5041,8 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_shard_location(request.location) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _delete_fence = match self.try_begin_shard_delete(request.location) {
+        let _delete_fence = match self.try_begin_shard_delete(request.location, &request.shard_key)
+        {
             Ok(delete_fence) => delete_fence,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
@@ -5153,6 +5308,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_replica_state_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5160,6 +5316,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self
             .node
             .get_pg(request.pg_id.get())
@@ -5178,6 +5335,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_max_log_index_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5185,6 +5343,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self
             .node
             .get_pg(request.pg_id.get())
@@ -5203,6 +5362,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_next_id_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandNextIdRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5216,6 +5376,7 @@ impl StorageNodeConnectionHandler {
                 message: "metadata command min log index must not be zero".to_string(),
             });
         };
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response =
             match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
                 self.next_metadata_command_id_from_pg(request.pg_id, &pg, min_log_index)
@@ -5288,6 +5449,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_envelope_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5295,6 +5457,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.pending_metadata_command_envelope(
                 self.config.node_id.as_u32(),
@@ -5314,6 +5477,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_validate_replay_state_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
         preserve_pending_slot: bool,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -5322,6 +5486,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             if preserve_pending_slot {
                 pg.validate_metadata_command_replay_state_preserving_pending_slot(
@@ -5348,6 +5513,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_applied_hashes_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5355,6 +5521,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.applied_metadata_command_log_entry_hashes(
                 self.config.node_id.as_u32(),
@@ -5394,6 +5561,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_matching_applied_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandMatchingAppliedRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5401,6 +5569,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.has_matching_applied_metadata_command_log_entry(
                 self.config.node_id.as_u32(),
@@ -5422,6 +5591,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_abandoned_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5429,6 +5599,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -5446,6 +5617,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_record_abandoned_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5453,6 +5625,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.record_metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -5489,6 +5662,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_apply_and_record_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5496,6 +5670,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()) {
             Ok(pg) => match pg
                 .apply_metadata_command_and_record(self.config.node_id.as_u32(), &request.command)
@@ -5569,6 +5744,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_acceptance_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5576,6 +5752,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_acceptance(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -5612,6 +5789,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_abandon_acceptance_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5619,6 +5797,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_abandon_acceptance(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -5655,6 +5834,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_slot_insert_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandPendingSlotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5673,6 +5853,7 @@ impl StorageNodeConnectionHandler {
             }
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.try_insert_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
@@ -5707,6 +5888,24 @@ impl StorageNodeConnectionHandler {
                 );
                 encode_storage_rpc_success_response(&payload)
             }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                let payload = encode_metadata_command_pending_slot_insert_response(
+                    &StorageRpcMetadataCommandPendingSlotInsertResponse {
+                        outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
         Ok(response)
@@ -5714,6 +5913,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_bucket_control_pending_slot_insert_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandPendingSlotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5737,6 +5937,7 @@ impl StorageNodeConnectionHandler {
             });
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             let inserted = pg.try_insert_bucket_control_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
@@ -5792,6 +5993,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_slot_remove_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5799,6 +6001,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.remove_pending_metadata_command_slot(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -5815,6 +6018,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_slot_replace_response(
         &self,
+        session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandPendingSlotReplaceRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -5836,6 +6040,7 @@ impl StorageNodeConnectionHandler {
             .scope_bucket
             .as_ref()
             .map(|_| request.replacement.bucket_name().clone());
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.replace_pending_metadata_command_slot_for_reissue(
                 self.config.node_id.as_u32(),
@@ -5855,6 +6060,44 @@ impl StorageNodeConnectionHandler {
         Ok(response)
     }
 
+    fn metadata_command_pg_lock_acquire_response(
+        &self,
+        session: &mut StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.pg_id, "metadata command critical section")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        session.acquire_metadata_command_pg_lock(&self.metadata_command_locks, request.pg_id);
+        Ok(encode_storage_rpc_success_response(&[]))
+    }
+
+    fn metadata_command_pg_lock_release_response(
+        &self,
+        session: &mut StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.pg_id, "metadata command critical section")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        session.release_metadata_command_pg_lock(request.pg_id);
+        Ok(encode_storage_rpc_success_response(&[]))
+    }
+
     fn validate_shard_locations(
         &self,
         locations: &[ShardLocation],
@@ -5868,14 +6111,16 @@ impl StorageNodeConnectionHandler {
     fn try_begin_shard_delete(
         &self,
         location: ShardLocation,
+        shard_key: &ShardKey,
     ) -> Result<StorageNodeShardDeleteFence, StorageRpcErrorResponse> {
         self.read_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .try_begin_delete(location)?;
+            .try_begin_delete(location, shard_key)?;
         Ok(StorageNodeShardDeleteFence {
             read_handles: Arc::clone(&self.read_handles),
             location,
+            shard_key: shard_key.clone(),
         })
     }
 
@@ -6194,14 +6439,17 @@ impl Drop for StorageNodeActiveSessionGuard {
 
 #[derive(Debug, Default)]
 struct StorageNodeReadHandleState {
-    location_counts: BTreeMap<ShardLocationKey, usize>,
-    delete_fences: BTreeSet<ShardLocationKey>,
+    handle_counts: BTreeMap<ReadHandleShardKey, usize>,
+    delete_fences: BTreeSet<ReadHandleShardKey>,
     live_read_operations: usize,
     live_read_handle_locations: usize,
 }
 
 impl StorageNodeReadHandleState {
-    fn try_acquire(&mut self, locations: &[ShardLocation]) -> Result<(), StorageRpcErrorResponse> {
+    fn try_acquire(
+        &mut self,
+        entries: &[(ShardLocation, ShardKey)],
+    ) -> Result<(), StorageRpcErrorResponse> {
         if self.live_read_operations >= STORAGE_NODE_MAX_LIVE_READ_OPERATIONS {
             return Err(resource_exhausted_response(format!(
                 "storage-node live read operation limit {} is exhausted",
@@ -6210,7 +6458,7 @@ impl StorageNodeReadHandleState {
         }
         let live_read_handle_locations = self
             .live_read_handle_locations
-            .checked_add(locations.len())
+            .checked_add(entries.len())
             .ok_or_else(|| {
                 resource_exhausted_response(
                     "storage-node live read handle location counter overflowed".to_string(),
@@ -6222,21 +6470,19 @@ impl StorageNodeReadHandleState {
                 STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS
             )));
         }
-        for location in locations {
-            if self
-                .delete_fences
-                .contains(&ShardLocationKey::from(*location))
-            {
-                return Err(resource_exhausted_response(format!(
-                    "shard at {:?} is being deleted",
-                    location
+        for (location, shard_key) in entries {
+            let key = ReadHandleShardKey::new(*location, shard_key);
+            if self.delete_fences.contains(&key) {
+                return Err(shard_delete_in_progress_response(format!(
+                    "shard {:?} at {:?} is being deleted",
+                    shard_key, location
                 )));
             }
         }
-        for location in locations {
+        for (location, shard_key) in entries {
             *self
-                .location_counts
-                .entry(ShardLocationKey::from(*location))
+                .handle_counts
+                .entry(ReadHandleShardKey::new(*location, shard_key))
                 .or_insert(0) += 1;
         }
         self.live_read_operations += 1;
@@ -6244,60 +6490,69 @@ impl StorageNodeReadHandleState {
         Ok(())
     }
 
-    fn release(&mut self, locations: &[ShardLocation]) {
+    fn release(&mut self, entries: &[(ShardLocation, ShardKey)]) {
         self.live_read_operations = self
             .live_read_operations
             .checked_sub(1)
             .expect("read handle operation release without acquire");
         self.live_read_handle_locations = self
             .live_read_handle_locations
-            .checked_sub(locations.len())
+            .checked_sub(entries.len())
             .expect("read handle location release without acquire");
-        for location in locations {
-            let key = ShardLocationKey::from(*location);
+        for (location, shard_key) in entries {
+            let key = ReadHandleShardKey::new(*location, shard_key);
             let entry = self
-                .location_counts
+                .handle_counts
                 .get_mut(&key)
                 .expect("read handle release without acquire");
             *entry -= 1;
             if *entry == 0 {
-                self.location_counts.remove(&key);
+                self.handle_counts.remove(&key);
             }
         }
     }
 
+    #[cfg(test)]
     fn count(&self, location: ShardLocation) -> usize {
-        self.location_counts
-            .get(&ShardLocationKey::from(location))
-            .copied()
-            .unwrap_or(0)
+        let location_key = ShardLocationKey::from(location);
+        self.handle_counts
+            .iter()
+            .filter(|(key, _)| key.location == location_key)
+            .map(|(_, count)| *count)
+            .sum()
     }
 
-    fn try_begin_delete(&mut self, location: ShardLocation) -> Result<(), StorageRpcErrorResponse> {
-        let key = ShardLocationKey::from(location);
-        if self.count(location) > 0 {
+    fn try_begin_delete(
+        &mut self,
+        location: ShardLocation,
+        shard_key: &ShardKey,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        let key = ReadHandleShardKey::new(location, shard_key);
+        if self.handle_counts.get(&key).copied().unwrap_or(0) > 0 {
             return Err(resource_exhausted_response(format!(
-                "shard at {:?} has active read handles",
-                location
+                "shard {:?} at {:?} has active read handles",
+                shard_key, location
             )));
         }
         if !self.delete_fences.insert(key) {
             return Err(resource_exhausted_response(format!(
-                "shard at {:?} is already being deleted",
-                location
+                "shard {:?} at {:?} is already being deleted",
+                shard_key, location
             )));
         }
         Ok(())
     }
 
-    fn finish_delete(&mut self, location: ShardLocation) {
-        self.delete_fences.remove(&ShardLocationKey::from(location));
+    fn finish_delete(&mut self, location: ShardLocation, shard_key: &ShardKey) {
+        self.delete_fences
+            .remove(&ReadHandleShardKey::new(location, shard_key));
     }
 }
 
 struct StorageNodeShardDeleteFence {
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     location: ShardLocation,
+    shard_key: ShardKey,
 }
 
 impl Drop for StorageNodeShardDeleteFence {
@@ -6305,7 +6560,7 @@ impl Drop for StorageNodeShardDeleteFence {
         self.read_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .finish_delete(self.location);
+            .finish_delete(self.location, &self.shard_key);
     }
 }
 
@@ -6328,10 +6583,39 @@ impl From<ShardLocation> for ShardLocationKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadHandleShardKey {
+    location: ShardLocationKey,
+    shard_key: ShardKey,
+}
+
+impl ReadHandleShardKey {
+    fn new(location: ShardLocation, shard_key: &ShardKey) -> Self {
+        Self {
+            location: ShardLocationKey::from(location),
+            shard_key: shard_key.clone(),
+        }
+    }
+}
+
+impl PartialOrd for ReadHandleShardKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReadHandleShardKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.location
+            .cmp(&other.location)
+            .then_with(|| self.shard_key.as_bytes().cmp(other.shard_key.as_bytes()))
+    }
+}
+
 struct StorageNodeSession<'a> {
     shared_handles: &'a Mutex<StorageNodeReadHandleState>,
     read_operations: BTreeMap<String, SessionReadHandle>,
+    metadata_command_guards: BTreeMap<PgId, StorageNodeMetadataCommandGuard>,
 }
 
 impl<'a> StorageNodeSession<'a> {
@@ -6339,16 +6623,47 @@ impl<'a> StorageNodeSession<'a> {
         Self {
             shared_handles,
             read_operations: BTreeMap::new(),
+            metadata_command_guards: BTreeMap::new(),
         }
+    }
+
+    fn holds_metadata_command_pg_lock(&self, pg_id: PgId) -> bool {
+        self.metadata_command_guards.contains_key(&pg_id)
+    }
+
+    fn acquire_metadata_command_pg_lock(
+        &mut self,
+        locks: &StorageNodeMetadataCommandLocks,
+        pg_id: PgId,
+    ) {
+        if self.metadata_command_guards.contains_key(&pg_id) {
+            return;
+        }
+        let guard = locks.acquire(pg_id);
+        self.metadata_command_guards.insert(pg_id, guard);
+    }
+
+    fn release_metadata_command_pg_lock(&mut self, pg_id: PgId) {
+        self.metadata_command_guards.remove(&pg_id);
     }
 
     fn acquire_read_handles(
         &mut self,
         request: StorageRpcReadHandleAcquireRequest,
     ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
+        let entries: Vec<(ShardLocation, ShardKey)> = request
+            .locations
+            .iter()
+            .copied()
+            .zip(request.shard_keys.iter().cloned())
+            .collect();
         match self.read_operations.get(&request.read_operation_id) {
-            Some(existing) if existing.locations == request.locations && existing.is_acquired => {
-                return Ok(existing.locations.clone());
+            Some(existing) if existing.entries == entries && existing.is_acquired => {
+                return Ok(existing
+                    .entries
+                    .iter()
+                    .map(|(location, _)| *location)
+                    .collect());
             }
             Some(_) => {
                 return Err(StorageRpcErrorResponse {
@@ -6371,11 +6686,11 @@ impl<'a> StorageNodeSession<'a> {
         self.shared_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .try_acquire(&request.locations)?;
+            .try_acquire(&entries)?;
         self.read_operations.insert(
             request.read_operation_id,
             SessionReadHandle {
-                locations: request.locations.clone(),
+                entries,
                 is_acquired: true,
             },
         );
@@ -6392,7 +6707,7 @@ impl<'a> StorageNodeSession<'a> {
         self.shared_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release(&existing.locations);
+            .release(&existing.entries);
     }
 }
 
@@ -6404,7 +6719,7 @@ impl Drop for StorageNodeSession<'_> {
             .unwrap_or_else(|e| e.into_inner());
         for existing in self.read_operations.values_mut() {
             if existing.is_acquired {
-                shared_handles.release(&existing.locations);
+                shared_handles.release(&existing.entries);
                 existing.is_acquired = false;
             }
         }
@@ -6413,7 +6728,7 @@ impl Drop for StorageNodeSession<'_> {
 
 #[derive(Debug)]
 struct SessionReadHandle {
-    locations: Vec<ShardLocation>,
+    entries: Vec<(ShardLocation, ShardKey)>,
     is_acquired: bool,
 }
 
@@ -6426,6 +6741,13 @@ fn rpc_stream_error(error: StorageRpcStreamError) -> StorageNodeServerError {
 fn resource_exhausted_response(message: String) -> StorageRpcErrorResponse {
     StorageRpcErrorResponse {
         code: StorageRpcErrorCode::ResourceExhausted,
+        message,
+    }
+}
+
+fn shard_delete_in_progress_response(message: String) -> StorageRpcErrorResponse {
+    StorageRpcErrorResponse {
+        code: StorageRpcErrorCode::ShardDeleteInProgress,
         message,
     }
 }
@@ -6463,6 +6785,25 @@ fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorRespon
     StorageRpcErrorResponse {
         code: StorageRpcErrorCode::Internal,
         message: error.to_string(),
+    }
+}
+
+fn object_metadata_command_build_error_outcome(
+    error: ObjectPgActionError,
+) -> Result<StorageRpcObjectMetadataCommandBuildOutcome, StorageRpcErrorResponse> {
+    match error {
+        ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        }) => Ok(StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        }),
+        error => Err(object_pg_error_response(error)),
     }
 }
 
@@ -6710,7 +7051,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -6802,6 +7143,7 @@ mod tests {
         encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
             read_operation_id: read_operation_id.to_string(),
             locations: vec![location],
+            shard_keys: vec![test_shard_key(location.shard_index().get())],
         })
         .unwrap()
     }
@@ -7017,9 +7359,12 @@ mod tests {
             .read_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        handles.try_acquire(&[location]).unwrap();
+        let shard_key = test_shard_key(location.shard_index().get());
+        handles
+            .try_acquire(&[(location, shard_key.clone())])
+            .unwrap();
         assert_eq!(handles.count(location), 1);
-        handles.release(&[location]);
+        handles.release(&[(location, shard_key)]);
         assert_eq!(handles.count(location), 0);
     }
 
@@ -8304,6 +8649,126 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_serializes_metadata_command_pending_insert_per_pg() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config).unwrap();
+        let handler = server.connection_handler();
+        let pg_id = PgId::new(0);
+        let command = test_metadata_command(0, 1);
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id,
+            command: command.clone(),
+            scope_bucket: Some(command.bucket_name().clone()),
+        };
+        let pg_guard = server.metadata_command_locks.acquire(pg_id);
+        let (tx, rx) = mpsc::channel();
+        let handler_for_thread = handler.clone();
+        let join = thread::spawn(move || {
+            let session = StorageNodeSession::new(&handler_for_thread.read_handles);
+            let response = handler_for_thread
+                .metadata_command_pending_slot_insert_response(&session, request)
+                .unwrap();
+            tx.send(response).unwrap();
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(pg_guard);
+        let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_pending_slot_insert_response(&payload).unwrap();
+        assert_eq!(
+            decoded.outcome,
+            StorageRpcMetadataCommandPendingSlotInsertOutcome::Inserted
+        );
+        assert!(server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn storage_node_server_metadata_command_pg_lock_spans_connection_session() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let socket_path = config.socket_path.clone();
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+        };
+        let payload = encode_metadata_command_state_request(&request);
+        let mut owner = UnixStream::connect(&socket_path).unwrap();
+        let acquire = send_frame(
+            &mut owner,
+            1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            payload.clone(),
+        );
+        decode_storage_rpc_response_payload(&acquire.payload)
+            .unwrap()
+            .unwrap();
+
+        let owner_read = send_frame(
+            &mut owner,
+            2,
+            StorageRpcMessageKind::MetadataCommandMaxLogIndex,
+            payload.clone(),
+        );
+        let owner_read_payload = decode_storage_rpc_response_payload(&owner_read.payload)
+            .unwrap()
+            .unwrap();
+        let owner_max =
+            decode_metadata_command_max_log_index_response(&owner_read_payload).unwrap();
+        assert_eq!(owner_max.max_log_index, 0);
+
+        let (tx, rx) = mpsc::channel();
+        let blocked_socket_path = socket_path.clone();
+        let blocked_payload = payload.clone();
+        let blocked = thread::spawn(move || {
+            let mut client = UnixStream::connect(blocked_socket_path).unwrap();
+            let response = send_frame(
+                &mut client,
+                1,
+                StorageRpcMessageKind::MetadataCommandMaxLogIndex,
+                blocked_payload,
+            );
+            tx.send(response).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let release = send_frame(
+            &mut owner,
+            3,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease,
+            payload,
+        );
+        decode_storage_rpc_response_payload(&release.payload)
+            .unwrap()
+            .unwrap();
+        let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        blocked.join().unwrap();
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_max_log_index_response(&payload).unwrap();
+        assert_eq!(decoded.max_log_index, 0);
+    }
+
+    #[test]
     fn storage_node_server_build_mark_deleting_returns_already_deleting_bucket() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -8679,20 +9144,28 @@ mod tests {
     #[test]
     fn storage_node_read_handle_state_delete_fence_is_atomic_with_acquire() {
         let location = test_location(1, 0, 7);
+        let shard_key = test_shard_key(7);
+        let other_shard_key = ShardKey::new(&[0x99; 16], 99, 7);
         let mut state = StorageNodeReadHandleState::default();
 
-        state.try_begin_delete(location).unwrap();
-        let error = state.try_acquire(&[location]).unwrap_err();
-        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        state.try_begin_delete(location, &shard_key).unwrap();
+        state
+            .try_acquire(&[(location, other_shard_key.clone())])
+            .unwrap();
+        state.release(&[(location, other_shard_key)]);
+        let error = state
+            .try_acquire(&[(location, shard_key.clone())])
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::ShardDeleteInProgress);
         assert!(error.message.contains("being deleted"));
-        state.finish_delete(location);
+        state.finish_delete(location, &shard_key);
 
-        state.try_acquire(&[location]).unwrap();
-        let error = state.try_begin_delete(location).unwrap_err();
+        state.try_acquire(&[(location, shard_key.clone())]).unwrap();
+        let error = state.try_begin_delete(location, &shard_key).unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
         assert!(error.message.contains("active read handles"));
-        state.release(&[location]);
-        state.try_begin_delete(location).unwrap();
+        state.release(&[(location, shard_key.clone())]);
+        state.try_begin_delete(location, &shard_key).unwrap();
     }
 
     #[test]
@@ -8822,6 +9295,7 @@ mod tests {
                 .acquire_read_handles(StorageRpcReadHandleAcquireRequest {
                     read_operation_id: format!("read-op-{i}"),
                     locations: vec![location],
+                    shard_keys: vec![test_shard_key(location.shard_index().get())],
                 })
                 .unwrap();
         }
@@ -8829,6 +9303,7 @@ mod tests {
             .acquire_read_handles(StorageRpcReadHandleAcquireRequest {
                 read_operation_id: "read-op-over-limit".to_string(),
                 locations: vec![location],
+                shard_keys: vec![test_shard_key(location.shard_index().get())],
             })
             .unwrap_err();
 
@@ -8846,14 +9321,19 @@ mod tests {
             live_read_operations: STORAGE_NODE_MAX_LIVE_READ_OPERATIONS,
             ..StorageNodeReadHandleState::default()
         };
-        let error = operations_exhausted.try_acquire(&[location]).unwrap_err();
+        let shard_key = test_shard_key(location.shard_index().get());
+        let error = operations_exhausted
+            .try_acquire(&[(location, shard_key.clone())])
+            .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
 
         let mut locations_exhausted = StorageNodeReadHandleState {
             live_read_handle_locations: STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS,
             ..StorageNodeReadHandleState::default()
         };
-        let error = locations_exhausted.try_acquire(&[location]).unwrap_err();
+        let error = locations_exhausted
+            .try_acquire(&[(location, shard_key)])
+            .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
     }
 

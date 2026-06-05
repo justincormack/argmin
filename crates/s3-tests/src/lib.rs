@@ -450,7 +450,7 @@ async fn assert_distinct_external_s3_owners(
 
     let alt_bucket = unique_bucket();
     if let Err(err) = create_bucket_in_region(alt_client, &alt_bucket, region).await {
-        let _ = client.delete_bucket().bucket(&primary_bucket).send().await;
+        delete_external_setup_probe_bucket(client, &primary_bucket, "primary").await;
         panic!("create alternate probe bucket for external s3-tests setup: {err:?}");
     }
 
@@ -470,8 +470,8 @@ async fn assert_distinct_external_s3_owners(
         if let Err(err) =
             create_bucket_in_region(owner_root_client, &owner_root_bucket, region).await
         {
-            let _ = client.delete_bucket().bucket(&primary_bucket).send().await;
-            let _ = alt_client.delete_bucket().bucket(&alt_bucket).send().await;
+            delete_external_setup_probe_bucket(client, &primary_bucket, "primary").await;
+            delete_external_setup_probe_bucket(alt_client, &alt_bucket, "alternate").await;
             panic!("create owner-root probe bucket for external s3-tests setup: {err:?}");
         }
 
@@ -491,12 +491,8 @@ async fn assert_distinct_external_s3_owners(
             )
             .to_string();
 
-        owner_root_client
-            .delete_bucket()
-            .bucket(&owner_root_bucket)
-            .send()
-            .await
-            .expect("delete owner-root probe bucket during external s3-tests setup");
+        delete_external_setup_probe_bucket(owner_root_client, &owner_root_bucket, "owner-root")
+            .await;
 
         assert_eq!(
             owner_root_id, primary_owner_id,
@@ -515,23 +511,23 @@ async fn assert_distinct_external_s3_owners(
         .expect("expected owner ID in alternate probe GetBucketAcl during external s3-tests setup")
         .to_string();
 
-    client
-        .delete_bucket()
-        .bucket(&primary_bucket)
-        .send()
-        .await
-        .expect("delete primary probe bucket during external s3-tests setup");
-    alt_client
-        .delete_bucket()
-        .bucket(&alt_bucket)
-        .send()
-        .await
-        .expect("delete alternate probe bucket during external s3-tests setup");
+    delete_external_setup_probe_bucket(client, &primary_bucket, "primary").await;
+    delete_external_setup_probe_bucket(alt_client, &alt_bucket, "alternate").await;
 
     assert_ne!(
         primary_owner_id, alt_owner_id,
         "S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
     );
+}
+
+async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label: &str) {
+    match client.delete_bucket().bucket(bucket).send().await {
+        Ok(_) => {}
+        Err(err) if err.code() == Some("NoSuchBucket") => {}
+        Err(err) => {
+            panic!("delete {label} probe bucket during external s3-tests setup: {err:?}");
+        }
+    }
 }
 
 pub async fn create_bucket(

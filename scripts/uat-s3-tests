@@ -8,21 +8,25 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/uat-s3-tests [options] [cargo nextest args...]
 
-Start the standalone `argmin-s3` binary with UAT-only test credentials, then
-run `s3-tests` against that process as an external S3 endpoint.
+Start `argmin-s3` with UAT-only test credentials, then run `s3-tests` against
+that process group as an external S3 endpoint. The default topology is
+multi-process `multihost`; use `--topology local` for the older single-process
+local server.
 
 Options:
   --listen ADDR          Server listen address (default: 127.0.0.1:19000)
   --data-dir PATH        Server data directory (default: temporary directory)
   --bucket-prefix PREFIX Bucket prefix for s3-tests (default: argmin-s3-)
   --timeout-secs SECS    S3 client timeout (default: 30)
+  --topology NAME        Test topology: multihost or local (default: multihost)
   --binary PATH          Run an already-built argmin-s3-compatible binary
-  --release              Run the release binary via cargo run --release
+  --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
   -h, --help             Show this help
 
 Examples:
   ./scripts/uat-s3-tests --test bucket_crud
+  ./scripts/uat-s3-tests --topology local --test bucket_crud
   ./scripts/uat-s3-tests --binary ./target/debug/argmin-s3 --test bucket_crud
   ./scripts/uat-s3-tests --release
 EOF
@@ -37,6 +41,7 @@ listen_addr="${ARGMIN_UAT_LISTEN_ADDR:-127.0.0.1:19000}"
 data_dir="${ARGMIN_UAT_DATA_DIR:-}"
 bucket_prefix="${S3_TEST_BUCKET_PREFIX:-argmin-s3-}"
 timeout_secs="${S3_TEST_TIMEOUT_SECS:-30}"
+topology="${ARGMIN_UAT_TOPOLOGY:-multihost}"
 release=0
 cleanup=0
 keep_temp_data_dir=0
@@ -64,6 +69,11 @@ while (($#)); do
         --timeout-secs)
             [[ $# -ge 2 ]] || die "--timeout-secs requires a value"
             timeout_secs="$2"
+            shift 2
+            ;;
+        --topology)
+            [[ $# -ge 2 ]] || die "--topology requires a value"
+            topology="$2"
             shift 2
             ;;
         --binary)
@@ -99,6 +109,13 @@ cd "$ROOT"
 if [[ -n "$server_binary" && "$release" -eq 1 ]]; then
     die "--binary cannot be combined with --release"
 fi
+case "$topology" in
+    multihost|local)
+        ;;
+    *)
+        die "--topology must be multihost or local"
+        ;;
+esac
 if [[ -n "$server_binary" ]]; then
     if [[ "$server_binary" == */* ]]; then
         [[ -x "$server_binary" ]] || die "--binary path is not executable: $server_binary"
@@ -113,7 +130,12 @@ if [[ -z "$data_dir" ]]; then
         cleanup=1
     fi
 fi
-server_log="$data_dir/argmin-s3.log"
+logs_dir="$data_dir/logs"
+sockets_dir="$data_dir/sockets"
+mkdir -p "$logs_dir"
+mkdir -p "$sockets_dir"
+chmod 700 "$sockets_dir"
+server_log="$logs_dir/argmin-s3.log"
 
 host="${listen_addr%:*}"
 port="${listen_addr##*:}"
@@ -144,6 +166,11 @@ export ARGMIN_TLS_CERT_PATH="${ARGMIN_TLS_CERT_PATH:-$cert_path}"
 export ARGMIN_TLS_KEY_PATH="${ARGMIN_TLS_KEY_PATH:-$key_path}"
 export ARGMIN_REGION="${ARGMIN_REGION:-us-east-1}"
 export ARGMIN_ABORT_ON_500="${ARGMIN_ABORT_ON_500:-1}"
+export ARGMIN_EC_K="${ARGMIN_EC_K:-4}"
+export ARGMIN_EC_M="${ARGMIN_EC_M:-2}"
+export ARGMIN_LOCAL_NODE_COUNT="${ARGMIN_LOCAL_NODE_COUNT:-$((ARGMIN_EC_K + ARGMIN_EC_M))}"
+export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-16}"
+export ARGMIN_STORAGE_CLUSTER_EPOCH="${ARGMIN_STORAGE_CLUSTER_EPOCH:-1}"
 
 if [[ -n "${S3_TEST_TRACE:-}" && -z "${ARGMIN_TRACE:-}" ]]; then
     export ARGMIN_TRACE="$S3_TEST_TRACE"
@@ -177,8 +204,89 @@ export S3_TEST_BUCKET_PREFIX="$bucket_prefix"
 export S3_TEST_TIMEOUT_SECS="$timeout_secs"
 export S3_TEST_TLS_CA_CERT_PATH="${S3_TEST_TLS_CA_CERT_PATH:-$ca_path}"
 
+server_pids=()
+server_logs=()
+server_names=()
+
+print_command() {
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+}
+
+server_cmd=()
+
+start_process() {
+    local name="$1"
+    local log_path="$2"
+    shift 2
+    echo "== argmin-s3 UAT $name =="
+    print_command "$@"
+    "$@" >"$log_path" 2>&1 &
+    server_pids+=("$!")
+    server_logs+=("$log_path")
+    server_names+=("$name")
+}
+
+wait_for_process() {
+    local pid="$1"
+    local log_path="$2"
+    local name="$3"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        cat "$log_path" >&2 || true
+        die "$name exited before becoming ready"
+    fi
+}
+
+cleanup_server() {
+    local status=$?
+    for pid in "${server_pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    for pid in "${server_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    if ((status != 0)); then
+        for index in "${!server_logs[@]}"; do
+            local log_path="${server_logs[$index]}"
+            local name="${server_names[$index]}"
+            echo "== argmin-s3 UAT $name log ==" >&2
+            if [[ -s "$log_path" ]]; then
+                tail -n 200 "$log_path" >&2 || true
+            else
+                echo "server log is empty: $log_path" >&2
+            fi
+        done
+    fi
+    if ((cleanup)); then
+        rm -rf "$data_dir"
+    else
+        echo "UAT data directory kept at $data_dir" >&2
+        echo "UAT server logs kept at $logs_dir" >&2
+    fi
+    exit "$status"
+}
+trap cleanup_server EXIT INT TERM
+
 if [[ -n "$server_binary" ]]; then
     server_cmd=("$server_binary")
+elif [[ "$topology" == "multihost" ]]; then
+    build_cmd=(cargo build -p argmin-s3)
+    if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
+        build_cmd+=(--features deep-tracing)
+    fi
+    if ((release)); then
+        build_cmd+=(--release)
+        built_binary="$ROOT/target/release/argmin-s3"
+    else
+        built_binary="$ROOT/target/debug/argmin-s3"
+    fi
+    echo "== argmin-s3 UAT build =="
+    print_command "${build_cmd[@]}"
+    "${build_cmd[@]}"
+    server_cmd=("$built_binary")
 else
     server_cmd=(cargo run -p argmin-s3)
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
@@ -190,42 +298,78 @@ else
     server_cmd+=(--)
 fi
 
-echo "== argmin-s3 UAT server =="
-printf '+'
-printf ' %q' "${server_cmd[@]}"
-printf '\n'
-"${server_cmd[@]}" >"$server_log" 2>&1 &
-server_pid=$!
+if [[ "$topology" == "local" ]]; then
+    start_process "local server" "$server_log" env \
+        -u ARGMIN_STORAGE_NODE_ID \
+        -u ARGMIN_STORAGE_NODE_DATA_DIR \
+        -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
+        -u ARGMIN_STORAGE_NODE_SOCKETS \
+        ARGMIN_PROCESS_ROLE=legacy-local \
+        ARGMIN_DATA_DIR="$data_dir" \
+        ARGMIN_LISTEN_ADDR="$listen_addr" \
+        "${server_cmd[@]}"
+else
+    socket_entries=()
+    for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
+        socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+        socket_entries+=("$node_id=$socket_path")
+    done
+    storage_node_sockets="$(
+        IFS=,
+        echo "${socket_entries[*]}"
+    )"
 
-cleanup_server() {
-    local status=$?
-    if kill -0 "$server_pid" 2>/dev/null; then
-        kill "$server_pid" 2>/dev/null || true
-        wait "$server_pid" 2>/dev/null || true
-    fi
-    if ((status != 0)); then
-        echo "== argmin-s3 UAT server log ==" >&2
-        if [[ -s "$server_log" ]]; then
-            tail -n 200 "$server_log" >&2 || true
-        else
-            echo "server log is empty: $server_log" >&2
+    for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
+        socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+        node_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")"
+        node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
+        start_process "storage-node-$node_id" "$node_log" env \
+            -u ARGMIN_STORAGE_NODE_SOCKETS \
+            ARGMIN_PROCESS_ROLE=storage-node \
+            ARGMIN_STORAGE_NODE_ID="$node_id" \
+            ARGMIN_STORAGE_NODE_DATA_DIR="$node_data_dir" \
+            ARGMIN_STORAGE_NODE_SOCKET_PATH="$socket_path" \
+            ARGMIN_DATA_DIR="$data_dir" \
+            ARGMIN_LISTEN_ADDR="$listen_addr" \
+            "${server_cmd[@]}"
+    done
+
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        ready=1
+        for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
+            wait_for_process "${server_pids[$node_id]}" "${server_logs[$node_id]}" "storage-node-$node_id"
+            socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+            if [[ ! -S "$socket_path" ]]; then
+                ready=0
+            fi
+        done
+        if ((ready)); then
+            break
         fi
-    fi
-    if ((cleanup)); then
-        rm -rf "$data_dir"
-    else
-        echo "UAT data directory kept at $data_dir" >&2
-        echo "UAT server log kept at $server_log" >&2
-    fi
-    exit "$status"
-}
-trap cleanup_server EXIT INT TERM
+        sleep 0.1
+    done
+    for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
+        socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+        [[ -S "$socket_path" ]] || die "storage-node-$node_id did not create socket $socket_path"
+    done
+
+    frontend_log="$logs_dir/frontend.log"
+    start_process "frontend" "$frontend_log" env \
+        -u ARGMIN_STORAGE_NODE_ID \
+        -u ARGMIN_STORAGE_NODE_DATA_DIR \
+        -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
+        ARGMIN_PROCESS_ROLE=frontend \
+        ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
+        ARGMIN_DATA_DIR="$data_dir/frontend" \
+        "${server_cmd[@]}"
+fi
+
+frontend_index=$((${#server_pids[@]} - 1))
+frontend_pid="${server_pids[$frontend_index]}"
+frontend_log="${server_logs[$frontend_index]}"
 
 for _ in {1..200}; do
-    if ! kill -0 "$server_pid" 2>/dev/null; then
-        cat "$server_log" >&2 || true
-        die "argmin-s3 exited before becoming ready"
-    fi
+    wait_for_process "$frontend_pid" "$frontend_log" "frontend"
     if curl -k -sS "$endpoint/" >/dev/null 2>&1; then
         break
     fi
@@ -233,7 +377,7 @@ for _ in {1..200}; do
 done
 
 if ! curl -k -sS "$endpoint/" >/dev/null 2>&1; then
-    cat "$server_log" >&2 || true
+    cat "$frontend_log" >&2 || true
     die "argmin-s3 did not become ready at $endpoint"
 fi
 

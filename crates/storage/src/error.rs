@@ -76,6 +76,15 @@ pub enum StoreError {
     },
 
     #[error(
+        "storage RPC {operation} on node {node_id} found shard deletion in progress: {message}"
+    )]
+    StorageRpcShardDeleteInProgress {
+        node_id: u32,
+        operation: &'static str,
+        message: String,
+    },
+
+    #[error(
         "payload operation for PG {pg_id} has cluster epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
     StalePayloadOperation {

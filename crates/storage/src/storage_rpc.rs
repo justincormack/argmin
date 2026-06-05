@@ -103,7 +103,8 @@ const STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
     + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN
     + 4
-    + STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS * STORAGE_RPC_SHARD_LOCATION_LEN;
+    + STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS
+        * (STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN);
 const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
     4 + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN;
 const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
@@ -483,6 +484,8 @@ pub(crate) enum StorageRpcMessageKind {
     ShardScavengerObservations = 118,
     ShardScavengerObservationResolve = 119,
     ObjectStreamUploadsPgList = 120,
+    MetadataCommandPgLockAcquire = 121,
+    MetadataCommandPgLockRelease = 122,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,6 +503,7 @@ pub(crate) enum StorageRpcErrorCode {
     Internal = 10,
     ResourceExhausted = 11,
     ReclaimClaimNotFound = 12,
+    ShardDeleteInProgress = 13,
 }
 
 impl StorageRpcErrorCode {
@@ -517,6 +521,7 @@ impl StorageRpcErrorCode {
             10 => Ok(Self::Internal),
             11 => Ok(Self::ResourceExhausted),
             12 => Ok(Self::ReclaimClaimNotFound),
+            13 => Ok(Self::ShardDeleteInProgress),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -569,6 +574,8 @@ impl StorageRpcMessageKind {
                 "metadata command bucket-control pending slot insert"
             }
             Self::MetadataCommandApplyAndRecord => "metadata command apply and record",
+            Self::MetadataCommandPgLockAcquire => "metadata command PG lock acquire",
+            Self::MetadataCommandPgLockRelease => "metadata command PG lock release",
             Self::BucketHeadRaw => "bucket head raw",
             Self::BucketHeadInfo => "bucket head info",
             Self::BucketCreateCommandBuild => "bucket create command build",
@@ -790,6 +797,8 @@ impl StorageRpcMessageKind {
             118 => Ok(Self::ShardScavengerObservations),
             119 => Ok(Self::ShardScavengerObservationResolve),
             120 => Ok(Self::ObjectStreamUploadsPgList),
+            121 => Ok(Self::MetadataCommandPgLockAcquire),
+            122 => Ok(Self::MetadataCommandPgLockRelease),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1222,6 +1231,12 @@ pub(crate) enum StorageRpcObjectMetadataCommandBuildOutcome {
     Command(Box<crate::metadata_command::MetadataCommandEnvelope>),
     StaleSnapshot,
     Missing,
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1278,7 +1293,13 @@ pub(crate) struct StorageRpcMultipartCompletionSnapshotRequest {
 #[derive(Debug, Clone)]
 pub(crate) enum StorageRpcMultipartCompletionSnapshotOutcome {
     Loaded(Box<MultipartCompletionSnapshot>),
-    NoSuchUpload { upload_id: UploadId },
+    NoSuchUpload {
+        upload_id: UploadId,
+    },
+    PartNotFound {
+        upload_id: UploadId,
+        part_number: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1958,6 +1979,12 @@ fn validate_stream_part_finalize_snapshot_identity(
 pub(crate) enum StorageRpcDirectPutCommandBuildOutcome {
     Command(Box<crate::metadata_command::MetadataCommandEnvelope>),
     StaleSnapshot,
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2221,6 +2248,12 @@ pub(crate) enum StorageRpcMetadataCommandPendingSlotInsertOutcome {
         existing_log_index: u64,
         candidate_log_index: u64,
     },
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2448,6 +2481,7 @@ pub(crate) struct StorageRpcScavengerObservationKeyRequest {
 pub(crate) struct StorageRpcReadHandleAcquireRequest {
     pub(crate) read_operation_id: String,
     pub(crate) locations: Vec<ShardLocation>,
+    pub(crate) shard_keys: Vec<ShardKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2547,6 +2581,7 @@ pub(crate) struct StorageRpcBucketWriteReservationRecordRequest {
 pub(crate) enum StorageRpcBucketWriteReservationAcquireOutcome {
     Acquired(BucketWriteReservationRecord),
     Draining,
+    BucketNotFound { name: BucketName },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2814,6 +2849,10 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::MetadataCommandNextId => {
             STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandPgLockAcquire
+        | StorageRpcMessageKind::MetadataCommandPgLockRelease => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketHeadRaw | StorageRpcMessageKind::BucketHeadInfo => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
@@ -3913,6 +3952,14 @@ pub(crate) fn encode_multipart_completion_snapshot_response(
             put_u8(&mut out, 1);
             put_string(&mut out, upload_id.as_str());
         }
+        StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+            upload_id,
+            part_number,
+        } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, upload_id.as_str());
+            put_u32(&mut out, *part_number);
+        }
     }
     Ok(out)
 }
@@ -3927,6 +3974,10 @@ pub(crate) fn decode_multipart_completion_snapshot_response(
         )),
         1 => StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
             upload_id: decoder.read_upload_id()?,
+        },
+        2 => StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+            upload_id: decoder.read_upload_id()?,
+            part_number: decoder.read_u32()?,
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
@@ -5691,6 +5742,18 @@ pub(crate) fn encode_object_metadata_command_build_response(
         }
         StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => put_u8(&mut out, 1),
         StorageRpcObjectMetadataCommandBuildOutcome::Missing => put_u8(&mut out, 2),
+        StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 3);
+            put_u32(&mut out, *node_id);
+            put_u32(&mut out, *pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, *log_index);
+        }
     }
     out
 }
@@ -5705,6 +5768,12 @@ pub(crate) fn decode_object_metadata_command_build_response(
         )),
         1 => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
         2 => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
+        3 => StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "invalid object metadata command build outcome tag",
@@ -5778,6 +5847,18 @@ pub(crate) fn encode_direct_put_command_build_response(
             put_metadata_command_envelope_response_item(&mut out, command);
         }
         StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot => put_u8(&mut out, 1),
+        StorageRpcDirectPutCommandBuildOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 2);
+            put_u32(&mut out, *node_id);
+            put_u32(&mut out, *pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, *log_index);
+        }
     }
     out
 }
@@ -5791,6 +5872,12 @@ pub(crate) fn decode_direct_put_command_build_response(
             decoder.read_metadata_command_envelope_response_item()?,
         )),
         1 => StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
+        2 => StorageRpcDirectPutCommandBuildOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+        },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "invalid direct PUT command build outcome tag",
@@ -7162,6 +7249,18 @@ pub(crate) fn encode_metadata_command_pending_slot_insert_response(
             put_u64(&mut out, existing_log_index);
             put_u64(&mut out, candidate_log_index);
         }
+        StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 2);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
     }
     out
 }
@@ -7177,6 +7276,12 @@ pub(crate) fn decode_metadata_command_pending_slot_insert_response(
             cluster_epoch: decoder.read_cluster_epoch()?,
             existing_log_index: decoder.read_u64()?,
             candidate_log_index: decoder.read_u64()?,
+        },
+        2 => StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
@@ -8332,8 +8437,16 @@ pub(crate) fn encode_read_handle_acquire_request(
             "read handle acquire must include at least one shard location",
         ));
     }
+    if request.locations.len() != request.shard_keys.len() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire locations and shard keys must have the same length",
+        ));
+    }
     validate_read_handle_location_count(request.locations.len())?;
     validate_read_handle_locations(&request.locations)?;
+    for (location, shard_key) in request.locations.iter().zip(request.shard_keys.iter()) {
+        validate_shard_location_matches_key(location, shard_key)?;
+    }
     let mut out = Vec::new();
     put_string(&mut out, &request.read_operation_id);
     put_u32(
@@ -8347,6 +8460,9 @@ pub(crate) fn encode_read_handle_acquire_request(
     );
     for location in &request.locations {
         put_shard_location(&mut out, *location);
+    }
+    for shard_key in &request.shard_keys {
+        put_bytes(&mut out, shard_key.as_bytes());
     }
     Ok(out)
 }
@@ -8368,19 +8484,30 @@ pub(crate) fn decode_read_handle_acquire_request(
         ));
     }
     validate_read_handle_location_count(location_count)?;
-    if location_count > decoder.remaining_len() / STORAGE_RPC_SHARD_LOCATION_LEN {
+    if location_count
+        > decoder.remaining_len()
+            / (STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN)
+    {
         return Err(StorageRpcPayloadError::Truncated);
     }
     let mut locations = Vec::with_capacity(location_count);
     for _ in 0..location_count {
         locations.push(decoder.read_shard_location()?);
     }
+    let mut shard_keys = Vec::with_capacity(location_count);
+    for _ in 0..location_count {
+        shard_keys.push(decoder.read_shard_key()?);
+    }
     decoder.finish()?;
     validate_read_operation_id(&read_operation_id)?;
     validate_read_handle_locations(&locations)?;
+    for (location, shard_key) in locations.iter().zip(shard_keys.iter()) {
+        validate_shard_location_matches_key(location, shard_key)?;
+    }
     Ok(StorageRpcReadHandleAcquireRequest {
         read_operation_id,
         locations,
+        shard_keys,
     })
 }
 
@@ -8721,6 +8848,10 @@ pub(crate) fn encode_bucket_write_reservation_record_response(
         StorageRpcBucketWriteReservationAcquireOutcome::Draining => {
             put_u8(&mut out, 1);
         }
+        StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { name } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, name.as_str());
+        }
     }
     Ok(out)
 }
@@ -8736,6 +8867,9 @@ pub(crate) fn decode_bucket_write_reservation_record_response(
             StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record)
         }
         1 => StorageRpcBucketWriteReservationAcquireOutcome::Draining,
+        2 => StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound {
+            name: decoder.read_bucket_name()?,
+        },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown bucket write reservation acquire outcome tag",
@@ -13875,6 +14009,23 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_pending_slot_insert_response_round_trips_log_conflict() {
+        let response = StorageRpcMetadataCommandPendingSlotInsertResponse {
+            outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 9,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                log_index: 11,
+            },
+        };
+
+        let bytes = encode_metadata_command_pending_slot_insert_response(&response);
+        let decoded = decode_metadata_command_pending_slot_insert_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn metadata_command_pending_slot_remove_response_round_trips() {
         for removed in [false, true] {
             let response = StorageRpcMetadataCommandPendingSlotRemoveResponse { removed };
@@ -14349,6 +14500,30 @@ mod tests {
     }
 
     #[test]
+    fn multipart_completion_snapshot_response_preserves_missing_part() {
+        let upload_id = crate::tests::multipart_upload_id("completion-missing-part-upload");
+        let response = StorageRpcMultipartCompletionSnapshotResponse {
+            outcome: StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+                upload_id: upload_id.clone(),
+                part_number: 9999,
+            },
+        };
+
+        let bytes = encode_multipart_completion_snapshot_response(&response).unwrap();
+        let decoded = decode_multipart_completion_snapshot_response(&bytes).unwrap();
+
+        let StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+            upload_id: decoded_upload_id,
+            part_number,
+        } = decoded.outcome
+        else {
+            panic!("expected missing part outcome");
+        };
+        assert_eq!(decoded_upload_id, upload_id);
+        assert_eq!(part_number, 9999);
+    }
+
+    #[test]
     fn scavenger_list_files_request_and_response_round_trip() {
         let request = StorageRpcScavengerListFilesRequest {
             node_id: NodeId::new(7),
@@ -14564,6 +14739,7 @@ mod tests {
         let request = StorageRpcReadHandleAcquireRequest {
             read_operation_id: "read-op-1".to_string(),
             locations: vec![test_shard_location(0), test_shard_location(1)],
+            shard_keys: vec![test_shard_key(0), test_shard_key(1)],
         };
 
         let bytes = encode_read_handle_acquire_request(&request).unwrap();
@@ -14574,6 +14750,7 @@ mod tests {
             encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
                 read_operation_id: String::new(),
                 locations: vec![test_shard_location(0)],
+                shard_keys: vec![test_shard_key(0)],
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read operation id must not be empty",
@@ -14583,6 +14760,7 @@ mod tests {
             encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
                 read_operation_id: "x".repeat(STORAGE_RPC_MAX_READ_OPERATION_ID_LEN + 1),
                 locations: vec![test_shard_location(0)],
+                shard_keys: vec![test_shard_key(0)],
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read operation id exceeds maximum length",
@@ -14592,6 +14770,7 @@ mod tests {
             encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
                 read_operation_id: "read-op-2".to_string(),
                 locations: Vec::new(),
+                shard_keys: Vec::new(),
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read handle acquire must include at least one shard location",
@@ -14602,6 +14781,9 @@ mod tests {
                 read_operation_id: "read-op-too-many-locations".to_string(),
                 locations: (0..=STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS)
                     .map(test_shard_location_for_data_pg)
+                    .collect(),
+                shard_keys: (0..=STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS)
+                    .map(|_| test_shard_key(0))
                     .collect(),
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
@@ -14657,6 +14839,7 @@ mod tests {
             encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
                 read_operation_id: "read-op-duplicate".to_string(),
                 locations: vec![test_shard_location(1), test_shard_location(1)],
+                shard_keys: vec![test_shard_key(1), test_shard_key(1)],
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read handle acquire locations must be sorted and unique",
@@ -14666,6 +14849,7 @@ mod tests {
             encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
                 read_operation_id: "read-op-unsorted".to_string(),
                 locations: vec![test_shard_location(1), test_shard_location(0)],
+                shard_keys: vec![test_shard_key(1), test_shard_key(0)],
             }),
             Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "read handle acquire locations must be sorted and unique",
@@ -15760,6 +15944,15 @@ mod tests {
         let decoded = decode_bucket_write_reservation_record_response(&bytes).unwrap();
         assert_eq!(decoded, response);
 
+        let response = StorageRpcBucketWriteReservationRecordResponse {
+            outcome: StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound {
+                name: acquire.bucket.clone(),
+            },
+        };
+        let bytes = encode_bucket_write_reservation_record_response(&response).unwrap();
+        let decoded = decode_bucket_write_reservation_record_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
         let release = StorageRpcBucketWriteReservationRecordRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::INITIAL,
@@ -16229,6 +16422,35 @@ mod tests {
         };
         let bytes = encode_direct_put_command_build_response(&response);
         let decoded = decode_direct_put_command_build_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let response = StorageRpcDirectPutCommandBuildResponse {
+            outcome: StorageRpcDirectPutCommandBuildOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 3,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 9,
+            },
+        };
+        let bytes = encode_direct_put_command_build_response(&response);
+        let decoded = decode_direct_put_command_build_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn object_metadata_command_build_response_round_trips_log_conflict() {
+        let response = StorageRpcObjectMetadataCommandBuildResponse {
+            outcome: StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 3,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 9,
+            },
+        };
+
+        let bytes = encode_object_metadata_command_build_response(&response);
+        let decoded = decode_object_metadata_command_build_response(&bytes).unwrap();
+
         assert_eq!(decoded, response);
     }
 

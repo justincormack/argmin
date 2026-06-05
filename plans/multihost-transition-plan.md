@@ -5912,6 +5912,19 @@ Required test coverage:
    treated as a server-side admission/backpressure bug to investigate, not as a
    reason to reduce test request concurrency or disable production workers
 
+Status:
+
+- Started Phase 10.7 by extending the UAT S3 test runner with explicit
+  `local` and `multihost` topologies. `multihost` is the default for the UAT
+  script so external local S3 runs exercise separate storage-node and frontend
+  processes by default; `local` remains available for the older single-process
+  standalone binary mode. The multihost runner creates per-node data
+  directories, private Unix socket paths, per-process logs, starts all
+  storage-node processes before the frontend, waits for storage sockets and the
+  HTTPS frontend endpoint, and tears down/dumps all process logs together.
+- The topology-only frontend map that avoids opening placeholder PG
+  directories is still pending in this phase.
+
 ### Phase 10.8: Closeout Audit
 
 Before closing Phase 10, audit production code for remaining shared-memory

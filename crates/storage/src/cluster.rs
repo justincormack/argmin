@@ -887,10 +887,12 @@ impl StorageCluster {
         Ok(expected_hashes.is_some())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn matching_reissued_pending_command_if_safe(
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
+        primary_metadata_client: &dyn MetadataCommandNodeClient,
         primary_max_log_index: u64,
         acting_set_max_log_index: u64,
         stale_command: &MetadataCommandEnvelope,
@@ -898,15 +900,9 @@ impl StorageCluster {
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
         let payload_matches = current.payload() == stale_command.payload();
         let current_log_index = current.id().log_index().get();
-        let primary = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_state = primary
-            .metadata_command_client()
-            .metadata_command_replica_state(pg_id)?;
+        let primary_state = primary_metadata_client.metadata_command_replica_state(pg_id)?;
         if current_log_index == primary_state.applied_log_index {
-            let Some((_, log_hash)) = primary
-                .metadata_command_client()
+            let Some((_, log_hash)) = primary_metadata_client
                 .applied_metadata_command_log_entry_hashes(pg_id, &current)?
             else {
                 return Err(self.metadata_command_conflict(
@@ -928,6 +924,7 @@ impl StorageCluster {
             return self.matching_terminal_pending_command_if_safe(
                 pg_id,
                 primary_node_id,
+                primary_metadata_client,
                 acting_set_max_log_index,
                 &primary_state,
                 current,
@@ -1036,6 +1033,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
+        primary_metadata_client: &dyn MetadataCommandNodeClient,
         acting_set_max_log_index: u64,
         primary_state: &MetadataCommandReplicaState,
         current: MetadataCommandEnvelope,
@@ -1051,12 +1049,8 @@ impl StorageCluster {
                 acting_set_max_log_index,
             ));
         }
-        let primary = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let Some((previous_log_hash, terminal_log_hash)) = primary
-            .metadata_command_client()
-            .applied_metadata_command_log_entry_hashes(pg_id, &current)?
+        let Some((previous_log_hash, terminal_log_hash)) =
+            primary_metadata_client.applied_metadata_command_log_entry_hashes(pg_id, &current)?
         else {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
         };
@@ -1068,12 +1062,15 @@ impl StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            let node_max_log_index = node
-                .metadata_command_client()
-                .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
-            let node_state = node
-                .metadata_command_client()
-                .metadata_command_replica_state(pg_id)?;
+            let metadata_client: &dyn MetadataCommandNodeClient =
+                if node.node_id() == primary_node_id {
+                    primary_metadata_client
+                } else {
+                    node.metadata_command_client().as_ref()
+                };
+            let node_max_log_index =
+                metadata_client.max_metadata_command_log_index(pg_id, self.operation_epoch())?;
+            let node_state = metadata_client.metadata_command_replica_state(pg_id)?;
             if node_max_log_index > current_log_index {
                 return Err(self.metadata_command_conflict(
                     node.node_id(),
@@ -1094,14 +1091,11 @@ impl StorageCluster {
                 }
                 continue;
             }
-            if !node
-                .metadata_command_client()
-                .has_matching_applied_metadata_command_log_entry(
-                    pg_id,
-                    &current,
-                    previous_log_hash,
-                )?
-            {
+            if !metadata_client.has_matching_applied_metadata_command_log_entry(
+                pg_id,
+                &current,
+                previous_log_hash,
+            )? {
                 return Err(self.metadata_command_conflict(
                     node.node_id(),
                     pg_id,
@@ -1126,12 +1120,17 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let primary_max_log_index = primary
+        let primary_critical_section = primary
             .metadata_command_client()
+            .open_metadata_command_critical_section(pg_id, self.operation_epoch())?;
+        let primary_metadata_client = primary_critical_section.as_ref();
+        let primary_max_log_index = primary_metadata_client
             .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
-        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(pg_id)?;
-        if let Some(current) = primary
-            .metadata_command_client()
+        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(
+            pg_id,
+            Some((primary.node_id(), primary_metadata_client)),
+        )?;
+        if let Some(current) = primary_metadata_client
             .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
         {
             if current != *command {
@@ -1139,6 +1138,7 @@ impl StorageCluster {
                     .matching_reissued_pending_command_if_safe(
                         pg_id,
                         primary.node_id(),
+                        primary_metadata_client,
                         primary_max_log_index,
                         acting_set_max_log_index,
                         command,
@@ -1150,8 +1150,7 @@ impl StorageCluster {
             return Ok(None);
         }
         if acting_set_max_log_index > primary_max_log_index {
-            if let Some(current) = primary
-                .metadata_command_client()
+            if let Some(current) = primary_metadata_client
                 .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
             {
                 if current != *command {
@@ -1159,6 +1158,7 @@ impl StorageCluster {
                         .matching_reissued_pending_command_if_safe(
                             pg_id,
                             primary.node_id(),
+                            primary_metadata_client,
                             primary_max_log_index,
                             acting_set_max_log_index,
                             command,
@@ -1170,6 +1170,7 @@ impl StorageCluster {
                     .matching_reissued_pending_command_if_safe(
                         pg_id,
                         primary.node_id(),
+                        primary_metadata_client,
                         primary_max_log_index,
                         acting_set_max_log_index,
                         command,
@@ -1194,30 +1195,28 @@ impl StorageCluster {
             MetadataCommandId::new(self.operation_epoch(), pg_id, next_log_index),
             command.payload().clone(),
         );
-        if !primary
-            .metadata_command_client()
-            .replace_pending_metadata_command_slot_for_reissue(
-                pg_id,
-                command,
-                &replacement,
-                Some(&bucket),
-            )?
-        {
-            let current = primary
-                .metadata_command_client()
+        if !primary_metadata_client.replace_pending_metadata_command_slot_for_reissue(
+            pg_id,
+            command,
+            &replacement,
+            Some(&bucket),
+        )? {
+            let current = primary_metadata_client
                 .pending_metadata_command_envelope(pg_id, self.operation_epoch())?;
-            let primary_max_log_index = primary
-                .metadata_command_client()
+            let primary_max_log_index = primary_metadata_client
                 .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
             let Some(current) = current else {
                 return Ok(None);
             };
-            let acting_set_max_log_index =
-                self.max_metadata_command_log_index_on_acting_set(pg_id)?;
+            let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(
+                pg_id,
+                Some((primary.node_id(), primary_metadata_client)),
+            )?;
             return self
                 .matching_reissued_pending_command_if_safe(
                     pg_id,
                     primary.node_id(),
+                    primary_metadata_client,
                     primary_max_log_index,
                     acting_set_max_log_index,
                     command,
@@ -1237,15 +1236,24 @@ impl StorageCluster {
         self.reissue_pending_metadata_command(pg_id, command)
     }
 
-    fn max_metadata_command_log_index_on_acting_set(&self, pg_id: PgId) -> Result<u64, StoreError> {
+    fn max_metadata_command_log_index_on_acting_set(
+        &self,
+        pg_id: PgId,
+        primary_override: Option<(NodeId, &dyn MetadataCommandNodeClient)>,
+    ) -> Result<u64, StoreError> {
         let mut max_log_index = 0;
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
+            let metadata_client: &dyn MetadataCommandNodeClient = match primary_override.as_ref() {
+                Some((primary_node_id, primary_client)) if *primary_node_id == node.node_id() => {
+                    *primary_client
+                }
+                _ => node.metadata_command_client().as_ref(),
+            };
             max_log_index = max_log_index.max(
-                node.metadata_command_client()
-                    .max_metadata_command_log_index(pg_id, self.operation_epoch())?,
+                metadata_client.max_metadata_command_log_index(pg_id, self.operation_epoch())?,
             );
         }
         Ok(max_log_index)
@@ -1502,6 +1510,11 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<()>, StoreError> {
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
@@ -5408,6 +5421,14 @@ fn placed_segment_recoverable_shard_error(error: ShardIoError) -> Result<(), Sto
         | ShardIoError::Store {
             source: StoreError::IntegrityError { .. },
             ..
+        }
+        | ShardIoError::Store {
+            source:
+                StoreError::StorageRpcShardDeleteInProgress {
+                    operation: "read handles acquire",
+                    ..
+                },
+            ..
         } => Ok(()),
         ShardIoError::Store {
             source: StoreError::Io { context, source },
@@ -5434,6 +5455,41 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
 mod reissue_decision_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn placed_segment_direct_read_recovers_when_read_handle_acquire_hits_delete_fence() {
+        let error = ShardIoError::Store {
+            node_id: 5,
+            pg_id: 13,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            source: StoreError::StorageRpcShardDeleteInProgress {
+                node_id: 5,
+                operation: "read handles acquire",
+                message: "shard is being deleted".to_string(),
+            },
+        };
+
+        placed_segment_recoverable_shard_error(error).unwrap();
+    }
+
+    #[test]
+    fn placed_segment_direct_read_does_not_recover_unrelated_delete_fence_errors() {
+        let error = ShardIoError::Store {
+            node_id: 5,
+            pg_id: 13,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            source: StoreError::StorageRpcShardDeleteInProgress {
+                node_id: 5,
+                operation: "shard delete",
+                message: "shard is being deleted".to_string(),
+            },
+        };
+
+        assert!(matches!(
+            placed_segment_recoverable_shard_error(error),
+            Err(StoreError::ShardStore { .. })
+        ));
+    }
 
     fn replica_match(code: u8) -> ReissuedPendingCommandReplicaMatch {
         match code % 3 {
