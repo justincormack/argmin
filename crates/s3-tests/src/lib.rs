@@ -534,26 +534,7 @@ async fn create_external_setup_probe_bucket(
     label: &str,
 ) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
 {
-    match create_bucket_in_region(client, bucket, region).await {
-        Ok(()) => Ok(()),
-        Err(err)
-            if err.as_service_error().and_then(ProvideErrorMetadata::code)
-                == Some("BucketAlreadyOwnedByYou") =>
-        {
-            client
-                .head_bucket()
-                .bucket(bucket)
-                .send()
-                .await
-                .unwrap_or_else(|head_err| {
-                    panic!(
-                        "create {label} probe bucket for external s3-tests setup returned BucketAlreadyOwnedByYou but HeadBucket failed for {bucket}: {head_err:?}"
-                    );
-                });
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
+    create_bucket_in_region_accepting_verified_lost_success(client, bucket, region, label).await
 }
 
 async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label: &str) {
@@ -571,10 +552,8 @@ pub async fn create_bucket(
     bucket: &str,
 ) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
 {
-    create_bucket_request(client, bucket)
-        .send()
+    create_bucket_in_region_accepting_verified_lost_success(client, bucket, CTX.region(), "bucket")
         .await
-        .map(|_| ())
 }
 
 /// Create a bucket, retrying transient same-name reuse conflicts after `DeleteBucket`.
@@ -592,7 +571,7 @@ pub async fn create_bucket_retrying_reuse(
     const RETRY_DELAY: Duration = Duration::from_millis(200);
 
     for attempt in 0..MAX_ATTEMPTS {
-        match create_bucket(client, bucket).await {
+        match create_bucket_in_region(client, bucket, CTX.region()).await {
             Ok(()) => return Ok(()),
             Err(err) if is_retryable_bucket_reuse_error(&err) && attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -623,6 +602,30 @@ async fn create_bucket_in_region(
         .map(|_| ())
 }
 
+async fn create_bucket_in_region_accepting_verified_lost_success(
+    client: &Client,
+    bucket: &str,
+    region: &str,
+    label: &str,
+) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
+{
+    match create_bucket_in_region(client, bucket, region).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_create_bucket_lost_success_retry(&err) => {
+            match client.head_bucket().bucket(bucket).send().await {
+                Ok(_) => Ok(()),
+                Err(head_err) => {
+                    eprintln!(
+                        "create {label} returned BucketAlreadyOwnedByYou but HeadBucket failed for {bucket}: {head_err:?}"
+                    );
+                    Err(err)
+                }
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn create_bucket_request_in_region(
     client: &Client,
     bucket: &str,
@@ -645,6 +648,12 @@ fn is_retryable_bucket_reuse_error(
         err.as_service_error().and_then(ProvideErrorMetadata::code),
         Some("BucketAlreadyExists" | "BucketAlreadyOwnedByYou" | "OperationAborted")
     )
+}
+
+fn is_create_bucket_lost_success_retry(
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
+) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("BucketAlreadyOwnedByYou")
 }
 
 pub fn test_agent() -> Agent {
