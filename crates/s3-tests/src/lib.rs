@@ -444,12 +444,14 @@ async fn assert_distinct_external_s3_owners(
     );
 
     let primary_bucket = unique_bucket();
-    create_bucket_in_region(client, &primary_bucket, region)
+    create_external_setup_probe_bucket(client, &primary_bucket, region, "primary")
         .await
         .expect("create primary probe bucket for external s3-tests setup");
 
     let alt_bucket = unique_bucket();
-    if let Err(err) = create_bucket_in_region(alt_client, &alt_bucket, region).await {
+    if let Err(err) =
+        create_external_setup_probe_bucket(alt_client, &alt_bucket, region, "alternate").await
+    {
         delete_external_setup_probe_bucket(client, &primary_bucket, "primary").await;
         panic!("create alternate probe bucket for external s3-tests setup: {err:?}");
     }
@@ -467,8 +469,13 @@ async fn assert_distinct_external_s3_owners(
         .to_string();
     if let Some(owner_root_client) = owner_root_client {
         let owner_root_bucket = unique_bucket();
-        if let Err(err) =
-            create_bucket_in_region(owner_root_client, &owner_root_bucket, region).await
+        if let Err(err) = create_external_setup_probe_bucket(
+            owner_root_client,
+            &owner_root_bucket,
+            region,
+            "owner-root",
+        )
+        .await
         {
             delete_external_setup_probe_bucket(client, &primary_bucket, "primary").await;
             delete_external_setup_probe_bucket(alt_client, &alt_bucket, "alternate").await;
@@ -518,6 +525,35 @@ async fn assert_distinct_external_s3_owners(
         primary_owner_id, alt_owner_id,
         "S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
     );
+}
+
+async fn create_external_setup_probe_bucket(
+    client: &Client,
+    bucket: &str,
+    region: &str,
+    label: &str,
+) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
+{
+    match create_bucket_in_region(client, bucket, region).await {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                == Some("BucketAlreadyOwnedByYou") =>
+        {
+            client
+                .head_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap_or_else(|head_err| {
+                    panic!(
+                        "create {label} probe bucket for external s3-tests setup returned BucketAlreadyOwnedByYou but HeadBucket failed for {bucket}: {head_err:?}"
+                    );
+                });
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label: &str) {
