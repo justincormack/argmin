@@ -3610,6 +3610,11 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
     };
 
     delete_bucket_lifecycle_test(&coord, "bucket", test_requester(), None).unwrap();
+    let bucket_incarnation_generation = coord
+        .storage_node
+        .head_bucket_info(&trusted_bucket_name("bucket"))
+        .unwrap()
+        .bucket_incarnation_generation;
 
     assert!(!coord
         .read_runtime()
@@ -3617,6 +3622,7 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
             &trusted_bucket_name("bucket"),
             &trusted_object_key("logs/app"),
             &upload.upload_id,
+            bucket_incarnation_generation,
             deadline,
         )
         .unwrap());
@@ -3688,7 +3694,13 @@ fn lifecycle_abort_stops_when_delete_drain_starts_after_claim() {
 
     assert!(!coord
         .read_runtime()
-        .abort_multipart_upload_if_due(&bucket, &key, &upload.upload_id, deadline)
+        .abort_multipart_upload_if_due(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            claim.bucket_incarnation_generation,
+            deadline,
+        )
         .unwrap());
     assert!(coord
         .storage_node
@@ -3763,9 +3775,13 @@ fn lifecycle_current_expiry_stops_when_delete_drain_starts_after_claim() {
 
     let outcome = coord
         .storage_node
-        .expire_current_object_if_due(&bucket, &key, version_id, |_, _| {
-            Ok::<bool, ServerError>(true)
-        })
+        .expire_current_object_if_due(
+            &bucket,
+            &key,
+            version_id,
+            claim.bucket_incarnation_generation,
+            |_, _| Ok::<bool, ServerError>(true),
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -3859,9 +3875,12 @@ fn lifecycle_noncurrent_expiry_stops_when_delete_drain_starts_after_claim() {
 
     let reclaimed = coord
         .storage_node
-        .delete_noncurrent_live_versions_if_due(&bucket, &key, |_, _| {
-            Ok::<HashSet<VersionId>, ServerError>(HashSet::from([noncurrent_version_id]))
-        })
+        .delete_noncurrent_live_versions_if_due(
+            &bucket,
+            &key,
+            claim.bucket_incarnation_generation,
+            |_, _| Ok::<HashSet<VersionId>, ServerError>(HashSet::from([noncurrent_version_id])),
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -3930,9 +3949,13 @@ fn lifecycle_delete_marker_cleanup_stops_when_delete_drain_starts_after_claim() 
 
     let deleted = coord
         .storage_node
-        .delete_expired_delete_marker_if_due(&bucket, &key, marker_version_id, |_, _| {
-            Ok::<bool, ServerError>(true)
-        })
+        .delete_expired_delete_marker_if_due(
+            &bucket,
+            &key,
+            marker_version_id,
+            claim.bucket_incarnation_generation,
+            |_, _| Ok::<bool, ServerError>(true),
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -4025,7 +4048,12 @@ fn lifecycle_aborting_upload_finish_stops_when_delete_drain_starts_after_claim()
 
     assert!(!coord
         .read_runtime()
-        .abort_multipart_upload_for_lifecycle_sweep(&bucket, &key, &upload.upload_id)
+        .abort_multipart_upload_for_lifecycle_sweep(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            claim.bucket_incarnation_generation,
+        )
         .unwrap());
     let upload_record = coord
         .storage_node

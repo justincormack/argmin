@@ -127,6 +127,8 @@ pub struct BucketScopedTestHooks {
     pub target: Option<BucketName>,
     pub before_bucket_lock_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_lifecycle_context_load: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_lifecycle_bucket_write_proof_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_completed_multipart_prune:
@@ -193,6 +195,24 @@ pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn maybe_run_before_lifecycle_context_load_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_lifecycle_context_load)
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(super) fn maybe_run_before_lifecycle_context_load_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| {
+        hooks.before_lifecycle_bucket_write_proof_acquire
+    })
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(super) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {

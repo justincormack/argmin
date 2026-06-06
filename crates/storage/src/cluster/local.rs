@@ -4229,6 +4229,16 @@ mod tests {
             .unwrap();
     }
 
+    fn current_bucket_incarnation(
+        cluster: &crate::StorageCluster,
+        bucket: &crate::BucketName,
+    ) -> u64 {
+        cluster
+            .head_bucket_info(bucket)
+            .unwrap()
+            .bucket_incarnation_generation
+    }
+
     struct DirectPutCommitReqFixture<'a> {
         bucket: &'a crate::BucketName,
         key: &'a crate::ObjectKey,
@@ -22648,11 +22658,17 @@ mod tests {
         let part_vid = uploaded_segment.segment_vid;
 
         let aborted = cluster
-            .abort_multipart_upload_if_due(&bucket, &key, &upload_id, |raw_lifecycle, upload| {
-                assert_eq!(raw_lifecycle, Some("<LifecycleConfiguration/>"));
-                assert_eq!(upload.state, crate::UploadState::InProgress);
-                Ok::<bool, ()>(true)
-            })
+            .abort_multipart_upload_if_due(
+                &bucket,
+                &key,
+                &upload_id,
+                current_bucket_incarnation(&cluster, &bucket),
+                |raw_lifecycle, upload| {
+                    assert_eq!(raw_lifecycle, Some("<LifecycleConfiguration/>"));
+                    assert_eq!(upload.state, crate::UploadState::InProgress);
+                    Ok::<bool, ()>(true)
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(aborted);
@@ -30233,11 +30249,17 @@ mod tests {
             write_committed_direct_segment_for(&cluster, &bucket, &key, b"expired current");
 
         let outcome = cluster
-            .expire_current_object_if_due(&bucket, &key, committed.version_id, |raw, record| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                assert_eq!(record.generation_id, committed.generation_id);
-                Ok::<_, ()>(true)
-            })
+            .expire_current_object_if_due(
+                &bucket,
+                &key,
+                committed.version_id,
+                current_bucket_incarnation(&cluster, &bucket),
+                |raw, record| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    assert_eq!(record.generation_id, committed.generation_id);
+                    Ok::<_, ()>(true)
+                },
+            )
             .unwrap()
             .unwrap()
             .expect("current object should expire");
@@ -30272,6 +30294,245 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_current_expiration_stops_after_bucket_recreate_before_proof() {
+        let _serial = lock_bucket_scoped_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        put_test_lifecycle(&cluster, &bucket);
+        let old_bucket_incarnation = cluster
+            .head_bucket_info(&bucket)
+            .unwrap()
+            .bucket_incarnation_generation;
+        let old_committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"old lifecycle object");
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let fresh_generation_id = Arc::new(Mutex::new(None));
+        let hook_cluster = Arc::clone(&cluster);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let old_generation_id = old_committed.generation_id;
+        let hook_ran_for_hook = Arc::clone(&hook_ran);
+        let fresh_generation_id_for_hook = Arc::clone(&fresh_generation_id);
+        let _hook_guard =
+            crate::node::install_bucket_scoped_test_hooks(crate::node::BucketScopedTestHooks {
+                target: Some(bucket.clone()),
+                before_lifecycle_bucket_write_proof_acquire: Some(Arc::new(move || {
+                    if hook_ran_for_hook.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    hook_cluster
+                        .delete_current_object_if(&hook_bucket, &hook_key, |_| Ok::<(), ()>(()))
+                        .unwrap()
+                        .expect("old live object should be deleted before bucket recreate");
+                    hook_cluster
+                        .reclaim_object_payload_if_unleased(
+                            &hook_bucket,
+                            &hook_key,
+                            old_generation_id,
+                        )
+                        .expect("test should reclaim the old payload");
+                    hook_cluster
+                        .begin_bucket_delete(&hook_bucket)
+                        .expect("test should begin old bucket delete");
+                    assert_eq!(
+                        hook_cluster
+                            .try_finalize_bucket_delete(&hook_bucket)
+                            .expect("test should finalize old bucket delete"),
+                        crate::BucketDeleteFinalizeOutcome::Finalized
+                    );
+                    create_test_bucket(&hook_cluster, &hook_bucket);
+                    let fresh = write_committed_direct_segment_for_with_versioning(
+                        &hook_cluster,
+                        &hook_bucket,
+                        &hook_key,
+                        crate::BucketVersioningState::Disabled,
+                        [0xc1; 16],
+                        [0xc2; 16],
+                        b"fresh recreated object",
+                    );
+                    *fresh_generation_id_for_hook.lock().unwrap() = Some(fresh.generation_id);
+                })),
+                ..crate::node::BucketScopedTestHooks::default()
+            });
+
+        let outcome = cluster
+            .expire_current_object_if_due(
+                &bucket,
+                &key,
+                old_committed.version_id,
+                old_bucket_incarnation,
+                |_, _| Ok::<_, ()>(true),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(
+            outcome.is_none(),
+            "stale lifecycle context must not delete the recreated bucket's object"
+        );
+        let new_bucket = cluster.head_bucket_info(&bucket).unwrap();
+        assert!(
+            new_bucket.bucket_incarnation_generation > old_bucket_incarnation,
+            "test setup should recreate the bucket incarnation"
+        );
+        assert!(
+            !new_bucket.bucket_lifecycle_present,
+            "recreated bucket should not inherit the old lifecycle config"
+        );
+        let current = cluster.test_get_object_meta(&bucket, &key).unwrap();
+        let live = current.as_live().expect("fresh object should remain live");
+        let fresh_generation_id = (*fresh_generation_id.lock().unwrap())
+            .expect("hook should write a fresh recreated object");
+        assert_eq!(live.version_id, crate::VersionId::Null);
+        assert_eq!(live.generation_id, fresh_generation_id);
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    #[test]
+    fn lifecycle_current_expiration_stops_after_bucket_recreate_before_context_load() {
+        let _serial = lock_bucket_scoped_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        put_test_lifecycle(&cluster, &bucket);
+        let old_bucket_incarnation = current_bucket_incarnation(&cluster, &bucket);
+        let old_committed =
+            write_committed_direct_segment_for(&cluster, &bucket, &key, b"old lifecycle object");
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let selector_ran = Arc::new(AtomicBool::new(false));
+        let fresh_generation_id = Arc::new(Mutex::new(None));
+        let hook_cluster = Arc::clone(&cluster);
+        let hook_bucket = bucket.clone();
+        let hook_key = key.clone();
+        let old_generation_id = old_committed.generation_id;
+        let hook_ran_for_hook = Arc::clone(&hook_ran);
+        let fresh_generation_id_for_hook = Arc::clone(&fresh_generation_id);
+        let _hook_guard =
+            crate::node::install_bucket_scoped_test_hooks(crate::node::BucketScopedTestHooks {
+                target: Some(bucket.clone()),
+                before_lifecycle_context_load: Some(Arc::new(move || {
+                    if hook_ran_for_hook.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    hook_cluster
+                        .delete_current_object_if(&hook_bucket, &hook_key, |_| Ok::<(), ()>(()))
+                        .unwrap()
+                        .expect("old live object should be deleted before bucket recreate");
+                    hook_cluster
+                        .reclaim_object_payload_if_unleased(
+                            &hook_bucket,
+                            &hook_key,
+                            old_generation_id,
+                        )
+                        .expect("test should reclaim the old payload");
+                    hook_cluster
+                        .begin_bucket_delete(&hook_bucket)
+                        .expect("test should begin old bucket delete");
+                    assert_eq!(
+                        hook_cluster
+                            .try_finalize_bucket_delete(&hook_bucket)
+                            .expect("test should finalize old bucket delete"),
+                        crate::BucketDeleteFinalizeOutcome::Finalized
+                    );
+                    create_test_bucket(&hook_cluster, &hook_bucket);
+                    put_test_lifecycle(&hook_cluster, &hook_bucket);
+                    let fresh = write_committed_direct_segment_for_with_versioning(
+                        &hook_cluster,
+                        &hook_bucket,
+                        &hook_key,
+                        crate::BucketVersioningState::Disabled,
+                        [0xd1; 16],
+                        [0xd2; 16],
+                        b"fresh recreated object",
+                    );
+                    *fresh_generation_id_for_hook.lock().unwrap() = Some(fresh.generation_id);
+                })),
+                ..crate::node::BucketScopedTestHooks::default()
+            });
+
+        let selector_ran_for_closure = Arc::clone(&selector_ran);
+        let outcome = cluster
+            .expire_current_object_if_due(
+                &bucket,
+                &key,
+                old_committed.version_id,
+                old_bucket_incarnation,
+                move |_, _| {
+                    selector_ran_for_closure.store(true, Ordering::SeqCst);
+                    Ok::<_, ()>(true)
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(
+            !selector_ran.load(Ordering::SeqCst),
+            "old lifecycle claim must not evaluate the recreated bucket's lifecycle"
+        );
+        assert!(
+            outcome.is_none(),
+            "old lifecycle claim must not delete the recreated bucket's object"
+        );
+        let new_bucket = cluster.head_bucket_info(&bucket).unwrap();
+        assert!(
+            new_bucket.bucket_incarnation_generation > old_bucket_incarnation,
+            "test setup should recreate the bucket incarnation"
+        );
+        assert!(
+            new_bucket.bucket_lifecycle_present,
+            "recreated bucket intentionally has lifecycle to prove the incarnation fence"
+        );
+        let current = cluster.test_get_object_meta(&bucket, &key).unwrap();
+        let live = current.as_live().expect("fresh object should remain live");
+        let fresh_generation_id = (*fresh_generation_id.lock().unwrap())
+            .expect("hook should write a fresh recreated object");
+        assert_eq!(live.version_id, crate::VersionId::Null);
+        assert_eq!(live.generation_id, fresh_generation_id);
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    #[test]
     fn lifecycle_suspended_current_expiration_replaces_null_live_on_all_acting_nodes() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -30303,11 +30564,17 @@ mod tests {
         assert_eq!(committed.version_id, crate::VersionId::Null);
 
         let outcome = cluster
-            .expire_current_object_if_due(&bucket, &key, committed.version_id, |raw, record| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                assert_eq!(record.generation_id, committed.generation_id);
-                Ok::<_, ()>(true)
-            })
+            .expire_current_object_if_due(
+                &bucket,
+                &key,
+                committed.version_id,
+                current_bucket_incarnation(&cluster, &bucket),
+                |raw, record| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    assert_eq!(record.generation_id, committed.generation_id);
+                    Ok::<_, ()>(true)
+                },
+            )
             .unwrap()
             .unwrap()
             .expect("suspended null live object should expire");
@@ -30396,11 +30663,17 @@ mod tests {
         assert_eq!(committed.version_id, crate::VersionId::from_u64(1));
 
         let outcome = cluster
-            .expire_current_object_if_due(&bucket, &key, committed.version_id, |raw, record| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                assert_eq!(record.generation_id, committed.generation_id);
-                Ok::<_, ()>(true)
-            })
+            .expire_current_object_if_due(
+                &bucket,
+                &key,
+                committed.version_id,
+                current_bucket_incarnation(&cluster, &bucket),
+                |raw, record| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    assert_eq!(record.generation_id, committed.generation_id);
+                    Ok::<_, ()>(true)
+                },
+            )
             .unwrap()
             .unwrap()
             .expect("enabled current live object should expire");
@@ -30496,35 +30769,45 @@ mod tests {
         );
 
         let mut reclaimed = cluster
-            .delete_noncurrent_live_versions_if_due(&bucket, &key, |raw, versions| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                Ok::<_, ()>(
-                    [older.version_id, middle.version_id]
-                        .into_iter()
-                        .filter(|version_id| {
-                            versions
-                                .iter()
-                                .any(|stored| stored.version_id() == *version_id)
-                        })
-                        .collect(),
-                )
-            })
+            .delete_noncurrent_live_versions_if_due(
+                &bucket,
+                &key,
+                current_bucket_incarnation(&cluster, &bucket),
+                |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    Ok::<_, ()>(
+                        [older.version_id, middle.version_id]
+                            .into_iter()
+                            .filter(|version_id| {
+                                versions
+                                    .iter()
+                                    .any(|stored| stored.version_id() == *version_id)
+                            })
+                            .collect(),
+                    )
+                },
+            )
             .unwrap()
             .unwrap();
         let next_reclaimed = cluster
-            .delete_noncurrent_live_versions_if_due(&bucket, &key, |raw, versions| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                Ok::<_, ()>(
-                    [older.version_id, middle.version_id]
-                        .into_iter()
-                        .filter(|version_id| {
-                            versions
-                                .iter()
-                                .any(|stored| stored.version_id() == *version_id)
-                        })
-                        .collect(),
-                )
-            })
+            .delete_noncurrent_live_versions_if_due(
+                &bucket,
+                &key,
+                current_bucket_incarnation(&cluster, &bucket),
+                |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    Ok::<_, ()>(
+                        [older.version_id, middle.version_id]
+                            .into_iter()
+                            .filter(|version_id| {
+                                versions
+                                    .iter()
+                                    .any(|stored| stored.version_id() == *version_id)
+                            })
+                            .collect(),
+                    )
+                },
+            )
             .unwrap()
             .unwrap();
         reclaimed.extend(next_reclaimed);
@@ -30547,6 +30830,7 @@ mod tests {
                 &bucket,
                 &key,
                 marker.version_id,
+                current_bucket_incarnation(&cluster, &bucket),
                 |raw, versions| {
                     assert_eq!(raw, Some("<LifecycleConfiguration/>"));
                     assert!(versions.iter().any(|stored| {
@@ -30709,20 +30993,25 @@ mod tests {
 
         let calls_for_selector = Arc::clone(&selector_calls);
         let reclaimed = first_cluster
-            .delete_noncurrent_live_versions_if_due(&bucket, &key, move |raw, versions| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                calls_for_selector.fetch_add(1, Ordering::SeqCst);
-                let older_live = versions
-                    .iter()
-                    .find(|stored| stored.version_id() == older.version_id)
-                    .and_then(crate::StoredObject::as_live)
-                    .expect("older version should be listed");
-                if older_live.object_lock.legal_hold == crate::StoredLegalHoldStatus::On {
-                    Ok::<_, ()>(HashSet::new())
-                } else {
-                    Ok(HashSet::from([older.version_id]))
-                }
-            })
+            .delete_noncurrent_live_versions_if_due(
+                &bucket,
+                &key,
+                current_bucket_incarnation(&first_cluster, &bucket),
+                move |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    calls_for_selector.fetch_add(1, Ordering::SeqCst);
+                    let older_live = versions
+                        .iter()
+                        .find(|stored| stored.version_id() == older.version_id)
+                        .and_then(crate::StoredObject::as_live)
+                        .expect("older version should be listed");
+                    if older_live.object_lock.legal_hold == crate::StoredLegalHoldStatus::On {
+                        Ok::<_, ()>(HashSet::new())
+                    } else {
+                        Ok(HashSet::from([older.version_id]))
+                    }
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(reclaimed.is_empty());
@@ -30825,60 +31114,65 @@ mod tests {
             Some(key.as_str()),
         );
         let reclaimed = first_cluster
-            .delete_noncurrent_live_versions_if_due(&bucket, &key, move |raw, versions| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                calls_for_selector.fetch_add(1, Ordering::SeqCst);
-                let older_live = versions
-                    .iter()
-                    .find(|stored| stored.version_id() == install_version_id)
-                    .and_then(crate::StoredObject::as_live)
-                    .expect("older version should be listed");
-                if older_live.object_lock.legal_hold == crate::StoredLegalHoldStatus::On {
-                    return Ok::<_, ()>(HashSet::new());
-                }
-                if !install_once.swap(true, Ordering::SeqCst) {
-                    let pg_id = PgId::new(2);
-                    let primary = install_map
-                        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .delete_noncurrent_live_versions_if_due(
+                &bucket,
+                &key,
+                current_bucket_incarnation(&first_cluster, &bucket),
+                move |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    calls_for_selector.fetch_add(1, Ordering::SeqCst);
+                    let older_live = versions
+                        .iter()
+                        .find(|stored| stored.version_id() == install_version_id)
+                        .and_then(crate::StoredObject::as_live)
+                        .expect("older version should be listed");
+                    if older_live.object_lock.legal_hold == crate::StoredLegalHoldStatus::On {
+                        return Ok::<_, ()>(HashSet::new());
+                    }
+                    if !install_once.swap(true, Ordering::SeqCst) {
+                        let pg_id = PgId::new(2);
+                        let primary = install_map
+                            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                            .unwrap();
+                        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                        let stored = crate::PgMetadataStore::get_object_version(
+                            &*pg,
+                            &install_bucket,
+                            &install_key,
+                            install_version_id,
+                        )
                         .unwrap();
-                    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-                    let stored = crate::PgMetadataStore::get_object_version(
-                        &*pg,
-                        &install_bucket,
-                        &install_key,
-                        install_version_id,
-                    )
-                    .unwrap();
-                    let live = stored.as_live().expect("older object is live").clone();
-                    let log_index = pg
-                        .max_metadata_command_log_index(ClusterEpoch::INITIAL)
-                        .unwrap()
-                        + 1;
-                    let command = MetadataCommandEnvelope::new(
-                        MetadataCommandId::new(
-                            ClusterEpoch::INITIAL,
-                            pg_id,
-                            MetadataCommandLogIndex::new(log_index).unwrap(),
-                        ),
-                        MetadataCommandPayload::PutObjectMetadata(Box::new(
-                            PutObjectMetadataCommand::from_live_object_and_mutation(
-                                live,
-                                PutObjectMetadataMutation::PutLegalHold(
-                                    crate::StoredLegalHoldStatus::On,
-                                ),
-                                install_proof.clone(),
+                        let live = stored.as_live().expect("older object is live").clone();
+                        let log_index = pg
+                            .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                            .unwrap()
+                            + 1;
+                        let command = MetadataCommandEnvelope::new(
+                            MetadataCommandId::new(
+                                ClusterEpoch::INITIAL,
+                                pg_id,
+                                MetadataCommandLogIndex::new(log_index).unwrap(),
                             ),
-                        )),
-                    );
-                    pg.try_insert_pending_metadata_command_slot(
-                        primary.node_id().as_u32(),
-                        &command,
-                        Some(&install_bucket),
-                    )
-                    .unwrap();
-                }
-                Ok(HashSet::from([install_version_id]))
-            })
+                            MetadataCommandPayload::PutObjectMetadata(Box::new(
+                                PutObjectMetadataCommand::from_live_object_and_mutation(
+                                    live,
+                                    PutObjectMetadataMutation::PutLegalHold(
+                                        crate::StoredLegalHoldStatus::On,
+                                    ),
+                                    install_proof.clone(),
+                                ),
+                            )),
+                        );
+                        pg.try_insert_pending_metadata_command_slot(
+                            primary.node_id().as_u32(),
+                            &command,
+                            Some(&install_bucket),
+                        )
+                        .unwrap();
+                    }
+                    Ok(HashSet::from([install_version_id]))
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(reclaimed.is_empty());
@@ -30974,27 +31268,32 @@ mod tests {
         let race_bucket = bucket.clone();
         let race_key = key.clone();
         let reclaimed = first_cluster
-            .delete_noncurrent_live_versions_if_due(&bucket, &key, move |raw, versions| {
-                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
-                let call = calls_for_selector.fetch_add(1, Ordering::SeqCst);
-                assert!(versions
-                    .iter()
-                    .any(|stored| stored.version_id() == older.version_id));
-                if call == 0 {
-                    write_committed_direct_segment_for_with_versioning(
-                        &second_cluster,
-                        &race_bucket,
-                        &race_key,
-                        crate::BucketVersioningState::Enabled,
-                        [0xe3; 16],
-                        [0xf3; 16],
-                        b"racing current",
-                    );
-                    Ok::<_, ()>(HashSet::from([older.version_id]))
-                } else {
-                    Ok(HashSet::new())
-                }
-            })
+            .delete_noncurrent_live_versions_if_due(
+                &bucket,
+                &key,
+                current_bucket_incarnation(&first_cluster, &bucket),
+                move |raw, versions| {
+                    assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                    let call = calls_for_selector.fetch_add(1, Ordering::SeqCst);
+                    assert!(versions
+                        .iter()
+                        .any(|stored| stored.version_id() == older.version_id));
+                    if call == 0 {
+                        write_committed_direct_segment_for_with_versioning(
+                            &second_cluster,
+                            &race_bucket,
+                            &race_key,
+                            crate::BucketVersioningState::Enabled,
+                            [0xe3; 16],
+                            [0xf3; 16],
+                            b"racing current",
+                        );
+                        Ok::<_, ()>(HashSet::from([older.version_id]))
+                    } else {
+                        Ok(HashSet::new())
+                    }
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(reclaimed.is_empty());
@@ -31080,6 +31379,7 @@ mod tests {
                 &bucket,
                 &key,
                 marker.version_id,
+                current_bucket_incarnation(&first_cluster, &bucket),
                 move |raw, versions| {
                     assert_eq!(raw, Some("<LifecycleConfiguration/>"));
                     let call = calls_for_selector.fetch_add(1, Ordering::SeqCst);
@@ -37461,9 +37761,13 @@ mod tests {
         ));
 
         let err = cluster
-            .expire_current_object_if_due(&bucket, &key, committed.version_id, |_, _| {
-                Ok::<_, ()>(true)
-            })
+            .expire_current_object_if_due(
+                &bucket,
+                &key,
+                committed.version_id,
+                current_bucket_incarnation(&cluster, &bucket),
+                |_, _| Ok::<_, ()>(true),
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -37590,9 +37894,12 @@ mod tests {
         ));
 
         let err = cluster
-            .delete_noncurrent_live_versions_if_due(&bucket, &key, |_, _| {
-                Ok::<_, ()>(HashSet::from([older.version_id]))
-            })
+            .delete_noncurrent_live_versions_if_due(
+                &bucket,
+                &key,
+                current_bucket_incarnation(&cluster, &bucket),
+                |_, _| Ok::<_, ()>(HashSet::from([older.version_id])),
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -37726,9 +38033,13 @@ mod tests {
         ));
 
         let err = cluster
-            .delete_expired_delete_marker_if_due(&bucket, &key, marker.version_id, |_, _| {
-                Ok::<_, ()>(true)
-            })
+            .delete_expired_delete_marker_if_due(
+                &bucket,
+                &key,
+                marker.version_id,
+                current_bucket_incarnation(&cluster, &bucket),
+                |_, _| Ok::<_, ()>(true),
+            )
             .unwrap_err();
         assert!(
             matches!(

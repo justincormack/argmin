@@ -73,6 +73,14 @@ fn metadata_command_is_matching_multipart_abort(
     )
 }
 
+fn metadata_command_matches_bucket_incarnation(
+    command: &MetadataCommandEnvelope,
+    bucket_incarnation_generation: u64,
+) -> bool {
+    super::StorageCluster::metadata_command_bucket_write_reservation_proof(command)
+        .is_some_and(|proof| proof.bucket_incarnation_generation == bucket_incarnation_generation)
+}
+
 fn lifecycle_sweep_root_source_rank(source: LifecycleSweepRootSource) -> u8 {
     match source {
         LifecycleSweepRootSource::ExpiredClaim => 0,
@@ -84,6 +92,7 @@ fn lifecycle_sweep_root_source_rank(source: LifecycleSweepRootSource) -> u8 {
 
 struct BucketLifecycleContext {
     bucket_info: BucketInfo,
+    bucket_incarnation_generation: u64,
     raw_lifecycle: Option<String>,
 }
 
@@ -4324,7 +4333,9 @@ impl super::StorageCluster {
     fn load_bucket_lifecycle_context(
         &self,
         bucket: &BucketName,
+        expected_bucket_incarnation_generation: u64,
     ) -> Result<Option<BucketLifecycleContext>, ObjectPgActionError> {
+        crate::node::maybe_run_before_lifecycle_context_load_hook(bucket);
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let bucket_store = self
             .local_map
@@ -4343,6 +4354,10 @@ impl super::StorageCluster {
                 ))
             }
         };
+        let bucket_incarnation_generation = bucket_info.bucket_incarnation_generation;
+        if bucket_incarnation_generation != expected_bucket_incarnation_generation {
+            return Ok(None);
+        }
         let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
             bucket_store
                 .bucket_metadata_client()
@@ -4353,6 +4368,7 @@ impl super::StorageCluster {
         };
         Ok(Some(BucketLifecycleContext {
             bucket_info,
+            bucket_incarnation_generation,
             raw_lifecycle,
         }))
     }
@@ -4474,6 +4490,30 @@ impl super::StorageCluster {
                 error,
             )),
         }
+    }
+
+    fn try_acquire_lifecycle_bucket_write_proof_for_object_metadata_command(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation_kind: &'static str,
+        expected_bucket_incarnation_generation: u64,
+    ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
+        crate::node::maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(bucket);
+        let Some(proof) = self.try_acquire_bucket_write_proof_for_object_metadata_command(
+            bucket,
+            key,
+            operation_kind,
+            false,
+        )?
+        else {
+            return Ok(None);
+        };
+        if proof.bucket_incarnation_generation == expected_bucket_incarnation_generation {
+            return Ok(Some(proof));
+        }
+        self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+        Ok(None)
     }
 
     fn release_bucket_write_proof_for_object_metadata_command(
@@ -4969,13 +5009,17 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         expected_version_id: VersionId,
+        expected_bucket_incarnation_generation: u64,
         mut should_expire: impl FnMut(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
-        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+        let Some(lifecycle_context) =
+            self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
+        else {
             return Ok(Ok(None));
         };
         let BucketLifecycleContext {
             bucket_info,
+            bucket_incarnation_generation,
             raw_lifecycle,
         } = lifecycle_context;
         if raw_lifecycle.is_none() {
@@ -4994,6 +5038,12 @@ impl super::StorageCluster {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.matches_request(bucket, key, expected_version_id) =>
                     {
+                        if !metadata_command_matches_bucket_incarnation(
+                            &command,
+                            bucket_incarnation_generation,
+                        ) {
+                            return Ok(Ok(None));
+                        }
                         let snapshot = storage_client.load_specific_object_delete_snapshot(
                             pg_id,
                             bucket,
@@ -5026,6 +5076,12 @@ impl super::StorageCluster {
                     MetadataCommandPayload::InsertDeleteMarker(marker)
                         if marker.matches_request(bucket, key) =>
                     {
+                        if !metadata_command_matches_bucket_incarnation(
+                            &command,
+                            bucket_incarnation_generation,
+                        ) {
+                            return Ok(Ok(None));
+                        }
                         let snapshot = storage_client
                             .load_current_object_delete_snapshot(pg_id, bucket, key)?;
                         let Some(StoredObject::Live(record)) = snapshot.stored else {
@@ -5068,11 +5124,11 @@ impl super::StorageCluster {
             }
 
             let bucket_write_reservation = match self
-                .try_acquire_bucket_write_proof_for_object_metadata_command(
+                .try_acquire_lifecycle_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
                     "lifecycle-current-expiry",
-                    false,
+                    bucket_incarnation_generation,
                 )? {
                 Some(proof) => proof,
                 None => return Ok(Ok(None)),
@@ -5239,13 +5295,17 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
+        expected_bucket_incarnation_generation: u64,
         mut select_versions: impl FnMut(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
-        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+        let Some(lifecycle_context) =
+            self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
+        else {
             return Ok(Ok(Vec::new()));
         };
         let BucketLifecycleContext {
             bucket_info: _bucket_info,
+            bucket_incarnation_generation,
             raw_lifecycle,
         } = lifecycle_context;
         if raw_lifecycle.is_none() {
@@ -5260,6 +5320,12 @@ impl super::StorageCluster {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
+                        if !metadata_command_matches_bucket_incarnation(
+                            &command,
+                            bucket_incarnation_generation,
+                        ) {
+                            return Ok(Ok(completed_reclaimed_generation_ids));
+                        }
                         let versions = storage_client
                             .list_object_versions_for_lifecycle(pg_id, bucket, key)?;
                         if versions.is_empty() {
@@ -5328,11 +5394,11 @@ impl super::StorageCluster {
                     Err(error) => return Err(error),
                 };
                 let bucket_write_reservation = match self
-                    .try_acquire_bucket_write_proof_for_object_metadata_command(
+                    .try_acquire_lifecycle_bucket_write_proof_for_object_metadata_command(
                         bucket,
                         key,
                         "lifecycle-noncurrent-expiry",
-                        false,
+                        bucket_incarnation_generation,
                     )? {
                     Some(proof) => proof,
                     None => return Ok(Ok(completed_reclaimed_generation_ids)),
@@ -5412,13 +5478,17 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         expected_version_id: VersionId,
+        expected_bucket_incarnation_generation: u64,
         mut should_delete: impl FnMut(Option<&str>, &[StoredObject]) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+        let Some(lifecycle_context) =
+            self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
+        else {
             return Ok(Ok(false));
         };
         let BucketLifecycleContext {
             bucket_info: _bucket_info,
+            bucket_incarnation_generation,
             raw_lifecycle,
         } = lifecycle_context;
         if raw_lifecycle.is_none() {
@@ -5434,6 +5504,12 @@ impl super::StorageCluster {
                     if delete.matches_request(bucket, key, expected_version_id)
                         && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
                     {
+                        if !metadata_command_matches_bucket_incarnation(
+                            &command,
+                            bucket_incarnation_generation,
+                        ) {
+                            return Ok(Ok(false));
+                        }
                         let versions = storage_client
                             .list_object_versions_for_lifecycle(pg_id, bucket, key)?;
                         if versions.is_empty() {
@@ -5461,11 +5537,11 @@ impl super::StorageCluster {
             }
 
             let bucket_write_reservation = match self
-                .try_acquire_bucket_write_proof_for_object_metadata_command(
+                .try_acquire_lifecycle_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
                     "lifecycle-expired-delete-marker",
-                    false,
+                    bucket_incarnation_generation,
                 )? {
                 Some(proof) => proof,
                 None => return Ok(Ok(false)),
@@ -7914,6 +7990,7 @@ impl super::StorageCluster {
             key,
             upload_id,
             AbortMultipartUploadDrainMode::Wait,
+            None,
         )
     }
 
@@ -7922,6 +7999,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        expected_bucket_incarnation_generation: u64,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.abort_multipart_upload_locked(
@@ -7930,6 +8008,7 @@ impl super::StorageCluster {
             key,
             upload_id,
             AbortMultipartUploadDrainMode::Stop,
+            Some(expected_bucket_incarnation_generation),
         )
     }
 
@@ -7940,10 +8019,16 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
         drain_mode: AbortMultipartUploadDrainMode,
+        expected_bucket_incarnation_generation: Option<u64>,
     ) -> Result<bool, ObjectPgActionError> {
         'retry_after_pending_conflict: loop {
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if metadata_command_is_matching_multipart_abort(&command, bucket, key, upload_id) {
+                    if expected_bucket_incarnation_generation.is_some_and(|expected| {
+                        !metadata_command_matches_bucket_incarnation(&command, expected)
+                    }) {
+                        return Ok(false);
+                    }
                     self.apply_exact_pending_object_metadata_command(
                         pg_id,
                         super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -7953,12 +8038,21 @@ impl super::StorageCluster {
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
-            let proof = match self.try_acquire_bucket_write_proof_for_object_metadata_command(
-                bucket,
-                key,
-                "abort-multipart-upload",
-                drain_mode == AbortMultipartUploadDrainMode::Wait,
-            )? {
+            let proof = match match expected_bucket_incarnation_generation {
+                Some(expected) => self
+                    .try_acquire_lifecycle_bucket_write_proof_for_object_metadata_command(
+                        bucket,
+                        key,
+                        "abort-multipart-upload",
+                        expected,
+                    )?,
+                None => self.try_acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "abort-multipart-upload",
+                    drain_mode == AbortMultipartUploadDrainMode::Wait,
+                )?,
+            } {
                 Some(proof) => proof,
                 None if drain_mode == AbortMultipartUploadDrainMode::Wait => {
                     continue 'retry_after_pending_conflict;
@@ -8011,6 +8105,11 @@ impl super::StorageCluster {
                         if metadata_command_is_matching_multipart_abort(
                             &pending, bucket, key, upload_id,
                         ) {
+                            if expected_bucket_incarnation_generation.is_some_and(|expected| {
+                                !metadata_command_matches_bucket_incarnation(&pending, expected)
+                            }) {
+                                return Ok(false);
+                            }
                             self.apply_exact_pending_object_metadata_command(
                                 pg_id,
                                 super::ExactPendingObjectMetadataCommand::for_checked_request(
@@ -8226,12 +8325,19 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        expected_bucket_incarnation_generation: u64,
         should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
+        let Some(lifecycle_context) =
+            self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
+        else {
             return Ok(Ok(false));
         };
-        let BucketLifecycleContext { raw_lifecycle, .. } = lifecycle_context;
+        let BucketLifecycleContext {
+            bucket_incarnation_generation,
+            raw_lifecycle,
+            ..
+        } = lifecycle_context;
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -8243,6 +8349,12 @@ impl super::StorageCluster {
                         && abort.upload_id == *upload_id
             );
             if matching_abort {
+                if !metadata_command_matches_bucket_incarnation(
+                    &command,
+                    bucket_incarnation_generation,
+                ) {
+                    return Ok(Ok(false));
+                }
                 self.apply_exact_pending_object_metadata_command(
                     pg_id,
                     super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -8275,6 +8387,7 @@ impl super::StorageCluster {
                     key,
                     upload_id,
                     AbortMultipartUploadDrainMode::Stop,
+                    Some(bucket_incarnation_generation),
                 )
                 .map(Ok);
         }
@@ -8296,6 +8409,7 @@ impl super::StorageCluster {
             key,
             upload_id,
             AbortMultipartUploadDrainMode::Stop,
+            Some(bucket_incarnation_generation),
         )
         .map(Ok)
     }

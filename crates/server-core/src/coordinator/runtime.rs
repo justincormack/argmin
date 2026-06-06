@@ -536,6 +536,9 @@ impl ReadRuntime {
             )) => return Ok(()),
             Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
+        if bucket_info.bucket_incarnation_generation != claim.bucket_incarnation_generation {
+            return Ok(());
+        }
 
         self.expire_due_current_objects_for_bucket(claim, &bucket_info, now_millis, stats)?;
         self.expire_due_noncurrent_versions_for_bucket(claim, &bucket_info, now_millis, stats)?;
@@ -600,7 +603,13 @@ impl ReadRuntime {
 
         for (key, version_id) in candidates {
             self.heartbeat_lifecycle_sweep_claim(claim)?;
-            if self.expire_current_object_if_due(&bucket_info.name, &key, version_id, now_millis)? {
+            if self.expire_current_object_if_due(
+                &bucket_info.name,
+                &key,
+                version_id,
+                claim.bucket_incarnation_generation,
+                now_millis,
+            )? {
                 stats.expired_current_objects += 1;
             }
         }
@@ -629,7 +638,12 @@ impl ReadRuntime {
 
         let mut finished = 0u64;
         for (key, upload_id) in candidates {
-            if self.abort_multipart_upload_for_lifecycle_sweep(bucket, &key, &upload_id)? {
+            if self.abort_multipart_upload_for_lifecycle_sweep(
+                bucket,
+                &key,
+                &upload_id,
+                claim.bucket_incarnation_generation,
+            )? {
                 finished += 1;
             }
         }
@@ -681,8 +695,12 @@ impl ReadRuntime {
 
         for key in candidate_keys {
             self.heartbeat_lifecycle_sweep_claim(claim)?;
-            stats.expired_noncurrent_versions +=
-                self.expire_noncurrent_versions_if_due(&bucket_info.name, &key, now_millis)?;
+            stats.expired_noncurrent_versions += self.expire_noncurrent_versions_if_due(
+                &bucket_info.name,
+                &key,
+                claim.bucket_incarnation_generation,
+                now_millis,
+            )?;
         }
 
         Ok(())
@@ -693,6 +711,7 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         expected_version_id: VersionId,
+        expected_bucket_incarnation_generation: u64,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         let outcome = self
@@ -701,6 +720,7 @@ impl ReadRuntime {
                 bucket,
                 key,
                 expected_version_id,
+                expected_bucket_incarnation_generation,
                 |raw_lifecycle, record| {
                     let Some(config) =
                         Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
@@ -740,41 +760,48 @@ impl ReadRuntime {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
+        expected_bucket_incarnation_generation: u64,
         now_millis: u64,
     ) -> Result<u64, ServerError> {
         let current_unix_seconds = Coordinator::current_unix_seconds()?;
         let reclaimed_generation_ids = self
             .storage_node
-            .delete_noncurrent_live_versions_if_due(bucket, key, |raw_lifecycle, versions| {
-                let Some(config) = Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
-                else {
-                    return Ok::<HashSet<VersionId>, ServerError>(HashSet::new());
-                };
-                let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
-                    &config, versions, now_millis,
-                )?;
-                let due_version_ids = due_versions
-                    .iter()
-                    .map(|candidate| candidate.version_id)
-                    .collect::<HashSet<_>>();
+            .delete_noncurrent_live_versions_if_due(
+                bucket,
+                key,
+                expected_bucket_incarnation_generation,
+                |raw_lifecycle, versions| {
+                    let Some(config) =
+                        Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
+                    else {
+                        return Ok::<HashSet<VersionId>, ServerError>(HashSet::new());
+                    };
+                    let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
+                        &config, versions, now_millis,
+                    )?;
+                    let due_version_ids = due_versions
+                        .iter()
+                        .map(|candidate| candidate.version_id)
+                        .collect::<HashSet<_>>();
 
-                let eligible_version_ids = versions
-                    .iter()
-                    .filter_map(|stored| stored.as_live())
-                    .filter(|record| due_version_ids.contains(&record.version_id))
-                    .filter(|record| {
-                        Coordinator::validate_delete_against_object_lock(
-                            record.object_lock,
-                            false,
-                            false,
-                            current_unix_seconds,
-                        )
-                        .is_ok()
-                    })
-                    .map(|record| record.version_id)
-                    .collect();
-                Ok::<HashSet<VersionId>, ServerError>(eligible_version_ids)
-            })
+                    let eligible_version_ids = versions
+                        .iter()
+                        .filter_map(|stored| stored.as_live())
+                        .filter(|record| due_version_ids.contains(&record.version_id))
+                        .filter(|record| {
+                            Coordinator::validate_delete_against_object_lock(
+                                record.object_lock,
+                                false,
+                                false,
+                                current_unix_seconds,
+                            )
+                            .is_ok()
+                        })
+                        .map(|record| record.version_id)
+                        .collect();
+                    Ok::<HashSet<VersionId>, ServerError>(eligible_version_ids)
+                },
+            )
             .map_err(Coordinator::map_object_pg_action_error)??;
 
         for generation_id in &reclaimed_generation_ids {
@@ -827,7 +854,13 @@ impl ReadRuntime {
 
         for (key, version_id) in candidates {
             self.heartbeat_lifecycle_sweep_claim(claim)?;
-            if self.expire_delete_marker_if_due(&bucket_info.name, &key, version_id, now_millis)? {
+            if self.expire_delete_marker_if_due(
+                &bucket_info.name,
+                &key,
+                version_id,
+                claim.bucket_incarnation_generation,
+                now_millis,
+            )? {
                 stats.expired_delete_markers += 1;
             } else {
                 stats.skipped_expired_delete_markers += 1;
@@ -842,6 +875,7 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         expected_version_id: VersionId,
+        expected_bucket_incarnation_generation: u64,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         self.storage_node
@@ -849,6 +883,7 @@ impl ReadRuntime {
                 bucket,
                 key,
                 expected_version_id,
+                expected_bucket_incarnation_generation,
                 |raw_lifecycle, versions| {
                     let Some(config) =
                         Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
@@ -907,6 +942,7 @@ impl ReadRuntime {
                 &bucket_info.name,
                 &key,
                 &upload_id,
+                claim.bucket_incarnation_generation,
                 now_millis,
             )? {
                 stats.aborted_multipart_uploads += 1;
@@ -921,6 +957,7 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        expected_bucket_incarnation_generation: u64,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         #[cfg(feature = "deep-tracing")]
@@ -936,21 +973,28 @@ impl ReadRuntime {
             );
         }
         self.storage_node
-            .abort_multipart_upload_if_due(bucket, key, upload_id, |raw_lifecycle, upload| {
-                let Some(config) = Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
-                else {
-                    return Ok::<bool, ServerError>(false);
-                };
+            .abort_multipart_upload_if_due(
+                bucket,
+                key,
+                upload_id,
+                expected_bucket_incarnation_generation,
+                |raw_lifecycle, upload| {
+                    let Some(config) =
+                        Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
+                    else {
+                        return Ok::<bool, ServerError>(false);
+                    };
 
-                let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
-                    &config,
-                    key.as_str(),
-                    upload.initiated_at,
-                ) else {
-                    return Ok::<bool, ServerError>(false);
-                };
-                Ok::<bool, ServerError>(headers.abort_time_millis <= now_millis)
-            })
+                    let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
+                        &config,
+                        key.as_str(),
+                        upload.initiated_at,
+                    ) else {
+                        return Ok::<bool, ServerError>(false);
+                    };
+                    Ok::<bool, ServerError>(headers.abort_time_millis <= now_millis)
+                },
+            )
             .map_err(Coordinator::map_object_pg_action_error)?
     }
 
@@ -959,9 +1003,15 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        expected_bucket_incarnation_generation: u64,
     ) -> Result<bool, ServerError> {
         self.storage_node
-            .abort_multipart_upload_for_lifecycle_sweep(bucket, key, upload_id)
+            .abort_multipart_upload_for_lifecycle_sweep(
+                bucket,
+                key,
+                upload_id,
+                expected_bucket_incarnation_generation,
+            )
             .map_err(Coordinator::map_object_pg_action_error)
     }
 
