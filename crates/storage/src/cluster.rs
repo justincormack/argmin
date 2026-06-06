@@ -1743,17 +1743,6 @@ impl StorageCluster {
         self.local_map.object_pg_for(bucket, key)
     }
 
-    fn notify_bucket_coordination_change_on_bucket_metadata_primary(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(), StoreError> {
-        self.local_map.notify_bucket_coordination_change(
-            self.operation_epoch(),
-            PgId::new(self.bucket_metadata_pg_id(bucket)),
-            bucket,
-        )
-    }
-
     fn metadata_command_bucket_write_reservation_proof(
         command: &MetadataCommandEnvelope,
     ) -> Option<&BucketWriteReservationProof> {
@@ -1830,7 +1819,6 @@ impl StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
             .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
-        self.notify_bucket_coordination_change_on_bucket_metadata_primary(&proof.bucket)?;
         Ok(())
     }
 

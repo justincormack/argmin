@@ -12577,53 +12577,33 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         if source.0 == destination.0 {
             let merged_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
-            let pg = self.storage_node.get_pg(source_pg_id.get())?;
-            let bucket =
-                SharedStorageNode::load_bucket_snapshot_from_pg(&pg, source.0, merged_request)?;
-            drop(pg);
+            let bucket = <Self as StorageNodeClient>::load_bucket_snapshot(
+                self,
+                source_pg_id,
+                source.0,
+                merged_request,
+            )?;
             return Ok(BucketSnapshotPair::Same {
                 bucket: Box::new(bucket),
             });
         }
 
-        let guards = self
-            .storage_node
-            .lock_bucket_pair_pgs(source_pg_id.get(), destination_pg_id.get())?;
-        match guards {
-            crate::node::BucketPairPgGuards::Same { bucket } => {
-                let source_snapshot =
-                    SharedStorageNode::load_bucket_snapshot_from_pg(&bucket, source.0, source.1)?;
-                let destination_snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &bucket,
-                    destination.0,
-                    destination.1,
-                )?;
-                drop(bucket);
-                Ok(BucketSnapshotPair::Distinct {
-                    source: Box::new(source_snapshot),
-                    destination: Box::new(destination_snapshot),
-                })
-            }
-            crate::node::BucketPairPgGuards::Distinct {
-                source: source_pg,
-                destination: destination_pg,
-            } => {
-                let source_snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &source_pg, source.0, source.1,
-                )?;
-                let destination_snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(
-                    &destination_pg,
-                    destination.0,
-                    destination.1,
-                )?;
-                drop(source_pg);
-                drop(destination_pg);
-                Ok(BucketSnapshotPair::Distinct {
-                    source: Box::new(source_snapshot),
-                    destination: Box::new(destination_snapshot),
-                })
-            }
-        }
+        let source_snapshot = <Self as StorageNodeClient>::load_bucket_snapshot(
+            self,
+            source_pg_id,
+            source.0,
+            source.1,
+        )?;
+        let destination_snapshot = <Self as StorageNodeClient>::load_bucket_snapshot(
+            self,
+            destination_pg_id,
+            destination.0,
+            destination.1,
+        )?;
+        Ok(BucketSnapshotPair::Distinct {
+            source: Box::new(source_snapshot),
+            destination: Box::new(destination_snapshot),
+        })
     }
 
     fn head_bucket_raw(

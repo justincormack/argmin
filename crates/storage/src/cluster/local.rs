@@ -1754,18 +1754,6 @@ impl LocalClusterMap {
             )
     }
 
-    pub(crate) fn notify_bucket_coordination_change(
-        &self,
-        operation_epoch: ClusterEpoch,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), StoreError> {
-        let node = self.metadata_pg_primary_node(operation_epoch, pg_id)?;
-        node.storage_node()
-            .notify_bucket_coordination_change(bucket);
-        Ok(())
-    }
-
     pub(crate) fn runtime_state(&self) -> Arc<LocalClusterRuntimeState> {
         Arc::clone(&self.runtime_state)
     }
@@ -2724,8 +2712,6 @@ fn release_open_metadata_command_bucket_write_reservation(
                 source: std::io::Error::other(source),
             },
         })?;
-    node.storage_node()
-        .notify_bucket_coordination_change(&proof.bucket);
     Ok(())
 }
 

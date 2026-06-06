@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+#[cfg(any(test, feature = "test-hooks"))]
 use std::time::Instant;
 
+#[cfg(any(test, feature = "test-hooks"))]
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 #[cfg(any(test, feature = "test-hooks"))]
 use s3_types::VersionId;
@@ -28,9 +30,9 @@ use crate::types::CreateBucketConfig;
 use crate::types::ListMultipartUploadsReq;
 #[cfg(test)]
 use crate::types::{
-    AuthorizedMultipartUploadRecord, BucketSnapshotPair, BucketSnapshotTagsRequest, BucketState,
-    ListObjectVersionsReq, ListedMultipartParts, MultipartCompletionPreflight,
-    MultipartCompletionSnapshot, MultipartUploadManagementLookup, ObjectReadSnapshotOutcome,
+    AuthorizedMultipartUploadRecord, BucketState, ListObjectVersionsReq, ListedMultipartParts,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartUploadManagementLookup,
+    ObjectReadSnapshotOutcome,
 };
 use crate::types::{
     BucketInfo, BucketName, BucketSnapshot, BucketSnapshotRequest, BucketSubresourceKind, EcShape,
@@ -48,7 +50,9 @@ use crate::types::{
 use crate::types::{StreamUploadState, StreamUploadTarget};
 
 const TRACE_TARGET: &str = "storage";
+#[cfg(any(test, feature = "test-hooks"))]
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
+#[cfg(any(test, feature = "test-hooks"))]
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 mod bucket_ops;
@@ -79,6 +83,7 @@ struct StorageEcWriteState {
     scratch: Arc<EncodeScratchPool>,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
 }
@@ -93,6 +98,7 @@ pub struct DirectPutMetadataPublishTestHookGuard {
     scope_id: usize,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for BucketLockGuard<'_> {
     fn drop(&mut self) {
         let _ = &self.guard;
@@ -113,16 +119,6 @@ impl Drop for DirectPutMetadataPublishTestHookGuard {
             AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks.lock().unwrap().remove(&self.scope_id);
     }
-}
-
-pub enum BucketPairPgGuards<'a> {
-    Same {
-        bucket: MutexGuard<'a, PgStore>,
-    },
-    Distinct {
-        source: MutexGuard<'a, PgStore>,
-        destination: MutexGuard<'a, PgStore>,
-    },
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -190,9 +186,6 @@ pub(super) fn maybe_run_before_bucket_lock_acquire_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_lock_acquire)
 }
 
-#[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_before_bucket_lock_acquire_hook(_: &BucketName) {}
-
 #[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_drain_wait)
@@ -255,22 +248,6 @@ pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(
         hook()?;
     }
     Ok(())
-}
-
-impl<'a> BucketPairPgGuards<'a> {
-    pub fn source(&self) -> &MutexGuard<'a, PgStore> {
-        match self {
-            Self::Same { bucket } => bucket,
-            Self::Distinct { source, .. } => source,
-        }
-    }
-
-    pub fn destination(&self) -> &MutexGuard<'a, PgStore> {
-        match self {
-            Self::Same { bucket } => bucket,
-            Self::Distinct { destination, .. } => destination,
-        }
-    }
 }
 
 /// A local storage node managing multiple PG stores.
@@ -354,8 +331,8 @@ pub struct SharedStorageNode {
     pg_topology: PgTopology,
     default_ec_shape: EcShape,
     data_dir: PathBuf,
+    #[cfg(any(test, feature = "test-hooks"))]
     bucket_locks: Vec<Mutex<()>>,
-    bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
     object_payload_leases: Mutex<ObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
     ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
@@ -396,6 +373,7 @@ struct ReclaimQueueState {
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 const BUCKET_LOCK_STRIPES: usize = 256;
 
 impl SharedStorageNode {
@@ -444,13 +422,11 @@ impl SharedStorageNode {
 
         pg_id_list.sort_unstable();
 
+        #[cfg(any(test, feature = "test-hooks"))]
         let mut bucket_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
+        #[cfg(any(test, feature = "test-hooks"))]
         for _ in 0..BUCKET_LOCK_STRIPES {
             bucket_locks.push(Mutex::new(()));
-        }
-        let mut bucket_coordination = Vec::with_capacity(BUCKET_LOCK_STRIPES);
-        for _ in 0..BUCKET_LOCK_STRIPES {
-            bucket_coordination.push((Mutex::new(0), Condvar::new()));
         }
         Ok(Self {
             stores,
@@ -459,8 +435,8 @@ impl SharedStorageNode {
             pg_topology: PgTopology::new(pg_ids).expect("shared storage node must have PGs"),
             default_ec_shape,
             data_dir: data_dir.to_path_buf(),
+            #[cfg(any(test, feature = "test-hooks"))]
             bucket_locks,
-            bucket_coordination,
             object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
@@ -530,26 +506,17 @@ impl SharedStorageNode {
             .map_or(0, |state| state.scratch.allocation_count())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn bucket_lock_index(&self, bucket: &BucketName) -> usize {
         (rapidhash_v3_micro_inline::<true, false>(bucket.as_str().as_bytes(), &RAPIDHASH_SECRETS)
             as usize)
             % self.bucket_locks.len()
     }
 
-    pub(crate) fn notify_bucket_coordination_change(&self, bucket: &BucketName) {
-        let idx = self.bucket_lock_index(bucket);
-        let (generation_lock, generation_cvar) = &self.bucket_coordination[idx];
-        let mut generation = generation_lock.lock().unwrap();
-        *generation += 1;
-        generation_cvar.notify_all();
-    }
-
     /// Lock a bucket-scoped stripe mutex.
     ///
-    /// Coordinator bucket-mutating operations use this as a coarse per-bucket
-    /// gate so multi-step flows (for example, delete-bucket emptiness check
-    /// followed by delete) cannot interleave with concurrent writes that would
-    /// make the bucket non-empty.
+    /// Test helper for legacy bucket lock probes.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn lock_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -1485,69 +1452,6 @@ impl SharedStorageNode {
         }
         Some(work)
     }
-
-    /// Lock two PGs for operations that span a metadata PG and a shard PG.
-    ///
-    /// When both IDs are the same, returns `(guard, None)` — the caller uses
-    /// the single guard for both roles. When different, locks in ascending
-    /// ID order to prevent deadlocks and returns `(lower_guard, Some(higher_guard))`.
-    ///
-    /// The first returned guard corresponds to `pg_a`, the second to `pg_b`.
-    pub(crate) fn lock_two_pgs(
-        &self,
-        pg_a: u32,
-        pg_b: u32,
-    ) -> Result<(MutexGuard<'_, PgStore>, Option<MutexGuard<'_, PgStore>>), StoreError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "SharedStorageNode::lock_two_pgs",
-            "pg_a={} pg_b={}",
-            pg_a,
-            pg_b
-        );
-        if pg_a == pg_b {
-            let guard = self.get_pg(pg_a)?;
-            return Ok((guard, None));
-        }
-
-        // Lock in ascending order to prevent deadlocks.
-        if pg_a < pg_b {
-            let guard_a = self.get_pg(pg_a)?;
-            let guard_b = self.get_pg(pg_b)?;
-            Ok((guard_a, Some(guard_b)))
-        } else {
-            let guard_b = self.get_pg(pg_b)?;
-            let guard_a = self.get_pg(pg_a)?;
-            Ok((guard_a, Some(guard_b)))
-        }
-    }
-
-    /// Lock a source/destination bucket PG pair while preserving request roles.
-    ///
-    /// Ordering is internal to storage. Callers provide the source and
-    /// destination PG IDs in request-role order and receive role-preserving
-    /// guards back.
-    pub fn lock_bucket_pair_pgs(
-        &self,
-        source_pg_id: u32,
-        destination_pg_id: u32,
-    ) -> Result<BucketPairPgGuards<'_>, StoreError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "SharedStorageNode::lock_bucket_pair_pgs",
-            "source_pg_id={} destination_pg_id={}",
-            source_pg_id,
-            destination_pg_id
-        );
-        let (source, destination) = self.lock_two_pgs(source_pg_id, destination_pg_id)?;
-        Ok(match destination {
-            Some(destination) => BucketPairPgGuards::Distinct {
-                source,
-                destination,
-            },
-            None => BucketPairPgGuards::Same { bucket: source },
-        })
-    }
 }
 
 impl EncodeScratchPool {
@@ -1734,65 +1638,6 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
-    }
-
-    #[test]
-    fn shared_node_lock_two_pgs_same() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let (guard, opt) = node.lock_two_pgs(0, 0).unwrap();
-        assert!(opt.is_none());
-        assert_eq!(guard.pg_id(), 0);
-    }
-
-    #[test]
-    fn shared_node_lock_two_pgs_different() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let (guard_a, opt_b) = node.lock_two_pgs(0, 1).unwrap();
-        assert_eq!(guard_a.pg_id(), 0);
-        let guard_b = opt_b.unwrap();
-        assert_eq!(guard_b.pg_id(), 1);
-    }
-
-    #[test]
-    fn shared_node_lock_two_pgs_reversed_order() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        // Request pg_b=0, pg_a=1 — should still lock 0 first internally,
-        // but return guards in the requested order.
-        let (guard_a, opt_b) = node.lock_two_pgs(1, 0).unwrap();
-        assert_eq!(guard_a.pg_id(), 1);
-        let guard_b = opt_b.unwrap();
-        assert_eq!(guard_b.pg_id(), 0);
-    }
-
-    #[test]
-    fn shared_node_lock_bucket_pair_pgs_same() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let guards = node.lock_bucket_pair_pgs(0, 0).unwrap();
-        match guards {
-            BucketPairPgGuards::Same { bucket } => assert_eq!(bucket.pg_id(), 0),
-            BucketPairPgGuards::Distinct { .. } => panic!("expected same-bucket guards"),
-        }
-    }
-
-    #[test]
-    fn shared_node_lock_bucket_pair_pgs_preserves_roles() {
-        let tmp = test_util::tempdir();
-        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
-        let guards = node.lock_bucket_pair_pgs(1, 0).unwrap();
-        match guards {
-            BucketPairPgGuards::Same { .. } => panic!("expected distinct-bucket guards"),
-            BucketPairPgGuards::Distinct {
-                source,
-                destination,
-            } => {
-                assert_eq!(source.pg_id(), 1);
-                assert_eq!(destination.pg_id(), 0);
-            }
-        }
     }
 
     fn create_bucket_for_snapshot_test(node: &SharedStorageNode, name: &str) -> BucketName {

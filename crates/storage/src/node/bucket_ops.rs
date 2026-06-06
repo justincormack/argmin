@@ -63,8 +63,6 @@ impl SharedStorageNode {
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::mark_bucket_deleting(&*bucket_pg, bucket)?;
         bucket_pg.refresh_metadata_command_state_digest()?;
-        drop(bucket_pg);
-        self.notify_bucket_coordination_change(bucket);
         Ok(())
     }
 
@@ -326,67 +324,6 @@ impl SharedStorageNode {
                 crate::error::MetadataError::BucketNotFound { .. },
             )) => Ok(BucketDeleteFinalizeOutcome::NotFound),
             Err(other) => Err(other),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn load_bucket_snapshot_pair(
-        &self,
-        source: (&BucketName, BucketSnapshotRequest),
-        destination: (&BucketName, BucketSnapshotRequest),
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        if source.0 == destination.0 {
-            let merged_request = BucketSnapshotRequest {
-                policy: source.1.policy || destination.1.policy,
-                tags: match (source.1.tags, destination.1.tags) {
-                    (BucketSnapshotTagsRequest::Always, _)
-                    | (_, BucketSnapshotTagsRequest::Always) => BucketSnapshotTagsRequest::Always,
-                    (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
-                    | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
-                        BucketSnapshotTagsRequest::IfBucketAbacEnabled
-                    }
-                    (
-                        BucketSnapshotTagsRequest::NotRequested,
-                        BucketSnapshotTagsRequest::NotRequested,
-                    ) => BucketSnapshotTagsRequest::NotRequested,
-                },
-                lifecycle: source.1.lifecycle || destination.1.lifecycle,
-                cors: source.1.cors || destination.1.cors,
-            };
-            let bucket = self.load_bucket_snapshot(source.0, merged_request)?;
-            return Ok(BucketSnapshotPair::Same {
-                bucket: Box::new(bucket),
-            });
-        }
-
-        let guards = self.lock_bucket_pair_pgs(
-            self.pg_topology.bucket_pg_for(source.0),
-            self.pg_topology.bucket_pg_for(destination.0),
-        )?;
-        match guards {
-            BucketPairPgGuards::Same { bucket } => Ok(BucketSnapshotPair::Distinct {
-                source: Box::new(Self::load_bucket_snapshot_from_pg(
-                    &bucket, source.0, source.1,
-                )?),
-                destination: Box::new(Self::load_bucket_snapshot_from_pg(
-                    &bucket,
-                    destination.0,
-                    destination.1,
-                )?),
-            }),
-            BucketPairPgGuards::Distinct {
-                source: source_pg,
-                destination: destination_pg,
-            } => Ok(BucketSnapshotPair::Distinct {
-                source: Box::new(Self::load_bucket_snapshot_from_pg(
-                    &source_pg, source.0, source.1,
-                )?),
-                destination: Box::new(Self::load_bucket_snapshot_from_pg(
-                    &destination_pg,
-                    destination.0,
-                    destination.1,
-                )?),
-            }),
         }
     }
 

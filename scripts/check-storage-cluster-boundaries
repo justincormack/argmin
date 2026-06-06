@@ -158,7 +158,7 @@ production_cluster_direct_local_node_bypasses=$(
         }
     }
     function direct_node_local_call(line) {
-        return line ~ /\.(get_pg|lock_bucket|lock_multipart_completion_bucket|notify_bucket_coordination_change)\(/
+        return line ~ /\.(get_pg|lock_bucket|lock_two_pgs|lock_bucket_pair_pgs|lock_multipart_completion_bucket|notify_bucket_coordination_change)\(/
     }
     {
         update_function_context()
@@ -207,7 +207,9 @@ fail_with_matches \
 
 removed_bucket_pg_lock_helpers=$(
     rg -n --color=never \
-        'lock_bucket_on_bucket_metadata_primary|lock_bucket_on_object_metadata_primary|lock_bucket_on_metadata_pg_primary|lock_multipart_completion_bucket_on_bucket_metadata_primary|lock_multipart_completion_bucket_on_metadata_pg_primary' \
+        'lock_bucket_on_bucket_metadata_primary|lock_bucket_on_object_metadata_primary|lock_bucket_on_metadata_pg_primary|lock_multipart_completion_bucket_on_bucket_metadata_primary|lock_multipart_completion_bucket_on_metadata_pg_primary|lock_two_pgs|lock_bucket_pair_pgs|BucketPairPgGuards' \
+        crates/storage/src/lib.rs \
+        crates/storage/src/node.rs \
         crates/storage/src/cluster.rs \
         crates/storage/src/cluster/request_ops.rs \
         crates/storage/src/cluster/local.rs \

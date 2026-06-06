@@ -1805,7 +1805,6 @@ impl super::StorageCluster {
                                 bucket, pg_id, expired.drain_id
                             )),
                         );
-                        self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                         continue;
                     }
                     match node
@@ -1846,7 +1845,6 @@ impl super::StorageCluster {
         node.bucket_write_reservation_client()
             .clear_durable_bucket_write_drain(PgId::new(drain.pg_id), &drain.record)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-        self.notify_bucket_coordination_change_on_bucket_metadata_primary(&drain.record.bucket)?;
         Ok(())
     }
 
@@ -1990,7 +1988,6 @@ impl super::StorageCluster {
                 .head_bucket_raw(pg_id, bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if current.state == BucketState::Deleting {
-                self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
@@ -2002,7 +1999,6 @@ impl super::StorageCluster {
         let durable_drain = match self.begin_durable_bucket_delete_drain(bucket)? {
             super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
             super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
-                self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
@@ -2157,7 +2153,6 @@ impl super::StorageCluster {
 
         match result {
             Ok(()) => {
-                self.notify_bucket_coordination_change_on_bucket_metadata_primary(bucket)?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",

@@ -358,8 +358,9 @@ First static local cluster config decision:
 
 Raw PG test dependency inventory:
 
-1. storage unit and integration tests call `SharedStorageNode::get_pg` and
-   `lock_two_pgs` directly
+1. storage unit and integration tests still call `SharedStorageNode::get_pg`
+   directly in storage-owned setup/assertion helpers; the old two-PG lock helper
+   has been removed
 2. coordinator tests use `test_bucket_pg_id_for`, `test_object_pg_id_for`,
    `test_data_pg_id_for`, and `test_lock_bucket_pg`
 3. coordinator reclaim and multipart tests use `test_shard_exists`,
@@ -4664,22 +4665,26 @@ Phase 9.1 audit checklist:
      serialized inside one process
    - replacement owner: Phase 9.3 PG-primary metadata command serialization
 7. bucket operation locks
-   - current process-local mechanism:
-     `SharedStorageNode::bucket_locks`
+   - retired process-local mechanism:
+     `SharedStorageNode::bucket_locks`, now cfg-gated to tests/test hooks in
+     Phase 10.8
    - classification: request serialization and precondition stability
-   - risk: bucket property, delete, lifecycle, and object-operation decisions
-     can observe stable state only inside one process
+   - outcome: bucket property, delete, lifecycle, and object-operation request
+     paths now rely on PG-primary command preconditions, durable bucket state
+     checks, and bucket write-drain/reservation rows rather than same-process
+     lock stripes
    - replacement owner: PG-primary command preconditions and durable bucket
      state checks in Phase 9.3 and Phase 9.4
 8. bucket write drain waiters
-   - current process-local mechanism:
+   - retired process-local mechanism:
      `SharedStorageNode::bucket_coordination` condition variables and local
-     wakeups in bucket write reservation/drain paths
+     wakeups in bucket write reservation/drain paths, removed in Phase 10.8
    - classification: request lifecycle and write-drain coordination
-   - risk: delete/finalize progress can depend on same-process waiters and
-     wakeups
+   - outcome: delete/finalize progress now depends on durable bucket
+     write-drain/reservation rows and restartable polling, not same-process
+     waiters or wakeups
    - replacement owner: Phase 9.4 durable or PG-primary bucket write-drain
-     state, with restartable polling or notifications
+     state
 9. bucket write reservation counters
    - retired mechanism: durable bucket rows with reservation fields, treated as
      runtime coordination state rather than command-owned metadata before Phase
@@ -5235,13 +5240,15 @@ Progress:
   but max-log and pending-slot checks for fresh command ids now happen behind
   storage-client methods; the boundary guardrail no longer carries the
   cluster-side allocator exception.
-- Migrated remaining production cluster topology, local lock, local notification,
-  and EC shard-encoding use cases behind `LocalClusterMap` helpers. PG id
+- Migrated remaining production cluster topology, local lock, and EC
+  shard-encoding use cases behind `LocalClusterMap` helpers. PG id
   derivation, default EC shape, EC scratch-pool-backed encoding,
-  bucket/object-scoped local locks, multipart completion contention locks, and
-  bucket coordination notifications are no longer reached through ad hoc
-  `SharedStorageNode` calls from `StorageCluster`/`request_ops`; the local map is
-  the only in-process implementation boundary for those local-only operations.
+  bucket/object-scoped local locks, and multipart completion contention locks
+  are no longer reached through ad hoc `SharedStorageNode` calls from
+  `StorageCluster`/`request_ops`; the local map is the only in-process
+  implementation boundary for those local-only operations. Bucket coordination
+  notifications were later removed entirely in Phase 10.8 after durable
+  drain/reservation polling became the request lifecycle mechanism.
   The boundary guardrail now rejects production cluster code that calls direct
   node `get_pg`, `lock_bucket`, `lock_multipart_completion_bucket`, or
   `notify_bucket_coordination_change` helpers outside cfg-gated test hooks.
@@ -5974,6 +5981,18 @@ Status:
   storage-node snapshot validation instead of same-process object-PG bucket
   mutexes. The boundary script now rejects reintroducing bucket- or object-PG
   request-path lock helpers.
+- Removed the ordered two-PG bucket snapshot pair lock helper and its exported
+  guard type. Same-node source/destination bucket snapshot pairs now use the
+  same operation-shaped routed snapshot reads as remote paths: same-bucket
+  requests are merged into one snapshot load, and distinct-bucket requests load
+  each bucket independently without holding multiple PG mutexes together.
+- Removed the obsolete bucket coordination condition variables and notification
+  helpers. Bucket delete/drain progress now uses durable bucket
+  write-drain/reservation rows plus restartable polling; there are no remaining
+  request-path same-process bucket coordination wakeups.
+- Gated the legacy `SharedStorageNode::lock_bucket` stripe lock surface to
+  tests/test hooks. Production `SharedStorageNode` no longer carries bucket
+  lock stripes, and the remaining lock probes are explicitly test-shaped.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
