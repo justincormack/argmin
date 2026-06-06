@@ -82,9 +82,7 @@ fn lifecycle_sweep_root_source_rank(source: LifecycleSweepRootSource) -> u8 {
     }
 }
 
-struct BucketLifecycleContext<'a> {
-    bucket_primary_node_id: NodeId,
-    _bucket_guard: crate::node::BucketLockGuard<'a>,
+struct BucketLifecycleContext {
     bucket_info: BucketInfo,
     raw_lifecycle: Option<String>,
 }
@@ -833,7 +831,6 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(&bucket)?;
         {
             match primary_store
                 .bucket_metadata_client()
@@ -2193,7 +2190,6 @@ impl super::StorageCluster {
             )),
         );
         let bucket_incarnation_generation = {
-            let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
             let info = match bucket_store
                 .bucket_metadata_client()
                 .head_bucket_raw(PgId::new(bucket_pg_id), bucket)
@@ -2640,7 +2636,6 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             let info = primary_store
                 .bucket_metadata_client()
@@ -2814,7 +2809,6 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
                 .bucket_metadata_client()
@@ -2914,7 +2908,6 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
                 .bucket_metadata_client()
@@ -3035,7 +3028,6 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let _bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         {
             primary_store
                 .bucket_metadata_client()
@@ -4345,13 +4337,11 @@ impl super::StorageCluster {
     fn load_bucket_lifecycle_context(
         &self,
         bucket: &BucketName,
-    ) -> Result<Option<BucketLifecycleContext<'_>>, ObjectPgActionError> {
+    ) -> Result<Option<BucketLifecycleContext>, ObjectPgActionError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let bucket_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let bucket_primary_node_id = bucket_store.node_id();
-        let bucket_guard = self.lock_bucket_on_bucket_metadata_primary(bucket)?;
         let bucket_info = match bucket_store
             .bucket_metadata_client()
             .head_bucket_info(pg_id, bucket)
@@ -4375,8 +4365,6 @@ impl super::StorageCluster {
             None
         };
         Ok(Some(BucketLifecycleContext {
-            bucket_primary_node_id,
-            _bucket_guard: bucket_guard,
             bucket_info,
             raw_lifecycle,
         }))
@@ -5003,8 +4991,6 @@ impl super::StorageCluster {
             return Ok(Ok(None));
         };
         let BucketLifecycleContext {
-            bucket_primary_node_id,
-            _bucket_guard: _lifecycle_bucket_guard,
             bucket_info,
             raw_lifecycle,
         } = lifecycle_context;
@@ -5013,16 +4999,8 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let object_primary_node_id = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .node_id();
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
-            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
-        } else {
-            None
-        };
+        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         let owner = OwnerIdentity::new(
             bucket_info.owner_principal.clone(),
             bucket_info.owner_canonical_id.clone(),
@@ -5284,8 +5262,6 @@ impl super::StorageCluster {
             return Ok(Ok(Vec::new()));
         };
         let BucketLifecycleContext {
-            bucket_primary_node_id,
-            _bucket_guard: _lifecycle_bucket_guard,
             bucket_info: _bucket_info,
             raw_lifecycle,
         } = lifecycle_context;
@@ -5294,16 +5270,8 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let object_primary_node_id = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .node_id();
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
-            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
-        } else {
-            None
-        };
+        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         let mut completed_reclaimed_generation_ids = Vec::new();
 
         'retry: loop {
@@ -5468,8 +5436,6 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         };
         let BucketLifecycleContext {
-            bucket_primary_node_id,
-            _bucket_guard: _lifecycle_bucket_guard,
             bucket_info: _bucket_info,
             raw_lifecycle,
         } = lifecycle_context;
@@ -5478,16 +5444,8 @@ impl super::StorageCluster {
         }
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let object_primary_node_id = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .node_id();
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
-            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
-        } else {
-            None
-        };
+        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -7458,8 +7416,6 @@ impl super::StorageCluster {
         let upload_id = req.upload_id.clone();
         let generation_id = req.generation_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
-        let _completion_guard =
-            self.lock_multipart_completion_bucket_on_bucket_metadata_primary(&bucket)?;
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
 
         'retry_after_pending_conflict: loop {
@@ -8346,23 +8302,10 @@ impl super::StorageCluster {
         let Some(lifecycle_context) = self.load_bucket_lifecycle_context(bucket)? else {
             return Ok(Ok(false));
         };
-        let BucketLifecycleContext {
-            bucket_primary_node_id,
-            _bucket_guard: _lifecycle_bucket_guard,
-            raw_lifecycle,
-            ..
-        } = lifecycle_context;
+        let BucketLifecycleContext { raw_lifecycle, .. } = lifecycle_context;
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let object_primary_node_id = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .node_id();
-        let _object_bucket_guard = if bucket_primary_node_id != object_primary_node_id {
-            Some(self.lock_bucket_on_object_metadata_primary(bucket, key)?)
-        } else {
-            None
-        };
+        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_abort = matches!(
                 command.payload(),

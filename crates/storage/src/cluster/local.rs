@@ -1765,16 +1765,6 @@ impl LocalClusterMap {
         Ok(node.storage_node().lock_bucket(bucket))
     }
 
-    pub(crate) fn lock_multipart_completion_bucket_on_metadata_pg_primary(
-        &self,
-        operation_epoch: ClusterEpoch,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<BucketLockGuard<'_>, StoreError> {
-        let node = self.metadata_pg_primary_node(operation_epoch, pg_id)?;
-        Ok(node.storage_node().lock_multipart_completion_bucket(bucket))
-    }
-
     pub(crate) fn notify_bucket_coordination_change(
         &self,
         operation_epoch: ClusterEpoch,

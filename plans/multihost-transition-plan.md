@@ -5957,6 +5957,16 @@ Exit criteria:
 7. production request paths no longer require same-process storage-node mutexes
    or condition variables for correctness
 
+Status:
+
+- Started Phase 10.8 with the shared-memory audit. Bucket-PG request-path
+  mutex helpers for create/delete/bucket-control/lifecycle and multipart
+  completion have been removed; those paths now rely on durable bucket
+  reservations/drains and the storage-node-owned metadata command
+  serialization boundary. The storage boundary script now rejects reintroducing
+  those bucket-PG lock helpers. Object-PG bucket lock call sites remain the
+  next audit slice.
+
 ## Phase 11: Failure, Peering, Repair, And Migration
 
 Add real distributed behavior after the normal path is already shaped correctly.

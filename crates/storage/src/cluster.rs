@@ -1744,17 +1744,6 @@ impl StorageCluster {
         self.local_map.object_pg_for(bucket, key)
     }
 
-    fn lock_bucket_on_bucket_metadata_primary(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<BucketLockGuard<'_>, StoreError> {
-        self.local_map.lock_bucket_on_metadata_pg_primary(
-            self.operation_epoch(),
-            PgId::new(self.bucket_metadata_pg_id(bucket)),
-            bucket,
-        )
-    }
-
     fn notify_bucket_coordination_change_on_bucket_metadata_primary(
         &self,
         bucket: &BucketName,
@@ -1764,18 +1753,6 @@ impl StorageCluster {
             PgId::new(self.bucket_metadata_pg_id(bucket)),
             bucket,
         )
-    }
-
-    fn lock_multipart_completion_bucket_on_bucket_metadata_primary(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<BucketLockGuard<'_>, StoreError> {
-        self.local_map
-            .lock_multipart_completion_bucket_on_metadata_pg_primary(
-                self.operation_epoch(),
-                PgId::new(self.bucket_metadata_pg_id(bucket)),
-                bucket,
-            )
     }
 
     fn metadata_command_bucket_write_reservation_proof(
