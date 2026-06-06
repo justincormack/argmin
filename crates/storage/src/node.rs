@@ -399,6 +399,48 @@ const BUCKET_LOCK_STRIPES: usize = 256;
 impl SharedStorageNode {
     pub const DEFAULT_EC_SHAPE: EcShape = EcShape { k: 4, m: 2 };
 
+    pub(crate) fn topology_only(
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+    ) -> Result<Self, StoreError> {
+        EcConfig::new(default_ec_shape.k, default_ec_shape.m).map_err(|error| {
+            StoreError::ErasureCoding {
+                context: "validate storage default ec shape",
+                reason: error.to_string(),
+            }
+        })?;
+        let mut pg_id_list = pg_ids.to_vec();
+        pg_id_list.sort_unstable();
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        let mut bucket_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
+        #[cfg(any(test, feature = "test-hooks"))]
+        for _ in 0..BUCKET_LOCK_STRIPES {
+            bucket_locks.push(Mutex::new(()));
+        }
+
+        Ok(Self {
+            stores: HashMap::new(),
+            pg_paths: HashMap::new(),
+            pg_id_list,
+            pg_topology: PgTopology::new(pg_ids).expect("topology-only storage node must have PGs"),
+            default_ec_shape,
+            data_dir: PathBuf::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            bucket_locks,
+            object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
+            reclaim_queue: (
+                Mutex::new(ReclaimQueueState {
+                    work_queue: VecDeque::new(),
+                    queued_objects: HashSet::new(),
+                    queued_bucket_deletes: HashSet::new(),
+                }),
+                Condvar::new(),
+            ),
+            ec_write_states: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// Open a shared storage node, creating PG directories as needed.
     pub fn open(data_dir: &Path, pg_ids: &[u32]) -> Result<Self, StoreError> {
         Self::open_with_default_ec_shape(data_dir, pg_ids, Self::DEFAULT_EC_SHAPE)

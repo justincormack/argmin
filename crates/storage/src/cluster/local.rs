@@ -376,6 +376,15 @@ impl LocalNodeStore {
         }
     }
 
+    fn topology_only(
+        node_id: NodeId,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+    ) -> Result<Self, StoreError> {
+        let storage_node = Arc::new(SharedStorageNode::topology_only(pg_ids, default_ec_shape)?);
+        Ok(Self::new(node_id, PathBuf::new(), storage_node))
+    }
+
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -919,6 +928,78 @@ impl LocalClusterMap {
             cluster_epoch,
             false,
         )
+    }
+
+    pub fn open_frontend_topology_only_with_epoch(
+        metadata_primary_node_id: NodeId,
+        node_ids: impl IntoIterator<Item = NodeId>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Self, ClusterBuildError> {
+        let mut ordered_node_ids = Vec::new();
+        let mut node_id_set = BTreeSet::<NodeId>::new();
+        for node_id in node_ids {
+            if !node_id_set.insert(node_id) {
+                return Err(ClusterBuildError::DuplicateNodeId {
+                    id: node_id.as_u32(),
+                });
+            }
+            ordered_node_ids.push(node_id);
+        }
+        if ordered_node_ids.is_empty() {
+            return Err(ClusterBuildError::EmptyCluster);
+        }
+        if !node_id_set.contains(&metadata_primary_node_id) {
+            return Err(ClusterBuildError::MetadataPrimaryNotFound {
+                id: metadata_primary_node_id.as_u32(),
+            });
+        }
+        let pg_ids = validate_local_pg_ids(pg_ids)?;
+        let placement_map = build_local_placement_map(node_id_set.iter().copied())?;
+        validate_local_payload_placement(&placement_map, default_ec_shape)?;
+
+        let acting_set = Arc::<[NodeId]>::from(node_id_set.iter().copied().collect::<Vec<_>>());
+        let storage_pg_ids: Vec<u32> = pg_ids.iter().map(|pg_id| pg_id.get()).collect();
+        let pg_topology = PgTopology::new(&storage_pg_ids).map_err(|reason| {
+            ClusterBuildError::InvalidLocalPlacement {
+                reason: reason.to_string(),
+            }
+        })?;
+        let pg_routes = build_static_pg_routes(
+            cluster_epoch,
+            metadata_primary_node_id,
+            Arc::clone(&acting_set),
+            &pg_ids,
+        );
+
+        let mut nodes = BTreeMap::new();
+        for node_id in ordered_node_ids {
+            let node_store =
+                LocalNodeStore::topology_only(node_id, &storage_pg_ids, default_ec_shape).map_err(
+                    |source| ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source,
+                    },
+                )?;
+            nodes.insert(node_id, node_store);
+        }
+        let metadata_primary = nodes
+            .get(&metadata_primary_node_id)
+            .expect("validated metadata primary should have been opened");
+
+        Ok(Self {
+            epoch: cluster_epoch,
+            metadata_primary_node_id,
+            pg_ids: storage_pg_ids.into_boxed_slice(),
+            pg_topology,
+            default_ec_shape,
+            pg_routes,
+            placement_map,
+            runtime_state: Arc::new(LocalClusterRuntimeState::new()),
+            process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
+            nodes,
+        })
     }
 
     fn open_with_configs_inner(
@@ -6609,6 +6690,40 @@ mod tests {
             map.node(NodeId::new(0)).unwrap().data_dir(),
             map.node(NodeId::new(1)).unwrap().data_dir()
         );
+    }
+
+    #[test]
+    fn opens_frontend_topology_only_map_without_pg_stores() {
+        let node_ids = [NodeId::new(0), NodeId::new(1)];
+        let ec_shape = EcShape { k: 1, m: 1 };
+        let epoch = ClusterEpoch::new(9).unwrap();
+        let map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+            NodeId::new(1),
+            node_ids,
+            &[0, 3],
+            ec_shape,
+            epoch,
+        )
+        .unwrap();
+
+        assert_eq!(map.epoch(), epoch);
+        assert_eq!(map.metadata_primary_node_id(), NodeId::new(1));
+        assert_eq!(map.node_count(), 2);
+        assert_eq!(map.node_ids().collect::<Vec<_>>(), node_ids);
+        let route = map.pg_route(PgId::new(3)).unwrap();
+        assert_eq!(route.cluster_epoch(), epoch);
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+        assert_eq!(route.acting_set(), node_ids);
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap();
+            assert_eq!(node.data_dir(), Path::new(""));
+            assert_eq!(node.storage_node().pg_ids(), &[0, 3]);
+            assert!(matches!(
+                node.storage_node().get_pg(0),
+                Err(StoreError::PgNotFound { pg_id: 0 })
+            ));
+        }
     }
 
     struct RecordingPlacedShardClient {

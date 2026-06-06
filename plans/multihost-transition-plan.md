@@ -5641,15 +5641,16 @@ bucket PG reads for these public/cache-freshness paths.
 The early `frontend`/`combined` unsupported-role gate has been removed for the
 Phase 10.5 request path. Frontend roles now require
 `ARGMIN_STORAGE_NODE_SOCKETS` as a complete `node_id=/absolute/socket` map,
-build a frontend-placeholder `LocalClusterMap` at the configured cluster epoch,
-and install the full Unix storage-node client set for shard IO, shard acks,
-read handles, metadata commands, bucket metadata/coordination, object
+build a topology-only `LocalClusterMap` at the configured cluster epoch, and
+install the full Unix storage-node client set for shard IO, shard acks, read
+handles, metadata commands, bucket metadata/coordination, object
 read/listing/mutation metadata, direct PUT metadata, and generation/version
 allocation. Combined mode binds its configured storage-node listener first,
 requires its own socket-map entry to match `ARGMIN_STORAGE_NODE_SOCKET_PATH`,
 then starts the HTTP/coordinator frontend over the same socket client boundary.
-The placeholder frontend map intentionally skips local metadata-command replay
-validation because the storage-node-owned PG is the command-stream authority.
+The topology-only frontend map intentionally opens no local PG stores and skips
+local metadata-command replay validation because the storage-node-owned PG is
+the command-stream authority.
 Remote frontend and combined coordinators initially keep object reclaim, bucket
 finalization, and lifecycle workers disabled until Phase 10.6 routes those
 worker metadata surfaces through the same RPC boundary and adds restart/resume
@@ -5657,15 +5658,10 @@ coverage. Shard-scavenger startup is owned by Phase 10.6 once its dedicated RPC
 boundary is routed and tested.
 
 Phase 10.5 is complete for the frontend/combined request-path RPC routing that
-the current cluster-map shape can express. There are three explicit
-transitional gaps left after this closeout. First, remote frontend construction
-still opens local placeholder node/PG directories to satisfy `LocalClusterMap`
-topology; those placeholder PGs must not be request metadata authority, and
-removing them in favor of a topology-only frontend map is deferred to the Phase
-10.7 multi-process harness/topology work. Second, background worker metadata
-access is intentionally deferred to Phase 10.6. Third, full multihost
-end-to-end process harness coverage is deferred to Phase 10.7 rather than
-adding a narrow smoke test here.
+the current cluster-map shape can express. Background worker metadata access is
+intentionally deferred to Phase 10.6, and full multihost end-to-end process
+harness coverage is deferred to Phase 10.7 rather than adding a narrow smoke
+test here.
 
 Metadata command bytes should be reused directly inside RPC messages for
 command install/apply/convergence operations. The RPC envelope routes the
@@ -5814,9 +5810,9 @@ Required tests:
 11. `frontend` and `combined` roles parse and build from a complete static
    `ARGMIN_STORAGE_NODE_SOCKETS` map; missing, relative, byte-duplicate,
    canonical-equivalent duplicate, incomplete, or combined-self-mismatched
-   socket entries fail at config/build time, and the frontend placeholder map
-   uses the configured cluster epoch without validating local placeholder PG
-  replay state. Remote frontend workers may start once each worker's RPC
+   socket entries fail at config/build time, and the topology-only frontend map
+   uses the configured cluster epoch without validating local PG replay state.
+  Remote frontend workers may start once each worker's RPC
   boundary is routed and covered; full separate-process frontend/combined
   startup and HTTP S3 coverage belongs to the Phase 10.7 harness.
 
@@ -5880,9 +5876,8 @@ Status: complete.
   reclaim/finalizer, lifecycle, shard-scavenger, and stale stream-session
   scavenger workers, with focused Unix-storage-node coverage proving those
   workers discover and mutate storage-node-owned PG state rather than frontend
-  placeholder PGs. The full separate-process frontend/combined harness and
-  removal of transitional frontend placeholder PG directories remain Phase 10.7
-  work.
+  placeholder PGs. The full separate-process frontend/combined harness remains
+  Phase 10.7 work.
 
 ### Phase 10.7: Multi-Process Harness
 
@@ -5931,8 +5926,11 @@ Status:
   directories, private Unix socket paths, per-process logs, starts all
   storage-node processes before the frontend, waits for storage sockets and the
   HTTPS frontend endpoint, and tears down/dumps all process logs together.
-- The topology-only frontend map that avoids opening placeholder PG
-  directories is still pending in this phase.
+- Frontend-only cluster construction now uses a topology-only `LocalClusterMap`
+  shape. It creates node IDs, PG routes, placement metadata, runtime state, and
+  Unix storage-node clients without opening local placeholder node/PG
+  directories; any accidental broad local storage access fails closed with
+  `PgNotFound` instead of reading placeholder metadata.
 
 ### Phase 10.8: Closeout Audit
 
@@ -5993,6 +5991,16 @@ Status:
 - Gated the legacy `SharedStorageNode::lock_bucket` stripe lock surface to
   tests/test hooks. Production `SharedStorageNode` no longer carries bucket
   lock stripes, and the remaining lock probes are explicitly test-shaped.
+- Removed the remaining frontend-only placeholder PG directory dependency.
+  Remote frontend startup now builds a topology-only local map and installs
+  Unix storage-node clients over that topology, so frontend-only processes no
+  longer open PG stores solely to satisfy cluster-map construction.
+- Audited production coordinator request paths for direct PG guards after the
+  topology-only frontend change. The remaining `SharedStorageNode::get_pg` and
+  `MutexGuard<PgStore>` uses in `request_ops.rs` are under
+  `test`/`test-hooks`; request paths route through node-client/RPC surfaces, and
+  `scripts/check-storage-cluster-boundaries` passes as the guardrail against
+  reintroducing production direct-PG access.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

@@ -15,8 +15,8 @@ use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
 };
 use storage::{
-    CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap, LocalNodeStoreConfig,
-    LocalUnixStorageNodeClientConfig, NodeId, PgState, StorageCluster,
+    CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap, LocalUnixStorageNodeClientConfig,
+    NodeId, PgState, StorageCluster,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -283,19 +283,10 @@ fn build_remote_frontend_storage_cluster(
         k: ec_config.data_shards,
         m: ec_config.parity_shards,
     };
-    let local_configs: Vec<LocalNodeStoreConfig> = (0..config.local_node_count)
-        .map(|raw_node_id| {
-            let node_id = NodeId::new(raw_node_id);
-            LocalNodeStoreConfig::new(
-                node_id,
-                Path::new(&config.data_dir)
-                    .join(format!("frontend-placeholder-node-{:04}", node_id.as_u32())),
-            )
-        })
-        .collect();
-    let mut local_map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let mut local_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
         NodeId::new(0),
-        local_configs,
+        node_ids,
         &config.storage_pg_ids,
         ec_shape,
         cluster_epoch,
@@ -527,6 +518,10 @@ mod tests {
             assert_eq!(route.cluster_epoch(), ClusterEpoch::new(9).unwrap());
             assert_eq!(route.primary_node_id(), NodeId::new(0));
         }
+        assert!(
+            !tmp.join("frontend").exists(),
+            "frontend-only cluster construction must not open placeholder PG directories"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
