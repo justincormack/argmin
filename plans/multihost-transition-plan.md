@@ -6041,6 +6041,13 @@ Status:
   storage node against the same data directory and Unix socket path, waits for
   the restarted process to bind, and runs a second focused S3 probe through the
   unchanged frontend. The initial smoke run passed both probes.
+- Added a targeted `./scripts/uat-s3-tests --smoke
+  storage-node-kill-fails-closed` mode for process-kill evidence. The smoke
+  uses the same one-storage-node, one-PG topology, runs a focused S3 probe,
+  kills storage-node 0 without restarting it, then requires the next S3 probe
+  through the still-running frontend to fail with an explicit S3/client error
+  instead of passing against stale local state or hanging. The initial smoke run
+  returned a normal S3 `InternalError` 500 in under a second.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

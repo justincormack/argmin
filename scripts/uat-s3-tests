@@ -20,7 +20,7 @@ Options:
   --timeout-secs SECS    S3 client timeout (default: 30)
   --topology NAME        Test topology: multihost or local (default: multihost)
   --smoke NAME           Run a focused smoke instead of the full suite:
-                         storage-node-restart
+                         storage-node-restart, storage-node-kill-fails-closed
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
@@ -125,10 +125,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart)
+    ""|storage-node-restart|storage-node-kill-fails-closed)
         ;;
     *)
-        die "--smoke must be storage-node-restart"
+        die "--smoke must be storage-node-restart or storage-node-kill-fails-closed"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -152,11 +152,14 @@ if [[ -z "$data_dir" ]]; then
     fi
 fi
 
-if [[ "$smoke" == "storage-node-restart" ]]; then
+if [[ "$smoke" == "storage-node-restart" || "$smoke" == "storage-node-kill-fails-closed" ]]; then
     export ARGMIN_EC_K=1
     export ARGMIN_EC_M=0
     export ARGMIN_LOCAL_NODE_COUNT=1
     export ARGMIN_PG_COUNT=1
+fi
+if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
+    export ARGMIN_ABORT_ON_500=0
 fi
 
 logs_dir="$data_dir/logs"
@@ -316,6 +319,16 @@ restart_storage_node() {
     wait_for_storage_node_socket "$node_id"
 }
 
+kill_storage_node() {
+    local node_id="$1"
+    local pid="${storage_node_pids[$node_id]}"
+    echo "== argmin-s3 UAT kill storage-node-$node_id =="
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
 cleanup_server() {
     local status=$?
     for pid in "${server_pids[@]}"; do
@@ -448,10 +461,48 @@ run_nextest() {
     "${cmd[@]}"
 }
 
+run_nextest_expect_failure() {
+    local label="$1"
+    shift
+    local cmd=(cargo nextest run -p s3-tests)
+    if (($#)); then
+        cmd+=("$@")
+    fi
+    local failure_log="$logs_dir/${label// /-}.log"
+
+    echo "== argmin-s3 UAT $label =="
+    printf '+'
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    set +e
+    "${cmd[@]}" >"$failure_log" 2>&1
+    local status=$?
+    set -e
+    if ((status == 0)); then
+        cat "$failure_log" >&2 || true
+        die "$label unexpectedly passed"
+    fi
+    if ! grep -Eq "InternalError|DispatchFailure|ServiceError" "$failure_log"; then
+        cat "$failure_log" >&2 || true
+        die "$label failed without a clear S3/client error"
+    fi
+    echo "== argmin-s3 UAT $label expected failure observed =="
+    if grep -m1 -E "InternalError|DispatchFailure|ServiceError" "$failure_log"; then
+        :
+    fi
+    echo "PASS: $label failed closed as expected"
+    echo "Captured expected-failure log: $failure_log"
+    echo "Summary: expected failure observed; UAT smoke passed"
+}
+
 if [[ "$smoke" == "storage-node-restart" ]]; then
     run_nextest "pre-restart s3-tests smoke" test_object_default_content_type
     restart_storage_node 0
     run_nextest "post-restart s3-tests smoke" test_object_read_not_exist
+elif [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
+    run_nextest "pre-kill s3-tests smoke" test_object_default_content_type
+    kill_storage_node 0
+    run_nextest_expect_failure "post-kill s3-tests smoke" test_object_read_not_exist
 else
     run_nextest "s3-tests" "${cargo_args[@]}"
 fi
