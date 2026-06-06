@@ -170,13 +170,16 @@ is included in the canonical metadata digest.
 Multipart upload state is canonical metadata. `CreateMultipartUpload` publishes
 an exact `InProgress` upload row, and terminal object-PG commands serialize
 through the pending command stream before deleting that row. Abort and complete
-preparation are protected by the object-PG bucket lock while they snapshot
-cleanup and install the pending command; abort does not write an intermediate
-`Aborting` state before the abort command exists. Terminal commands also carry
-active streamed UploadPart sessions and staged segment rows for that upload so
-command apply removes their metadata and cluster cleanup can delete their staged
-payload shards. `UploadState` values outside the command path are test-hook
-state injection only.
+preparation are storage-node snapshot/build operations: they reload upload,
+part, stream-session, and cleanup rows under the object-PG command construction
+boundary, install a durable pending command, and rely on command-stream
+serialization plus storage-side snapshot validation rather than process-local
+bucket locks. Abort does not write an intermediate `Aborting` state before the
+abort command exists. Terminal commands also carry active streamed UploadPart
+sessions and staged segment rows for that upload so command apply removes their
+metadata and cluster cleanup can delete their staged payload shards.
+`UploadState` values outside the command path are test-hook state injection
+only.
 
 Bucket metadata commands keep the AWS-facing operation split at the storage API
 boundary, but the durable command carries the command-owned bucket-table

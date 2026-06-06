@@ -150,17 +150,28 @@ priority, and failure semantics explicitly support it.
 
 ### Process-Local Coordination
 
-These are currently correctness mechanisms and therefore must be moved behind
-cluster-owned or PG-primary-owned mechanisms:
+These process-local mechanisms either had to move behind cluster-owned or
+PG-primary-owned mechanisms, or had to be made explicitly test-only before
+multihost mode could be considered correct:
 
-1. PG mutexes
-2. ordered two-PG locking helpers
-3. bucket write drain waits
-4. multipart completion locks
-5. coordinator-local object payload generation leases
-6. in-memory reclaim work queue
-7. bucket cache invalidation and freshness paths
-8. any tests that inspect or mutate raw local PG state as if it were global
+1. PG mutexes: local-mode serialization remains local, but remote metadata
+   command install/reissue/fanout uses storage-node-owned PG-primary critical
+   sections.
+2. ordered two-PG locking helpers: retired in Phase 10.8; bucket snapshot pairs
+   now use routed operation-shaped snapshot reads.
+3. bucket write drain waits: replaced by durable bucket write
+   reservations/drains plus restartable polling.
+4. multipart completion locks: retired; completion ordering and object
+   publication use durable PG-primary command serialization.
+5. coordinator-local object payload generation leases: replaced by
+   command-owned reservation/allocation paths where correctness depends on
+   durable metadata.
+6. in-memory reclaim work queue: wake hint only; durable reclaim/finalizer roots
+   are rescanned before blocking.
+7. bucket cache invalidation and freshness paths: correctness-neutral
+   performance state guarded by durable execution/incarnation identity checks.
+8. any tests that inspect or mutate raw local PG state as if it were global:
+   must remain explicit test hooks and must not be production authority.
 
 ### Background Work
 
@@ -1363,10 +1374,11 @@ Work items:
        the multipart upload row, generation reservation, part rows, and streamed
        part staging metadata from every acting object-PG node
      - keep payload shard deletion cluster-owned; abort preparation snapshots
-       the primary cleanup rows under the object-PG bucket lock and carries
-       them in the abort command so partial-apply retries can still clean
-       uploaded part and active streamed UploadPart payloads after metadata
-       converges
+       primary cleanup rows through the object-PG storage-side snapshot/build
+       boundary and carries them in the abort command so partial-apply retries
+       can still clean uploaded part and active streamed UploadPart payloads
+       after metadata converges. Phase 10.8 later removed the process-local
+       object-PG bucket lock from this path.
      - include regression coverage for create -> abort -> fresh create on the
        same key, proving abort does not leave replica-local generation
        reservations that poison the next create
@@ -2004,8 +2016,9 @@ Completed:
   - included `multipart_uploads.state` in the canonical full-PG digest and
     removed the abort-prepare path's off-command `Aborting` state write; abort
     and complete commands now carry the exact terminal cleanup snapshot they
-    observed under the object-PG bucket lock and delete the upload row through
-    metadata command apply
+    observed through the storage-side object-PG snapshot/build boundary and
+    delete the upload row through metadata command apply. Phase 10.8 later
+    removed the process-local object-PG bucket lock from this path.
   - narrowed the raw multipart upload state setter to test/test-hook builds, so
     production code cannot change digest-covered upload state outside command
     apply
@@ -6048,6 +6061,12 @@ Status:
   through the still-running frontend to fail with an explicit S3/client error
   instead of passing against stale local state or hanging. The initial smoke run
   returned a normal S3 `InternalError` 500 in under a second.
+- Audited current guides and observability notes for stale bucket-lock
+  authority language. The metadata model, threat model, and production
+  observability plan now describe durable metadata command serialization,
+  bucket write reservations/drains, and storage-side snapshot validation as the
+  production correctness boundaries; process-local bucket locks are documented
+  as test probes or retired surfaces.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

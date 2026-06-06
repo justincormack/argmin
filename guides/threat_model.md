@@ -86,7 +86,10 @@ non-confidential deployment mode.
 
 ### Metadata and storage layer
 - **SQLite and shard files:** parameterized queries reduce SQL injection risk; shard paths are derived from hashed shard keys, preventing user-controlled path traversal.
-- **Durability measures:** temp-file writes + fsync/rename for shards; per-PG mutexing and bucket locks limit race conditions.
+- **Durability measures:** temp-file writes + fsync/rename for shards, per-PG
+  metadata command serialization, durable bucket write reservations/drains, and
+  storage-side snapshot validation limit race conditions. Bucket locks are
+  retained only for test probes and are not production correctness boundaries.
 - **Background maintenance paths:** reclaim queues, payload leases,
   multipart/session cleanup, and lifecycle sweeps are security-relevant even
   though they are internal. Races or stale-state bugs here can cause resource

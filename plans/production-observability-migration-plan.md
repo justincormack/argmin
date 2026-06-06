@@ -42,7 +42,6 @@ Completed:
   - `request_finish`
   - `request_error`
   - `slow_request`
-  - `bucket_lock_wait_exceeded`
 - dense request/stream/layout observability is now `deep-tracing` only
 - `crates/observability` now provides small helper APIs for the remaining
   production events
@@ -52,7 +51,6 @@ Completed:
   - `request_finish_total`
   - `request_error_total`
   - `slow_request_total`
-  - `bucket_lock_wait_exceeded_total`
 
 Remaining:
 
@@ -140,8 +138,6 @@ that still needs further cleanup.
 - `crates/server-core/src/coordinator.rs`
   - broad operation-level local trace coverage across many S3 paths
   - read-path tracing such as `ReadHandle::next_chunk`
-- `crates/storage/src/node.rs`
-  - thresholded bucket lock wait summaries
 - `crates/storage/src/pg_store.rs`
   - dense storage-layer local trace coverage
 - `crates/auth/src/request.rs` and `crates/auth/src/post.rs`
@@ -241,7 +237,6 @@ Status: mostly completed in commits `e83680a`, `0af4140`, `b2224ed`, and
 - `request_finish`
 - `request_error`
 - `slow_request`
-- `lock_wait_exceeded`
 - optional future additions if needed:
   - `auth_failure`
   - `background_queue_delay_exceeded`
