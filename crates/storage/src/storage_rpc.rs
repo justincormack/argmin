@@ -55,6 +55,7 @@ use std::num::NonZeroU32;
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+const STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN: usize = 0;
 pub(crate) const STORAGE_RPC_MAX_READ_OPERATION_ID_LEN: usize = 256;
 pub(crate) const STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS: usize = 1024;
 pub(crate) const STORAGE_RPC_MAX_SHARD_ACK_ITEMS: usize = 4096;
@@ -110,6 +111,22 @@ const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
 const STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN: usize =
+    8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + 2 * STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_NAME_LEN: usize = 63;
 const STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN: usize = 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN: usize = 256;
@@ -360,6 +377,39 @@ const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN + 8 + 4 + 4096;
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ERROR_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN + 4 + 4096;
+const STORAGE_RPC_MAX_BUCKET_CLAIM_TOKEN_PAYLOAD_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
+    + 8
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+    + 8
+    + 4;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_TOKEN_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_OBJECT_KEY_LEN
+        + 8
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 4;
+const STORAGE_RPC_MAX_DURABLE_CLAIM_TOKEN_PAYLOAD_LEN: usize = 1
+    + if STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_TOKEN_PAYLOAD_LEN
+        > STORAGE_RPC_MAX_BUCKET_CLAIM_TOKEN_PAYLOAD_LEN
+    {
+        STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_TOKEN_PAYLOAD_LEN
+    } else {
+        STORAGE_RPC_MAX_BUCKET_CLAIM_TOKEN_PAYLOAD_LEN
+    };
+const STORAGE_RPC_MAX_CLAIM_HEARTBEAT_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_DURABLE_CLAIM_TOKEN_PAYLOAD_LEN + 8 + 1 + 8;
+const STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_DURABLE_CLAIM_TOKEN_PAYLOAD_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -2809,6 +2859,11 @@ fn message_kind_request_max_payload_len(
     generic_max_payload_len: usize,
 ) -> usize {
     let kind_max_payload_len = match kind {
+        StorageRpcMessageKind::Health => STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN,
+        StorageRpcMessageKind::MetadataCommand => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ShardWrite => STORAGE_RPC_MAX_PAYLOAD_LEN,
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN
         }
@@ -2838,8 +2893,32 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardScavengerObservationResolve => {
             STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ClaimHeartbeat => STORAGE_RPC_MAX_CLAIM_HEARTBEAT_PAYLOAD_LEN,
+        StorageRpcMessageKind::ClaimRelease => STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN,
+        StorageRpcMessageKind::ProofRelease => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::MetadataCommandReplicaState => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandAcceptance
+        | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
+        | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
+        | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
+        | StorageRpcMessageKind::MetadataCommandAbandoned
+        | StorageRpcMessageKind::MetadataCommandRecordAbandoned
+        | StorageRpcMessageKind::MetadataCommandApplyAndRecord => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandPendingSlotInsert
+        | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandMaxLogIndex
         | StorageRpcMessageKind::MetadataCommandPendingEnvelope
@@ -3053,7 +3132,6 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::BucketFastPathIdentities => {
             STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN
         }
-        _ => generic_max_payload_len,
     };
     kind_max_payload_len.min(generic_max_payload_len)
 }
@@ -3132,10 +3210,10 @@ pub(crate) fn decode_storage_rpc_response_payload(
 pub(crate) fn encode_metadata_command_item(
     item: &StorageRpcMetadataCommandItem,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if item.command_bytes.len() > STORAGE_RPC_MAX_PAYLOAD_LEN {
+    if item.command_bytes.len() > STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: item.command_bytes.len(),
-            limit: STORAGE_RPC_MAX_PAYLOAD_LEN,
+            limit: STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN,
         });
     }
     if checksum::crc64::checksum(&item.command_bytes) != item.command_checksum {
@@ -3156,9 +3234,15 @@ pub(crate) fn decode_metadata_command_item(
     bytes: &[u8],
 ) -> Result<StorageRpcMetadataCommandItem, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let command_checksum = decoder.read_u64()?;
-    let command_bytes = decoder.read_bytes()?.to_vec();
+    let item = decoder.read_metadata_command_item()?;
     decoder.finish()?;
+    Ok(item)
+}
+
+fn validate_metadata_command_item(
+    command_checksum: u64,
+    command_bytes: Vec<u8>,
+) -> Result<StorageRpcMetadataCommandItem, StorageRpcPayloadError> {
     if checksum::crc64::checksum(&command_bytes) != command_checksum {
         return Err(StorageRpcPayloadError::MetadataCommandChecksumMismatch);
     }
@@ -3171,6 +3255,13 @@ pub(crate) fn decode_metadata_command_item(
         command_checksum,
         command_bytes,
     })
+}
+
+fn metadata_command_envelope_from_item(
+    item: &StorageRpcMetadataCommandItem,
+) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
+    decode_metadata_command_envelope(&item.command_bytes)
+        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
 }
 
 pub(crate) fn encode_metadata_command_request(
@@ -3197,18 +3288,9 @@ pub(crate) fn decode_metadata_command_request(
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
-    let command_checksum = decoder.read_u64()?;
-    let command_bytes = decoder.read_bytes()?.to_vec();
+    let item = decoder.read_metadata_command_item()?;
     decoder.finish()?;
-    let item_bytes = {
-        let mut out = Vec::new();
-        put_u64(&mut out, command_checksum);
-        put_bytes(&mut out, &command_bytes);
-        out
-    };
-    let item = decode_metadata_command_item(&item_bytes)?;
-    let command = decode_metadata_command_envelope(&item.command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let command = metadata_command_envelope_from_item(&item)?;
     validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
     Ok(StorageRpcMetadataCommandRequest {
         node_id,
@@ -6014,9 +6096,7 @@ pub(crate) fn decode_bucket_metadata_control_pending_match_request(
 ) -> Result<StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let bucket = decoder.read_bucket_request()?;
-    let command_bytes = decoder.read_bytes()?.to_vec();
-    let command = decode_metadata_command_envelope(&command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let command = decoder.read_metadata_command_envelope_bytes()?;
     let mutation = decoder.read_bucket_metadata_control_mutation()?;
     decoder.finish()?;
     if command.id().cluster_epoch() != bucket.cluster_epoch || command.id().pg_id() != bucket.pg_id
@@ -6257,9 +6337,7 @@ pub(crate) fn decode_create_bucket_command_build_response(
     let outcome = match decoder.read_u8()? {
         0 => StorageRpcCreateBucketCommandBuildOutcome::Exists(decoder.read_bucket_info()?),
         1 => {
-            let command_bytes = decoder.read_bytes()?.to_vec();
-            let command = decode_metadata_command_envelope(&command_bytes)
-                .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+            let command = decoder.read_metadata_command_envelope_bytes()?;
             StorageRpcCreateBucketCommandBuildOutcome::Command(Box::new(command))
         }
         _ => {
@@ -6286,10 +6364,8 @@ pub(crate) fn decode_completed_multipart_order_command_build_response(
 ) -> Result<StorageRpcCompletedMultipartOrderCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let completion_order = decoder.read_u64()?;
-    let command_bytes = decoder.read_bytes()?.to_vec();
+    let command = decoder.read_metadata_command_envelope_bytes()?;
     decoder.finish()?;
-    let command = decode_metadata_command_envelope(&command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
     Ok(StorageRpcCompletedMultipartOrderCommandBuildResponse {
         completion_order,
         command,
@@ -6308,10 +6384,8 @@ pub(crate) fn decode_bucket_metadata_control_command_build_response(
     bytes: &[u8],
 ) -> Result<StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let command_bytes = decoder.read_bytes()?.to_vec();
+    let command = decoder.read_metadata_command_envelope_bytes()?;
     decoder.finish()?;
-    let command = decode_metadata_command_envelope(&command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
     Ok(StorageRpcBucketMetadataControlCommandBuildResponse { command })
 }
 
@@ -6341,9 +6415,7 @@ pub(crate) fn decode_bucket_mark_deleting_command_build_response(
             decoder.read_bucket_info()?,
         ),
         1 => {
-            let command_bytes = decoder.read_bytes()?.to_vec();
-            let command = decode_metadata_command_envelope(&command_bytes)
-                .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+            let command = decoder.read_metadata_command_envelope_bytes()?;
             StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(Box::new(command))
         }
         _ => {
@@ -7104,17 +7176,8 @@ pub(crate) fn decode_metadata_command_pending_slot_request(
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
-    let command_checksum = decoder.read_u64()?;
-    let command_bytes = decoder.read_bytes()?.to_vec();
-    let item_bytes = {
-        let mut out = Vec::new();
-        put_u64(&mut out, command_checksum);
-        put_bytes(&mut out, &command_bytes);
-        out
-    };
-    let item = decode_metadata_command_item(&item_bytes)?;
-    let command = decode_metadata_command_envelope(&item.command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let item = decoder.read_metadata_command_item()?;
+    let command = metadata_command_envelope_from_item(&item)?;
     validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
     let scope_bucket = match decoder.read_u8()? {
         0 => None,
@@ -7181,29 +7244,11 @@ pub(crate) fn decode_metadata_command_pending_slot_replace_request(
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
-    let previous_checksum = decoder.read_u64()?;
-    let previous_bytes = decoder.read_bytes()?.to_vec();
-    let previous_item_bytes = {
-        let mut out = Vec::new();
-        put_u64(&mut out, previous_checksum);
-        put_bytes(&mut out, &previous_bytes);
-        out
-    };
-    let previous_item = decode_metadata_command_item(&previous_item_bytes)?;
-    let previous = decode_metadata_command_envelope(&previous_item.command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let previous_item = decoder.read_metadata_command_item()?;
+    let previous = metadata_command_envelope_from_item(&previous_item)?;
     validate_metadata_command_route(cluster_epoch, pg_id, previous.id())?;
-    let replacement_checksum = decoder.read_u64()?;
-    let replacement_bytes = decoder.read_bytes()?.to_vec();
-    let replacement_item_bytes = {
-        let mut out = Vec::new();
-        put_u64(&mut out, replacement_checksum);
-        put_bytes(&mut out, &replacement_bytes);
-        out
-    };
-    let replacement_item = decode_metadata_command_item(&replacement_item_bytes)?;
-    let replacement = decode_metadata_command_envelope(&replacement_item.command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let replacement_item = decoder.read_metadata_command_item()?;
+    let replacement = metadata_command_envelope_from_item(&replacement_item)?;
     validate_metadata_command_route(cluster_epoch, pg_id, replacement.id())?;
     let scope_bucket = match decoder.read_u8()? {
         0 => None,
@@ -7443,19 +7488,8 @@ pub(crate) fn decode_metadata_command_pending_envelope_response(
     let command = match decoder.read_u8()? {
         0 => None,
         1 => {
-            let command_checksum = decoder.read_u64()?;
-            let command_bytes = decoder.read_bytes()?.to_vec();
-            let item_bytes = {
-                let mut out = Vec::new();
-                put_u64(&mut out, command_checksum);
-                put_bytes(&mut out, &command_bytes);
-                out
-            };
-            let item = decode_metadata_command_item(&item_bytes)?;
-            Some(
-                decode_metadata_command_envelope(&item.command_bytes)
-                    .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?,
-            )
+            let item = decoder.read_metadata_command_item()?;
+            Some(metadata_command_envelope_from_item(&item)?)
         }
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
@@ -7488,17 +7522,8 @@ pub(crate) fn decode_metadata_command_matching_applied_request(
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
-    let command_checksum = decoder.read_u64()?;
-    let command_bytes = decoder.read_bytes()?.to_vec();
-    let item_bytes = {
-        let mut out = Vec::new();
-        put_u64(&mut out, command_checksum);
-        put_bytes(&mut out, &command_bytes);
-        out
-    };
-    let item = decode_metadata_command_item(&item_bytes)?;
-    let command = decode_metadata_command_envelope(&item.command_bytes)
-        .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
+    let item = decoder.read_metadata_command_item()?;
+    let command = metadata_command_envelope_from_item(&item)?;
     validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
     let expected_previous_log_hash = decoder.read_u64()?;
     decoder.finish()?;
@@ -9755,6 +9780,37 @@ impl<'a> StorageRpcDecoder<'a> {
         self.read_exact(len)
     }
 
+    fn read_bytes_with_payload_limit(
+        &mut self,
+        limit: usize,
+    ) -> Result<&'a [u8], StorageRpcPayloadError> {
+        let len = self.read_u32()? as usize;
+        if len > limit {
+            return Err(StorageRpcPayloadError::PayloadTooLarge { len, limit });
+        }
+        self.read_exact(len)
+    }
+
+    fn read_metadata_command_item(
+        &mut self,
+    ) -> Result<StorageRpcMetadataCommandItem, StorageRpcPayloadError> {
+        let command_checksum = self.read_u64()?;
+        let command_bytes = self
+            .read_bytes_with_payload_limit(STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN)?
+            .to_vec();
+        validate_metadata_command_item(command_checksum, command_bytes)
+    }
+
+    fn read_metadata_command_envelope_bytes(
+        &mut self,
+    ) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
+        let command_bytes = self
+            .read_bytes_with_payload_limit(STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN)?
+            .to_vec();
+        decode_metadata_command_envelope(&command_bytes)
+            .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
+    }
+
     fn read_string(&mut self) -> Result<String, StorageRpcPayloadError> {
         std::str::from_utf8(self.read_bytes()?)
             .map(str::to_owned)
@@ -9772,13 +9828,19 @@ impl<'a> StorageRpcDecoder<'a> {
     }
 
     fn read_bucket_name(&mut self) -> Result<BucketName, StorageRpcPayloadError> {
-        BucketName::try_from(self.read_string()?)
-            .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid bucket name"))
+        BucketName::try_from(self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_NAME_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("bucket name exceeds maximum length"),
+        )?)
+        .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid bucket name"))
     }
 
     fn read_object_key(&mut self) -> Result<ObjectKey, StorageRpcPayloadError> {
-        ObjectKey::try_from(self.read_string()?)
-            .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid object key"))
+        ObjectKey::try_from(self.read_string_with_limit(
+            STORAGE_RPC_MAX_OBJECT_KEY_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("object key exceeds maximum length"),
+        )?)
+        .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid object key"))
     }
 
     fn read_optional_object_key(&mut self) -> Result<Option<ObjectKey>, StorageRpcPayloadError> {
@@ -9883,8 +9945,14 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<StorageRpcBucketClaimToken, StorageRpcPayloadError> {
         let bucket = self.read_bucket_name()?;
         let bucket_incarnation_generation = self.read_u64()?;
-        let claim_id = self.read_string()?;
-        let owner_token = self.read_string()?;
+        let claim_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+        )?;
         let cluster_epoch = self.read_cluster_epoch()?;
         let pg_id = self.read_u32()?;
         Ok(StorageRpcBucketClaimToken {
@@ -9905,8 +9973,14 @@ impl<'a> StorageRpcDecoder<'a> {
         let key = self.read_object_key()?;
         let generation_id = self.read_generation_id()?;
         let reclaim_kind = self.read_object_payload_reclaim_kind()?;
-        let claim_id = self.read_string()?;
-        let owner_token = self.read_string()?;
+        let claim_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+        )?;
+        let owner_token = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+        )?;
         let cluster_epoch = self.read_cluster_epoch()?;
         let pg_id = self.read_u32()?;
         Ok(StorageRpcObjectPayloadReclaimClaimToken {
@@ -11458,17 +11532,8 @@ impl<'a> StorageRpcDecoder<'a> {
     fn read_metadata_command_envelope_response_item(
         &mut self,
     ) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
-        let command_checksum = self.read_u64()?;
-        let command_bytes = self.read_bytes()?.to_vec();
-        let item_bytes = {
-            let mut out = Vec::new();
-            put_u64(&mut out, command_checksum);
-            put_bytes(&mut out, &command_bytes);
-            out
-        };
-        let item = decode_metadata_command_item(&item_bytes)?;
-        decode_metadata_command_envelope(&item.command_bytes)
-            .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
+        let item = self.read_metadata_command_item()?;
+        metadata_command_envelope_from_item(&item)
     }
 
     fn read_live_object_record(&mut self) -> Result<LiveObjectRecord, StorageRpcPayloadError> {
@@ -13897,6 +13962,43 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_item_rejects_oversized_command_before_allocating() {
+        let mut bytes = Vec::new();
+        put_u64(&mut bytes, 0);
+        put_u32(
+            &mut bytes,
+            u32::try_from(STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN + 1).unwrap(),
+        );
+
+        assert_eq!(
+            decode_metadata_command_item(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN + 1,
+                limit: STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn command_envelope_response_rejects_oversized_command_before_allocating() {
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 1);
+        put_u32(
+            &mut bytes,
+            u32::try_from(STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN + 1).unwrap(),
+        );
+
+        assert!(matches!(
+            decode_create_bucket_command_build_response(&bytes),
+            Err(StorageRpcPayloadError::PayloadTooLarge {
+                len,
+                limit,
+            }) if len == STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN + 1
+                && limit == STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN
+        ));
+    }
+
+    #[test]
     fn metadata_command_request_carries_route_and_command_identity() {
         let command = test_metadata_command();
         let request = StorageRpcMetadataCommandRequest {
@@ -14861,6 +14963,21 @@ mod tests {
     fn storage_rpc_request_frame_rejects_payload_over_kind_limit_before_allocating() {
         for (kind, payload_len, limit) in [
             (
+                StorageRpcMessageKind::Health,
+                STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommand,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardWrite,
+                STORAGE_RPC_MAX_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::ReadHandlesAcquire,
                 STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN,
@@ -14876,9 +14993,139 @@ mod tests {
                 STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::ShardReadRange,
+                STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardDelete,
+                STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardAckLoad,
+                STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardAckDelete,
+                STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardAckRecord,
+                STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardAckValidate,
+                STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerListFiles,
+                STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerShardRows,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerPayloadReferences,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerObservations,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerObservationRecord,
+                STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_RECORD_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_RECORD_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerObservationResolve,
+                STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ClaimHeartbeat,
+                STORAGE_RPC_MAX_CLAIM_HEARTBEAT_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_CLAIM_HEARTBEAT_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ClaimRelease,
+                STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ProofRelease,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::MetadataCommandReplicaState,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandAcceptance,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandAbandonAcceptance,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandAppliedLogHashes,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
+                STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandAbandoned,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandPendingSlotReplace,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::ObjectGenerationNext,

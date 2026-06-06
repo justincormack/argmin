@@ -6001,6 +6001,34 @@ Status:
   `test`/`test-hooks`; request paths route through node-client/RPC surfaces, and
   `scripts/check-storage-cluster-boundaries` passes as the guardrail against
   reintroducing production direct-PG access.
+- Audited local reclaim queues and background wakeups. The in-process reclaim
+  queue and condition variable are wake hints only: `wait_for_reclaim_work`
+  refreshes durable object-payload reclaim roots and bucket-delete finalizer
+  roots on each poll before blocking, and Phase 10.6 restart-shaped Unix
+  coverage proves reopened frontend maps rediscover storage-node-owned work
+  without relying on queued in-memory hints.
+- Audited process-local cache authority. Bucket fast-path and parsed-policy
+  caches remain process-local performance state guarded by the Phase 9.9
+  request-time durable identity proof; both execution and incarnation
+  generation are loaded through the bucket metadata client, so remote frontends
+  validate against the storage-node-owned bucket PG. The batched generation
+  loader is watcher-only and skipped/unavailable PGs do not make cached entries
+  fresh.
+- Audited metadata command serialization after the topology-only frontend
+  change. The local PG mutex remains as local-mode serialization/backpressure,
+  but remote frontend command install/reissue/fanout opens the
+  storage-node-owned metadata-command critical-section session before reading or
+  mutating command-stream state, so cross-process serialization is owned by the
+  storage-node primary.
+- Audited RPC request size/checksum validation. The request-frame cap table is
+  now exhaustive for every `StorageRpcMessageKind`; health, durable claim,
+  proof-release, shard-write, and metadata-command mutation messages no longer
+  fall through to the generic 64 MiB cap. Metadata command request and response
+  decoders share bounded item/envelope helpers that cap embedded canonical
+  command bytes before allocation, while bucket/object names and durable
+  claim-token fields use bounded decoders. Focused storage RPC tests cover
+  kind-specific preallocation rejection plus nested metadata-command byte
+  rejection for both checksum-item and plain command-envelope response paths.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
