@@ -2269,10 +2269,16 @@ impl super::StorageCluster {
                 outcome @ (BucketDeleteFinalizeOutcome::Finalized
                 | BucketDeleteFinalizeOutcome::NotFound),
             ) => match release_finalizer_claim() {
-                Ok(()) => Ok(outcome),
+                Ok(()) => {
+                    crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
+                    Ok(outcome)
+                }
                 Err(BucketWriteDrainError::Metadata(MetadataError::ReclaimClaimNotFound {
                     ..
-                })) => Ok(outcome),
+                })) => {
+                    crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
+                    Ok(outcome)
+                }
                 Err(error) => Err(error),
             },
             Ok(outcome) => {

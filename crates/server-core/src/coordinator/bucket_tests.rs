@@ -7,7 +7,7 @@ use s3_types::{
     LifecycleRule, LifecycleRuleFilter, LifecycleRuleStatus, LifecycleTag,
 };
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, BucketSubresourceAux,
@@ -648,21 +648,15 @@ fn create_bucket_reloads_when_deleting_bucket_is_recreated_by_racer() {
     let hook_bucket = bucket.clone();
     let hook_owner = owner.clone();
     let hook_acl_grants = acl_grants.clone();
-    let lock_attempts = Arc::new(AtomicUsize::new(0));
     let raced = Arc::new(AtomicBool::new(false));
     let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
         target: Some(bucket.clone()),
-        before_bucket_lock_acquire: Some(Arc::new({
-            let lock_attempts = Arc::clone(&lock_attempts);
+        after_bucket_delete_finalize: Some(Arc::new({
             let raced = Arc::clone(&raced);
             move || {
-                if lock_attempts.fetch_add(1, Ordering::SeqCst) != 1 {
-                    return;
-                }
                 if raced.swap(true, Ordering::SeqCst) {
                     return;
                 }
-                storage.try_finalize_bucket_delete(&hook_bucket).unwrap();
                 storage
                     .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
                         name: hook_bucket.as_str(),

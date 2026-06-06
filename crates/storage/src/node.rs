@@ -132,6 +132,7 @@ pub struct BucketScopedTestHooks {
     pub before_bucket_lock_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_bucket_delete_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_completed_multipart_prune:
@@ -209,6 +210,14 @@ pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_bucket_delete_finalize)
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn maybe_run_before_multipart_completion_lock_hook(bucket: &BucketName) {
