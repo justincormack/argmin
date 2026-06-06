@@ -1,0 +1,258 @@
+Stale lifecycle metadata can delete recreated-bucket objects
+Link: https://chatgpt.com/codex/cloud/security/findings/2078ef40ad488191ad79d7f7d5effa6d?sev=
+Criticality: high (attack path: high)
+Status: fixed
+Fixed by: 3778d0e2cd2458434c25d1db91346cf36a7eea4b
+Fix link: https://github.com/justincormack/argmin/commit/3778d0e2cd2458434c25d1db91346cf36a7eea4b
+
+# Fix Details
+The fix adds a durable bucket-incarnation fence to lifecycle sweep mutations instead
+of relying on removed process-local bucket-PG serialization.
+
+- Server-core lifecycle sweeps pass the claimed `bucket_incarnation_generation`
+  into every per-candidate lifecycle mutation, including current object expiry,
+  noncurrent version expiry, expired delete-marker cleanup, abort-incomplete MPU,
+  and finishing already-Aborting MPU cleanup.
+- Storage lifecycle context loading now takes the expected bucket incarnation and
+  returns no work if the reloaded bucket row belongs to a newer same-name bucket.
+- Lifecycle bucket-write proof acquisition now verifies the acquired proof matches
+  the expected incarnation. A proof for a recreated bucket is released and the
+  stale lifecycle mutation stops.
+- Matching pending lifecycle commands are only converged for the current sweep
+  when the command-owned bucket-write proof matches the expected incarnation.
+- Regressions cover both race windows: bucket delete/finalize/recreate before
+  lifecycle context reload, with lifecycle enabled again on the recreated bucket,
+  and bucket delete/finalize/recreate after context load but before bucket-write
+  proof acquisition. The new bucket-scoped hook tests are serialized to avoid
+  parallel test hook interference.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ea51c5e
+Author: justin@specialbusservice.com
+Created: 06/06/2026, 11:59:28
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit removed the process-local bucket-PG guard from load_bucket_lifecycle_context and related bucket request paths without adding an equivalent durable incarnation fence. Object lifecycle mutations still acquire bucket-write reservations, but those reservations are for the current active bucket and are not checked against the bucket metadata/lifecycle incarnation that was originally read.
+The commit removes the bucket metadata primary mutex guard from lifecycle context loading and bucket creation/control paths. Lifecycle mutation helpers now load bucket_info and raw_lifecycle, drop any bucket-incarnation serialization, and later acquire a durable bucket-write proof for whatever active bucket currently exists. The reservation acquisition is not passed the bucket_incarnation_generation that was read with the lifecycle configuration. If a bucket is deleted and then recreated with the same name between these steps, stale lifecycle rules, versioning state, and owner data from the old incarnation can be applied to objects in the new incarnation. For non-versioned buckets the expected VersionId is VersionId::Null, so a stale lifecycle candidate can match and delete a fresh object with the same key in the recreated bucket. For versioned/suspended buckets, the old versioning state and owner identity can also drive the wrong delete-marker vs hard-delete behavior. This can allow an authenticated old bucket owner who can configure lifecycle/delete/recreate timing, or a racing lifecycle worker after bucket-name reuse, to corrupt or delete data belonging to the new bucket incarnation.
+
+# Validation
+## Rubric
+- [x] Confirm the commit removed the process-local bucket metadata PG guard/incarnation-carrying state from lifecycle context loading.
+- [x] Confirm lifecycle mutation uses `bucket_info`/`raw_lifecycle` after leaving the bucket metadata PG path and before/while locking only the object metadata PG.
+- [x] Confirm same-name bucket delete/recreate can occur without an equivalent bucket metadata mutex held by the lifecycle operation.
+- [x] Confirm durable bucket-write reservation acquisition/validation selects the current active bucket incarnation and does not compare against the lifecycle context's originally read incarnation.
+- [x] Dynamically demonstrate that a stale old lifecycle context can acquire a proof for the recreated bucket and delete a fresh `VersionId::Null` object in the new incarnation.
+## Report
+Validated the finding. Direct crash attempt: built and ran a targeted existing lifecycle test with debug symbols (`RUSTFLAGS='-C debuginfo=2 -C opt-level=0' cargo test -p storage lifecycle_current_expiry -- --nocapture`); it passed with no crash, as expected for a logical race. Valgrind attempt was made but `valgrind` is not installed in the container. Debugger attempt: `lldb` breakpoint at `crates/storage/src/cluster/request_ops.rs:5087` showed execution in `StorageCluster::expire_current_object_if_due` immediately before `try_acquire_bucket_write_proof_for_object_metadata_command`, with backtrace through the lifecycle test.
+
+Code/path evidence: `BucketLifecycleContext` now contains only `bucket_info` and `raw_lifecycle` (`request_ops.rs:85-88`), with no bucket-PG guard or incarnation field. `load_bucket_lifecycle_context` reads `head_bucket_info` and lifecycle subresource (`request_ops.rs:4337-4370`) and returns that unfenced context. `expire_current_object_if_due` then carries that context forward, locks only the object metadata PG (`request_ops.rs:4989-5003`), acquires a bucket-write reservation later (`request_ops.rs:5087-5096`), and builds the delete using stale `bucket_info.versioning` (`request_ops.rs:5135-5146`). Bucket creation checks/creates without the removed bucket metadata primary lock (`request_ops.rs:821-850`). Reservation acquisition copies the current active bucket row's incarnation (`pg_store.rs:11214-11224`), and validation only checks the proof against the current active bucket incarnation (`node_client.rs:12414-12440`), not against the lifecycle context originally read.
+
+Dynamic PoC: I added a temporary Rust unit test `lifecycle_stale_context_after_bucket_recreate_deletes_new_nonversioned_object_poc` (artifact patch). It uses the existing `before_bucket_lock_acquire` test hook to pause lifecycle after old lifecycle context is loaded but before object lock/reservation. While paused it deletes/finalizes the old bucket, recreates the same name without lifecycle, writes a fresh non-versioned object with the same key (`VersionId::Null`), then resumes lifecycle. The test asserts the new bucket incarnation increased, the new bucket has no lifecycle config, and yet `expire_current_object_if_due` returns a reclaim generation for the fresh object and all object-PG replicas report `ObjectNotFound`. Command output: `cargo test -p storage lifecycle_stale_context_after_bucket_recreate_deletes_new_nonversioned_object_poc -- --nocapture` => 1 passed, exit_code=0. A fixed implementation with an incarnation fence should reject/return None rather than deleting the fresh object.
+
+# Evidence
+crates/storage/src/cluster/request_ops.rs (L4345 to 4367)
+  Note: Lifecycle context is loaded from the bucket metadata PG, but after this commit it no longer keeps a bucket metadata mutex guard or returns an incarnation fence with the lifecycle data.
+```
+        let bucket_info = match bucket_store
+            .bucket_metadata_client()
+            .head_bucket_info(pg_id, bucket)
+        {
+            Ok(info) => info,
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
+                return Ok(None)
+            }
+            Err(error) => {
+                return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                    error,
+                ))
+            }
+        };
+        let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
+            bucket_store
+                .bucket_metadata_client()
+                .get_bucket_subresource(pg_id, bucket, BucketSubresourceKind::Lifecycle)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+        } else {
+            None
+        };
+        Ok(Some(BucketLifecycleContext {
+```
+
+crates/storage/src/cluster/request_ops.rs (L4993 to 5003)
+  Note: The lifecycle operation carries stale bucket_info/raw_lifecycle forward and only locks the object metadata PG, not the bucket metadata PG that would serialize bucket recreation.
+```
+        let BucketLifecycleContext {
+            bucket_info,
+            raw_lifecycle,
+        } = lifecycle_context;
+        if raw_lifecycle.is_none() {
+            return Ok(Ok(None));
+        }
+
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
+```
+
+crates/storage/src/cluster/request_ops.rs (L5087 to 5096)
+  Note: The bucket-write proof is acquired after the lifecycle metadata was read; it is not tied to the bucket_incarnation_generation from that read.
+```
+            let bucket_write_reservation = match self
+                .try_acquire_bucket_write_proof_for_object_metadata_command(
+                    bucket,
+                    key,
+                    "lifecycle-current-expiry",
+                    false,
+                )? {
+                Some(proof) => proof,
+                None => return Ok(Ok(None)),
+            };
+```
+
+crates/storage/src/cluster/request_ops.rs (L5135 to 5169)
+  Note: The delete command is built using the previously loaded bucket_info.versioning and owner, so old-incarnation lifecycle metadata can determine how a current-incarnation object is deleted.
+```
+            let command = match bucket_info.versioning {
+                BucketVersioningState::Disabled => storage_client
+                    .build_delete_current_object_command(BuildDeleteCurrentObjectCommandReq {
+                        pg_id,
+                        cluster_epoch: self.operation_epoch(),
+                        bucket,
+                        key,
+                        expected_current: snapshot.stored.as_ref(),
+                        expected_target: snapshot.target.as_ref(),
+                        bucket_write_reservation: &bucket_write_reservation,
+                    })
+                    .and_then(|command| command.ok_or(ObjectPgActionError::StaleObjectReadSubject)),
+                BucketVersioningState::Enabled => {
+                    let marker_vid = match self.reserve_next_object_version(pg_id, bucket, key) {
+                        Ok(marker_vid) => marker_vid,
+                        Err(error) => {
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    storage_client.build_insert_delete_marker_command(
+                        BuildInsertDeleteMarkerCommandReq {
+                            pg_id,
+                            cluster_epoch: self.operation_epoch(),
+                            bucket,
+                            key,
+                            expected_current: snapshot.stored.as_ref(),
+                            version_id: marker_vid,
+                            owner: &owner,
+                            stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+                            expected_stale_payload_source: None,
+                            bucket_write_reservation: &bucket_write_reservation,
+                        },
+```
+
+crates/storage/src/cluster/request_ops.rs (L821 to 849)
+  Note: Bucket creation now proceeds without the removed bucket metadata primary lock, allowing a same-name bucket to be recreated while a lifecycle operation is holding stale bucket metadata.
+```
+    pub fn create_bucket_with_config_and_load_info(
+        &self,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
+        let bucket = BucketName::try_from(config.name).map_err(|reason| {
+            MetadataError::InvalidBucketName {
+                reason: reason.to_string(),
+            }
+        })?;
+        let pg_id = self.bucket_metadata_pg_id(&bucket);
+        let primary_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        {
+            match primary_store
+                .bucket_metadata_client()
+                .head_bucket_raw(PgId::new(pg_id), &bucket)
+            {
+                Ok(info) => {
+                    return Ok(BucketCreateAttemptOutcome::Exists(info));
+                }
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                    ..
+                })) => {}
+                Err(other) => return Err(other),
+            }
+        }
+
+        let pg_id = PgId::new(pg_id);
+```
+
+crates/storage/src/pg_store.rs (L11214 to 11224)
+  Note: Durable bucket-write reservation acquisition selects the current active bucket row and stores its current incarnation, but callers do not provide or verify the lifecycle context's expected incarnation.
+```
+                "INSERT INTO bucket_write_reservations \
+             (bucket_name, reservation_id, owner_token, cluster_epoch, bucket_execution_generation, \
+              bucket_incarnation_generation, operation_kind, created_at, lease_deadline, target_context) \
+             SELECT name, ?1, ?2, ?3, bucket_execution_generation, bucket_incarnation_generation, ?4, ?5, ?6, ?7 \
+             FROM buckets \
+             WHERE name = ?8 AND state = ?9 \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM bucket_write_drains \
+                   WHERE bucket_name = buckets.name AND state = ?10\
+               ) \
+             ON CONFLICT(bucket_name, reservation_id) DO NOTHING",
+```
+
+Proposed patch: (no diff available)
+
+# Attack-path analysis
+Final: high | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Kept as high rather than critical. The issue is a validated production-code TOCTOU bug with high integrity/availability impact on object data: request_ops.rs loads lifecycle context without a guard or incarnation field, later acquires a reservation for the current bucket, and builds delete commands from stale bucket_info. The prior validation PoC demonstrated fresh object deletion after bucket delete/recreate. It is not critical because it is not unauthenticated, does not expose secrets or code execution, and has high attack complexity. Likelihood is low due to required old-bucket privileges and tight timing, but the impact is severe enough for high in an object-storage service when bucket-name reuse can cross an ownership boundary.
+## Likelihood
+high - The path is reachable through production lifecycle processing and authenticated S3 bucket-control APIs, and an executable unit-level PoC demonstrated the deletion effect. However, practical exploitation requires bucket-owner/admin credentials over the old bucket, lifecycle timing, deletion/finalization, bucket-name reuse, and a same-key object in the race window. Default deployment is localhost/internal and the project is often effectively single-tenant, reducing real-world probability. | Remote network vector
+## Impact
+high - A stale lifecycle rule and stale bucket versioning/owner state can cause deletion or wrong delete-marker behavior for an object in a recreated bucket incarnation. For non-versioned buckets, VersionId::Null allows the stale candidate to match a fresh same-key object. This is a direct integrity and availability violation for object data; confidentiality is not demonstrated.
+## Assumptions
+- The argmin-s3 frontend is deployed as the product S3-compatible service and reachable by authenticated clients on its configured listen address.
+- Bucket names can be reused after deletion/finalization, including by a different authenticated principal/account if policy permits normal S3-style creation after the old bucket is gone.
+- Lifecycle background sweeping is enabled, as it is in the normal Coordinator construction used by the runtime frontend.
+- The attacker can authenticate as the old bucket owner or bucket administrator and can configure lifecycle rules and delete the old bucket.
+- Authenticated S3 principal with bucket-owner or bucket-admin privileges over the old bucket
+- Ability to configure lifecycle rules for the old bucket
+- Ability to delete/finalize the old bucket
+- Same bucket name is recreated before a stale lifecycle mutation obtains its bucket-write reservation
+- Fresh object in the recreated bucket has the same key and, for the easiest non-versioned case, VersionId::Null
+- A timing race between lifecycle context load and later object mutation/reservation
+## Path
+old owner/admin -> PUT lifecycle -> lifecycle loads old bucket_info/raw_lifecycle
+                         -> delete/finalize/recreate same bucket name -> fresh same-key object
+                         -> reservation for current active bucket -> stale delete command -> data loss
+## Path evidence
+- `crates/storage/src/cluster/request_ops.rs:85-88` - BucketLifecycleContext now contains only bucket_info and raw_lifecycle; the removed diff shows the prior bucket_primary_node_id and bucket metadata guard are gone.
+- `crates/storage/src/cluster/request_ops.rs:4337-4370` - load_bucket_lifecycle_context reads bucket_info and the lifecycle subresource from the bucket metadata PG and returns them without an incarnation fence or held bucket-PG guard.
+- `crates/storage/src/cluster/request_ops.rs:4983-5003` - expire_current_object_if_due consumes the stale lifecycle context and then locks only the object metadata primary for the bucket/key.
+- `crates/storage/src/cluster/request_ops.rs:5087-5096` - The bucket-write proof is acquired after lifecycle metadata was loaded and no expected bucket_incarnation_generation from that load is supplied.
+- `crates/storage/src/cluster/request_ops.rs:5135-5169` - The lifecycle delete/delete-marker command is selected using stale bucket_info.versioning and owner-derived data.
+- `crates/storage/src/cluster/request_ops.rs:821-850` - Bucket creation checks/creates the bucket without the removed bucket metadata primary lock, enabling same-name recreation during the stale lifecycle window.
+- `crates/storage/src/pg_store.rs:11214-11224` - Durable bucket-write reservation acquisition copies the current active bucket row's bucket_incarnation_generation rather than checking a caller-provided expected incarnation.
+- `crates/storage/src/node_client.rs:12414-12440` - Reservation proof validation checks the proof against the current active bucket incarnation, not against the lifecycle metadata incarnation originally read.
+- `crates/server-http/src/http/mod.rs:1270-1295` - The main HTTP API exposes create and delete bucket operations to authenticated requesters.
+- `crates/server-http/src/http/mod.rs:2196-2229` - The main HTTP API exposes put/get/delete bucket lifecycle operations to authenticated requesters.
+- `crates/server-core/src/coordinator/runtime.rs:150-182` - The lifecycle sweeper is spawned as a normal runtime background thread.
+- `crates/argmin-s3/src/config.rs:82-105` - Service configuration documents the default HTTP listen address 127.0.0.1:9000 and environment-controlled credentials/secrets.
+## Narrative
+The finding is real and in-scope. The commit removed the bucket metadata primary guard from BucketLifecycleContext and from bucket creation paths. Lifecycle expiry now reads bucket_info/raw_lifecycle, later locks only the object metadata PG, and then acquires a durable bucket-write reservation for whatever active bucket currently exists. The reservation record stores the current active bucket incarnation, and validation checks it against the current bucket row, but no caller-supplied expected lifecycle-context incarnation is checked. The earlier validation PoC used the normal storage lifecycle path with a test pause to demonstrate that after deleting and recreating a bucket with the same name, a fresh non-versioned object with the same key was deleted by stale lifecycle state. Exploitation requires authenticated bucket-owner/admin privileges and a tight race, so likelihood is low, but the data integrity/availability impact can be high when bucket names are reused across ownership boundaries.
+## Controls
+- AWS SigV4 authentication in auth/server-http before S3 operation dispatch
+- Bucket owner/account-admin authorization for DeleteBucket and PutLifecycleConfiguration
+- Bucket policy authorization checks for bucket control actions
+- Lifecycle sweep claims include bucket incarnation but are not propagated as a mutation fence
+- Durable bucket-write reservations exist but currently reserve the current active bucket without comparing to the lifecycle context's read incarnation
+- HTTP max connection and max in-flight request limits
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Default listen address is localhost unless ARGMIN_LISTEN_ADDR is changed
+## Blindspots
+- This stage used static repository evidence plus the earlier validation report; no additional HTTP-level end-to-end exploit was run.
+- No Kubernetes, Terraform, Docker Compose, or load balancer manifests were found in the inspected repository depth, so public exposure is inferred only from application configuration.
+- The executable PoC verified bucket-incarnation reuse deletion, but a different-account recreated-bucket variant was not dynamically proven here.
+- Actual exploitability depends on deployment concurrency, lifecycle sweep timing, bucket deletion finalization behavior, and whether the service is operated as single-tenant or multi-tenant.
