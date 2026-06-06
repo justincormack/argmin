@@ -19,6 +19,8 @@ Options:
   --bucket-prefix PREFIX Bucket prefix for s3-tests (default: argmin-s3-)
   --timeout-secs SECS    S3 client timeout (default: 30)
   --topology NAME        Test topology: multihost or local (default: multihost)
+  --smoke NAME           Run a focused smoke instead of the full suite:
+                         storage-node-restart
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
@@ -42,6 +44,7 @@ data_dir="${ARGMIN_UAT_DATA_DIR:-}"
 bucket_prefix="${S3_TEST_BUCKET_PREFIX:-argmin-s3-}"
 timeout_secs="${S3_TEST_TIMEOUT_SECS:-30}"
 topology="${ARGMIN_UAT_TOPOLOGY:-multihost}"
+smoke="${ARGMIN_UAT_SMOKE:-}"
 release=0
 cleanup=0
 keep_temp_data_dir=0
@@ -74,6 +77,11 @@ while (($#)); do
         --topology)
             [[ $# -ge 2 ]] || die "--topology requires a value"
             topology="$2"
+            shift 2
+            ;;
+        --smoke)
+            [[ $# -ge 2 ]] || die "--smoke requires a value"
+            smoke="$2"
             shift 2
             ;;
         --binary)
@@ -116,6 +124,19 @@ case "$topology" in
         die "--topology must be multihost or local"
         ;;
 esac
+case "$smoke" in
+    ""|storage-node-restart)
+        ;;
+    *)
+        die "--smoke must be storage-node-restart"
+        ;;
+esac
+if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
+    die "--smoke $smoke requires --topology multihost"
+fi
+if [[ -n "$smoke" && ${#cargo_args[@]} -ne 0 ]]; then
+    die "--smoke cannot be combined with cargo nextest args"
+fi
 if [[ -n "$server_binary" ]]; then
     if [[ "$server_binary" == */* ]]; then
         [[ -x "$server_binary" ]] || die "--binary path is not executable: $server_binary"
@@ -130,6 +151,14 @@ if [[ -z "$data_dir" ]]; then
         cleanup=1
     fi
 fi
+
+if [[ "$smoke" == "storage-node-restart" ]]; then
+    export ARGMIN_EC_K=1
+    export ARGMIN_EC_M=0
+    export ARGMIN_LOCAL_NODE_COUNT=1
+    export ARGMIN_PG_COUNT=1
+fi
+
 logs_dir="$data_dir/logs"
 sockets_dir="$data_dir/sockets"
 mkdir -p "$logs_dir"
@@ -207,6 +236,8 @@ export S3_TEST_TLS_CA_CERT_PATH="${S3_TEST_TLS_CA_CERT_PATH:-$ca_path}"
 server_pids=()
 server_logs=()
 server_names=()
+storage_node_pids=()
+storage_node_logs=()
 
 print_command() {
     printf '+'
@@ -228,6 +259,25 @@ start_process() {
     server_names+=("$name")
 }
 
+start_storage_node() {
+    local node_id="$1"
+    local socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+    local node_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")"
+    local node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
+    start_process "storage-node-$node_id" "$node_log" env \
+        -u ARGMIN_STORAGE_NODE_SOCKETS \
+        ARGMIN_PROCESS_ROLE=storage-node \
+        ARGMIN_STORAGE_NODE_ID="$node_id" \
+        ARGMIN_STORAGE_NODE_DATA_DIR="$node_data_dir" \
+        ARGMIN_STORAGE_NODE_SOCKET_PATH="$socket_path" \
+        ARGMIN_DATA_DIR="$data_dir" \
+        ARGMIN_LISTEN_ADDR="$listen_addr" \
+        "${server_cmd[@]}"
+    local index=$((${#server_pids[@]} - 1))
+    storage_node_pids[$node_id]="${server_pids[$index]}"
+    storage_node_logs[$node_id]="${server_logs[$index]}"
+}
+
 wait_for_process() {
     local pid="$1"
     local log_path="$2"
@@ -236,6 +286,34 @@ wait_for_process() {
         cat "$log_path" >&2 || true
         die "$name exited before becoming ready"
     fi
+}
+
+wait_for_storage_node_socket() {
+    local node_id="$1"
+    local pid="${storage_node_pids[$node_id]}"
+    local log_path="${storage_node_logs[$node_id]}"
+    local socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        wait_for_process "$pid" "$log_path" "storage-node-$node_id"
+        if [[ -S "$socket_path" ]] && grep -q "storage-node $node_id listening" "$log_path"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    cat "$log_path" >&2 || true
+    die "storage-node-$node_id did not become ready at $socket_path"
+}
+
+restart_storage_node() {
+    local node_id="$1"
+    local pid="${storage_node_pids[$node_id]}"
+    echo "== argmin-s3 UAT restart storage-node-$node_id =="
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    start_storage_node "$node_id"
+    wait_for_storage_node_socket "$node_id"
 }
 
 cleanup_server() {
@@ -320,37 +398,11 @@ else
     )"
 
     for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
-        socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
-        node_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")"
-        node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
-        start_process "storage-node-$node_id" "$node_log" env \
-            -u ARGMIN_STORAGE_NODE_SOCKETS \
-            ARGMIN_PROCESS_ROLE=storage-node \
-            ARGMIN_STORAGE_NODE_ID="$node_id" \
-            ARGMIN_STORAGE_NODE_DATA_DIR="$node_data_dir" \
-            ARGMIN_STORAGE_NODE_SOCKET_PATH="$socket_path" \
-            ARGMIN_DATA_DIR="$data_dir" \
-            ARGMIN_LISTEN_ADDR="$listen_addr" \
-            "${server_cmd[@]}"
+        start_storage_node "$node_id"
     done
 
-    for ((attempt = 0; attempt < 200; attempt++)); do
-        ready=1
-        for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
-            wait_for_process "${server_pids[$node_id]}" "${server_logs[$node_id]}" "storage-node-$node_id"
-            socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
-            if [[ ! -S "$socket_path" ]]; then
-                ready=0
-            fi
-        done
-        if ((ready)); then
-            break
-        fi
-        sleep 0.1
-    done
     for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
-        socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
-        [[ -S "$socket_path" ]] || die "storage-node-$node_id did not create socket $socket_path"
+        wait_for_storage_node_socket "$node_id"
     done
 
     frontend_log="$logs_dir/frontend.log"
@@ -381,13 +433,25 @@ if ! curl -k -sS "$endpoint/" >/dev/null 2>&1; then
     die "argmin-s3 did not become ready at $endpoint"
 fi
 
-cmd=(cargo nextest run -p s3-tests)
-if ((${#cargo_args[@]})); then
-    cmd+=("${cargo_args[@]}")
-fi
+run_nextest() {
+    local label="$1"
+    shift
+    local cmd=(cargo nextest run -p s3-tests)
+    if (($#)); then
+        cmd+=("$@")
+    fi
 
-echo "== argmin-s3 UAT s3-tests =="
-printf '+'
-printf ' %q' "${cmd[@]}"
-printf '\n'
-"${cmd[@]}"
+    echo "== argmin-s3 UAT $label =="
+    printf '+'
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    "${cmd[@]}"
+}
+
+if [[ "$smoke" == "storage-node-restart" ]]; then
+    run_nextest "pre-restart s3-tests smoke" test_object_default_content_type
+    restart_storage_node 0
+    run_nextest "post-restart s3-tests smoke" test_object_read_not_exist
+else
+    run_nextest "s3-tests" "${cargo_args[@]}"
+fi

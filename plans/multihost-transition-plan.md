@@ -6029,6 +6029,18 @@ Status:
   claim-token fields use bounded decoders. Focused storage RPC tests cover
   kind-specific preallocation rejection plus nested metadata-command byte
   rejection for both checksum-item and plain command-envelope response paths.
+- Ran the full local multi-process S3 UAT harness after the closeout audit
+  changes. `./scripts/uat-s3-tests` built the server, started one frontend and
+  six separate storage-node processes over Unix sockets, and completed
+  `cargo nextest run -p s3-tests` with `1533 tests run: 1533 passed` in
+  188.947s.
+- Added a targeted `./scripts/uat-s3-tests --smoke storage-node-restart` mode
+  for process-shaped restart evidence. The smoke starts a one-storage-node,
+  one-PG multihost topology so every post-restart S3 request must route through
+  restarted storage-node 0, runs a focused S3 probe, kills and restarts the
+  storage node against the same data directory and Unix socket path, waits for
+  the restarted process to bind, and runs a second focused S3 probe through the
+  unchanged frontend. The initial smoke run passed both probes.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
