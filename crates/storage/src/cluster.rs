@@ -26,7 +26,6 @@ use crate::metadata_command::{
     MetadataCommandReplicaState, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
     ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
-use crate::node::BucketLockGuard;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
 use crate::node_client::{
@@ -1911,18 +1910,6 @@ impl StorageCluster {
         )
     }
 
-    fn lock_bucket_on_object_metadata_primary(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<BucketLockGuard<'_>, StoreError> {
-        self.local_map.lock_bucket_on_metadata_pg_primary(
-            self.operation_epoch(),
-            PgId::new(self.object_metadata_pg_id(bucket, key)),
-            bucket,
-        )
-    }
-
     fn object_mutation_metadata_primary_client(
         &self,
         bucket: &BucketName,
@@ -2238,7 +2225,6 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
@@ -3038,7 +3024,6 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
@@ -3173,14 +3158,6 @@ impl StorageCluster {
                 release_result?;
             }};
         }
-        let _bucket_guard = match self.lock_bucket_on_object_metadata_primary(&req.bucket, &req.key)
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                cleanup_direct_put_attempt_before_command_ownership!();
-                return Err(error.into());
-            }
-        };
         let shard_batch: Vec<(&ShardKey, WriteAck)> = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
@@ -3201,7 +3178,6 @@ impl StorageCluster {
                     (match self.pending_metadata_command_for_bucket(pg_id, &req.bucket) {
                         Ok(command) => command,
                         Err(error) => {
-                            drop(_bucket_guard);
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error.into());
                         }
@@ -3216,7 +3192,6 @@ impl StorageCluster {
                     ) {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
-                            drop(_bucket_guard);
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error);
                         }
@@ -3224,7 +3199,6 @@ impl StorageCluster {
                     match action(snapshot.auth_snapshot.clone()) {
                         Ok(()) => {}
                         Err(error) => {
-                            drop(_bucket_guard);
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Ok(Err(error));
                         }
@@ -3234,7 +3208,6 @@ impl StorageCluster {
                         match self.reserve_next_object_version(pg_id, &req.bucket, &req.key) {
                             Ok(version_id) => version_id,
                             Err(error) => {
-                                drop(_bucket_guard);
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
@@ -3268,14 +3241,12 @@ impl StorageCluster {
                                 &req.bucket,
                             );
                             if let Err(error) = cleanup {
-                                drop(_bucket_guard);
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
                             continue;
                         }
                         Err(error) => {
-                            drop(_bucket_guard);
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Err(error);
                         }
@@ -3303,7 +3274,6 @@ impl StorageCluster {
                     Ok(has_abandoned_log) => has_abandoned_log,
                     Err(error) => {
                         let error = bucket_snapshot_error_to_object_pg_action_error(error.source);
-                        drop(_bucket_guard);
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
@@ -3331,7 +3301,6 @@ impl StorageCluster {
                                 }
                                 Err(error) => error,
                             };
-                        drop(_bucket_guard);
                         self.delete_direct_put_segment_payload_shards(
                             req.data_pg_id,
                             req.ec,
@@ -3343,7 +3312,6 @@ impl StorageCluster {
                     }
                     if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
                     {
-                        drop(_bucket_guard);
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
@@ -3353,7 +3321,6 @@ impl StorageCluster {
                     break (command, false);
                 }
                 if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
-                    drop(_bucket_guard);
                     cleanup_direct_put_attempt_before_command_ownership!();
                     return Err(error);
                 }
@@ -3361,7 +3328,6 @@ impl StorageCluster {
 
             if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
                 if new_pending_command {
-                    drop(_bucket_guard);
                     let release_result =
                         self.release_metadata_command_bucket_write_reservation(&command);
                     self.release_object_generation_reservation_after_pending_drain_best_effort(
@@ -3389,7 +3355,6 @@ impl StorageCluster {
                 &shard_batch,
             ) {
                 if new_pending_command {
-                    drop(_bucket_guard);
                     let release_result =
                         self.release_metadata_command_bucket_write_reservation(&command);
                     self.release_object_generation_reservation_after_pending_drain_best_effort(
@@ -3417,7 +3382,6 @@ impl StorageCluster {
                 ) {
                     Ok(installed) => installed,
                     Err(error) => {
-                        drop(_bucket_guard);
                         let release_result =
                             self.release_metadata_command_bucket_write_reservation(&command);
                         self.release_object_generation_reservation_after_pending_drain_best_effort(
@@ -3441,7 +3405,6 @@ impl StorageCluster {
                     let cleanup =
                         self.drain_pending_object_metadata_commands_for_bucket(pg_id, &req.bucket);
                     if let Err(error) = cleanup {
-                        drop(_bucket_guard);
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
@@ -3476,7 +3439,6 @@ impl StorageCluster {
                         .reissue_pending_metadata_command(pg_id, &command)
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                     else {
-                        drop(_bucket_guard);
                         if new_pending_command {
                             self.release_metadata_command_bucket_write_reservation(&command)
                                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
@@ -3514,7 +3476,6 @@ impl StorageCluster {
                             &command,
                         )
                         .map_err(ObjectPgActionError::from)?;
-                        drop(_bucket_guard);
                         self.release_object_generation_reservation_after_pending_drain_best_effort(
                             pg_id,
                             &req.bucket,
@@ -3968,7 +3929,6 @@ impl StorageCluster {
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         mutation_client.prepare_stream_segment_append(pg_id, bucket, key, request)
@@ -4002,22 +3962,6 @@ impl StorageCluster {
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = match self.lock_bucket_on_object_metadata_primary(bucket, key) {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
-                return Err(error.into());
-            }
-        };
         let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {
             Ok(client) => client,
             Err(error) => {
@@ -4593,7 +4537,6 @@ impl StorageCluster {
         #[cfg(any(test, feature = "test-hooks"))]
         self.maybe_run_before_stream_abort_storage_hook();
 
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         loop {
             pending_completed_session =
                 self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;

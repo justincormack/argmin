@@ -264,11 +264,12 @@ Phase 9.3 tests must therefore cover UploadPartCopy races with destination MPU
 abort and complete, plus cleanup of copied staged segments when the destination
 upload becomes terminal before finalize.
 
-Local multipart locks such as `lock_multipart_completion_bucket` and
-`lock_bucket` may remain as in-process contention reducers while the server is
-still single-process. They are not command-stream authorities. Correctness must
-come from durable PG-primary pending slots, command apply validation, and
-fresh-snapshot restart after contention.
+The old process-local multipart-completion lock is not part of the completion
+path. Completed-upload ordering and object publication correctness must come
+from durable PG-primary pending slots, command apply validation, and
+fresh-snapshot restart after contention. Remaining bucket locks are not
+command-stream authorities and must not be used as production correctness
+boundaries.
 
 Multipart publisher rules:
 

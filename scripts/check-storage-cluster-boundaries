@@ -207,14 +207,14 @@ fail_with_matches \
 
 removed_bucket_pg_lock_helpers=$(
     rg -n --color=never \
-        'lock_bucket_on_bucket_metadata_primary|lock_multipart_completion_bucket_on_bucket_metadata_primary|lock_multipart_completion_bucket_on_metadata_pg_primary' \
+        'lock_bucket_on_bucket_metadata_primary|lock_bucket_on_object_metadata_primary|lock_bucket_on_metadata_pg_primary|lock_multipart_completion_bucket_on_bucket_metadata_primary|lock_multipart_completion_bucket_on_metadata_pg_primary' \
         crates/storage/src/cluster.rs \
         crates/storage/src/cluster/request_ops.rs \
         crates/storage/src/cluster/local.rs \
         || true
 )
 fail_with_matches \
-    "Bucket-PG request-path mutex helpers were removed for Phase 10.8; use durable reservations/drains and storage-node command serialization" \
+    "Bucket/object-PG request-path mutex helpers were removed for Phase 10.8; use durable reservations/drains and storage-node command serialization" \
     "$removed_bucket_pg_lock_helpers"
 
 legacy_object_pending_helpers=$(

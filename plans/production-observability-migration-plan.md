@@ -43,7 +43,6 @@ Completed:
   - `request_error`
   - `slow_request`
   - `bucket_lock_wait_exceeded`
-  - `multipart_completion_bucket_lock_wait_exceeded`
 - dense request/stream/layout observability is now `deep-tracing` only
 - `crates/observability` now provides small helper APIs for the remaining
   production events
@@ -54,7 +53,6 @@ Completed:
   - `request_error_total`
   - `slow_request_total`
   - `bucket_lock_wait_exceeded_total`
-  - `multipart_completion_bucket_lock_wait_exceeded_total`
 
 Remaining:
 

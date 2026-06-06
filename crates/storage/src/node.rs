@@ -133,8 +133,6 @@ pub struct BucketScopedTestHooks {
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub before_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub after_multipart_completion_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_completed_multipart_prune:
         Option<Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>>,
 }
@@ -218,22 +216,6 @@ pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(bucket: &BucketName) {
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(_: &BucketName) {}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_before_multipart_completion_lock_hook(bucket: &BucketName) {
-    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_multipart_completion_lock)
-}
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_before_multipart_completion_lock_hook(_: &BucketName) {}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_after_multipart_completion_lock_hook(bucket: &BucketName) {
-    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_multipart_completion_lock)
-}
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_after_multipart_completion_lock_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
@@ -374,7 +356,6 @@ pub struct SharedStorageNode {
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
     bucket_coordination: Vec<(Mutex<u64>, Condvar)>,
-    multipart_completion_locks: Vec<Mutex<()>>,
     object_payload_leases: Mutex<ObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
     ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
@@ -471,11 +452,6 @@ impl SharedStorageNode {
         for _ in 0..BUCKET_LOCK_STRIPES {
             bucket_coordination.push((Mutex::new(0), Condvar::new()));
         }
-        let mut multipart_completion_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
-        for _ in 0..BUCKET_LOCK_STRIPES {
-            multipart_completion_locks.push(Mutex::new(()));
-        }
-
         Ok(Self {
             stores,
             pg_paths,
@@ -485,7 +461,6 @@ impl SharedStorageNode {
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
             bucket_coordination,
-            multipart_completion_locks,
             object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
@@ -1114,43 +1089,6 @@ impl SharedStorageNode {
         let pg_id = self.test_bucket_pg_id_for(bucket);
         let guard = self.get_pg(pg_id)?;
         Ok(BucketPgTestGuard { guard })
-    }
-
-    /// Lock a bucket-scoped stripe mutex used to reduce in-process multipart
-    /// completion contention.
-    ///
-    /// This is not metadata command-stream authority. Completed-upload order
-    /// and object publication correctness come from bucket-PG/object-PG
-    /// commands, durable pending slots, and command apply validation.
-    pub fn lock_multipart_completion_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "SharedStorageNode::lock_multipart_completion_bucket",
-            "bucket={:?}",
-            bucket
-        );
-        let idx = self.bucket_lock_index(bucket);
-        let trace = observability::current_context();
-        maybe_run_before_multipart_completion_lock_hook(bucket);
-        let wait_started_at = Instant::now();
-        let guard = self.multipart_completion_locks[idx]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        maybe_run_after_multipart_completion_lock_hook(bucket);
-        let wait_us = wait_started_at.elapsed().as_micros();
-        if wait_us >= LOCK_WAIT_EVENT_THRESHOLD_US {
-            if let Some(trace) = &trace {
-                let _ = observability::emit_multipart_completion_bucket_lock_wait_exceeded(
-                    trace,
-                    TRACE_TARGET,
-                    bucket,
-                    idx,
-                    wait_us,
-                );
-            }
-        }
-        let _ = trace;
-        BucketLockGuard { guard }
     }
 
     /// Lock and return a guard for the given PG.

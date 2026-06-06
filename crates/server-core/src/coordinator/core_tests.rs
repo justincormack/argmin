@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use storage::{
@@ -4327,77 +4327,6 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
     assert!(
         res.is_ok(),
         "complete_multipart_upload should succeed without waiting on bucket lock: {res:?}"
-    );
-    handle.join().unwrap();
-}
-
-#[test]
-fn complete_multipart_upload_waits_for_multipart_completion_lock() {
-    let tmp = test_util::tempdir();
-    let bucket = "bucket-complete-waits-lock";
-    let pg_ids: Vec<u32> = (0..4).collect();
-    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
-        Arc::clone(&storage_cluster),
-    );
-    let completer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
-        Arc::clone(&storage_cluster),
-    );
-    admin
-        .create_bucket_for_owner("default-owner", bucket, false)
-        .unwrap();
-
-    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, "key", &[(1, b"part")]);
-
-    let _serial = STORAGE_TEST_HOOK_SERIAL
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-    let reached_before_lock = Arc::new(Barrier::new(2));
-    let reached_before_lock_hook = Arc::clone(&reached_before_lock);
-    let (acquired_lock_tx, acquired_lock_rx) = mpsc::channel();
-    let guard = storage_cluster.test_lock_multipart_completion_bucket(&trusted_bucket_name(bucket));
-    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
-        target: Some(trusted_bucket_name(bucket)),
-        before_multipart_completion_lock: Some(Arc::new(move || {
-            reached_before_lock_hook.wait();
-        })),
-        after_multipart_completion_lock: Some(Arc::new(move || {
-            let _ = acquired_lock_tx.send(());
-        })),
-        ..BucketScopedTestHooks::default()
-    });
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
-            upload: multipart_object_request_with_expected_owner(
-                bucket,
-                "key",
-                &upload_id,
-                test_requester(),
-                None,
-            ),
-            parts: &parts,
-            claimed_checksum: None,
-            expected_object_size: None,
-            cond: &WriteCondition::default(),
-            sse_customer: None,
-        });
-        tx.send(res).unwrap();
-    });
-
-    reached_before_lock.wait();
-    assert!(matches!(
-        acquired_lock_rx.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    drop(guard);
-    acquired_lock_rx.recv().unwrap();
-    let res = rx.recv().unwrap();
-    assert!(
-        res.is_ok(),
-        "complete_multipart_upload should succeed after multipart completion lock is released: {res:?}"
     );
     handle.join().unwrap();
 }

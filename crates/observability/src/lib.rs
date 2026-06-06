@@ -88,7 +88,6 @@ static REQUEST_FINISH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -406,7 +405,6 @@ pub struct MetricsSnapshot {
     pub request_error_total: u64,
     pub slow_request_total: u64,
     pub bucket_lock_wait_exceeded_total: u64,
-    pub multipart_completion_bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
 }
@@ -438,8 +436,6 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         request_error_total: REQUEST_ERROR_TOTAL.load(Ordering::Relaxed),
         slow_request_total: SLOW_REQUEST_TOTAL.load(Ordering::Relaxed),
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
-        multipart_completion_bucket_lock_wait_exceeded_total:
-            MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),
         shard_scavenger_scan_incomplete_total: SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL
@@ -550,25 +546,6 @@ pub fn emit_bucket_lock_wait_exceeded<T: fmt::Debug>(
         context,
         target,
         "bucket_lock_wait_exceeded",
-        Some(format_args!(
-            "bucket={:?} stripe={} wait_us={}",
-            bucket, stripe, wait_us
-        )),
-    )
-}
-
-pub fn emit_multipart_completion_bucket_lock_wait_exceeded<T: fmt::Debug>(
-    context: &TraceContext,
-    target: &'static str,
-    bucket: &T,
-    stripe: usize,
-    wait_us: u128,
-) -> bool {
-    MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
-    event_in_context(
-        context,
-        target,
-        "multipart_completion_bucket_lock_wait_exceeded",
         Some(format_args!(
             "bucket={:?} stripe={} wait_us={}",
             bucket, stripe, wait_us
@@ -979,7 +956,6 @@ mod tests {
         );
         emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
-        emit_multipart_completion_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 7, 2_500);
         emit_shard_scavenger_observation(
             "storage",
             ShardScavengerObservationSummary {
@@ -1001,10 +977,6 @@ mod tests {
         assert_eq!(
             after.bucket_lock_wait_exceeded_total,
             before.bucket_lock_wait_exceeded_total + 1
-        );
-        assert_eq!(
-            after.multipart_completion_bucket_lock_wait_exceeded_total,
-            before.multipart_completion_bucket_lock_wait_exceeded_total + 1
         );
         assert_eq!(
             after.shard_scavenger_observation_total,

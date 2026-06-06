@@ -4054,14 +4054,12 @@ impl super::StorageCluster {
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
-            let bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
                         let snapshot_version_id = match requested_version_id {
                             Some(version_id) => {
                                 if version_id != update.object.version_id {
-                                    drop(bucket_guard);
                                     self.drain_pending_object_metadata_command(pg_id, &command)?;
                                     continue;
                                 }
@@ -4076,7 +4074,6 @@ impl super::StorageCluster {
                             snapshot_version_id,
                         )?;
                         if stored.version_id() != update.object.version_id {
-                            drop(bucket_guard);
                             self.drain_pending_object_metadata_command(pg_id, &command)?;
                             continue;
                         }
@@ -4095,7 +4092,6 @@ impl super::StorageCluster {
                                 "conflicting pending command for object metadata update",
                             ));
                         }
-                        drop(bucket_guard);
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -4104,11 +4100,9 @@ impl super::StorageCluster {
                     }
                 }
 
-                drop(bucket_guard);
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
                 continue;
             }
-            drop(bucket_guard);
 
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
@@ -4135,12 +4129,10 @@ impl super::StorageCluster {
                 }};
             }
 
-            let bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             if self
                 .pending_metadata_command_for_bucket(pg_id, bucket)?
                 .is_some()
             {
-                drop(bucket_guard);
                 release_bucket_write_proof!()?;
                 continue;
             }
@@ -4153,7 +4145,6 @@ impl super::StorageCluster {
             ) {
                 Ok(stored) => stored,
                 Err(error) => {
-                    drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -4161,7 +4152,6 @@ impl super::StorageCluster {
             let (value, version_id, mutation) = match action(&stored) {
                 Ok(command) => command,
                 Err(error) => {
-                    drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     return Ok(Err(error));
                 }
@@ -4180,7 +4170,6 @@ impl super::StorageCluster {
                 },
             ) {
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                    drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     continue;
                 }
@@ -4188,18 +4177,15 @@ impl super::StorageCluster {
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     continue;
                 }
                 Err(error) => {
-                    drop(bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
             };
-            drop(bucket_guard);
             let install = match self
                 .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
             {
@@ -4544,7 +4530,6 @@ impl super::StorageCluster {
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -4693,7 +4678,6 @@ impl super::StorageCluster {
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -4857,7 +4841,6 @@ impl super::StorageCluster {
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -5006,7 +4989,6 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         let owner = OwnerIdentity::new(
             bucket_info.owner_principal.clone(),
             bucket_info.owner_canonical_id.clone(),
@@ -5277,7 +5259,6 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         let mut completed_reclaimed_generation_ids = Vec::new();
 
         'retry: loop {
@@ -5451,7 +5432,6 @@ impl super::StorageCluster {
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
 
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -5948,8 +5928,6 @@ impl super::StorageCluster {
                     }
                 }
             }
-
-            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             loop {
                 if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let matching_reclaim_delete = matches!(
@@ -6491,13 +6469,6 @@ impl super::StorageCluster {
                 }
             }};
         }
-        let _bucket_guard = match self.lock_bucket_on_object_metadata_primary(bucket, key) {
-            Ok(guard) => guard,
-            Err(error) => {
-                release_caller_bucket_write_proof_if_unowned!()?;
-                return Err(error.into());
-            }
-        };
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         let (command, new_pending_command, prepared) = loop {
@@ -6885,7 +6856,6 @@ impl super::StorageCluster {
         } = req;
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(&bucket, &key)?;
         macro_rules! release_caller_bucket_write_proof {
             () => {{
                 self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -6897,7 +6867,6 @@ impl super::StorageCluster {
             {
                 Ok(applied_commands) => applied_commands,
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
@@ -6909,7 +6878,6 @@ impl super::StorageCluster {
             {
                 Ok(upload) => upload,
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
@@ -6919,13 +6887,11 @@ impl super::StorageCluster {
             let (authorized_upload, result) = match action(&upload) {
                 Ok((authorized_upload, result)) => (authorized_upload, result),
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Ok(Err(error));
                 }
             };
             if authorized_upload.record() != &upload {
-                drop(_bucket_guard);
                 release_caller_bucket_write_proof!()?;
                 return Err(BucketSnapshotLoadError::Metadata(
                     MetadataError::NoSuchUpload {
@@ -6949,13 +6915,11 @@ impl super::StorageCluster {
                 super::applied_stream_create_command(&applied_commands, &create),
             ) {
                 Ok(true) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Ok(Ok(result));
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
@@ -6980,7 +6944,6 @@ impl super::StorageCluster {
                     if let Err(error) =
                         self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
                     {
-                        drop(_bucket_guard);
                         release_caller_bucket_write_proof!()?;
                         return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                             error,
@@ -6989,7 +6952,6 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
@@ -7002,7 +6964,6 @@ impl super::StorageCluster {
                 Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
                 Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => continue,
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
@@ -7045,7 +7006,6 @@ impl super::StorageCluster {
                 }
             };
             let bucket_write_reservation = BucketWriteReservationProof::from(&reservation.record);
-            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             macro_rules! release_caller_bucket_write_proof {
                 () => {{
                     self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -7057,7 +7017,6 @@ impl super::StorageCluster {
             {
                 Ok(applied_commands) => applied_commands,
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7067,13 +7026,11 @@ impl super::StorageCluster {
             {
                 Ok(upload) => upload,
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(error);
                 }
             };
             if upload != *authorized_upload.record() {
-                drop(_bucket_guard);
                 release_caller_bucket_write_proof!()?;
                 return Err(MetadataError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
@@ -7096,13 +7053,11 @@ impl super::StorageCluster {
                 super::applied_stream_create_command(&applied_commands, &create),
             ) {
                 Ok(true) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Ok(session_id.clone());
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7125,16 +7080,13 @@ impl super::StorageCluster {
                     if let Err(error) =
                         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                     {
-                        drop(_bucket_guard);
                         release_caller_bucket_write_proof!()?;
                         return Err(error);
                     }
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     continue;
                 }
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7143,12 +7095,10 @@ impl super::StorageCluster {
             {
                 Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
                 Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     continue;
                 }
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_caller_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7443,7 +7393,6 @@ impl super::StorageCluster {
                 }
             };
             let bucket_write_reservation = BucketWriteReservationProof::from(&reservation.record);
-            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(&bucket, &key)?;
             macro_rules! release_bucket_write_proof {
                 () => {{
                     self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -7461,7 +7410,6 @@ impl super::StorageCluster {
                         &req.part_records,
                     ) {
                         let outcome = Self::complete_multipart_outcome_from_command(commit);
-                        drop(_bucket_guard);
                         release_bucket_write_proof!()?;
                         self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
                         self.prune_completed_multipart_uploads_for_bucket_with_limit(
@@ -7472,14 +7420,12 @@ impl super::StorageCluster {
                     }
                 }
                 if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
-                    drop(_bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
             }
 
             if req.part_records.is_empty() {
-                drop(_bucket_guard);
                 release_bucket_write_proof!()?;
                 return Err(MetadataError::Db {
                     context: "complete multipart command empty parts",
@@ -7496,7 +7442,6 @@ impl super::StorageCluster {
                         req.expected_stale_payload_source = current_stale_payload_source;
                     }
                     Err(error) => {
-                        drop(_bucket_guard);
                         release_bucket_write_proof!()?;
                         return Err(error);
                     }
@@ -7507,7 +7452,6 @@ impl super::StorageCluster {
                 match self.reserve_next_object_version(pg_id, &bucket, &key) {
                     Ok(version_id) => version_id,
                     Err(error) => {
-                        drop(_bucket_guard);
                         release_bucket_write_proof!()?;
                         return Err(error);
                     }
@@ -7518,7 +7462,6 @@ impl super::StorageCluster {
             let completion_order = match self.reserve_completed_multipart_upload_order(&bucket) {
                 Ok(completion_order) => completion_order,
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7568,11 +7511,9 @@ impl super::StorageCluster {
                     if let Err(error) =
                         self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
                     {
-                        drop(_bucket_guard);
                         release_bucket_write_proof!()?;
                         return Err(error);
                     }
-                    drop(_bucket_guard);
                     release_bucket_write_proof!()?;
                     continue 'retry_after_pending_conflict;
                 }
@@ -7584,12 +7525,10 @@ impl super::StorageCluster {
                     {
                         Ok(source) => source,
                         Err(error) => {
-                            drop(_bucket_guard);
                             release_bucket_write_proof!()?;
                             return Err(error);
                         }
                     };
-                    drop(_bucket_guard);
                     release_bucket_write_proof!()?;
                     if current_stale_payload_source == req.expected_stale_payload_source {
                         return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);
@@ -7598,7 +7537,6 @@ impl super::StorageCluster {
                     continue 'retry_after_pending_conflict;
                 }
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7613,7 +7551,6 @@ impl super::StorageCluster {
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    drop(_bucket_guard);
                     if let Err(error) =
                         self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
                     {
@@ -7624,7 +7561,6 @@ impl super::StorageCluster {
                     continue 'retry_after_pending_conflict;
                 }
                 Err(error) => {
-                    drop(_bucket_guard);
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
@@ -7645,18 +7581,15 @@ impl super::StorageCluster {
                         ),
                         Ok(None) => false,
                         Err(error) => {
-                            drop(_bucket_guard);
                             release_bucket_write_proof!()?;
                             return Err(error.into());
                         }
                     };
-                drop(_bucket_guard);
                 if !pending_owns_proof {
                     release_bucket_write_proof!()?;
                 }
                 continue 'retry_after_pending_conflict;
             }
-            drop(_bucket_guard);
             self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
 
             let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
@@ -7692,7 +7625,6 @@ impl super::StorageCluster {
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
-            let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
             let mut pending_command = None;
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let is_matching_stream_part_commit = matches!(
@@ -7716,7 +7648,6 @@ impl super::StorageCluster {
                 ) {
                     Ok(reservation) => reservation,
                     Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
-                        drop(_bucket_guard);
                         self.wait_for_durable_bucket_write_drain(bucket)
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
                         continue;
@@ -7982,7 +7913,6 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.abort_multipart_upload_locked(
             pg_id,
             bucket,
@@ -7999,7 +7929,6 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.abort_multipart_upload_locked(
             pg_id,
             bucket,
@@ -8129,7 +8058,6 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         self.abort_authorized_multipart_upload_locked(pg_id, authorized_upload)
     }
 
@@ -8311,7 +8239,6 @@ impl super::StorageCluster {
         let BucketLifecycleContext { raw_lifecycle, .. } = lifecycle_context;
 
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let _object_bucket_guard = self.lock_bucket_on_object_metadata_primary(bucket, key)?;
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_abort = matches!(
                 command.payload(),
@@ -8809,14 +8736,5 @@ impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_lock_bucket(&self, bucket: &BucketName) -> crate::node::BucketLockGuard<'_> {
         self.metadata_primary_test_hook_node().lock_bucket(bucket)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_lock_multipart_completion_bucket(
-        &self,
-        bucket: &BucketName,
-    ) -> crate::node::BucketLockGuard<'_> {
-        self.metadata_primary_test_hook_node()
-            .lock_multipart_completion_bucket(bucket)
     }
 }

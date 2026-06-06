@@ -12,7 +12,6 @@ use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
-use crate::node::BucketLockGuard;
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
@@ -1753,16 +1752,6 @@ impl LocalClusterMap {
                 ec,
                 write_shards,
             )
-    }
-
-    pub(crate) fn lock_bucket_on_metadata_pg_primary(
-        &self,
-        operation_epoch: ClusterEpoch,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<BucketLockGuard<'_>, StoreError> {
-        let node = self.metadata_pg_primary_node(operation_epoch, pg_id)?;
-        Ok(node.storage_node().lock_bucket(bucket))
     }
 
     pub(crate) fn notify_bucket_coordination_change(

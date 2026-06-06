@@ -3246,10 +3246,11 @@ Proposed subphases:
         publishers are no longer exempt from snapshot-sensitive install rules
       - make any remaining local multipart locks clearly performance-only, or
         remove them if they no longer reduce useful contention
-        - status: `lock_multipart_completion_bucket` is documented as an
-          in-process contention reducer only; completed-upload order and object
-          publication correctness come from bucket-PG/object-PG commands,
-          durable pending slots, and command apply validation
+        - status: `lock_multipart_completion_bucket` and its stripe storage
+          have been removed. Completed-upload order and object publication
+          correctness are covered by durable bucket-PG/object-PG command
+          stream tests for completed-upload order allocation, command ID races,
+          partial command retry, and completion publication.
       - remove or gate any remaining direct/test-only multipart mutators that
         can bypass the command stream
         - status: remaining direct multipart seeders/mutators are `#[cfg(test)]`
@@ -4655,8 +4656,9 @@ Phase 9.1 audit checklist:
      and PG-primary state before Phase 10
 6. multipart completion and upload lifecycle locks
    - current process-local mechanism:
-     `SharedStorageNode::multipart_completion_locks`, bucket locks used around
-     multipart complete, abort, and UploadPart stream validation
+     bucket locks formerly used around multipart complete, abort, and UploadPart
+     stream validation. `SharedStorageNode::multipart_completion_locks` has
+     been removed.
    - classification: request serialization
    - risk: complete, abort, UploadPart, and streamed UploadPart races are only
      serialized inside one process
@@ -5964,8 +5966,14 @@ Status:
   completion have been removed; those paths now rely on durable bucket
   reservations/drains and the storage-node-owned metadata command
   serialization boundary. The storage boundary script now rejects reintroducing
-  those bucket-PG lock helpers. Object-PG bucket lock call sites remain the
-  next audit slice.
+  those bucket-PG lock helpers.
+- Removed the remaining object-PG bucket lock helper from production request
+  paths. Object metadata mutations, generation reservations, direct/stream PUT,
+  multipart completion/abort, lifecycle actions, and reclaim deletion now rely
+  on durable pending-command ownership, bucket-write reservations/drains, and
+  storage-node snapshot validation instead of same-process object-PG bucket
+  mutexes. The boundary script now rejects reintroducing bucket- or object-PG
+  request-path lock helpers.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
