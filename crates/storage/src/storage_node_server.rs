@@ -5743,6 +5743,23 @@ impl StorageNodeConnectionHandler {
                     );
                     encode_storage_rpc_success_response(&payload)
                 }
+                Err(BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::StaleBucketMetadataCommand {
+                        name,
+                        bucket_execution_generation,
+                    },
+                )) => {
+                    let payload = encode_metadata_command_state_outcome_response(
+                        &StorageRpcMetadataCommandStateOutcomeResponse {
+                            outcome:
+                                StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                                    name,
+                                    bucket_execution_generation,
+                                },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
                 Err(BucketSnapshotLoadError::Metadata(error)) => {
                     encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::Internal,
@@ -7069,8 +7086,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::metadata_command::{
-        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+        CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        MetadataCommandPayload, PutBucketAclCommand, ReserveObjectGenerationCommand,
+        ReserveObjectVersionCommand,
     };
     use crate::storage_rpc::{
         decode_bucket_mark_deleting_command_build_response, decode_health_response,
@@ -7107,7 +7125,7 @@ mod tests {
         StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
         StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     };
-    use crate::traits::ShardStore;
+    use crate::traits::{PgMetadataStore, ShardStore};
     use crate::types::{
         DataPgId, GenerationId, PgId, ShardIndex, ShardKey, ShardScavengerObservationKey,
         ShardScavengerObservationReason, ShardScavengerObservationRecord, VersionId,
@@ -8680,6 +8698,98 @@ mod tests {
             decoded.outcome,
             StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
                 version_id: VersionId::from_u64(1)
+            }
+        );
+    }
+
+    #[test]
+    fn storage_node_server_preserves_stale_bucket_metadata_apply_conflict() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let bucket = crate::tests::bucket_name("stale-bucket-rpc");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let pg = server._node.get_pg(0).unwrap();
+        let create_config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &crate::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+        };
+        let create = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+            ),
+        );
+        pg.apply_metadata_command_and_record(7, &create).unwrap();
+        let initial = pg.head_bucket_record_raw(&bucket).unwrap();
+        let newer = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                initial.clone().with_execution_generation(2),
+                crate::AclGrants::default(),
+                true,
+                false,
+            )),
+        );
+        pg.apply_metadata_command_and_record(7, &newer).unwrap();
+        drop(pg);
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                initial.with_execution_generation(1),
+                crate::AclGrants::default(),
+                false,
+                true,
+            )),
+        );
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command: stale,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert_eq!(
+            decoded.outcome,
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name: bucket,
+                bucket_execution_generation: 1,
             }
         );
     }

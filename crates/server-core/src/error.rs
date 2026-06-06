@@ -188,6 +188,9 @@ pub enum ServerError {
     #[error("bucket is in an invalid state for this operation")]
     InvalidBucketState,
 
+    #[error("a conflicting conditional operation is currently in progress against this resource")]
+    OperationAborted,
+
     #[error("ACL not supported with BucketOwnerEnforced")]
     AccessControlListNotSupported,
 
@@ -374,6 +377,7 @@ impl ServerError {
                 "ServerSideEncryptionConfigurationNotFoundError"
             }
             Self::InvalidBucketState => "InvalidBucketState",
+            Self::OperationAborted => "OperationAborted",
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied
@@ -462,7 +466,7 @@ impl ServerError {
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::ObjectLockConfigurationNotFound { .. } => 404,
             Self::ServerSideEncryptionConfigurationNotFound { .. } => 404,
-            Self::InvalidBucketState => 409,
+            Self::InvalidBucketState | Self::OperationAborted => 409,
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
@@ -568,6 +572,14 @@ mod tests {
         assert_eq!(
             ServerError::InvalidBucketState.s3_error_code(),
             "InvalidBucketState"
+        );
+    }
+
+    #[test]
+    fn s3_error_code_operation_aborted() {
+        assert_eq!(
+            ServerError::OperationAborted.s3_error_code(),
+            "OperationAborted"
         );
     }
 
@@ -884,6 +896,7 @@ mod tests {
         assert_eq!(ServerError::BucketAlreadyOwnedByYou.http_status(), 409);
         assert_eq!(ServerError::BucketNotEmpty.http_status(), 409);
         assert_eq!(ServerError::InvalidBucketState.http_status(), 409);
+        assert_eq!(ServerError::OperationAborted.http_status(), 409);
     }
 
     #[test]

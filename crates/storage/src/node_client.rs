@@ -3357,6 +3357,12 @@ impl UnixStorageNodeClient {
                         .to_string(),
                 ))
             }
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stale bucket metadata command"
+                        .to_string(),
+                )),
         }
     }
 
@@ -3417,6 +3423,19 @@ impl UnixStorageNodeClient {
             } => Err(BucketSnapshotLoadError::Metadata(
                 MetadataError::ObjectVersionReservationConflict { version_id },
             )),
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name,
+                bucket_execution_generation,
+            } => match stale_bucket_metadata_command_error(
+                command,
+                name,
+                bucket_execution_generation,
+                "decode metadata command apply and record response",
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+            },
         }
     }
 
@@ -4207,6 +4226,53 @@ fn metadata_command_log_conflict_error(
         cluster_epoch: conflict.cluster_epoch,
         log_index: conflict.log_index,
     }
+}
+
+fn stale_bucket_metadata_command_error(
+    command: &MetadataCommandEnvelope,
+    name: BucketName,
+    bucket_execution_generation: u64,
+    decode_context: &'static str,
+    rpc_payload_error: impl FnOnce(&'static str, String) -> StoreError,
+) -> Result<MetadataError, StoreError> {
+    let expected = match command.payload() {
+        MetadataCommandPayload::PutBucketVersioning(command) => Some((
+            command.bucket_name(),
+            command.bucket.bucket_execution_generation,
+        )),
+        MetadataCommandPayload::PutBucketAcl(command) => Some((
+            command.bucket_name(),
+            command.bucket.bucket_execution_generation,
+        )),
+        MetadataCommandPayload::PutBucketProperty(command) => Some((
+            command.bucket_name(),
+            command.bucket.bucket_execution_generation,
+        )),
+        MetadataCommandPayload::PutBucketSubresource(command) => {
+            Some((&command.name, command.bucket_execution_generation))
+        }
+        MetadataCommandPayload::MarkBucketDeleting(command) => Some((
+            command.bucket_name(),
+            command.bucket.bucket_execution_generation,
+        )),
+        _ => None,
+    };
+    let Some((expected_name, expected_generation)) = expected else {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stale bucket metadata command outcome is impossible for command kind".to_string(),
+        ));
+    };
+    if name != *expected_name || bucket_execution_generation != expected_generation {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stale bucket metadata command outcome identity mismatch".to_string(),
+        ));
+    }
+    Ok(MetadataError::StaleBucketMetadataCommand {
+        name,
+        bucket_execution_generation,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -5125,6 +5191,19 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             } => Err(BucketSnapshotLoadError::Metadata(
                 MetadataError::ObjectVersionReservationConflict { version_id },
             )),
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name,
+                bucket_execution_generation,
+            } => match stale_bucket_metadata_command_error(
+                command,
+                name,
+                bucket_execution_generation,
+                "decode metadata command apply and record response",
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+            },
         }
     }
 
@@ -5178,6 +5257,12 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                         .to_string(),
                 ))
             }
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stale bucket metadata command"
+                        .to_string(),
+                )),
         }
     }
 
@@ -20401,6 +20486,13 @@ mod tests {
         fn apply_error_from_fake_response(
             outcome: StorageRpcMetadataCommandStateOutcome,
         ) -> BucketSnapshotLoadError {
+            apply_error_from_fake_response_for_command(outcome, test_metadata_command(0, 1))
+        }
+
+        fn apply_error_from_fake_response_for_command(
+            outcome: StorageRpcMetadataCommandStateOutcome,
+            command: MetadataCommandEnvelope,
+        ) -> BucketSnapshotLoadError {
             let tmp = test_util::tempdir();
             let socket_path = tmp.path().join("sock").join("storage.sock");
             private_socket_dir(socket_path.parent().unwrap());
@@ -20427,7 +20519,7 @@ mod tests {
             let err = MetadataCommandNodeClient::apply_metadata_command_and_record(
                 &client,
                 PgId::new(0),
-                &test_metadata_command(0, 1),
+                &command,
             )
             .unwrap_err();
 
@@ -20491,6 +20583,65 @@ mod tests {
             BucketSnapshotLoadError::Metadata(MetadataError::ObjectVersionReservationConflict {
                 version_id
             }) if version_id == VersionId::from_u64(7)
+        ));
+
+        let bucket = crate::tests::bucket_name("stale-bucket-rpc");
+        let stale_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+                bucket.clone(),
+                BucketSubresourceMutation::Delete {
+                    kind: BucketSubresourceKind::Cors,
+                },
+                11,
+            )),
+        );
+        let stale_bucket = apply_error_from_fake_response_for_command(
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name: bucket.clone(),
+                bucket_execution_generation: 11,
+            },
+            stale_command.clone(),
+        );
+        assert!(matches!(
+            stale_bucket,
+            BucketSnapshotLoadError::Metadata(MetadataError::StaleBucketMetadataCommand {
+                ref name,
+                bucket_execution_generation: 11,
+            }) if name == &bucket
+        ));
+
+        let stale_bucket_mismatch = apply_error_from_fake_response_for_command(
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name: crate::tests::bucket_name("wrong-stale-bucket-rpc"),
+                bucket_execution_generation: 11,
+            },
+            stale_command,
+        );
+        assert!(matches!(
+            stale_bucket_mismatch,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode metadata command apply and record response",
+                ..
+            })
+        ));
+
+        let impossible_stale_bucket = apply_error_from_fake_response(
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name: bucket,
+                bucket_execution_generation: 11,
+            },
+        );
+        assert!(matches!(
+            impossible_stale_bucket,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode metadata command apply and record response",
+                ..
+            })
         ));
     }
 

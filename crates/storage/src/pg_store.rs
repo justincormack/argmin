@@ -529,13 +529,6 @@ fn bucket_property_conflict_context(effect: BucketPropertyEffect) -> &'static st
     }
 }
 
-fn bucket_subresource_stale_context(mutation: &BucketSubresourceMutation) -> &'static str {
-    match mutation {
-        BucketSubresourceMutation::Put { .. } => "apply stale put bucket subresource command",
-        BucketSubresourceMutation::Delete { .. } => "apply stale delete bucket subresource command",
-    }
-}
-
 fn bucket_subresource_conflict_context(mutation: &BucketSubresourceMutation) -> &'static str {
     match mutation {
         BucketSubresourceMutation::Put { .. } => "apply conflicting put bucket subresource command",
@@ -5528,9 +5521,9 @@ impl PgStore {
                     });
                 }
                 if info.bucket_execution_generation > explicit {
-                    return Err(MetadataError::Db {
-                        context: bucket_subresource_stale_context(mutation),
-                        source: rusqlite::Error::InvalidQuery,
+                    return Err(MetadataError::StaleBucketMetadataCommand {
+                        name: name.clone(),
+                        bucket_execution_generation: explicit,
                     });
                 }
             }
@@ -6511,7 +6504,7 @@ impl PgStore {
         &self,
         target: &BucketRecord,
         effect: BucketRecordUpdateEffect,
-        stale_context: &'static str,
+        _stale_context: &'static str,
         conflict_context: &'static str,
     ) -> Result<(), MetadataError> {
         let current = self.head_bucket_record_raw(&target.name)?;
@@ -6525,9 +6518,9 @@ impl PgStore {
             });
         }
         if current.bucket_execution_generation > target.bucket_execution_generation {
-            return Err(MetadataError::Db {
-                context: stale_context,
-                source: rusqlite::Error::InvalidQuery,
+            return Err(MetadataError::StaleBucketMetadataCommand {
+                name: target.name.clone(),
+                bucket_execution_generation: target.bucket_execution_generation,
             });
         }
         if !Self::bucket_record_preimage_matches_update(&current, target, effect) {
@@ -21811,10 +21804,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MetadataError::Db {
-                    context: "apply stale bucket versioning command",
-                    ..
-                }
+                MetadataError::StaleBucketMetadataCommand {
+                    ref name,
+                    bucket_execution_generation: 11,
+                } if name == &bucket
             ),
             "expected stale command rejection, got {err:?}"
         );
@@ -21908,10 +21901,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MetadataError::Db {
-                    context: "apply stale bucket acl command",
-                    ..
-                }
+                MetadataError::StaleBucketMetadataCommand {
+                    ref name,
+                    bucket_execution_generation: 11,
+                } if name == &bucket
             ),
             "expected stale command rejection, got {err:?}"
         );
@@ -22013,10 +22006,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MetadataError::Db {
-                    context: "apply stale bucket encryption command",
-                    ..
-                }
+                MetadataError::StaleBucketMetadataCommand {
+                    ref name,
+                    bucket_execution_generation: 11,
+                } if name == &bucket
             ),
             "expected stale command rejection, got {err:?}"
         );
@@ -22122,10 +22115,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MetadataError::Db {
-                    context: "apply stale put bucket subresource command",
-                    ..
-                }
+                MetadataError::StaleBucketMetadataCommand {
+                    ref name,
+                    bucket_execution_generation: 11,
+                } if name == &bucket
             ),
             "expected stale command rejection, got {err:?}"
         );

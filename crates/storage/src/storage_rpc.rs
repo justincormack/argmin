@@ -2416,6 +2416,10 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
     ObjectVersionReservationConflict {
         version_id: VersionId,
     },
+    StaleBucketMetadataCommand {
+        name: BucketName,
+        bucket_execution_generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7714,6 +7718,14 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_u8(&mut out, 3);
             put_u64(&mut out, version_id.to_u64());
         }
+        StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+            ref name,
+            bucket_execution_generation,
+        } => {
+            put_u8(&mut out, 4);
+            put_string(&mut out, name.as_str());
+            put_u64(&mut out, bucket_execution_generation);
+        }
     }
     out
 }
@@ -7741,6 +7753,10 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
         },
         3 => StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
             version_id: VersionId::from_u64(decoder.read_u64()?),
+        },
+        4 => StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+            name: decoder.read_bucket_name()?,
+            bucket_execution_generation: decoder.read_u64()?,
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(

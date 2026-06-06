@@ -308,6 +308,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::InvalidBucketState => {
             "bucket is in an invalid state for this operation".to_string()
         }
+        ServerError::OperationAborted => {
+            "A conflicting conditional operation is currently in progress against this resource. Please try again.".to_string()
+        }
         ServerError::AccessControlListNotSupported => {
             "ACLs are not supported for this bucket".to_string()
         }

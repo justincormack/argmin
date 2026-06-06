@@ -717,6 +717,14 @@ pub enum MetadataError {
     #[error("object version reservation conflict: version {version_id}")]
     ObjectVersionReservationConflict { version_id: crate::types::VersionId },
 
+    #[error(
+        "stale bucket metadata command for {name} at execution generation {bucket_execution_generation}"
+    )]
+    StaleBucketMetadataCommand {
+        name: crate::types::BucketName,
+        bucket_execution_generation: u64,
+    },
+
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },
 
