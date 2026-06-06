@@ -2413,6 +2413,9 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
         reservation_id: SessionId,
         generation_id: GenerationId,
     },
+    ObjectVersionReservationConflict {
+        version_id: VersionId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7707,6 +7710,10 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_string(&mut out, reservation_id.as_str());
             put_u64(&mut out, generation_id.get());
         }
+        StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { version_id } => {
+            put_u8(&mut out, 3);
+            put_u64(&mut out, version_id.to_u64());
+        }
     }
     out
 }
@@ -7731,6 +7738,9 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
         2 => StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
             reservation_id: decoder.read_session_id()?,
             generation_id: decoder.read_generation_id()?,
+        },
+        3 => StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+            version_id: VersionId::from_u64(decoder.read_u64()?),
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(

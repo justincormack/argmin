@@ -9594,10 +9594,7 @@ impl PgStore {
         }
         let expected = self.next_version_id(bucket, key)?;
         if expected.to_u64() > version_id.to_u64() {
-            return Err(MetadataError::Db {
-                context: "reserve object version command stale version",
-                source: rusqlite::Error::InvalidQuery,
-            });
+            return Err(MetadataError::ObjectVersionReservationConflict { version_id });
         }
         // A command from the active primary may be ahead of this replica if a
         // prior reservation partially applied before restart and the pending
@@ -21367,10 +21364,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MetadataError::Db {
-                    context: "reserve object version command stale version",
-                    ..
-                }
+                MetadataError::ObjectVersionReservationConflict { version_id }
+                    if version_id == first
             ),
             "expected stale version reservation rejection, got {err:?}"
         );

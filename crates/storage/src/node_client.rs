@@ -3350,6 +3350,13 @@ impl UnixStorageNodeClient {
                 "record abandoned response cannot contain object generation reservation conflict"
                     .to_string(),
             )),
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { .. } => {
+                Err(self.rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain object version reservation conflict"
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -3404,6 +3411,11 @@ impl UnixStorageNodeClient {
                     reservation_id: reservation_id.into_string(),
                     generation_id: generation_id.get(),
                 },
+            )),
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+                version_id,
+            } => Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::ObjectVersionReservationConflict { version_id },
             )),
         }
     }
@@ -5108,6 +5120,11 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                     generation_id: generation_id.get(),
                 },
             )),
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+                version_id,
+            } => Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::ObjectVersionReservationConflict { version_id },
+            )),
         }
     }
 
@@ -5154,6 +5171,13 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                 "record abandoned response cannot contain object generation reservation conflict"
                     .to_string(),
             )),
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { .. } => {
+                Err(self.rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain object version reservation conflict"
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -20455,6 +20479,18 @@ mod tests {
                 operation: "decode metadata command apply and record response",
                 ..
             })
+        ));
+
+        let stale_version = apply_error_from_fake_response(
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+                version_id: VersionId::from_u64(7),
+            },
+        );
+        assert!(matches!(
+            stale_version,
+            BucketSnapshotLoadError::Metadata(MetadataError::ObjectVersionReservationConflict {
+                version_id
+            }) if version_id == VersionId::from_u64(7)
         ));
     }
 

@@ -4428,6 +4428,29 @@ impl super::StorageCluster {
                     {
                         continue;
                     }
+                    if applied_nodes == 0
+                        && super::StorageCluster::reserve_object_version_conflict_matches(
+                            &command, &source,
+                        )
+                    {
+                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                            .map_err(|error| {
+                                super::bucket_snapshot_error_to_object_pg_action_error(error.source)
+                            })?;
+                        let pending = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                        if pending.as_ref() != Some(&command) {
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "pending object metadata command changed before stale version cleanup",
+                            ));
+                        }
+                        self.release_metadata_command_bucket_write_reservation(&command)
+                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
+                        return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                            source,
+                        ));
+                    }
                     if applied_nodes == 0 {
                         self.record_abandoned_metadata_command_to_acting_set(&command)
                             .map_err(|error| {

@@ -714,6 +714,9 @@ pub enum MetadataError {
         generation_id: u64,
     },
 
+    #[error("object version reservation conflict: version {version_id}")]
+    ObjectVersionReservationConflict { version_id: crate::types::VersionId },
+
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },
 

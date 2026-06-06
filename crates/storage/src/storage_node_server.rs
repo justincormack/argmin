@@ -5730,6 +5730,19 @@ impl StorageNodeConnectionHandler {
                     );
                     encode_storage_rpc_success_response(&payload)
                 }
+                Err(BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::ObjectVersionReservationConflict { version_id },
+                )) => {
+                    let payload = encode_metadata_command_state_outcome_response(
+                        &StorageRpcMetadataCommandStateOutcomeResponse {
+                            outcome:
+                                StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+                                    version_id,
+                                },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
                 Err(BucketSnapshotLoadError::Metadata(error)) => {
                     encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::Internal,
@@ -7057,7 +7070,7 @@ mod tests {
 
     use crate::metadata_command::{
         MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload, ReserveObjectGenerationCommand,
+        MetadataCommandPayload, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
     use crate::storage_rpc::{
         decode_bucket_mark_deleting_command_build_response, decode_health_response,
@@ -7067,17 +7080,18 @@ mod tests {
         decode_metadata_command_pending_envelope_response,
         decode_metadata_command_pending_slot_insert_response,
         decode_metadata_command_pending_slot_remove_response,
-        decode_metadata_command_state_response, decode_read_handle_acquire_response,
-        decode_read_handle_release_response, decode_scavenger_list_files_response,
-        decode_shard_ack_item_response, decode_shard_read_range_response,
-        decode_shard_read_response, decode_shard_write_ack, decode_storage_rpc_response_payload,
-        encode_bucket_mark_deleting_command_build_request, encode_bucket_pg_request,
-        encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
-        encode_metadata_command_pending_slot_request, encode_metadata_command_request,
-        encode_metadata_command_state_request, encode_read_handle_acquire_request,
-        encode_read_handle_release_request, encode_scavenger_list_files_request,
-        encode_scavenger_observation_key_request, encode_scavenger_observation_record_request,
-        encode_shard_ack_batch_request, encode_shard_ack_item_request, encode_shard_delete_request,
+        decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
+        decode_read_handle_acquire_response, decode_read_handle_release_response,
+        decode_scavenger_list_files_response, decode_shard_ack_item_response,
+        decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
+        decode_storage_rpc_response_payload, encode_bucket_mark_deleting_command_build_request,
+        encode_bucket_pg_request, encode_metadata_command_matching_applied_request,
+        encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_request,
+        encode_metadata_command_request, encode_metadata_command_state_request,
+        encode_read_handle_acquire_request, encode_read_handle_release_request,
+        encode_scavenger_list_files_request, encode_scavenger_observation_key_request,
+        encode_scavenger_observation_record_request, encode_shard_ack_batch_request,
+        encode_shard_ack_item_request, encode_shard_delete_request,
         encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
         encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcBucketMarkDeletingCommandBuildOutcome,
@@ -7086,17 +7100,17 @@ mod tests {
         StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdRequest,
         StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
-        StorageRpcMetadataCommandStateRequest, StorageRpcReadHandleAcquireRequest,
-        StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
-        StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
-        StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
-        StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-        StorageRpcShardWriteRequest,
+        StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
+        StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
+        StorageRpcScavengerListFilesRequest, StorageRpcScavengerObservationKeyRequest,
+        StorageRpcScavengerObservationRecordRequest, StorageRpcShardAckBatchRequest,
+        StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
+        StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     };
     use crate::traits::ShardStore;
     use crate::types::{
         DataPgId, GenerationId, PgId, ShardIndex, ShardKey, ShardScavengerObservationKey,
-        ShardScavengerObservationReason, ShardScavengerObservationRecord,
+        ShardScavengerObservationReason, ShardScavengerObservationRecord, VersionId,
     };
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
@@ -8601,6 +8615,73 @@ mod tests {
         );
         drop(client);
         join.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_server_preserves_stale_object_version_apply_conflict() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let bucket = crate::tests::bucket_name("stale-version-rpc");
+        let key = crate::tests::object_key("object");
+        let pg = server._node.get_pg(0).unwrap();
+        let applied = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                VersionId::from_u64(1),
+            )),
+        );
+        pg.apply_metadata_command_and_record(7, &applied).unwrap();
+        drop(pg);
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket,
+                key,
+                VersionId::from_u64(1),
+            )),
+        );
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command: stale,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert_eq!(
+            decoded.outcome,
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+                version_id: VersionId::from_u64(1)
+            }
+        );
     }
 
     #[test]

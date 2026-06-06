@@ -767,6 +767,21 @@ impl StorageCluster {
         )
     }
 
+    fn reserve_object_version_conflict_matches(
+        command: &MetadataCommandEnvelope,
+        error: &BucketSnapshotLoadError,
+    ) -> bool {
+        matches!(
+            (command.payload(), error),
+            (
+                MetadataCommandPayload::ReserveObjectVersion(reservation),
+                BucketSnapshotLoadError::Metadata(
+                    MetadataError::ObjectVersionReservationConflict { version_id },
+                ),
+            ) if reservation.version_id == *version_id
+        )
+    }
+
     fn metadata_command_is_bucket_pg_command(command: &MetadataCommandEnvelope) -> bool {
         matches!(
             command.payload(),
@@ -2424,7 +2439,15 @@ impl StorageCluster {
             if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
                 continue;
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            match self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command) {
+                Ok(()) => {}
+                Err(ObjectPgActionError::Metadata(
+                    MetadataError::ObjectVersionReservationConflict {
+                        version_id: stale_version,
+                    },
+                )) if stale_version == version_id => continue,
+                Err(error) => return Err(error),
+            }
             return Ok(version_id);
         }
     }
