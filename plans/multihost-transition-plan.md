@@ -6241,6 +6241,9 @@ Status:
 - Added direct PUT request-path regression coverage for metadata command log
   conflict during `CommitDirectPutObject` apply, verifying the public request
   maps the contention to `OperationAborted`.
+- Added delete-object request-path regression coverage for metadata command log
+  conflict during both `DeleteObjectVersion` and `InsertDeleteMarker` apply,
+  verifying the public request maps the contention to `OperationAborted`.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

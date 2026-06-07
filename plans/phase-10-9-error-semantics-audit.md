@@ -88,6 +88,9 @@ Updated in this audit slice:
 8. direct PUT now has a request-path regression that injects metadata command
    log conflict during `CommitDirectPutObject` apply and verifies the public
    request returns `OperationAborted`
+9. delete object now has request-path regressions that inject metadata command
+   log conflict during both `DeleteObjectVersion` and `InsertDeleteMarker`
+   apply and verify the public request returns `OperationAborted`
 
 Open audit items:
 
@@ -100,8 +103,7 @@ Open audit items:
    `ServerError::Store` or `ServerError::Metadata` for expected contention
    (started for production coordinator object-PG mappings)
 4. add more request-path regressions, not only mapper tests, for streamed PUT,
-   delete object, bucket subresources, lifecycle, and MPU completion/abort
-   contention
+   bucket subresources, lifecycle, and MPU completion/abort contention
 
 ## Follow-up Notes
 
