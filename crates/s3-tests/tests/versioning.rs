@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, EncodingType, ObjectIdentifier, VersioningConfiguration,
@@ -19,6 +20,65 @@ const CONTROL_KEY_CASES: &[(&str, &str)] = &[
 
 const XML_SPECIAL_KEY: &str = "xml<>&\"key";
 const XML_SPECIAL_KEY_ENCODED: &str = "xml%3C%3E%26%22key";
+const CONCURRENT_VERSION_OPERATION_ATTEMPTS: usize = 20;
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+async fn put_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put object during concurrent version race: {err:?}"),
+        }
+    }
+}
+
+async fn delete_object_version_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("delete object version during concurrent version race: {err:?}"),
+        }
+    }
+}
 
 fn expected_raw_list_key(decoded_key: &str) -> String {
     let mut escaped = String::with_capacity(decoded_key.len());
@@ -235,14 +295,7 @@ async fn create_versioned_object_concurrent(
         let key = key.clone();
         tasks.push(tokio::spawn(async move {
             let body = format!("data {i}");
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(key)
-                .body(ByteStream::from(body.into_bytes()))
-                .send()
-                .await
-                .unwrap();
+            put_object_retrying_operation_aborted(&client, &bucket, &key, body.into_bytes()).await;
         }));
     }
 
@@ -281,14 +334,13 @@ async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: S
             let key = version.key().unwrap().to_string();
             let version_id = version.version_id().unwrap().to_string();
             tasks.push(tokio::spawn(async move {
-                client
-                    .delete_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .version_id(version_id)
-                    .send()
-                    .await
-                    .unwrap();
+                delete_object_version_retrying_operation_aborted(
+                    &client,
+                    &bucket,
+                    &key,
+                    &version_id,
+                )
+                .await;
             }));
         }
         for marker in resp.delete_markers() {
@@ -297,14 +349,13 @@ async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: S
             let key = marker.key().unwrap().to_string();
             let version_id = marker.version_id().unwrap().to_string();
             tasks.push(tokio::spawn(async move {
-                client
-                    .delete_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .version_id(version_id)
-                    .send()
-                    .await
-                    .unwrap();
+                delete_object_version_retrying_operation_aborted(
+                    &client,
+                    &bucket,
+                    &key,
+                    &version_id,
+                )
+                .await;
             }));
         }
 
