@@ -405,6 +405,70 @@ fn put_object_persists_explicit_object_owner_identity() {
 }
 
 #[test]
+fn direct_put_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
+    let primary_node = storage_cluster
+        .local_pg_route(PgId::new(object_pg))
+        .unwrap()
+        .primary_node_id();
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
+        Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+                && context.node_id == primary_node
+            {
+                return Err(storage::StoreError::MetadataCommandLogConflict {
+                    node_id: primary_node.as_u32(),
+                    pg_id: object_pg,
+                    cluster_epoch: storage::ClusterEpoch::INITIAL,
+                    log_index: 1,
+                });
+            }
+            Ok(())
+        }),
+    );
+
+    let metadata = MetadataBlob::new();
+    let err = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"first-write",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected direct PUT command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn direct_put_retry_converges_pending_partial_metadata_command() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);

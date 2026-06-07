@@ -6238,6 +6238,9 @@ Status:
 - Mapped escaped object version reservation conflicts through the central
   object-PG mapper to `OperationAborted`, matching generation reservation
   conflict handling after the storage allocator retry loop has been exhausted.
+- Added direct PUT request-path regression coverage for metadata command log
+  conflict during `CommitDirectPutObject` apply, verifying the public request
+  maps the contention to `OperationAborted`.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

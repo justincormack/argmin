@@ -85,6 +85,9 @@ Updated in this audit slice:
 7. object version reservation conflicts now map through the central object-PG
    mapper to `OperationAborted`, matching the existing generation reservation
    conflict behavior
+8. direct PUT now has a request-path regression that injects metadata command
+   log conflict during `CommitDirectPutObject` apply and verifies the public
+   request returns `OperationAborted`
 
 Open audit items:
 
@@ -96,9 +99,9 @@ Open audit items:
 3. add guardrail checks for ad hoc request-path mappings that return
    `ServerError::Store` or `ServerError::Metadata` for expected contention
    (started for production coordinator object-PG mappings)
-4. add request-path regressions, not only mapper tests, for direct PUT,
-   streamed PUT, delete object, bucket subresources, lifecycle, and MPU
-   completion/abort contention
+4. add more request-path regressions, not only mapper tests, for streamed PUT,
+   delete object, bucket subresources, lifecycle, and MPU completion/abort
+   contention
 
 ## Follow-up Notes
 
