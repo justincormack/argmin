@@ -137,8 +137,9 @@ Updated in this audit slice:
    convert that pre-side-effect overload outcome to S3 `SlowDown`, including
    the routed shard-read shape where it is wrapped as
    `StoreError::ShardStore { source: StorageRpcResourceExhausted, .. }`.
-   The public `GetObject` body consumption path and coordinator-consumed copy
-   source paths (`CopyObject` and `UploadPartCopy`) now have request-shaped
+   The public body-consumption paths (`GetObject`, `GetObjectRange`, and
+   `GetObjectPart`) and coordinator-consumed copy source paths (`CopyObject`
+   plus full-source and ranged `UploadPartCopy`) now have request-shaped
    regressions that inject this nested shard-read overload and verify it
    returns `SlowDown`. Generic `StoreError::StorageRpc` remains an internal
    transport/protocol failure.
