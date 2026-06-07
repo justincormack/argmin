@@ -1081,6 +1081,98 @@ fn abort_multipart_upload_request_maps_command_log_conflict_to_operation_aborted
 }
 
 #[test]
+fn delete_bucket_begin_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::MarkBucketDeleting,
+    );
+
+    let err = delete_bucket_test(&coord, "bucket").unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected DeleteBucket begin command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn bucket_delete_finalizer_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::DeleteCompletedMultipartUpload,
+    );
+
+    let err = coord
+        .read_runtime()
+        .try_finalize_bucket_delete_for(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected bucket delete finalizer command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn lifecycle_current_expiry_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);

@@ -6244,6 +6244,20 @@ Status:
 - Added delete-object request-path regression coverage for metadata command log
   conflict during both `DeleteObjectVersion` and `InsertDeleteMarker` apply,
   verifying the public request maps the contention to `OperationAborted`.
+- Added request-path regression coverage for streamed PUT begin/finalize,
+  bucket subresource/control-plane mutations, multipart complete/abort, and
+  lifecycle-owned object mutations so escaped metadata command contention maps
+  to `OperationAborted` instead of HTTP 500.
+- Added delete-bucket request-path regression coverage for both
+  `MarkBucketDeleting` begin and explicit bucket-finalizer cleanup of completed
+  multipart tombstones. Both inject metadata command log conflict and verify
+  the public/worker-facing path returns `OperationAborted`.
+- Closed the mapper-audit slice in
+  [`phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md)
+  after adding typed storage-RPC resource exhaustion mapping to `SlowDown`,
+  preserving shard-delete-in-progress as internal/recoverable only, and adding
+  drift guardrails for object-PG mappers, bucket snapshot mappers,
+  bucket-write drain mappers, and payload-read storage-error mapping.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
