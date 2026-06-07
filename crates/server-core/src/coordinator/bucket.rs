@@ -3,8 +3,9 @@ use s3_types::{
     BucketVersioningState,
 };
 use storage::{
-    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    BucketState, EffectiveBucketEncryptionConfig, OwnerIdentity, PublicAccessBlockConfig,
+    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketObjectOwnership,
+    BucketOwnershipControls, BucketState, EffectiveBucketEncryptionConfig, OwnerIdentity,
+    PublicAccessBlockConfig,
 };
 
 #[cfg(test)]
@@ -89,6 +90,7 @@ impl Coordinator {
             &authorized.owner,
             &authorized.name,
             authorized.acl_grants,
+            authorized.ownership,
             authorized.object_lock_enabled,
         )?;
         let _ = observability::event(
@@ -100,18 +102,7 @@ impl Coordinator {
             )),
         );
         match create_outcome {
-            BucketCreateOutcome::Created => {
-                self.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
-                    bucket: BucketRequest {
-                        name: authorized.name,
-                        requester: authorized.requester.clone(),
-                        expected_bucket_owner: None,
-                    },
-                    config: BucketOwnershipControls {
-                        object_ownership: authorized.ownership,
-                    },
-                })
-            }
+            BucketCreateOutcome::Created => Ok(()),
             BucketCreateOutcome::AlreadyOwned => {
                 if authorized.locked_to_account_region
                     || !s3_types::is_legacy_create_bucket_region(&self.region)
@@ -229,6 +220,7 @@ impl Coordinator {
             owner,
             &trusted_bucket_name(name),
             acl_grants,
+            BucketObjectOwnership::ObjectWriter,
             object_lock_enabled,
         )
     }
@@ -238,6 +230,7 @@ impl Coordinator {
         owner: &OwnerIdentity,
         name: &BucketName,
         acl_grants: AclGrants,
+        ownership: BucketObjectOwnership,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
         let public_read = Self::acl_grants_public_read(&acl_grants);
@@ -263,10 +256,14 @@ impl Coordinator {
                     public_write,
                     versioning: initial_versioning,
                     object_lock: initial_object_lock,
+                    ownership_controls: BucketOwnershipControls {
+                        object_ownership: ownership,
+                    },
                 })
                 .map_err(Self::map_bucket_snapshot_load_error)?
             {
-                storage::node::BucketCreateAttemptOutcome::Created(_info) => {
+                storage::node::BucketCreateAttemptOutcome::Created(info) => {
+                    self.clear_bucket_fast_path(&info);
                     return Ok(BucketCreateOutcome::Created);
                 }
                 storage::node::BucketCreateAttemptOutcome::Exists(existing) => {

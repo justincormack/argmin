@@ -1319,6 +1319,9 @@ fn file_bucket_execution_generation_tracks_bucket_mutations() {
                 enabled: true,
                 default_retention: None,
             },
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         })
         .unwrap();
     assert_eq!(

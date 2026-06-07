@@ -6253,6 +6253,12 @@ Status:
   `MarkBucketDeleting` begin and explicit bucket-finalizer cleanup of completed
   multipart tombstones. Both inject metadata command log conflict and verify
   the public/worker-facing path returns `OperationAborted`.
+- Made public `CreateBucket` persist the requested ownership-control mode in
+  the initial create metadata command instead of issuing a follow-up
+  `PutBucketOwnershipControls` mutation. This removes a partial-create window
+  where a second-command failure could leave an active bucket with incorrect
+  ownership controls, and the create-bucket RPC/config payload now carries the
+  required ownership mode.
 - Closed the mapper-audit slice in
   [`phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md)
   after adding typed storage-RPC resource exhaustion mapping to `SlowDown`,

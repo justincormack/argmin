@@ -179,7 +179,7 @@ impl BucketRecord {
             public_read: config.public_read,
             public_write: config.public_write,
             public_access_block: None,
-            ownership_controls: None,
+            ownership_controls: Some(config.ownership_controls),
             bucket_policy_public: false,
             bucket_policy_generation: 0,
             bucket_lifecycle_generation: 0,
@@ -3813,6 +3813,9 @@ mod tests {
                 public_write: true,
                 versioning: BucketVersioningState::Enabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             generation,
@@ -4212,6 +4215,9 @@ mod tests {
                 public_write: true,
                 versioning: BucketVersioningState::Enabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             7,
@@ -4232,7 +4238,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x5b8043f7c37bffc9);
+        assert_eq!(envelope.checksum_crc64(), 0xc7ef32eb11d5a029);
     }
 
     #[test]
@@ -4249,6 +4255,9 @@ mod tests {
                 public_write: true,
                 versioning: BucketVersioningState::Enabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             7,
@@ -4315,7 +4324,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xe6286a7b17defac2);
+        assert_eq!(envelope.checksum_crc64(), 0xded2b526e07e9315);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4341,7 +4350,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x9bd85f22eb0bceff);
+        assert_eq!(envelope.checksum_crc64(), 0xfc8eac70d3d68f6e);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4398,7 +4407,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x5c48aa22f20a2615);
+        assert_eq!(envelope.checksum_crc64(), 0x64a9505966a649eb);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4479,13 +4488,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xcd86b7559cc652cf,
-                0xaf6399dc2142e9e9,
-                0x3324d84173aa90f7,
-                0x27d78e090540a726,
+                0x16f1db0b7267a5b8,
+                0xb4e05ca696704066,
+                0x8a5b37afaa0a55a6,
+                0x615b0ab251f082b6,
                 0x1b0b799a9d4141e7,
                 0xca47a94065b4d9aa,
-                0x877b71eb747e4066,
+                0xde1bfe2304c5beb8,
             ]
         );
     }

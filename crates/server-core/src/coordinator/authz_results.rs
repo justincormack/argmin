@@ -169,7 +169,6 @@ pub(super) struct AuthorizedDeleteBucketEncryption {
 #[derive(Debug)]
 pub(super) struct AuthorizedCreateBucket {
     pub(super) name: BucketName,
-    pub(super) requester: Requester,
     pub(super) owner: OwnerIdentity,
     pub(super) locked_to_account_region: bool,
     pub(super) acl: CreateBucketAcl,

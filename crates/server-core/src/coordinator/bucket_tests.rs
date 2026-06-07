@@ -670,6 +670,9 @@ fn create_bucket_reloads_when_deleting_bucket_is_recreated_by_racer() {
                             enabled: false,
                             default_retention: None,
                         },
+                        ownership_controls: storage::BucketOwnershipControls {
+                            object_ownership: storage::BucketObjectOwnership::ObjectWriter,
+                        },
                     })
                     .unwrap();
             }
@@ -744,6 +747,46 @@ fn create_bucket_idempotent_in_us_east_1_resets_acl() {
         &AclGrantee::AllUsers,
         AclPermission::Read,
     ));
+}
+
+#[test]
+fn create_bucket_persists_requested_ownership_controls_atomically() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: test_helpers::requester("owner-a"),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::BucketOwnerPreferred,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+
+    let info = coord
+        .storage_node
+        .head_bucket_info(&trusted_bucket_name("bucket"))
+        .unwrap();
+    assert_eq!(
+        info.ownership_controls,
+        Some(BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+        })
+    );
+    assert_eq!(
+        get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap(),
+        Some(BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+        })
+    );
 }
 
 #[test]

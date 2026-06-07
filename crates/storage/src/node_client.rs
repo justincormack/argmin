@@ -6741,6 +6741,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
                 public_write: config.public_write,
                 versioning: config.versioning,
                 object_lock: config.object_lock,
+                ownership_controls: config.ownership_controls,
             },
         };
         let payload = encode_create_bucket_command_build_request(&request).map_err(|error| {
@@ -15281,6 +15282,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         let command_id = MetadataCommandId::new(
             ClusterEpoch::new(1).unwrap(),
@@ -15319,6 +15323,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         let bad_command = MetadataCommandEnvelope::new(
             command_id,
@@ -15453,6 +15460,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             1,
@@ -15490,6 +15500,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             1,
@@ -15525,6 +15538,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         let wrong_payload_command = MetadataCommandEnvelope::new(
             command_id,

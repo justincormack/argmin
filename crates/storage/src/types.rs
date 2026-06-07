@@ -2456,6 +2456,7 @@ pub struct CreateBucketConfig<'a> {
     pub public_write: bool,
     pub versioning: BucketVersioningState,
     pub object_lock: BucketObjectLockConfig,
+    pub ownership_controls: BucketOwnershipControls,
 }
 
 /// Authoritative in-memory subset of bucket metadata used on hot object paths.

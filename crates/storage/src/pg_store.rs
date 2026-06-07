@@ -6369,8 +6369,8 @@ impl PgStore {
                 };
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation, bucket_incarnation_generation) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?15, ?16)",
+                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, ownership_controls_mode, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation, bucket_incarnation_generation) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, ?16, ?17)",
                     params![
                         config.name,
                         config.owner_principal,
@@ -6381,6 +6381,7 @@ impl PgStore {
                         config.acl_grants.serialized(),
                         i32::from(config.public_read),
                         i32::from(config.public_write),
+                        Self::ownership_controls_sql_value(Some(config.ownership_controls)),
                         Option::<u8>::None,
                         object_lock_enabled,
                         object_lock_default_mode,
@@ -10879,6 +10880,9 @@ impl PgMetadataStore for PgStore {
             public_write,
             versioning: BucketVersioningState::Disabled,
             object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         })
     }
 
@@ -17843,6 +17847,9 @@ mod tests {
             public_write: false,
             versioning: BucketVersioningState::Disabled,
             object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -17869,6 +17876,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Disabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
     }
@@ -17884,6 +17894,40 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn create_bucket_with_config_persists_required_ownership_controls() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 12).unwrap();
+        let bucket = trusted_bucket_name("raw-create-ownership");
+        let owner = test_owner();
+        let acl_grants = AclGrants::default();
+        let ownership_controls = crate::BucketOwnershipControls {
+            object_ownership: crate::BucketObjectOwnership::BucketOwnerPreferred,
+        };
+
+        store
+            .create_bucket_with_config(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls,
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .head_bucket_record_raw(&bucket)
+                .unwrap()
+                .ownership_controls,
+            Some(ownership_controls)
+        );
     }
 
     #[test]
@@ -21767,6 +21811,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Disabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
 
@@ -21860,6 +21907,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Disabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
 
@@ -21961,6 +22011,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Disabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
 
@@ -22076,6 +22129,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Disabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
 

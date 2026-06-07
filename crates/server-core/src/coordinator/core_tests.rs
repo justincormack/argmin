@@ -4938,6 +4938,9 @@ fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
             public_write: false,
             versioning: BucketVersioningState::Disabled,
             object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: storage::BucketOwnershipControls {
+                object_ownership: storage::BucketObjectOwnership::ObjectWriter,
+            },
         })
         .unwrap();
     let recreated = storage_cluster
@@ -5260,6 +5263,9 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
             public_write: false,
             versioning: BucketVersioningState::Disabled,
             object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: storage::BucketOwnershipControls {
+                object_ownership: storage::BucketObjectOwnership::ObjectWriter,
+            },
         })
         .unwrap();
     let recreated = storage_cluster.test_head_bucket_raw(&bucket_name).unwrap();
@@ -5376,6 +5382,9 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
             public_write: false,
             versioning: BucketVersioningState::Disabled,
             object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: storage::BucketOwnershipControls {
+                object_ownership: storage::BucketObjectOwnership::ObjectWriter,
+            },
         })
         .unwrap();
     storage_cluster

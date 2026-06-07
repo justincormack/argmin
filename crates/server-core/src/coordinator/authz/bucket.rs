@@ -30,7 +30,6 @@ impl Coordinator {
         }
         Ok(AuthorizedCreateBucket {
             name: req.name.clone(),
-            requester: req.requester.clone(),
             owner,
             locked_to_account_region,
             acl: req.acl.clone(),

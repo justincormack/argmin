@@ -8720,6 +8720,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         let create = MetadataCommandEnvelope::new(
             MetadataCommandId::new(

@@ -989,6 +989,9 @@ impl SharedStorageNode {
             public_write: false,
             versioning: BucketVersioningState::Disabled,
             object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         let _ = self
             .create_bucket_with_config_and_load_info(&create)

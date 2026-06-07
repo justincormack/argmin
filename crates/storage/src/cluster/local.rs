@@ -4106,6 +4106,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
     }
@@ -4271,6 +4274,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -7461,6 +7467,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
 
         let outcome = cluster
@@ -10022,6 +10031,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
 
         let err = cluster
@@ -10091,6 +10103,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
         let pg_id = PgId::new(1);
         let command = {
@@ -11962,6 +11977,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
 
@@ -15396,6 +15414,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap_err();
         assert!(matches!(
@@ -16043,6 +16064,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap_err();
         assert!(
@@ -16179,6 +16203,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         let crate::BucketCreateAttemptOutcome::Created(info) = outcome else {
@@ -32997,6 +33024,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Enabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         let created = match created {
@@ -33040,6 +33070,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Enabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -33102,6 +33135,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Enabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
 
         let err = cluster
@@ -33243,6 +33279,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -33319,6 +33358,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -33389,6 +33431,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap_err();
         assert!(
@@ -33414,6 +33459,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -34095,6 +34143,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -35078,6 +35129,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         let recreated_generation = match recreated {
@@ -35184,6 +35238,9 @@ mod tests {
                 public_write: false,
                 versioning: crate::BucketVersioningState::Disabled,
                 object_lock: crate::BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -38874,6 +38931,9 @@ mod tests {
             public_write: false,
             versioning: crate::BucketVersioningState::Disabled,
             object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
         };
 
         let err = stale_cluster

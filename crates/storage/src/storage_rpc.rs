@@ -363,7 +363,7 @@ const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
         + s3_types::CANONICAL_USER_ID_LEN
         + 4
         + STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN
-        + 11;
+        + 12;
 const STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
@@ -2052,6 +2052,7 @@ pub(crate) struct StorageRpcCreateBucketConfig {
     pub(crate) public_write: bool,
     pub(crate) versioning: BucketVersioningState,
     pub(crate) object_lock: BucketObjectLockConfig,
+    pub(crate) ownership_controls: BucketOwnershipControls,
 }
 
 impl StorageRpcCreateBucketConfig {
@@ -2065,6 +2066,7 @@ impl StorageRpcCreateBucketConfig {
             public_write: self.public_write,
             versioning: self.versioning,
             object_lock: self.object_lock,
+            ownership_controls: self.ownership_controls,
         }
     }
 }
@@ -10398,6 +10400,7 @@ impl<'a> StorageRpcDecoder<'a> {
             public_write: self.read_bool()?,
             versioning: self.read_bucket_versioning_state()?,
             object_lock: self.read_bucket_object_lock_config()?,
+            ownership_controls: self.read_bucket_ownership_controls()?,
         })
     }
 
@@ -12232,6 +12235,16 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_bucket_ownership_controls(
+        &mut self,
+    ) -> Result<BucketOwnershipControls, StorageRpcPayloadError> {
+        Ok(BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::from_u8(self.read_u8()?).ok_or(
+                StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid object ownership"),
+            )?,
+        })
+    }
+
     fn read_effective_bucket_encryption_config(
         &mut self,
     ) -> Result<EffectiveBucketEncryptionConfig, StorageRpcPayloadError> {
@@ -12442,6 +12455,7 @@ fn put_create_bucket_config(out: &mut Vec<u8>, config: &StorageRpcCreateBucketCo
     put_bool(out, config.public_write);
     put_u8(out, config.versioning as u8);
     put_bucket_object_lock_config(out, &config.object_lock);
+    put_u8(out, config.ownership_controls.object_ownership as u8);
 }
 
 fn put_bucket_info(out: &mut Vec<u8>, info: &BucketInfo) {
@@ -16819,6 +16833,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Enabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             7,
@@ -16845,6 +16862,9 @@ mod tests {
                 public_write: false,
                 versioning: BucketVersioningState::Enabled,
                 object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
             },
             123,
             7,
