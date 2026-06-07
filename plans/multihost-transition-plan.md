@@ -6068,6 +6068,152 @@ Status:
   production correctness boundaries; process-local bucket locks are documented
   as test probes or retired surfaces.
 
+### Phase 10.9: Multihost Stabilization Gate
+
+Before continuing into failure, peering, repair, and migration work, stabilize
+the Phase 10 multihost request path. Recent UAT runs have exposed three related
+problems:
+
+1. some expected storage races and command-stream contention paths can still
+   escape request handlers as HTTP 500s instead of S3-shaped retryable
+   responses
+2. nondeterministic race failures are hard to diagnose without adding temporary
+   trace code, which would not help production incidents
+3. the multi-process topology adds remote RPC, metadata-command traffic, shard
+   writes, and background-worker pressure, but the current backpressure model
+   does not make overload visible or pace the S3 test harness consistently
+
+The goal of this phase is not to relax S3 behavior or make the harness retry
+through bugs. The goal is to make expected contention and overload explicit,
+observable, and S3-shaped, while preserving fail-closed behavior for real
+invariants.
+
+Work items:
+
+1. error semantics audit
+   - enumerate every storage/coordinator error family that can cross into HTTP:
+     `ObjectPgActionError`, `BucketSnapshotLoadError`, `BucketWriteDrainError`,
+     `StoreError`, `MetadataError`, and structured storage-RPC errors
+   - classify each crossing as expected contention, overload/backpressure,
+     client error, or invariant/internal failure
+   - map expected metadata-command contention, stale-generation reservation
+     conflicts, retryable drain races, and similar normal same-key races to
+     S3-shaped retryable responses such as `OperationAborted`
+   - map overload and admission failures to an S3-shaped retryable overload
+     response, not EOF, timeout, or generic HTTP 500
+   - keep true invariant failures as HTTP 500, but require a stable cause label
+     and structured context
+   - replace request-path ad hoc `ServerError::Store` /
+     `ServerError::Metadata` mappings with shared operation-specific mappers
+     where the same error families are expected
+2. request-path mapping tests
+   - add tests for public request paths, not only central mapper functions
+   - cover direct PUT, stream PUT finalization, multipart completion, bucket
+     subresources, lifecycle mutations, delete-bucket begin/finalize, and
+     metadata-command reissue/fanout contention
+   - add guardrail coverage that rejects new coordinator request paths which
+     directly map expected storage contention to generic `Store`, `Metadata`,
+     or internal errors
+3. permanent race diagnostics
+   - add structured request/RPC/metadata-command events for contention and
+     retry paths: request id, operation, stable bucket/key hashes where
+     possible, PG id, node id, RPC kind, command id/log index, retry attempt,
+     final status, and mapped cause label
+   - require explicit redaction rules for every diagnostic field: no secret
+     material, no SSE-C keys or derived plaintext key material, no request
+     authorization headers, no object payload bytes, no policy/tag bodies unless
+     separately redacted and bounded, and no unbounded bucket/key/header strings
+   - bound diagnostic field sizes and prefer stable hashes over raw names for
+     bucket/key/object identity; raw names may be emitted only in existing
+     ordinary request logs where they are already part of the configured access
+     log policy
+   - add one compact cause-chain event for every HTTP 500
+   - add counters for HTTP 500s, `OperationAborted`, overload/`SlowDown`,
+     storage-RPC failures by kind/code, metadata-command conflicts by PG/kind,
+     pending-slot drain/reissue attempts, and storage-node command-session wait
+   - add a bounded in-memory flight-recorder ring buffer per process that can
+     be dumped on abort-on-500, panic, or explicit debug endpoint/trigger
+   - make any explicit debug dump endpoint or trigger local/admin-only and
+     disabled by default unless an operator enables it deliberately
+4. backpressure and admission control
+   - define explicit foreground budgets for frontend request admission,
+     request-body bytes in flight, per-storage-node RPC concurrency,
+     per-PG metadata-command concurrency, shard IO concurrency, and shard bytes
+     in flight
+   - make overload decisions before expensive body reads or long shard/RPC work
+     where possible
+   - propagate storage-node saturation to the frontend as a typed retryable
+     overload response
+   - enforce a side-effect boundary for overload responses: return overload
+     before accepting a side-effecting operation, or only after the operation has
+     a durable idempotent command/session/reservation identity that makes client
+     retry safe
+   - fail closed instead of returning retryable overload if the server cannot
+     prove whether a non-idempotent shard write, shard ack, metadata command,
+     reservation, read handle, or cleanup side effect was accepted
+   - reserve lower-priority budgets for lifecycle, reclaim, and scavenger work
+     so background workers cannot starve foreground S3 requests
+   - ensure the UAT harness does not hide failures by retrying transport EOFs
+     or HTTP 500s; pacing must come from server-side admission/backpressure
+5. multihost UAT observability
+   - make the UAT harness always preserve a concise metrics/log summary on
+     failure: slowest operations, 409/503/500 counts, transport failures, RPC
+     latency, queue wait histograms, and storage-node saturation events
+   - add a repeated-run mode for nondeterministic failures that runs selected
+     UAT tests N times with `ARGMIN_ABORT_ON_500=1`, preserves the failing
+     iteration's data/logs, and prints the flight-recorder dump location
+   - add a stress/pacing UAT mode that intentionally exceeds configured budgets
+     and asserts S3-shaped retryable overload responses instead of timeouts,
+     EOFs, or process aborts
+
+Required tests:
+
+1. direct buffered PUT and streamed PUT expected object-PG contention return
+   `OperationAborted`, not HTTP 500
+2. multipart completion and abort expected object-PG contention return
+   operation-appropriate S3 errors, not HTTP 500
+3. bucket subresource concurrent mutations and stale execution-generation races
+   return retryable/conditional S3-shaped errors, not HTTP 500
+4. lifecycle and delete-bucket/finalizer races preserve eventually-convergent
+   behavior without returning generic 500s for expected contention
+5. frontend request admission overload returns the chosen S3 overload response
+   before request bodies time out
+6. storage-node RPC saturation returns a typed overload response and does not
+   close the connection mid-request
+7. overload injection before write/RPC admission leaves no command installed, no
+   shard ack written, no leaked bucket-write reservation, no leaked object
+   generation reservation, and no leaked read handle
+8. overload after idempotent command/session identity is established can be
+   retried safely and converges without duplicate mutation or leaked cleanup
+   state
+9. background lifecycle/reclaim/scavenger load cannot starve a bounded foreground
+   S3 PUT/GET/MPU workload
+10. every HTTP 500 in a focused failure-injection test emits a structured cause
+   label and enough request/RPC/PG context to debug without temporary tracing
+11. diagnostics and flight-recorder dumps redact secrets, payload context,
+    request headers, SSE-C material, and unbounded names; explicit dump access
+    is local/admin-only
+12. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
+   deterministic diagnostics for the first failing iteration
+13. guardrails fail if a new coordinator request path maps expected
+    metadata-command contention directly to generic `Store`, `Metadata`, or
+    internal errors
+
+Exit criteria:
+
+1. full local multi-process UAT passes repeatedly with `ARGMIN_ABORT_ON_500=1`
+   and without transport EOFs, operation-attempt timeouts, or generic HTTP 500s
+   for expected contention
+2. overload under configured stress returns bounded S3-shaped retryable
+   responses and recovers when load drops
+3. all remaining HTTP 500s are reserved for invariant/internal failures and
+   include stable structured diagnostics
+4. Phase 10 multihost request paths have central, reviewed error semantics
+   rather than ad hoc per-request mappings
+5. production diagnostics are sufficient to debug the known race classes without
+   adding temporary trace code
+6. Phase 11 starts only after this stabilization gate is closed
+
 ## Phase 11: Failure, Peering, Repair, And Migration
 
 Add real distributed behavior after the normal path is already shaped correctly.
