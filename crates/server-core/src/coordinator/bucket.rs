@@ -48,6 +48,10 @@ impl Coordinator {
         err: storage::BucketSnapshotLoadError,
     ) -> ServerError {
         match err {
+            storage::BucketSnapshotLoadError::Store(
+                storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandPendingConflict { .. },
+            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(other) => ServerError::Store(other),
             storage::BucketSnapshotLoadError::Metadata(storage::MetadataError::BucketNotEmpty) => {
                 ServerError::BucketNotEmpty

@@ -907,6 +907,10 @@ impl Coordinator {
             .storage_node
             .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Policy)
             .map_err(|error| match error {
+                storage::BucketSnapshotLoadError::Store(
+                    storage::StoreError::MetadataCommandLogConflict { .. }
+                    | storage::StoreError::MetadataCommandPendingConflict { .. },
+                ) => ServerError::OperationAborted,
                 storage::BucketSnapshotLoadError::Store(other) => ServerError::Store(other),
                 storage::BucketSnapshotLoadError::Metadata(
                     storage::MetadataError::BucketNotFound { name },

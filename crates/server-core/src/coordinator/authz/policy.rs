@@ -60,6 +60,10 @@ pub(super) fn load_bucket_tags_for_policy_action(
         .storage_node
         .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Tagging)
         .map_err(|error| match error {
+            storage::BucketSnapshotLoadError::Store(
+                storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandPendingConflict { .. },
+            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
             storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { name },

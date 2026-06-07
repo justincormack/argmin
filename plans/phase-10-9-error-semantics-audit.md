@@ -91,6 +91,17 @@ Updated in this audit slice:
 9. delete object now has request-path regressions that inject metadata command
    log conflict during both `DeleteObjectVersion` and `InsertDeleteMarker`
    apply and verify the public request returns `OperationAborted`
+10. streamed PUT now has request-path regressions for both session creation and
+   finalization. The create regression covers `CreateStreamUpload` contention
+   escaping through the bucket snapshot mapper, and the finalize regression
+   covers `CommitDirectPutObject` contention escaping through the object-PG
+   mapper; both verify the public request returns `OperationAborted`.
+11. bucket snapshot store-contention mappers now classify
+   `MetadataCommandLogConflict` and `MetadataCommandPendingConflict` as
+   `OperationAborted`, including the bucket handle, runtime, and bucket
+   subresource policy/tag loading paths. The boundary script now rejects new
+   ad hoc production `BucketSnapshotLoadError::Store` arms that map directly to
+   `ServerError::Store` outside the central mappers.
 
 Open audit items:
 
@@ -102,8 +113,8 @@ Open audit items:
 3. add guardrail checks for ad hoc request-path mappings that return
    `ServerError::Store` or `ServerError::Metadata` for expected contention
    (started for production coordinator object-PG mappings)
-4. add more request-path regressions, not only mapper tests, for streamed PUT,
-   bucket subresources, lifecycle, and MPU completion/abort contention
+4. add more request-path regressions, not only mapper tests, for bucket
+   subresources, lifecycle, and MPU completion/abort contention
 
 ## Follow-up Notes
 
@@ -128,6 +139,10 @@ Open audit items:
   mappers that fall back from `BucketSnapshotLoadError::Metadata(...)` to raw
   `ServerError::Metadata(...)` unless the same mapper segment also handles
   `StaleBucketMetadataCommand` explicitly.
+- It also rejects production coordinator `BucketSnapshotLoadError::Store` arms
+  that map directly to `ServerError::Store` outside the central bucket snapshot
+  mappers, because bucket snapshot loads can wrap object-PG command-stream
+  contention in stream create and bucket subresource paths.
 - The boundary script also rejects production coordinator bucket-write drain
   error arms that map raw `BucketWriteDrainError::Store` or `Metadata` variants
   directly to `ServerError::Store` or `ServerError::Metadata` outside

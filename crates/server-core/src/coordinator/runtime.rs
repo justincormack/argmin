@@ -287,6 +287,10 @@ impl ShardScavengerSweeper {
 impl ReadRuntime {
     fn map_bucket_snapshot_error(error: storage::BucketSnapshotLoadError) -> ServerError {
         match error {
+            storage::BucketSnapshotLoadError::Store(
+                storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandPendingConflict { .. },
+            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
             storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { name },

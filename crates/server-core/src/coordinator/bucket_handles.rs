@@ -389,6 +389,10 @@ impl<'a> BucketHandleLoader<'a> {
         error: storage::BucketSnapshotLoadError,
     ) -> ServerError {
         match error {
+            storage::BucketSnapshotLoadError::Store(
+                storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandPendingConflict { .. },
+            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
             storage::BucketSnapshotLoadError::Metadata(error) => match error {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
