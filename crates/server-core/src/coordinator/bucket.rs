@@ -21,6 +21,28 @@ use super::{
 };
 use crate::error::ServerError;
 
+pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
+    match err {
+        storage::BucketWriteDrainError::Store(
+            storage::StoreError::MetadataCommandLogConflict { .. }
+            | storage::StoreError::MetadataCommandPendingConflict { .. },
+        )
+        | storage::BucketWriteDrainError::Metadata(
+            storage::MetadataError::StaleBucketMetadataCommand { .. },
+        ) => ServerError::OperationAborted,
+        storage::BucketWriteDrainError::Store(other) => ServerError::Store(other),
+        storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotEmpty) => {
+            ServerError::BucketNotEmpty
+        }
+        storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
+            name,
+        }) => ServerError::BucketNotFound {
+            name: name.to_string(),
+        },
+        storage::BucketWriteDrainError::Metadata(other) => ServerError::Metadata(other),
+    }
+}
+
 impl Coordinator {
     pub(super) fn map_bucket_snapshot_load_error(
         err: storage::BucketSnapshotLoadError,
@@ -46,19 +68,8 @@ impl Coordinator {
         self.observe_bucket_fast_path_generation(&info.name, info.bucket_execution_generation);
     }
 
-    fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
-        match err {
-            storage::BucketWriteDrainError::Store(other) => ServerError::Store(other),
-            storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotEmpty) => {
-                ServerError::BucketNotEmpty
-            }
-            storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
-                name,
-            }) => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            storage::BucketWriteDrainError::Metadata(other) => ServerError::Metadata(other),
-        }
+    pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
+        map_bucket_write_drain_error(err)
     }
 
     pub fn create_bucket(&self, req: &CreateBucketRequest) -> Result<(), ServerError> {

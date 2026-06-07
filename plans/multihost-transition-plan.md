@@ -6230,6 +6230,11 @@ Status:
   through the central bucket snapshot mapper and adding a drift guardrail that
   rejects production bucket snapshot metadata fallbacks unless they explicitly
   handle stale bucket metadata command generations.
+- Continued the delete-bucket side of the audit by routing bucket-finalize
+  helpers through the central bucket-write drain mapper, mapping escaped
+  command-stream contention in bucket-write drain paths to `OperationAborted`,
+  and adding a drift guardrail against ad hoc bucket-write drain Store/Metadata
+  mappings.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

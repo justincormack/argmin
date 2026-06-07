@@ -78,6 +78,10 @@ Updated in this audit slice:
    mapper, so create-bucket lost/recreate checks, bucket-exists, expected-owner
    validation, and delete authorization do not leak stale bucket command races
    as raw metadata failures
+6. delete-bucket drain/finalize request helpers now delegate to the central
+   bucket-write drain mapper, and that mapper converts escaped metadata command
+   log/pending conflicts plus stale bucket metadata command generations to
+   `OperationAborted`
 
 Open audit items:
 
@@ -120,3 +124,7 @@ Open audit items:
   mappers that fall back from `BucketSnapshotLoadError::Metadata(...)` to raw
   `ServerError::Metadata(...)` unless the same mapper segment also handles
   `StaleBucketMetadataCommand` explicitly.
+- The boundary script also rejects production coordinator bucket-write drain
+  error arms that map raw `BucketWriteDrainError::Store` or `Metadata` variants
+  directly to `ServerError::Store` or `ServerError::Metadata` outside
+  `Coordinator::map_bucket_write_drain_error`.

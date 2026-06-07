@@ -1110,10 +1110,7 @@ impl ReadRuntime {
                 | storage::BucketDeleteFinalizeOutcome::Pending
                 | storage::BucketDeleteFinalizeOutcome::Finalized,
             ) => Ok(()),
-            Err(storage::BucketWriteDrainError::Store(other)) => Err(ServerError::Store(other)),
-            Err(storage::BucketWriteDrainError::Metadata(other)) => {
-                Err(ServerError::Metadata(other))
-            }
+            Err(error) => Err(super::bucket::map_bucket_write_drain_error(error)),
         }
     }
 

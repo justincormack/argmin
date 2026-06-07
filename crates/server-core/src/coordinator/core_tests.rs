@@ -187,6 +187,43 @@ fn stale_bucket_metadata_command_maps_to_operation_aborted() {
 }
 
 #[test]
+fn bucket_write_drain_contention_maps_to_operation_aborted() {
+    let bucket = trusted_bucket_name("bucket-write-drain-contention");
+    let epoch = storage::ClusterEpoch::INITIAL;
+    assert!(matches!(
+        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
+            storage::StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: epoch,
+                log_index: 3,
+            },
+        )),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
+        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
+            storage::StoreError::MetadataCommandPendingConflict {
+                pg_id: 2,
+                cluster_epoch: epoch,
+                existing_log_index: 3,
+                candidate_log_index: 4,
+            },
+        )),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
+        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Metadata(
+            storage::MetadataError::StaleBucketMetadataCommand {
+                name: bucket,
+                bucket_execution_generation: 5,
+            },
+        )),
+        ServerError::OperationAborted
+    ));
+}
+
+#[test]
 fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
