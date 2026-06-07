@@ -6249,6 +6249,10 @@ Status:
   subresource/control-plane mutations, create/complete/abort multipart, streamed
   upload-part append/finalize, and lifecycle-owned object mutations so escaped
   metadata command contention maps to `OperationAborted` instead of HTTP 500.
+- Extended that coverage through public copy wrappers: `CopyObject` now covers
+  destination stream-create and stream-finalize command contention after source
+  authorization/read setup, and `UploadPartCopy` covers destination
+  `CommitStreamPart` contention after source snapshot/read succeeds.
 - Added delete-bucket request-path regression coverage for both
   `MarkBucketDeleting` begin and explicit bucket-finalizer cleanup of completed
   multipart tombstones. Both inject metadata command log conflict and verify

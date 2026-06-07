@@ -1328,6 +1328,140 @@ fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_operatio
 }
 
 #[test]
+fn copy_object_destination_create_stream_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"copy-source",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("dst");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CreateStreamUpload,
+    );
+
+    let err = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected CopyObject destination stream create conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn copy_object_destination_finalize_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"copy-source",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("dst");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CommitDirectPutObject,
+    );
+
+    let err = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected CopyObject destination finalize conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn stream_append_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -2082,6 +2216,82 @@ fn upload_part_finalize_request_maps_command_log_conflict_to_operation_aborted()
     assert!(
         matches!(err, ServerError::OperationAborted),
         "expected UploadPart finalize command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn upload_part_copy_destination_finalize_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"upload-part-copy-source",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("dst");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CommitStreamPart,
+    );
+
+    let err = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "src", None),
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected UploadPartCopy destination commit conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
 }

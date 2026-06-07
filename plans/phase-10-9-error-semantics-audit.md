@@ -113,6 +113,10 @@ Updated in this audit slice:
    abort covers `AbortStreamUpload`, and finalize covers `ReserveObjectVersion`
    plus `CommitDirectPutObject` contention escaping through the object-PG
    mapper; all verify the public request returns `OperationAborted`.
+   `CopyObject` also has wrapper-path regressions for destination
+   `CreateStreamUpload` and `CommitDirectPutObject` contention, proving the
+   source-read plus cleanup wrapper does not convert destination stream errors
+   into HTTP 500s.
 11. bucket snapshot store-contention mappers now classify
    `MetadataCommandLogConflict` and `MetadataCommandPendingConflict` as
    `OperationAborted`, including the bucket handle, runtime, and bucket
@@ -131,7 +135,9 @@ Updated in this audit slice:
    during `CreateMultipartUpload`, `ReserveObjectVersion`,
    `CommitMultipartObject`,
    `AbortMultipartUpload`, `AppendStreamSegment`, and `CommitStreamPart` apply
-   and verify the public request returns `OperationAborted`.
+   and verify the public request returns `OperationAborted`. `UploadPartCopy`
+   has the same wrapper-path coverage for destination `CommitStreamPart`
+   contention after source snapshot/read succeeds.
 14. lifecycle worker mutation paths now have regressions for current-object
    expiry and incomplete-MPU abort. Each injects metadata command log conflict
    during the lifecycle-owned command apply and verifies the worker-facing
