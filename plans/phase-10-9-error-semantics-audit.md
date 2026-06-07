@@ -37,7 +37,7 @@ the side-effect-safe boundary described in the phase plan.
 | `StoreError::MetadataCommandLogConflict` | expected command-stream contention when emitted from request-shaped metadata mutation paths | `OperationAborted` | The storage layer often drains/retries this internally. If it escapes to a public request handler, it should not be HTTP 500. Divergent command bytes still fail closed before reaching this mapper. |
 | `StoreError::MetadataCommandPendingConflict` | expected same-PG pending-slot contention | `OperationAborted` | Normal cross-frontend race while another command owns the pending slot. |
 | `MetadataError::ObjectGenerationReservationConflict` | expected stale generation reservation race | `OperationAborted` | Direct/stream PUT should retry internally where possible; escaped contention is still client-retryable, not internal. |
-| `MetadataError::ObjectVersionReservationConflict` | expected version allocator race in command-owned allocator paths | `OperationAborted` candidate | Storage currently handles many of these internally. Audit remaining request crossings before enabling a blanket mapper. |
+| `MetadataError::ObjectVersionReservationConflict` | expected version allocator race in command-owned allocator paths | `OperationAborted` | Storage retries the exact allocator race internally where possible; an escaped typed conflict is still retryable client contention, not an internal failure. |
 | `MetadataError::StaleBucketMetadataCommand` | expected stale bucket execution generation race | `OperationAborted` | Bucket subresource/control-plane mutations and request-time bucket snapshot helpers should use this mapping consistently. |
 | `MetadataError::BucketWriteDraining` | expected delete-bucket drain race for writes | internal retry or `OperationAborted` candidate | Most write paths should wait/retry while the drain is active. Any escaped public request shape needs operation-specific review. |
 | `MetadataError::BucketWriteReservationConflict` / `BucketWriteDrainConflict` | durable reservation/drain identity conflict | fail closed unless exact-idempotent retry is proven | Usually indicates wrong or stale proof identity. Do not blanket-map to retryable HTTP without a request-specific idempotency proof. |
@@ -82,31 +82,30 @@ Updated in this audit slice:
    bucket-write drain mapper, and that mapper converts escaped metadata command
    log/pending conflicts plus stale bucket metadata command generations to
    `OperationAborted`
+7. object version reservation conflicts now map through the central object-PG
+   mapper to `OperationAborted`, matching the existing generation reservation
+   conflict behavior
 
 Open audit items:
 
-1. decide whether `MetadataError::ObjectVersionReservationConflict` should be
-   added to the central object mapper for all request-shaped object mutation
-   paths, or only for allocator-specific paths with proof of retry safety
-2. classify escaped `BucketWriteDraining` for create/PUT/MPU/copy/delete paths:
+1. classify escaped `BucketWriteDraining` for create/PUT/MPU/copy/delete paths:
    internal wait/retry is preferred, but any public escape needs an
    operation-specific S3 shape
-3. split `StoreError::StorageRpc` into typed overload/contention outcomes versus
+2. split `StoreError::StorageRpc` into typed overload/contention outcomes versus
    generic transport/protocol failures
-4. add guardrail checks for ad hoc request-path mappings that return
+3. add guardrail checks for ad hoc request-path mappings that return
    `ServerError::Store` or `ServerError::Metadata` for expected contention
    (started for production coordinator object-PG mappings)
-5. add request-path regressions, not only mapper tests, for direct PUT,
+4. add request-path regressions, not only mapper tests, for direct PUT,
    streamed PUT, delete object, bucket subresources, lifecycle, and MPU
    completion/abort contention
 
 ## Follow-up Notes
 
-- Object version reservation conflicts are not yet blanket-mapped to
-  `OperationAborted`. `StorageCluster::reserve_next_object_version` already
-  retries the exact stale-version conflict internally and only escapes other
-  cases. Those escapes may indicate mismatched durable command identity and need
-  request-specific proof before they become retryable HTTP responses.
+- Object version reservation conflicts are now mapped to `OperationAborted`.
+  `StorageCluster::reserve_next_object_version` still retries the exact
+  stale-version race internally first; the mapper handles only conflicts that
+  escape that storage retry loop.
 - Bucket write draining is currently handled inside the storage write-snapshot
   and object-mutation helpers by waiting for the durable drain and retrying.
   That is the preferred shape. Public request mappers should not grow a blanket

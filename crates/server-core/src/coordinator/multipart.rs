@@ -52,7 +52,8 @@ impl Coordinator {
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             )
             | storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::ObjectGenerationReservationConflict { .. },
+                storage::MetadataError::ObjectGenerationReservationConflict { .. }
+                | storage::MetadataError::ObjectVersionReservationConflict { .. },
             ) => ServerError::OperationAborted,
             storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
             storage::ObjectPgActionError::InvalidRequest { reason } => {

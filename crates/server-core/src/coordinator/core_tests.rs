@@ -157,6 +157,20 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             },
         ),
     );
+    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
+        storage::MetadataError::ObjectVersionReservationConflict {
+            version_id: storage::VersionId::from_u64(7),
+        },
+    ));
+    assert_read_snapshot_maps_to_operation_aborted(
+        &bucket,
+        &key,
+        storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectVersionReservationConflict {
+                version_id: storage::VersionId::from_u64(7),
+            },
+        ),
+    );
 }
 
 #[test]

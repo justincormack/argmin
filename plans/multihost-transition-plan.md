@@ -6235,6 +6235,9 @@ Status:
   command-stream contention in bucket-write drain paths to `OperationAborted`,
   and adding a drift guardrail against ad hoc bucket-write drain Store/Metadata
   mappings.
+- Mapped escaped object version reservation conflicts through the central
+  object-PG mapper to `OperationAborted`, matching generation reservation
+  conflict handling after the storage allocator retry loop has been exhausted.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
