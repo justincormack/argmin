@@ -105,10 +105,11 @@ Updated in this audit slice:
    apply and verify the public request returns `OperationAborted`
 10. streamed PUT now has request-path regressions for session creation, segment
    append, abort, and finalization. The create regression covers
-   `CreateStreamUpload` contention escaping through the bucket snapshot mapper,
-   append covers `AppendStreamSegment`, abort covers `AbortStreamUpload`, and
-   finalize covers `CommitDirectPutObject` contention escaping through the
-   object-PG mapper; all verify the public request returns `OperationAborted`.
+   `ReserveObjectGeneration` and `CreateStreamUpload` contention escaping
+   through the bucket snapshot mapper, append covers `AppendStreamSegment`,
+   abort covers `AbortStreamUpload`, and finalize covers `CommitDirectPutObject`
+   contention escaping through the object-PG mapper; all verify the public
+   request returns `OperationAborted`.
 11. bucket snapshot store-contention mappers now classify
    `MetadataCommandLogConflict` and `MetadataCommandPendingConflict` as
    `OperationAborted`, including the bucket handle, runtime, and bucket

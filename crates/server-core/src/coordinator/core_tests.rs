@@ -1172,6 +1172,36 @@ fn stream_put_begin_request_maps_command_log_conflict_to_operation_aborted() {
 }
 
 #[test]
+fn stream_put_begin_generation_reservation_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::ReserveObjectGeneration,
+    );
+
+    let err = begin_stream_put_test(&coord, "bucket", "key").unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected stream PUT begin generation reservation conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn stream_put_finalize_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
