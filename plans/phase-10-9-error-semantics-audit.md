@@ -102,6 +102,18 @@ Updated in this audit slice:
    subresource policy/tag loading paths. The boundary script now rejects new
    ad hoc production `BucketSnapshotLoadError::Store` arms that map directly to
    `ServerError::Store` outside the central mappers.
+12. bucket metadata write request paths now have regressions for each bucket-PG
+   command family: `PutBucketVersioning`, `PutBucketAcl`, `PutBucketProperty`,
+   and `PutBucketSubresource`. Each injects a metadata command log conflict at
+   apply time and verifies the public request returns `OperationAborted`.
+13. multipart completion and abort now have request-path regressions that
+   inject metadata command log conflict during `CommitMultipartObject` and
+   `AbortMultipartUpload` apply and verify the public request returns
+   `OperationAborted`.
+14. lifecycle worker mutation paths now have regressions for current-object
+   expiry and incomplete-MPU abort. Each injects metadata command log conflict
+   during the lifecycle-owned command apply and verifies the worker-facing
+   result is `OperationAborted` rather than a raw internal store error.
 
 Open audit items:
 
@@ -113,8 +125,9 @@ Open audit items:
 3. add guardrail checks for ad hoc request-path mappings that return
    `ServerError::Store` or `ServerError::Metadata` for expected contention
    (started for production coordinator object-PG mappings)
-4. add more request-path regressions, not only mapper tests, for bucket
-   subresources, lifecycle, and MPU completion/abort contention
+4. no remaining request-path-only mapper regressions are known after the
+   direct PUT, streamed PUT, delete object, bucket metadata, MPU, and lifecycle
+   worker coverage above
 
 ## Follow-up Notes
 

@@ -713,7 +713,7 @@ impl ReadRuntime {
         Ok(())
     }
 
-    fn expire_current_object_if_due(
+    pub(super) fn expire_current_object_if_due(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

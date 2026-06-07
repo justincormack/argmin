@@ -40,6 +40,68 @@ fn setup_direct_coordinator_with_storage_cluster(
     .unwrap()
 }
 
+fn install_bucket_command_log_conflict_hook(
+    storage_cluster: &Arc<StorageCluster>,
+    bucket: &BucketName,
+    kind: MetadataCommandApplyTestKind,
+) -> storage::MetadataCommandApplyContextTestHookGuard {
+    let bucket_pg = storage_cluster.test_bucket_pg_id_for(bucket);
+    let primary_node = storage_cluster
+        .local_pg_route(PgId::new(bucket_pg))
+        .unwrap()
+        .primary_node_id();
+    let hook_bucket = bucket.clone();
+    storage_cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
+        move |context| {
+            if context.kind == kind
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.is_none()
+                && context.node_id == primary_node
+            {
+                return Err(storage::StoreError::MetadataCommandLogConflict {
+                    node_id: primary_node.as_u32(),
+                    pg_id: bucket_pg,
+                    cluster_epoch: storage::ClusterEpoch::INITIAL,
+                    log_index: 1,
+                });
+            }
+            Ok(())
+        },
+    ))
+}
+
+fn install_object_command_log_conflict_hook(
+    storage_cluster: &Arc<StorageCluster>,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    kind: MetadataCommandApplyTestKind,
+) -> storage::MetadataCommandApplyContextTestHookGuard {
+    let object_pg = storage_cluster.test_object_pg_id_for(bucket, key);
+    let primary_node = storage_cluster
+        .local_pg_route(PgId::new(object_pg))
+        .unwrap()
+        .primary_node_id();
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    storage_cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
+        move |context| {
+            if context.kind == kind
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+                && context.node_id == primary_node
+            {
+                return Err(storage::StoreError::MetadataCommandLogConflict {
+                    node_id: primary_node.as_u32(),
+                    pg_id: object_pg,
+                    cluster_epoch: storage::ClusterEpoch::INITIAL,
+                    log_index: 1,
+                });
+            }
+            Ok(())
+        },
+    ))
+}
+
 fn delete_bucket_metadata_or_accept_reclaim_worker_finalize(
     storage_cluster: &StorageCluster,
     bucket: &BucketName,
@@ -585,6 +647,142 @@ fn stream_put_finalize_request_maps_command_log_conflict_to_operation_aborted() 
 }
 
 #[test]
+fn put_bucket_versioning_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::PutBucketVersioning,
+    );
+
+    let err = put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected PutBucketVersioning command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn put_bucket_acl_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::PutBucketAcl,
+    );
+
+    let err =
+        put_bucket_canned_acl_test(&coord, "bucket", BucketAcl::Private, test_requester(), None)
+            .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected PutBucketAcl command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn put_bucket_property_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::PutBucketProperty,
+    );
+
+    let err = put_bucket_public_access_block_test(
+        &coord,
+        "bucket",
+        "<PublicAccessBlockConfiguration><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected PutBucketProperty command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn put_bucket_subresource_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::PutBucketSubresource,
+    );
+
+    let cors = "<CORSConfiguration><CORSRule><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+    let err = coord
+        .put_bucket_cors(&put_bucket_config_request_with_expected_owner(
+            "bucket",
+            cors,
+            test_requester(),
+            None,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected PutBucketSubresource command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn delete_object_version_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -720,6 +918,239 @@ fn delete_object_marker_insert_request_maps_command_log_conflict_to_operation_ab
     assert!(
         matches!(err, ServerError::OperationAborted),
         "expected delete marker command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn complete_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CommitMultipartObject,
+    );
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected CompleteMultipartUpload command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn abort_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, _parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::AbortMultipartUpload,
+    );
+
+    let err = coord
+        .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+            "bucket",
+            "key",
+            &upload_id,
+            test_requester(),
+            None,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected AbortMultipartUpload command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn lifecycle_current_expiry_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        "bucket",
+        "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"expire-me",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let version_id = coord
+        .storage_node
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .as_live()
+        .unwrap()
+        .version_id;
+    let bucket_incarnation_generation = coord
+        .storage_node
+        .head_bucket_info(&bucket)
+        .unwrap()
+        .bucket_incarnation_generation;
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::DeleteObjectVersion,
+    );
+
+    let err = coord
+        .read_runtime()
+        .expire_current_object_if_due(
+            &bucket,
+            &key,
+            version_id,
+            bucket_incarnation_generation,
+            u64::MAX,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected lifecycle current expiry command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn lifecycle_abort_multipart_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        "bucket",
+        "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request("bucket", "logs/app", test_requester()),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("logs/app");
+    let bucket_incarnation_generation = coord
+        .storage_node
+        .head_bucket_info(&bucket)
+        .unwrap()
+        .bucket_incarnation_generation;
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::AbortMultipartUpload,
+    );
+
+    let err = coord
+        .read_runtime()
+        .abort_multipart_upload_if_due(
+            &bucket,
+            &key,
+            &create.upload_id,
+            bucket_incarnation_generation,
+            u64::MAX,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected lifecycle multipart abort command conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
 }
