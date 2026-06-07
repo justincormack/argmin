@@ -318,9 +318,27 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         }
     }
 
+    fn nested_delete_in_progress() -> storage::StoreError {
+        storage::StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            source: Box::new(storage::StoreError::StorageRpcShardDeleteInProgress {
+                node_id: 1,
+                operation: "shard delete",
+                message: "shard delete fenced by read handle".to_string(),
+            }),
+        }
+    }
+
     assert!(matches!(
         super::map_store_error(nested_resource_exhausted()),
         ServerError::SlowDown
+    ));
+    assert!(matches!(
+        super::map_store_error(nested_delete_in_progress()),
+        ServerError::Store(storage::StoreError::ShardStore { source, .. })
+            if matches!(*source, storage::StoreError::StorageRpcShardDeleteInProgress { .. })
     ));
     assert!(matches!(
         Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(

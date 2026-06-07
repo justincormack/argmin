@@ -2444,6 +2444,68 @@ fail_with_matches \
     "Production coordinator bucket-write drain errors must use Coordinator::map_bucket_write_drain_error instead of ad hoc Store/Metadata mapping" \
     "$raw_coordinator_bucket_write_drain_error_mappers"
 
+raw_coordinator_payload_read_store_mapping=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+        in_test_cfg = 0
+        in_payload_read_call = 0
+        payload_read_call_start = ""
+        payload_read_has_store_mapper = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*#\[/ {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            in_test_cfg = pending_test_cfg
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (in_test_cfg) {
+            next
+        }
+        if (!in_payload_read_call && $0 ~ /read_segment_payload_stored_bytes_into[[:space:]]*\(/) {
+            in_payload_read_call = 1
+            payload_read_call_start = FILENAME ":" FNR ":" $0
+            payload_read_has_store_mapper = 0
+        }
+        if (in_payload_read_call \
+            && $0 ~ /map_err[[:space:]]*\([[:space:]]*super::map_store_error[[:space:]]*\)/) {
+            payload_read_has_store_mapper = 1
+        }
+        if (in_payload_read_call && $0 ~ /[?][[:space:]]*;/) {
+            if (!payload_read_has_store_mapper) {
+                print payload_read_call_start
+            }
+            in_payload_read_call = 0
+            payload_read_call_start = ""
+            payload_read_has_store_mapper = 0
+        } else if (in_payload_read_call && $0 ~ /;[[:space:]]*$/) {
+            in_payload_read_call = 0
+            payload_read_call_start = ""
+            payload_read_has_store_mapper = 0
+        }
+    }
+    ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
+        ! -name '*_tests.rs' \
+        ! -path '*/tests/*' \
+        | sort)
+)
+fail_with_matches \
+    "Production coordinator payload reads must map storage errors through map_store_error before using ?" \
+    "$raw_coordinator_payload_read_store_mapping"
+
 raw_coordinator_bucket_snapshot_store_mappers=$(
     awk '
     FNR == 1 {

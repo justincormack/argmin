@@ -30,6 +30,16 @@ contention and stale command-generation races.
 backpressure work should use this or a deliberately chosen equivalent only at
 the side-effect-safe boundary described in the phase plan.
 
+## Status
+
+Complete for the Phase 10.9 error-semantics audit slice. The request-path
+mapper regressions found during the audit have focused coverage, and the
+boundary script now rejects the known drift classes for object-PG mappers,
+bucket snapshot mappers, bucket-write drain mappers, and payload read storage
+error mapping. Remaining Phase 10.9 work should move to diagnostics,
+observability, and backpressure implementation rather than this mapper audit,
+unless a new concrete request-path HTTP 500 regression is found.
+
 ## Error Classification
 
 | Source error | Classification | HTTP shape | Notes |
@@ -43,7 +53,7 @@ the side-effect-safe boundary described in the phase plan.
 | `MetadataError::BucketWriteReservationConflict` / `BucketWriteDrainConflict` | durable reservation/drain identity conflict | fail closed unless exact-idempotent retry is proven | Usually indicates wrong or stale proof identity. Do not blanket-map to retryable HTTP without a request-specific idempotency proof. |
 | `MetadataError::BucketNotFound` / `ObjectNotFound` / `NoSuchUpload` / `PartNotFound` | client-visible absence when the operation can reveal it | operation-specific 4xx | Auth paths may intentionally convert missing objects to `AccessDenied`. |
 | `StoreError::StorageRpcResourceExhausted` | storage-node overload before a safe side-effect boundary | `SlowDown` | The storage-node server only emits this for bounded request/session/read-handle limits before accepting the side effect. Generic RPC decode/route/protocol failures remain internal. |
-| `StoreError::StorageRpcShardDeleteInProgress` | expected physical shard reclaim/read-handle contention | operation-specific retry/overload candidate | Needs side-effect-boundary review before exposing as `SlowDown` or another retryable response. |
+| `StoreError::StorageRpcShardDeleteInProgress` | physical shard reclaim/read-handle contention | internal/recoverable only | Read-handle acquire delete fences are treated as recoverable missing shards during EC read reconstruction. Delete-side fences are cleanup/delete contention and are not currently mapped to public `SlowDown`. |
 | `StoreError::StorageRpc` | transport or remote protocol failure | internal unless structured code says otherwise | Phase 10.9 should split typed overload and typed contention from generic transport failures. |
 | route, epoch, placement, digest, checksum, corruption, IO, DB, EC errors | invariant/storage failure | internal/fail closed | Must emit structured diagnostics rather than being hidden as retryable client contention. |
 
@@ -131,19 +141,23 @@ Updated in this audit slice:
    than mutating through the drain. Delete-bucket drain ownership paths use the
    central bucket-write drain mapper. There is still no blanket public HTTP
    mapping for `BucketWriteDraining`.
+17. `StorageRpcShardDeleteInProgress` was audited as a distinct typed RPC
+   outcome. The read path already treats read-handle acquire delete fences as
+   recoverable shard absence while reconstructing from other shards. Delete-side
+   occurrences are cleanup/delete contention and remain internal or
+   best-effort cleanup diagnostics; `map_store_error` intentionally does not
+   convert this outcome to public `SlowDown`.
+18. The boundary script now rejects production coordinator payload reads that
+   call `read_segment_payload_stored_bytes_into(...)` and use `?` without first
+   mapping through `map_store_error`. This protects the nested shard-read
+   overload shape from drifting back to HTTP 500.
 
 Open audit items:
 
-1. continue splitting `StoreError::StorageRpc` into typed outcomes where the
-   server-side side-effect boundary is proven. `ResourceExhausted` is now typed
-   and maps to `SlowDown`; `StorageRpcShardDeleteInProgress` still needs
-   operation-specific retry/overload review before any public mapping.
-2. add guardrail checks for ad hoc request-path mappings that return
-   `ServerError::Store` or `ServerError::Metadata` for expected contention
-   (started for production coordinator object-PG mappings)
-3. no remaining request-path-only mapper regressions are known after the
-   direct PUT, streamed PUT, delete object, bucket metadata, MPU, and lifecycle
-   worker coverage above
+None for this error-semantics mapper audit. No remaining request-path-only
+mapper regressions are known after the direct PUT, streamed PUT, delete object,
+bucket metadata, MPU, lifecycle worker, payload read, and typed storage RPC
+coverage above.
 
 ## Follow-up Notes
 
@@ -176,3 +190,7 @@ Open audit items:
   error arms that map raw `BucketWriteDrainError::Store` or `Metadata` variants
   directly to `ServerError::Store` or `ServerError::Metadata` outside
   `Coordinator::map_bucket_write_drain_error`.
+- The same guardrail now requires production coordinator payload read calls to
+  route storage errors through `map_store_error` before `?`, so nested
+  `ShardStore { source: StorageRpcResourceExhausted, .. }` continues to map to
+  S3 `SlowDown`.
