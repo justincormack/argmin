@@ -191,15 +191,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .head_bucket_info(&name)
-            .map_err(|error| match error {
-                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::BucketNotFound { name },
-                ) => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         if info.state != BucketState::Active {
             return Err(ServerError::BucketNotFound {
                 name: name.to_string(),
@@ -215,15 +207,7 @@ impl Coordinator {
         let info = self
             .storage_node
             .head_bucket_info(name)
-            .map_err(|error| match error {
-                storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::BucketNotFound { name },
-                ) => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         if info.state != BucketState::Active {
             return Err(ServerError::BucketNotFound {
                 name: name.to_string(),

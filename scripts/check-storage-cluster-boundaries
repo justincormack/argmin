@@ -2383,6 +2383,105 @@ fail_with_matches \
     "Production coordinator object-PG errors must use Coordinator::map_object_pg_action_error instead of ad hoc Store/Metadata mapping" \
     "$raw_coordinator_object_pg_error_mappers"
 
+raw_coordinator_bucket_snapshot_metadata_mappers=$(
+    awk '
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        in_test_cfg = 0
+        in_bucket_snapshot_mapper = 0
+        mapper_depth = 0
+        brace_depth = 0
+        stale_bucket_command_seen = 0
+        fallback_count = 0
+    }
+    function brace_delta(line,    opens, closes, tmp) {
+        tmp = line
+        opens = gsub(/\{/, "{", tmp)
+        tmp = line
+        closes = gsub(/\}/, "}", tmp)
+        return opens - closes
+    }
+    function flush_mapper(    i) {
+        if (in_bucket_snapshot_mapper && fallback_count > 0 && !stale_bucket_command_seen) {
+            for (i = 1; i <= fallback_count; i++) {
+                print fallback_line[i]
+            }
+        }
+        in_bucket_snapshot_mapper = 0
+        mapper_depth = 0
+        stale_bucket_command_seen = 0
+        fallback_count = 0
+        delete fallback_line
+    }
+    function flush_function() {
+        if (!in_test_cfg) {
+            flush_mapper()
+        }
+        in_bucket_snapshot_mapper = 0
+        mapper_depth = 0
+        stale_bucket_command_seen = 0
+        fallback_count = 0
+        delete fallback_line
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*#\[/ {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            flush_function()
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            in_test_cfg = pending_test_cfg
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (in_test_cfg) {
+            brace_depth += brace_delta($0)
+            next
+        }
+        if (!in_bucket_snapshot_mapper && $0 ~ /BucketSnapshotLoadError::/) {
+            in_bucket_snapshot_mapper = 1
+            mapper_depth = brace_depth
+            if ($0 ~ /match[^{]*\{/) {
+                mapper_depth++
+            }
+        }
+        if (in_bucket_snapshot_mapper && $0 ~ /StaleBucketMetadataCommand/) {
+            stale_bucket_command_seen = 1
+        }
+        if (in_bucket_snapshot_mapper && $0 ~ /ServerError::Metadata[[:space:]]*\(/) {
+            fallback_count++
+            fallback_line[fallback_count] = FILENAME ":" FNR ":" $0
+        }
+        brace_depth += brace_delta($0)
+        if (in_bucket_snapshot_mapper && brace_depth < mapper_depth) {
+            flush_mapper()
+        }
+    }
+    END {
+        flush_function()
+    }
+    ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
+        ! -name '*_tests.rs' \
+        ! -path '*/tests/*' \
+        | sort)
+)
+fail_with_matches \
+    "Production coordinator bucket snapshot mappers must handle StaleBucketMetadataCommand before raw Metadata fallback" \
+    "$raw_coordinator_bucket_snapshot_metadata_mappers"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

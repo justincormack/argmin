@@ -6226,6 +6226,10 @@ Status:
   may not add new hand-written `ObjectPgActionError` match arms that map raw
   storage `Store`/`Metadata` variants directly to `ServerError::Store` or
   `ServerError::Metadata` outside the central mapper.
+- Continued the error semantics audit by routing active-bucket-summary loads
+  through the central bucket snapshot mapper and adding a drift guardrail that
+  rejects production bucket snapshot metadata fallbacks unless they explicitly
+  handle stale bucket metadata command generations.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

@@ -74,6 +74,10 @@ Updated in this audit slice:
 4. bucket handle, policy/tag, cached-policy test helper, and lifecycle runtime
    bucket snapshot helpers now map `StaleBucketMetadataCommand` to
    `OperationAborted`
+5. active bucket summary helpers now delegate to the central bucket snapshot
+   mapper, so create-bucket lost/recreate checks, bucket-exists, expected-owner
+   validation, and delete authorization do not leak stale bucket command races
+   as raw metadata failures
 
 Open audit items:
 
@@ -112,3 +116,7 @@ Open audit items:
   formatting, not only the current one-line spelling. Operation-specific
   mappers should preserve their special 4xx cases first, then delegate all
   remaining object-PG errors to the central mapper.
+- The same boundary script now rejects production coordinator bucket snapshot
+  mappers that fall back from `BucketSnapshotLoadError::Metadata(...)` to raw
+  `ServerError::Metadata(...)` unless the same mapper segment also handles
+  `StaleBucketMetadataCommand` explicitly.
