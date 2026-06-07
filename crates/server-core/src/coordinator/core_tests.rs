@@ -604,6 +604,40 @@ fn direct_put_request_maps_command_log_conflict_to_operation_aborted() {
 }
 
 #[test]
+fn create_bucket_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::CreateBucket,
+    );
+
+    let err = coord
+        .create_bucket(&CreateBucketRequest {
+            name: bucket,
+            requester: test_requester(),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected CreateBucket command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn stream_put_begin_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -715,6 +749,72 @@ fn stream_put_finalize_request_maps_command_log_conflict_to_operation_aborted() 
     assert!(
         matches!(err, ServerError::OperationAborted),
         "expected stream PUT finalize command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn stream_append_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::AppendStreamSegment,
+    );
+
+    let err = coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"chunk")
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected stream append command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn stream_abort_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::AbortStreamUpload,
+    );
+
+    let err = coord
+        .abort_stream_put("bucket", "key", &session_id)
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected stream abort command conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
 }
@@ -851,6 +951,63 @@ fn put_bucket_subresource_request_maps_command_log_conflict_to_operation_aborted
     assert!(
         matches!(err, ServerError::OperationAborted),
         "expected PutBucketSubresource command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn put_object_metadata_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"tag-me",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::PutObjectMetadata,
+    );
+
+    let err = put_object_tags_test(
+        &coord,
+        "bucket",
+        "key",
+        None,
+        "foo=bar",
+        test_requester(),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected PutObjectMetadata command conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
 }
@@ -996,6 +1153,49 @@ fn delete_object_marker_insert_request_maps_command_log_conflict_to_operation_ab
 }
 
 #[test]
+fn create_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CreateMultipartUpload,
+    );
+
+    let metadata = MetadataBlob::new();
+    let err = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request("bucket", "key", test_requester()),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected CreateMultipartUpload command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
 fn complete_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -1037,6 +1237,114 @@ fn complete_multipart_upload_request_maps_command_log_conflict_to_operation_abor
     assert!(
         matches!(err, ServerError::OperationAborted),
         "expected CompleteMultipartUpload command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn upload_part_append_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request("bucket", "key", test_requester()),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    let session = begin_stream_part_test(&coord, "bucket", "key", &create.upload_id, 1).unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::AppendStreamSegment,
+    );
+
+    let err = coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session.session_id, 0, b"part")
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected UploadPart append command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn upload_part_finalize_request_maps_command_log_conflict_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request("bucket", "key", test_requester()),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    let session = begin_stream_part_test(&coord, "bucket", "key", &create.upload_id, 1).unwrap();
+    let data = b"part";
+    coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session.session_id, 0, data)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CommitStreamPart,
+    );
+
+    let err = coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request("bucket", "key", &create.upload_id, test_requester()),
+            session_id: &session.session_id,
+            part_number: 1,
+            crc64: checksum::crc64::checksum(data),
+            total_size: data.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected UploadPart finalize command conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
 }

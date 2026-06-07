@@ -102,11 +102,12 @@ Updated in this audit slice:
 9. delete object now has request-path regressions that inject metadata command
    log conflict during both `DeleteObjectVersion` and `InsertDeleteMarker`
    apply and verify the public request returns `OperationAborted`
-10. streamed PUT now has request-path regressions for both session creation and
-   finalization. The create regression covers `CreateStreamUpload` contention
-   escaping through the bucket snapshot mapper, and the finalize regression
-   covers `CommitDirectPutObject` contention escaping through the object-PG
-   mapper; both verify the public request returns `OperationAborted`.
+10. streamed PUT now has request-path regressions for session creation, segment
+   append, abort, and finalization. The create regression covers
+   `CreateStreamUpload` contention escaping through the bucket snapshot mapper,
+   append covers `AppendStreamSegment`, abort covers `AbortStreamUpload`, and
+   finalize covers `CommitDirectPutObject` contention escaping through the
+   object-PG mapper; all verify the public request returns `OperationAborted`.
 11. bucket snapshot store-contention mappers now classify
    `MetadataCommandLogConflict` and `MetadataCommandPendingConflict` as
    `OperationAborted`, including the bucket handle, runtime, and bucket
@@ -117,10 +118,14 @@ Updated in this audit slice:
    command family: `PutBucketVersioning`, `PutBucketAcl`, `PutBucketProperty`,
    and `PutBucketSubresource`. Each injects a metadata command log conflict at
    apply time and verifies the public request returns `OperationAborted`.
-13. multipart completion and abort now have request-path regressions that
-   inject metadata command log conflict during `CommitMultipartObject` and
-   `AbortMultipartUpload` apply and verify the public request returns
-   `OperationAborted`.
+   `CreateBucket` has the same request-path apply-time regression.
+   Object-metadata writes are covered through a `PutObjectMetadata` regression
+   using the public `PutObjectTagging` path.
+13. multipart creation, completion, abort, and streamed upload-part commit now
+   have request-path regressions that inject metadata command log conflict
+   during `CreateMultipartUpload`, `CommitMultipartObject`,
+   `AbortMultipartUpload`, `AppendStreamSegment`, and `CommitStreamPart` apply
+   and verify the public request returns `OperationAborted`.
 14. lifecycle worker mutation paths now have regressions for current-object
    expiry and incomplete-MPU abort. Each injects metadata command log conflict
    during the lifecycle-owned command apply and verifies the worker-facing

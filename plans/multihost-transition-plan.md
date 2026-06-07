@@ -6244,10 +6244,11 @@ Status:
 - Added delete-object request-path regression coverage for metadata command log
   conflict during both `DeleteObjectVersion` and `InsertDeleteMarker` apply,
   verifying the public request maps the contention to `OperationAborted`.
-- Added request-path regression coverage for streamed PUT begin/finalize,
-  bucket subresource/control-plane mutations, multipart complete/abort, and
-  lifecycle-owned object mutations so escaped metadata command contention maps
-  to `OperationAborted` instead of HTTP 500.
+- Added request-path regression coverage for create bucket, streamed PUT
+  begin/append/abort/finalize, object metadata writes, bucket
+  subresource/control-plane mutations, create/complete/abort multipart, streamed
+  upload-part append/finalize, and lifecycle-owned object mutations so escaped
+  metadata command contention maps to `OperationAborted` instead of HTTP 500.
 - Added delete-bucket request-path regression coverage for both
   `MarkBucketDeleting` begin and explicit bucket-finalizer cleanup of completed
   multipart tombstones. Both inject metadata command log conflict and verify
