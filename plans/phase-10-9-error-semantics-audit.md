@@ -101,15 +101,16 @@ Updated in this audit slice:
    `CommitDirectPutObject` apply and verify the public request returns
    `OperationAborted`
 9. delete object now has request-path regressions that inject metadata command
-   log conflict during both `DeleteObjectVersion` and `InsertDeleteMarker`
-   apply and verify the public request returns `OperationAborted`
+   log conflict during `DeleteObjectVersion`, `ReserveObjectVersion`, and
+   `InsertDeleteMarker` apply and verify the public request returns
+   `OperationAborted`
 10. streamed PUT now has request-path regressions for session creation, segment
    append, abort, and finalization. The create regression covers
    `ReserveObjectGeneration` and `CreateStreamUpload` contention escaping
    through the bucket snapshot mapper, append covers `AppendStreamSegment`,
-   abort covers `AbortStreamUpload`, and finalize covers `CommitDirectPutObject`
-   contention escaping through the object-PG mapper; all verify the public
-   request returns `OperationAborted`.
+   abort covers `AbortStreamUpload`, and finalize covers `ReserveObjectVersion`
+   plus `CommitDirectPutObject` contention escaping through the object-PG
+   mapper; all verify the public request returns `OperationAborted`.
 11. bucket snapshot store-contention mappers now classify
    `MetadataCommandLogConflict` and `MetadataCommandPendingConflict` as
    `OperationAborted`, including the bucket handle, runtime, and bucket
@@ -125,7 +126,8 @@ Updated in this audit slice:
    using the public `PutObjectTagging` path.
 13. multipart creation, completion, abort, and streamed upload-part commit now
    have request-path regressions that inject metadata command log conflict
-   during `CreateMultipartUpload`, `CommitMultipartObject`,
+   during `CreateMultipartUpload`, `ReserveObjectVersion`,
+   `CommitMultipartObject`,
    `AbortMultipartUpload`, `AppendStreamSegment`, and `CommitStreamPart` apply
    and verify the public request returns `OperationAborted`.
 14. lifecycle worker mutation paths now have regressions for current-object
