@@ -397,6 +397,9 @@ impl<'a> BucketHandleLoader<'a> {
                 storage::MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 },
+                storage::MetadataError::StaleBucketMetadataCommand { .. } => {
+                    ServerError::OperationAborted
+                }
                 other => ServerError::Metadata(other),
             },
         }

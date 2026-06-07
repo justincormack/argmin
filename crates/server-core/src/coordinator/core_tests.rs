@@ -3,7 +3,7 @@ use super::test_support::*;
 use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
-use crate::coordinator::bucket_handles::BucketHandleRequest;
+use crate::coordinator::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
@@ -83,34 +83,107 @@ fn rwlock_helpers_recover_after_panic() {
 
 #[test]
 fn object_pg_command_contention_maps_to_operation_aborted() {
+    let bucket = trusted_bucket_name("contention-bucket");
+    let key = trusted_object_key("contention-key");
+
+    fn assert_maps_to_operation_aborted(error: storage::ObjectPgActionError) {
+        assert!(matches!(
+            Coordinator::map_object_pg_action_error(error),
+            ServerError::OperationAborted
+        ));
+    }
+
+    fn assert_read_snapshot_maps_to_operation_aborted(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        error: storage::ObjectPgActionError,
+    ) {
+        assert!(matches!(
+            Coordinator::map_object_read_snapshot_error(bucket, key, None, true, error),
+            ServerError::OperationAborted
+        ));
+    }
+
     let epoch = storage::ClusterEpoch::INITIAL;
-    let cases = [
+    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Store(
+        storage::StoreError::MetadataCommandLogConflict {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: epoch,
+            log_index: 3,
+        },
+    ));
+    assert_read_snapshot_maps_to_operation_aborted(
+        &bucket,
+        &key,
         storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandLogConflict {
             node_id: 1,
             pg_id: 2,
             cluster_epoch: epoch,
             log_index: 3,
         }),
+    );
+    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Store(
+        storage::StoreError::MetadataCommandPendingConflict {
+            pg_id: 2,
+            cluster_epoch: epoch,
+            existing_log_index: 3,
+            candidate_log_index: 4,
+        },
+    ));
+    assert_read_snapshot_maps_to_operation_aborted(
+        &bucket,
+        &key,
         storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandPendingConflict {
             pg_id: 2,
             cluster_epoch: epoch,
             existing_log_index: 3,
             candidate_log_index: 4,
         }),
+    );
+    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
+        storage::MetadataError::ObjectGenerationReservationConflict {
+            reservation_id: "reservation".to_string(),
+            generation_id: 5,
+        },
+    ));
+    assert_read_snapshot_maps_to_operation_aborted(
+        &bucket,
+        &key,
         storage::ObjectPgActionError::Metadata(
             storage::MetadataError::ObjectGenerationReservationConflict {
                 reservation_id: "reservation".to_string(),
                 generation_id: 5,
             },
         ),
-    ];
+    );
+}
 
-    for error in cases {
-        assert!(matches!(
-            Coordinator::map_object_pg_action_error(error),
-            ServerError::OperationAborted
-        ));
-    }
+#[test]
+fn stale_bucket_metadata_command_maps_to_operation_aborted() {
+    let bucket = trusted_bucket_name("stale-bucket-command");
+    let error = storage::BucketSnapshotLoadError::Metadata(
+        storage::MetadataError::StaleBucketMetadataCommand {
+            name: bucket,
+            bucket_execution_generation: 7,
+        },
+    );
+    assert!(matches!(
+        Coordinator::map_bucket_snapshot_load_error(error),
+        ServerError::OperationAborted
+    ));
+
+    let bucket = trusted_bucket_name("stale-bucket-handle-command");
+    let error = storage::BucketSnapshotLoadError::Metadata(
+        storage::MetadataError::StaleBucketMetadataCommand {
+            name: bucket,
+            bucket_execution_generation: 8,
+        },
+    );
+    assert!(matches!(
+        BucketHandleLoader::map_bucket_snapshot_error(error),
+        ServerError::OperationAborted
+    ));
 }
 
 #[test]

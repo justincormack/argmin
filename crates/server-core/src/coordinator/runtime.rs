@@ -293,6 +293,9 @@ impl ReadRuntime {
             ) => ServerError::BucketNotFound {
                 name: name.to_string(),
             },
+            storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::StaleBucketMetadataCommand { .. },
+            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Metadata(error) => ServerError::Metadata(error),
         }
     }

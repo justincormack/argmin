@@ -66,6 +66,9 @@ pub(super) fn load_bucket_tags_for_policy_action(
             ) => ServerError::BucketNotFound {
                 name: name.to_string(),
             },
+            storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::StaleBucketMetadataCommand { .. },
+            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
         })?;
     match tags {

@@ -6214,6 +6214,15 @@ Exit criteria:
    adding temporary trace code
 6. Phase 11 starts only after this stabilization gate is closed
 
+Status:
+
+- Started Phase 10.9 with the error semantics audit in
+  [`phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md).
+  The first slice classifies expected metadata-command contention, stale object
+  generation reservations, stale bucket metadata command generations, current
+  RPC/overload gaps, and the request mappers that still need follow-up tests or
+  operation-specific review.
+
 ## Phase 11: Failure, Peering, Repair, And Migration
 
 Add real distributed behavior after the normal path is already shaped correctly.

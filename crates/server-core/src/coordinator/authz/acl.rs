@@ -1053,31 +1053,7 @@ impl Coordinator {
                     }
                 }
             }
-            storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
-            storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            storage::ObjectPgActionError::InvalidRequest { reason } => {
-                ServerError::InvalidRequest { reason }
-            }
-            storage::ObjectPgActionError::StaleObjectReadSubject => ServerError::InternalError {
-                reason: "stale object read subject escaped storage retry loop".to_string(),
-            },
-            storage::ObjectPgActionError::StaleDirectPutCommitSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale direct PUT commit snapshot escaped storage retry loop"
-                        .to_string(),
-                }
-            }
-            storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale stream finalize snapshot escaped storage retry loop".to_string(),
-                }
-            }
-            storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale multipart completion snapshot escaped storage retry loop"
-                        .to_string(),
-                }
-            }
+            other => Self::map_object_pg_action_error(other),
         }
     }
 
