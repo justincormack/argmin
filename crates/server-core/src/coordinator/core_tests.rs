@@ -373,6 +373,64 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
 }
 
 #[test]
+fn get_object_payload_read_resource_exhaustion_maps_to_slow_down() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"payload-read-overload",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
+        |location, _shard_key| {
+            Err(storage::StoreError::StorageRpcResourceExhausted {
+                node_id: location.node_id().as_u32(),
+                operation: "read payload shard",
+                message: "test injected shard-read overload".to_string(),
+            })
+        },
+    ));
+
+    let err = match coord.get_object(&GetObjectRequest {
+        sse_customer: None,
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: NO_READ,
+    }) {
+        Ok(result) => result.body.read_all().unwrap_err(),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, ServerError::SlowDown),
+        "expected payload read overload to map to SlowDown, got {err:?}"
+    );
+}
+
+#[test]
 fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);

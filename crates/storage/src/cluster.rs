@@ -313,6 +313,10 @@ pub type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub type PayloadShardReadTestHook =
+    Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -323,6 +327,7 @@ struct StorageClusterTestHooks {
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
+    before_placed_payload_shard_read: Option<PayloadShardReadTestHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
     best_effort_payload_cleanup_error: Option<PayloadCleanupErrorTestHook>,
@@ -350,6 +355,11 @@ pub struct ObjectGenerationCommandIdHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct StreamAppendCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct PayloadShardReadTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -404,6 +414,13 @@ impl Drop for ObjectGenerationCommandIdHookGuard {
 impl Drop for StreamAppendCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_stream_append_command_id = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for PayloadShardReadTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_placed_payload_shard_read = None;
     }
 }
 
@@ -1376,6 +1393,38 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_placed_payload_shard_read_hook(
+        &self,
+        location: ShardLocation,
+        shard_key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_placed_payload_shard_read
+            .clone();
+        if let Some(hook) = hook {
+            hook(&location, shard_key).map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_placed_payload_shard_read_hook(
+        &self,
+        _location: ShardLocation,
+        _shard_key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_metadata_primary_payload_ack_delete_hook(
         &self,
         shard_key: &ShardKey,
@@ -2032,6 +2081,20 @@ impl StorageCluster {
         PayloadCleanupTestHookGuard {
             hooks: Arc::clone(&self.test_hooks),
             kind: PayloadCleanupTestHookKind::PlacedShardDelete,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_placed_payload_shard_read_hook(
+        &self,
+        hook: PayloadShardReadTestHook,
+    ) -> PayloadShardReadTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_placed_payload_shard_read = Some(hook);
+        PayloadShardReadTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
         }
     }
 
@@ -4706,6 +4769,13 @@ impl StorageCluster {
         for (shard_index, (location, shard_key, ack)) in direct_shards.iter().enumerate() {
             let start = shard_index * shard_size;
             let end = start + shard_size;
+            if let Err(error) =
+                self.maybe_run_before_placed_payload_shard_read_hook(*location, shard_key)
+            {
+                read_handles.release().map_err(shard_io_error_to_store)?;
+                placed_segment_recoverable_shard_error(error)?;
+                return Ok(false);
+            }
             match self.local_map.read_payload_shard_into_without_handle(
                 self.operation_epoch(),
                 *location,
@@ -4863,6 +4933,8 @@ impl StorageCluster {
         if ack.stored_size != shard_size as u64 {
             return Ok(());
         }
+        self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+            .map_err(shard_io_error_to_store)?;
         match self.read_payload_shard(location, &shard_key, ack) {
             Ok(shard) => {
                 all_shards[shard_index] = Some(shard);

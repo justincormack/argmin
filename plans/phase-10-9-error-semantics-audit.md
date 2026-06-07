@@ -137,8 +137,10 @@ Updated in this audit slice:
    convert that pre-side-effect overload outcome to S3 `SlowDown`, including
    the routed shard-read shape where it is wrapped as
    `StoreError::ShardStore { source: StorageRpcResourceExhausted, .. }`.
-   Generic `StoreError::StorageRpc` remains an internal transport/protocol
-   failure.
+   The public `GetObject` body consumption path now has a request-shaped
+   regression that injects this nested shard-read overload and verifies it
+   returns `SlowDown`. Generic `StoreError::StorageRpc` remains an internal
+   transport/protocol failure.
 16. `BucketWriteDraining` was audited across the storage acquire sites. Public
    create/PUT/stream PUT/MPU object-mutation paths wait for the durable drain
    and retry before returning to server-core. Lifecycle uses the explicit
