@@ -431,6 +431,143 @@ fn get_object_payload_read_resource_exhaustion_maps_to_slow_down() {
 }
 
 #[test]
+fn copy_object_source_payload_read_resource_exhaustion_maps_to_slow_down() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"copy-source-overload",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
+        |location, _shard_key| {
+            Err(storage::StoreError::StorageRpcResourceExhausted {
+                node_id: location.node_id().as_u32(),
+                operation: "read payload shard",
+                message: "test injected copy source overload".to_string(),
+            })
+        },
+    ));
+
+    let err = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ServerError::SlowDown),
+        "expected copy source read overload to map to SlowDown, got {err:?}"
+    );
+}
+
+#[test]
+fn upload_part_copy_source_payload_read_resource_exhaustion_maps_to_slow_down() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"upload-part-copy-source-overload",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
+        |location, _shard_key| {
+            Err(storage::StoreError::StorageRpcResourceExhausted {
+                node_id: location.node_id().as_u32(),
+                operation: "read payload shard",
+                message: "test injected upload-part-copy source overload".to_string(),
+            })
+        },
+    ));
+
+    let err = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "src", None),
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ServerError::SlowDown),
+        "expected upload-part-copy source read overload to map to SlowDown, got {err:?}"
+    );
+}
+
+#[test]
 fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
