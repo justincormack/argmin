@@ -96,9 +96,10 @@ Updated in this audit slice:
 7. object version reservation conflicts now map through the central object-PG
    mapper to `OperationAborted`, matching the existing generation reservation
    conflict behavior
-8. direct PUT now has a request-path regression that injects metadata command
-   log conflict during `CommitDirectPutObject` apply and verifies the public
-   request returns `OperationAborted`
+8. direct PUT now has request-path regressions that inject metadata command
+   log conflict during `ReserveObjectGeneration`, `ReserveObjectVersion`, and
+   `CommitDirectPutObject` apply and verify the public request returns
+   `OperationAborted`
 9. delete object now has request-path regressions that inject metadata command
    log conflict during both `DeleteObjectVersion` and `InsertDeleteMarker`
    apply and verify the public request returns `OperationAborted`
