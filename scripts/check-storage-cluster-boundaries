@@ -2322,6 +2322,67 @@ fail_with_matches \
     "Route/control-plane error converted through generic StoreError::Io" \
     "$allowed_generic_route_io"
 
+raw_coordinator_object_pg_error_mappers=$(
+    awk '
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        in_test_cfg = 0
+        in_raw_object_pg_arm = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*#\[/ {
+        next
+    }
+    function update_function_context() {
+        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            current_fn = $0
+            sub(/^.*fn /, "", current_fn)
+            sub(/\(.*/, "", current_fn)
+            in_test_cfg = pending_test_cfg
+            pending_test_cfg = 0
+        } else if (pending_test_cfg \
+            && $0 !~ /^[[:space:]]*$/ \
+            && $0 !~ /^[[:space:]]*#\[/) {
+            pending_test_cfg = 0
+        }
+    }
+    {
+        update_function_context()
+        if (in_test_cfg || current_fn == "map_object_pg_action_error") {
+            in_raw_object_pg_arm = 0
+            next
+        }
+        if ($0 ~ /^[[:space:]]*storage::ObjectPgActionError::[A-Za-z0-9_]+/ \
+            || $0 ~ /^[[:space:]]*ObjectPgActionError::[A-Za-z0-9_]+/ \
+            || $0 ~ /^[[:space:]]*[|][[:space:]]*storage::ObjectPgActionError::[A-Za-z0-9_]+/ \
+            || $0 ~ /^[[:space:]]*[|][[:space:]]*ObjectPgActionError::[A-Za-z0-9_]+/) {
+            in_raw_object_pg_arm = 0
+        }
+        if ($0 ~ /ObjectPgActionError::(Store|Metadata)[[:space:]]*\(/) {
+            in_raw_object_pg_arm = 1
+        }
+        if (in_raw_object_pg_arm && $0 ~ /ServerError::(Store|Metadata)[[:space:]]*\(/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        if (in_raw_object_pg_arm \
+            && ($0 ~ /^[[:space:]]*}[,]?[[:space:]]*$/ \
+                || $0 ~ /^[[:space:]]*(other|_|[A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=>/)) {
+            in_raw_object_pg_arm = 0
+        }
+    }
+    ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
+        ! -name '*_tests.rs' \
+        ! -path '*/tests/*' \
+        | sort)
+)
+fail_with_matches \
+    "Production coordinator object-PG errors must use Coordinator::map_object_pg_action_error instead of ad hoc Store/Metadata mapping" \
+    "$raw_coordinator_object_pg_error_mappers"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

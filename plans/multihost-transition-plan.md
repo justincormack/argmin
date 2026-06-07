@@ -6222,6 +6222,10 @@ Status:
   generation reservations, stale bucket metadata command generations, current
   RPC/overload gaps, and the request mappers that still need follow-up tests or
   operation-specific review.
+- Added the first drift guardrail for the audit: production coordinator code
+  may not add new hand-written `ObjectPgActionError` match arms that map raw
+  storage `Store`/`Metadata` variants directly to `ServerError::Store` or
+  `ServerError::Metadata` outside the central mapper.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

@@ -87,7 +87,28 @@ Open audit items:
    generic transport/protocol failures
 4. add guardrail checks for ad hoc request-path mappings that return
    `ServerError::Store` or `ServerError::Metadata` for expected contention
+   (started for production coordinator object-PG mappings)
 5. add request-path regressions, not only mapper tests, for direct PUT,
    streamed PUT, delete object, bucket subresources, lifecycle, and MPU
    completion/abort contention
 
+## Follow-up Notes
+
+- Object version reservation conflicts are not yet blanket-mapped to
+  `OperationAborted`. `StorageCluster::reserve_next_object_version` already
+  retries the exact stale-version conflict internally and only escapes other
+  cases. Those escapes may indicate mismatched durable command identity and need
+  request-specific proof before they become retryable HTTP responses.
+- Bucket write draining is currently handled inside the storage write-snapshot
+  and object-mutation helpers by waiting for the durable drain and retrying.
+  That is the preferred shape. Public request mappers should not grow a blanket
+  `BucketWriteDraining` to HTTP mapping unless a specific operation proves the
+  side-effect boundary and desired S3 response.
+- `scripts/check-storage-cluster-boundaries` now rejects new production
+  coordinator `ObjectPgActionError` match arms that directly map
+  `Store(error)` to `ServerError::Store(error)` or `Metadata(error)` to
+  `ServerError::Metadata(error)` outside `Coordinator::map_object_pg_action_error`.
+  The check tracks the raw `Store`/`Metadata` arm across block and multiline
+  formatting, not only the current one-line spelling. Operation-specific
+  mappers should preserve their special 4xx cases first, then delegate all
+  remaining object-PG errors to the central mapper.
