@@ -86,6 +86,9 @@ static TRACE_SINK_OVERRIDE: OnceLock<TraceSink> = OnceLock::new();
 static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static REQUEST_FINISH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HTTP_500_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OPERATION_ABORTED_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SLOW_DOWN_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -403,6 +406,9 @@ pub struct MetricsSnapshot {
     pub inflight_requests: u64,
     pub request_finish_total: u64,
     pub request_error_total: u64,
+    pub http_500_response_total: u64,
+    pub operation_aborted_response_total: u64,
+    pub slow_down_response_total: u64,
     pub slow_request_total: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
@@ -434,6 +440,9 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         inflight_requests: INFLIGHT_REQUESTS.load(Ordering::Relaxed),
         request_finish_total: REQUEST_FINISH_TOTAL.load(Ordering::Relaxed),
         request_error_total: REQUEST_ERROR_TOTAL.load(Ordering::Relaxed),
+        http_500_response_total: HTTP_500_RESPONSE_TOTAL.load(Ordering::Relaxed),
+        operation_aborted_response_total: OPERATION_ABORTED_RESPONSE_TOTAL.load(Ordering::Relaxed),
+        slow_down_response_total: SLOW_DOWN_RESPONSE_TOTAL.load(Ordering::Relaxed),
         slow_request_total: SLOW_REQUEST_TOTAL.load(Ordering::Relaxed),
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
@@ -477,14 +486,27 @@ pub fn emit_request_error(
     summary: RequestSummary<'_>,
     stage: &'static str,
     error_code: &str,
+    cause_label: &'static str,
 ) -> bool {
     REQUEST_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if summary.status_code == 500 {
+        HTTP_500_RESPONSE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    match (summary.status_code, error_code) {
+        (409, "OperationAborted") => {
+            OPERATION_ABORTED_RESPONSE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        (503, "SlowDown") => {
+            SLOW_DOWN_RESPONSE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
     event_in_context(
         context,
         target,
         "request_error",
         Some(format_args!(
-            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} stage={} error_code={}",
+            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} stage={} error_code={} cause_label={}",
             summary.status_code,
             summary.method,
             summary.path,
@@ -496,7 +518,8 @@ pub fn emit_request_error(
             summary.bytes_sent,
             summary.lifetime_us,
             stage,
-            error_code
+            error_code,
+            cause_label
         )),
     )
 }
@@ -953,6 +976,7 @@ mod tests {
             summary,
             "response_body",
             "InternalError",
+            "storage_rpc_resource_exhausted",
         );
         emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
@@ -973,6 +997,18 @@ mod tests {
         let after = metrics_snapshot();
         assert_eq!(after.request_finish_total, before.request_finish_total + 1);
         assert_eq!(after.request_error_total, before.request_error_total + 1);
+        assert_eq!(
+            after.http_500_response_total,
+            before.http_500_response_total
+        );
+        assert_eq!(
+            after.operation_aborted_response_total,
+            before.operation_aborted_response_total
+        );
+        assert_eq!(
+            after.slow_down_response_total,
+            before.slow_down_response_total
+        );
         assert_eq!(after.slow_request_total, before.slow_request_total + 1);
         assert_eq!(
             after.bucket_lock_wait_exceeded_total,
@@ -985,6 +1021,82 @@ mod tests {
         assert_eq!(
             after.shard_scavenger_scan_incomplete_total,
             before.shard_scavenger_scan_incomplete_total + 1
+        );
+    }
+
+    #[test]
+    fn request_error_metrics_classify_500_operation_aborted_and_slow_down() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let before = metrics_snapshot();
+        let ctx = TraceContext::new_request();
+        let mut summary = RequestSummary {
+            method: "PUT",
+            path: "/bucket/key",
+            query: query_summary(""),
+            status_code: 500,
+            streaming: false,
+            body_len: 0,
+            bytes_sent: 0,
+            lifetime_us: 7,
+        };
+
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "InternalError",
+            "metadata_command_log_conflict",
+        );
+        summary.status_code = 409;
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "OperationAborted",
+            "operation_aborted",
+        );
+        summary.status_code = 503;
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "SlowDown",
+            "slow_down",
+        );
+        summary.status_code = 206;
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "InternalError",
+            "shard_store_storage_rpc_resource_exhausted",
+        );
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "SlowDown",
+            "slow_down",
+        );
+
+        let after = metrics_snapshot();
+        assert_eq!(after.request_error_total, before.request_error_total + 5);
+        assert_eq!(
+            after.http_500_response_total,
+            before.http_500_response_total + 1
+        );
+        assert_eq!(
+            after.operation_aborted_response_total,
+            before.operation_aborted_response_total + 1
+        );
+        assert_eq!(
+            after.slow_down_response_total,
+            before.slow_down_response_total + 1
         );
     }
 

@@ -6253,6 +6253,15 @@ Status:
   destination stream-create and stream-finalize command contention after source
   authorization/read setup, and `UploadPartCopy` covers destination
   `CommitStreamPart` contention after source snapshot/read succeeds.
+- Started the permanent diagnostics slice by adding redacted
+  `ServerError::diagnostic_cause_label()` classification, carrying those labels
+  through `S3Response::error*`, and emitting compact HTTP `request_error`
+  diagnostics with `error_code` plus `cause_label` for immediate error
+  responses and streaming body errors. Added counters for exact HTTP 500
+  responses, `OperationAborted`, and `SlowDown`. This covers the first compact
+  HTTP failure breadcrumb; per-RPC/per-metadata-command retry events, conflict
+  counters by PG/kind, command-session wait counters, and the bounded
+  flight-recorder/debug-dump path remain in the diagnostics slice.
 - Added delete-bucket request-path regression coverage for both
   `MarkBucketDeleting` begin and explicit bucket-finalizer cleanup of completed
   multipart tombstones. Both inject metadata command log conflict and verify

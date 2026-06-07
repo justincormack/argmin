@@ -136,6 +136,14 @@ pub struct S3Response {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub stream: Option<ReadHandle>,
+    pub(crate) error_diagnostic: Option<ErrorDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ErrorDiagnostic {
+    pub status_code: u16,
+    pub error_code: &'static str,
+    pub cause_label: &'static str,
 }
 
 pub struct CreateMultipartUploadResponseContext<'a> {
@@ -722,7 +730,17 @@ impl S3Response {
             headers: Vec::new(),
             body: Vec::new(),
             stream: None,
+            error_diagnostic: None,
         }
+    }
+
+    fn with_error_diagnostic(mut self, err: &ServerError) -> Self {
+        self.error_diagnostic = Some(ErrorDiagnostic {
+            status_code: err.http_status(),
+            error_code: err.s3_error_code(),
+            cause_label: err.diagnostic_cause_label(),
+        });
+        self
     }
 
     fn header(mut self, name: &str, value: &str) -> Self {
@@ -1933,13 +1951,13 @@ impl S3Response {
     #[must_use]
     pub fn error(err: &ServerError, resource: &str, host_id: &str) -> Self {
         let wire_ids = WireResponseIds::new(TEST_REQUEST_ID, host_id);
-        Self::client_error_response_with_ids(err, resource, &wire_ids)
+        Self::client_error_response_with_ids(err, resource, &wire_ids).with_error_diagnostic(err)
     }
 
     /// Build an error response with explicit wire IDs.
     #[must_use]
     pub fn error_with_ids(err: &ServerError, resource: &str, wire_ids: &WireResponseIds) -> Self {
-        Self::client_error_response_with_ids(err, resource, wire_ids)
+        Self::client_error_response_with_ids(err, resource, wire_ids).with_error_diagnostic(err)
     }
 }
 

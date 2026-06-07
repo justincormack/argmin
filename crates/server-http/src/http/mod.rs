@@ -43,7 +43,7 @@ use conditional::{
 };
 use md5_legacy::Digest;
 use request::{S3Request, TransportSecurity};
-use response::{S3Response, WireResponseIds};
+use response::{ErrorDiagnostic, S3Response, WireResponseIds};
 use router::{route, S3Operation};
 use s3_types::{
     requires_sigv4, BucketLifecycleConfiguration, BucketNamespace, LegalHoldStatus, ObjectLockMode,
@@ -657,17 +657,26 @@ impl ResponseBodyTrace {
     }
 
     fn emit_error(&mut self, err: &ServerError) {
+        self.emit_error_diagnostic(ErrorDiagnostic {
+            status_code: err.http_status(),
+            error_code: err.s3_error_code(),
+            cause_label: err.diagnostic_cause_label(),
+        });
+    }
+
+    fn emit_error_diagnostic(&mut self, diagnostic: ErrorDiagnostic) {
         if self.terminal_event_emitted {
             return;
         }
         self.terminal_event_emitted = true;
-        self.emit_slow_request_if_needed("error", Some(err.s3_error_code()));
+        self.emit_slow_request_if_needed("error", Some(diagnostic.error_code));
         let _ = observability::emit_request_error(
             &self.meta.context,
             TRACE_TARGET,
             self.request_summary(),
             "response_body",
-            err.s3_error_code(),
+            diagnostic.error_code,
+            diagnostic.cause_label,
         );
     }
 }
@@ -926,12 +935,12 @@ impl HttpFrontend {
                             TRACE_TARGET,
                             "dispatch_internal_error",
                             Some(format_args!(
-                                "method={} path={:?} status={} code={} error={:?}",
+                                "method={} path={:?} status={} code={} cause_label={}",
                                 s3req.method.as_str(),
                                 s3req.path(),
                                 err.http_status(),
                                 err.s3_error_code(),
-                                err
+                                err.diagnostic_cause_label()
                             )),
                         );
                     }
@@ -4558,8 +4567,12 @@ pub fn s3_response_to_hyper(
             S3Response::error_with_ids(&ServerError::InternalError { reason }, "", &wire_ids);
         let status = http::StatusCode::from_u16(resp.status_code)
             .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-        let trace =
+        let error_diagnostic = resp.error_diagnostic;
+        let mut trace =
             ResponseBodyTrace::new(trace_meta, resp.status_code, resp.body.len() as u64, false);
+        if let Some(diagnostic) = error_diagnostic {
+            trace.emit_error_diagnostic(diagnostic);
+        }
         let inflight_requests_guard = permit
             .as_ref()
             .map(|_| observability::inflight_requests_guard());
@@ -4602,12 +4615,17 @@ pub fn s3_response_to_hyper(
     };
     if (panic_on_500 || abort_on_500) && resp.status_code == 500 {
         let body = String::from_utf8_lossy(&resp.body);
+        let diagnostic_suffix = resp
+            .error_diagnostic
+            .map(|diagnostic| format!(" cause_label={}", diagnostic.cause_label))
+            .unwrap_or_default();
         fail_on_500_diagnostic(
             format!(
-                "server produced HTTP 500 response for {} {} (has_query={}): {body}",
+                "server produced HTTP 500 response for {} {} (has_query={}){}: {body}",
                 trace_meta.method,
                 trace_meta.path,
-                trace_meta.query.has_query()
+                trace_meta.query.has_query(),
+                diagnostic_suffix
             ),
             panic_on_500,
             abort_on_500,
@@ -4691,10 +4709,11 @@ pub fn s3_response_to_hyper(
         body_len,
         resp.stream.is_some(),
     );
+    let error_diagnostic = resp.error_diagnostic;
     let inflight_requests_guard = permit
         .as_ref()
         .map(|_| observability::inflight_requests_guard());
-    let body = match resp.stream {
+    let mut body = match resp.stream {
         Some(stream) => S3HyperBody::streaming(
             stream,
             permit,
@@ -4704,6 +4723,11 @@ pub fn s3_response_to_hyper(
         ),
         None => S3HyperBody::buffered(resp.body, permit, inflight_requests_guard, trace),
     };
+    if let Some(diagnostic) = error_diagnostic {
+        if let Some(trace) = body.trace.as_mut() {
+            trace.emit_error_diagnostic(diagnostic);
+        }
+    }
     let mut response = http::Response::new(body);
     *response.status_mut() = status;
     for (name, value) in validated_headers {
@@ -6497,6 +6521,7 @@ mod tests {
                 headers: Vec::new(),
                 body: Vec::new(),
                 stream: None,
+                error_diagnostic: None,
             };
             apply_response_overrides(&mut resp, &req);
             assert_eq!(find_header(&resp, header_name), Some(expected));
@@ -6541,6 +6566,7 @@ mod tests {
                 headers: Vec::new(),
                 body: Vec::new(),
                 stream: None,
+                error_diagnostic: None,
             };
             if header_name == "Content-Type" {
                 resp.headers.push((
@@ -6560,6 +6586,7 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
             stream: None,
+            error_diagnostic: None,
         };
         resp.headers.push((
             "Content-Type".to_string(),
@@ -6591,6 +6618,7 @@ mod tests {
             headers: Vec::new(),
             body: b"<Error><Code>InternalError</Code></Error>".to_vec(),
             stream: None,
+            error_diagnostic: None,
         };
 
         let _ = s3_response_to_hyper(
@@ -6619,6 +6647,7 @@ mod tests {
             ],
             body: b"hello".to_vec(),
             stream: None,
+            error_diagnostic: None,
         };
 
         let hyper_resp = s3_response_to_hyper(
@@ -6680,6 +6709,7 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
             stream: None,
+            error_diagnostic: None,
         };
 
         let hyper_resp = s3_response_to_hyper(
@@ -6714,6 +6744,36 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("stable-host-id")
         );
+    }
+
+    #[test]
+    fn streaming_body_error_diagnostic_preserves_response_status() {
+        let mut trace = ResponseBodyTrace::new(
+            ResponseTraceMeta::new(
+                observability::TraceContext::from_ids(
+                    "0123456789abcdef0123456789abcdef".to_string(),
+                    "2VG1X5NNMZ52HKC0".to_string(),
+                ),
+                Arc::<str>::from("stable-host-id"),
+                "GET",
+                "/bucket/key",
+                "partNumber=1",
+            ),
+            206,
+            1024,
+            true,
+        );
+
+        trace.emit_error(&ServerError::Store(
+            storage::StoreError::StorageRpcResourceExhausted {
+                node_id: 1,
+                operation: "ReadHandlesAcquire",
+                message: "limit exceeded".to_string(),
+            },
+        ));
+
+        assert_eq!(trace.status_code, 206);
+        assert!(trace.terminal_event_emitted);
     }
 
     #[test]

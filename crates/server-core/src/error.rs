@@ -301,6 +301,26 @@ pub enum ServerError {
 }
 
 impl ServerError {
+    /// Stable, redacted label for server-side diagnostics.
+    ///
+    /// This is intentionally coarser than `Debug`/`Display`: labels must be
+    /// safe to emit in production traces and metrics without leaking request,
+    /// policy, object, auth, or payload details.
+    pub fn diagnostic_cause_label(&self) -> &'static str {
+        match self {
+            Self::Store(error) => store_error_diagnostic_cause_label(error),
+            Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
+            Self::Ec(_) => "ec_error",
+            Self::MetadataBlobError { .. } => "metadata_blob_error",
+            Self::InternalError { .. } => "internal_error",
+            Self::IntegrityError { .. } => "integrity_error",
+            Self::SlowDown => "slow_down",
+            Self::OperationAborted => "operation_aborted",
+            Self::Auth(_) => "auth_error",
+            _ => self.s3_error_code(),
+        }
+    }
+
     /// Map to S3 error code string.
     pub fn s3_error_code(&self) -> &'static str {
         match self {
@@ -503,6 +523,56 @@ impl ServerError {
     }
 }
 
+fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
+        StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
+        StoreError::MetadataCommandPendingOnNonPrimary { .. } => {
+            "metadata_command_pending_on_non_primary"
+        }
+        StoreError::MetadataCommandLogChecksumMismatch { .. }
+        | StoreError::MetadataCommandLogHashMismatch { .. }
+        | StoreError::MetadataCommandReplicaStateDiverged { .. }
+        | StoreError::MetadataStateDigestMismatch { .. } => "metadata_command_replica_diverged",
+        StoreError::StorageRpcResourceExhausted { .. } => "storage_rpc_resource_exhausted",
+        StoreError::StorageRpcShardDeleteInProgress { .. } => {
+            "storage_rpc_shard_delete_in_progress"
+        }
+        StoreError::StorageRpc { .. } => "storage_rpc_error",
+        StoreError::ShardStore { source, .. } => match store_error_diagnostic_cause_label(source) {
+            "storage_rpc_resource_exhausted" => "shard_store_storage_rpc_resource_exhausted",
+            "storage_rpc_shard_delete_in_progress" => {
+                "shard_store_storage_rpc_shard_delete_in_progress"
+            }
+            "storage_rpc_error" => "shard_store_storage_rpc_error",
+            _ => "shard_store_error",
+        },
+        StoreError::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
+        StoreError::Io { .. } => "store_io_error",
+        StoreError::Db { .. } => "store_db_error",
+        StoreError::ErasureCoding { .. } => "store_erasure_coding_error",
+        _ => "store_error",
+    }
+}
+
+fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str {
+    match error {
+        MetadataError::BucketWriteDraining => "bucket_write_draining",
+        MetadataError::BucketWriteReservationConflict { .. } => "bucket_write_reservation_conflict",
+        MetadataError::BucketWriteDrainConflict { .. } => "bucket_write_drain_conflict",
+        MetadataError::ReclaimClaimConflict { .. } => "reclaim_claim_conflict",
+        MetadataError::ObjectGenerationReservationConflict { .. } => {
+            "object_generation_reservation_conflict"
+        }
+        MetadataError::ObjectVersionReservationConflict { .. } => {
+            "object_version_reservation_conflict"
+        }
+        MetadataError::StaleBucketMetadataCommand { .. } => "stale_bucket_metadata_command",
+        MetadataError::Db { .. } => "metadata_db_error",
+        _ => "metadata_error",
+    }
+}
+
 impl From<MetadataError> for ServerError {
     fn from(e: MetadataError) -> Self {
         match e {
@@ -590,6 +660,55 @@ mod tests {
             key: "k".into(),
         };
         assert_eq!(err.s3_error_code(), "NoSuchKey");
+    }
+
+    #[test]
+    fn diagnostic_cause_label_classifies_contention_and_rpc_overload() {
+        let log_conflict = ServerError::Store(StoreError::MetadataCommandLogConflict {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            log_index: 3,
+        });
+        assert_eq!(
+            log_conflict.diagnostic_cause_label(),
+            "metadata_command_log_conflict"
+        );
+
+        let pending_conflict = ServerError::Store(StoreError::MetadataCommandPendingConflict {
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            existing_log_index: 3,
+            candidate_log_index: 4,
+        });
+        assert_eq!(
+            pending_conflict.diagnostic_cause_label(),
+            "metadata_command_pending_conflict"
+        );
+
+        let shard_overload = ServerError::Store(StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            source: Box::new(StoreError::StorageRpcResourceExhausted {
+                node_id: 1,
+                operation: "ReadHandlesAcquire",
+                message: "limit exceeded".to_string(),
+            }),
+        });
+        assert_eq!(
+            shard_overload.diagnostic_cause_label(),
+            "shard_store_storage_rpc_resource_exhausted"
+        );
+
+        let stale_bucket = ServerError::Metadata(MetadataError::StaleBucketMetadataCommand {
+            name: storage::BucketName::try_from("bucket".to_string()).unwrap(),
+            bucket_execution_generation: 7,
+        });
+        assert_eq!(
+            stale_bucket.diagnostic_cause_label(),
+            "stale_bucket_metadata_command"
+        );
     }
 
     #[test]
