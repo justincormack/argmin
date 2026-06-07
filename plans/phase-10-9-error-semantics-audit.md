@@ -103,7 +103,9 @@ Updated in this audit slice:
 9. delete object now has request-path regressions that inject metadata command
    log conflict during `DeleteObjectVersion`, `ReserveObjectVersion`, and
    `InsertDeleteMarker` apply and verify the public request returns
-   `OperationAborted`
+   `OperationAborted`. Batch `DeleteObjects` also has a per-entry regression
+   proving the same mapped contention is serialized as an `OperationAborted`
+   item error rather than `InternalError`.
 10. streamed PUT now has request-path regressions for session creation, segment
    append, abort, and finalization. The create regression covers
    `ReserveObjectGeneration` and `CreateStreamUpload` contention escaping

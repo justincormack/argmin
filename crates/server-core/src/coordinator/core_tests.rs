@@ -1662,6 +1662,68 @@ fn delete_object_version_request_maps_command_log_conflict_to_operation_aborted(
 }
 
 #[test]
+fn delete_objects_entry_maps_command_log_conflict_to_operation_aborted_error() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"delete-me",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::DeleteObjectVersion,
+    );
+
+    let entries = [DeleteEntry {
+        key,
+        version_id: None,
+        cond: DeleteCondition::None,
+    }];
+    let result = coord
+        .delete_objects(&DeleteObjectsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            entries: &entries,
+            bypass_governance: false,
+        })
+        .unwrap();
+    assert!(
+        result.deleted.is_empty(),
+        "failed delete entry must not be reported as deleted: {result:?}"
+    );
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.errors[0].key, "key");
+    assert_eq!(result.errors[0].code, "OperationAborted");
+    drop(hook_guard);
+}
+
+#[test]
 fn delete_object_marker_insert_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
