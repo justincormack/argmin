@@ -47,6 +47,13 @@ const COMPLETE_MULTIPART_STALE_COMMIT_RETRIES: usize = 1;
 impl Coordinator {
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         match error {
+            storage::ObjectPgActionError::Store(
+                storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandPendingConflict { .. },
+            )
+            | storage::ObjectPgActionError::Metadata(
+                storage::MetadataError::ObjectGenerationReservationConflict { .. },
+            ) => ServerError::OperationAborted,
             storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
             storage::ObjectPgActionError::InvalidRequest { reason } => {
                 ServerError::InvalidRequest { reason }

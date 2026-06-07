@@ -82,6 +82,38 @@ fn rwlock_helpers_recover_after_panic() {
 }
 
 #[test]
+fn object_pg_command_contention_maps_to_operation_aborted() {
+    let epoch = storage::ClusterEpoch::INITIAL;
+    let cases = [
+        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandLogConflict {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: epoch,
+            log_index: 3,
+        }),
+        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandPendingConflict {
+            pg_id: 2,
+            cluster_epoch: epoch,
+            existing_log_index: 3,
+            candidate_log_index: 4,
+        }),
+        storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectGenerationReservationConflict {
+                reservation_id: "reservation".to_string(),
+                generation_id: 5,
+            },
+        ),
+    ];
+
+    for error in cases {
+        assert!(matches!(
+            Coordinator::map_object_pg_action_error(error),
+            ServerError::OperationAborted
+        ));
+    }
+}
+
+#[test]
 fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
