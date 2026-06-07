@@ -75,6 +75,13 @@ pub enum StoreError {
         message: String,
     },
 
+    #[error("storage RPC {operation} on node {node_id} exhausted resources: {message}")]
+    StorageRpcResourceExhausted {
+        node_id: u32,
+        operation: &'static str,
+        message: String,
+    },
+
     #[error(
         "storage RPC {operation} on node {node_id} found shard deletion in progress: {message}"
     )]

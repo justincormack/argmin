@@ -291,7 +291,7 @@ impl ReadRuntime {
                 storage::StoreError::MetadataCommandLogConflict { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
-            storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+            storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),
             storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { name },
             ) => ServerError::BucketNotFound {
@@ -1128,20 +1128,22 @@ impl ReadRuntime {
         let padded = segment.stored_size().div_ceil(k) * k;
 
         let mut buf = self.payload_buffer_pool.checkout(padded);
-        self.storage_node.read_segment_payload_stored_bytes_into(
-            SegmentStoredBytesRequest {
-                data_pg_id: segment.data_pg_id,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                stored_size: segment.stored_size(),
-                segment_crc64: segment.segment_crc64,
-                ec: EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
+        self.storage_node
+            .read_segment_payload_stored_bytes_into(
+                SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.stored_size(),
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
                 },
-            },
-            &mut buf,
-        )?;
+                &mut buf,
+            )
+            .map_err(super::map_store_error)?;
         if matches!(segment.encryption, ObjectEncryption::None) {
             Ok(buf.into_shared())
         } else {

@@ -77,6 +77,22 @@ fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
+    if store_error_is_resource_exhausted(&error) {
+        ServerError::SlowDown
+    } else {
+        ServerError::Store(error)
+    }
+}
+
+fn store_error_is_resource_exhausted(error: &storage::StoreError) -> bool {
+    match error {
+        storage::StoreError::StorageRpcResourceExhausted { .. } => true,
+        storage::StoreError::ShardStore { source, .. } => store_error_is_resource_exhausted(source),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
     BucketName::try_from(name.into())

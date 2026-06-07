@@ -300,6 +300,61 @@ fn bucket_write_drain_contention_maps_to_operation_aborted() {
 }
 
 #[test]
+fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
+    fn resource_exhausted() -> storage::StoreError {
+        storage::StoreError::StorageRpcResourceExhausted {
+            node_id: 1,
+            operation: "test operation",
+            message: "active read handles exceed limit".to_string(),
+        }
+    }
+
+    fn nested_resource_exhausted() -> storage::StoreError {
+        storage::StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            source: Box::new(resource_exhausted()),
+        }
+    }
+
+    assert!(matches!(
+        super::map_store_error(nested_resource_exhausted()),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
+            resource_exhausted(),
+        )),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
+            nested_resource_exhausted(),
+        )),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        Coordinator::map_bucket_snapshot_load_error(storage::BucketSnapshotLoadError::Store(
+            resource_exhausted(),
+        )),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        BucketHandleLoader::map_bucket_snapshot_error(storage::BucketSnapshotLoadError::Store(
+            resource_exhausted(),
+        )),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
+            resource_exhausted(),
+        )),
+        ServerError::SlowDown
+    ));
+}
+
+#[test]
 fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);

@@ -3913,6 +3913,13 @@ impl UnixStorageNodeClient {
                 message: error.message,
             };
         }
+        if error.code == StorageRpcErrorCode::ResourceExhausted {
+            return StoreError::StorageRpcResourceExhausted {
+                node_id: self.node_id.as_u32(),
+                operation: kind.operation_name(),
+                message: error.message,
+            };
+        }
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation: kind.operation_name(),
@@ -4030,6 +4037,13 @@ impl UnixStorageNodeReadHandleSession {
                 message: error.message,
             };
         }
+        if error.code == StorageRpcErrorCode::ResourceExhausted {
+            return StoreError::StorageRpcResourceExhausted {
+                node_id: self.node_id.as_u32(),
+                operation: kind.operation_name(),
+                message: error.message,
+            };
+        }
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation: kind.operation_name(),
@@ -4134,6 +4148,13 @@ impl UnixStorageNodeMetadataCommandSession {
         kind: StorageRpcMessageKind,
         error: StorageRpcErrorResponse,
     ) -> StoreError {
+        if error.code == StorageRpcErrorCode::ResourceExhausted {
+            return StoreError::StorageRpcResourceExhausted {
+                node_id: self.node_id.as_u32(),
+                operation: kind.operation_name(),
+                message: error.message,
+            };
+        }
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation: kind.operation_name(),
@@ -20864,11 +20885,11 @@ mod tests {
         let err = client.delete_placed_shard(data_pg_id, &key).unwrap_err();
         assert!(matches!(
             err,
-            StoreError::StorageRpc {
+            StoreError::StorageRpcResourceExhausted {
                 operation: "shard delete",
                 ref message,
                 ..
-            } if message.contains("ResourceExhausted") && message.contains("active read handles")
+            } if message.contains("active read handles")
         ));
 
         session.release_read_handles("protected-read").unwrap();
@@ -20888,6 +20909,71 @@ mod tests {
         assert!(matches!(
             reopened.read_shard_file(0, &key),
             Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn storage_rpc_resource_exhaustion_decodes_to_typed_store_error() {
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            "/tmp/unopened-storage-node.sock",
+        );
+        let err = StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::ResourceExhausted,
+            message: "active read handles exceed limit".to_string(),
+        };
+        assert!(matches!(
+            client.rpc_response_error(StorageRpcMessageKind::ShardDelete, err),
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 7,
+                operation: "shard delete",
+                ref message,
+            } if message.contains("active read handles")
+        ));
+
+        let (read_stream, _read_peer) = UnixStream::pair().unwrap();
+        let read_session = UnixStorageNodeReadHandleSession {
+            node_id: NodeId::new(8),
+            stream: read_stream,
+            next_request_id: 1,
+        };
+        let err = StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::ResourceExhausted,
+            message: "read handle session limit reached".to_string(),
+        };
+        assert!(matches!(
+            read_session.rpc_response_error(StorageRpcMessageKind::ReadHandlesAcquire, err),
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 8,
+                operation: "read handles acquire",
+                ref message,
+            } if message.contains("session limit")
+        ));
+
+        let (metadata_stream, _metadata_peer) = UnixStream::pair().unwrap();
+        let metadata_session = UnixStorageNodeMetadataCommandSession {
+            node_id: NodeId::new(9),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
+                stream: metadata_stream,
+                next_request_id: 1,
+                pg_id: PgId::new(3),
+                released: true,
+            }),
+        };
+        let err = StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::ResourceExhausted,
+            message: "metadata command session limit reached".to_string(),
+        };
+        assert!(matches!(
+            metadata_session
+                .rpc_response_error(StorageRpcMessageKind::MetadataCommandPgLockAcquire, err),
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 9,
+                operation: "metadata command PG lock acquire",
+                ref message,
+            } if message.contains("session limit")
         ));
     }
 

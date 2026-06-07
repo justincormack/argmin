@@ -42,6 +42,7 @@ the side-effect-safe boundary described in the phase plan.
 | `MetadataError::BucketWriteDraining` | expected delete-bucket drain race for writes | internal retry or `OperationAborted` candidate | Most write paths should wait/retry while the drain is active. Any escaped public request shape needs operation-specific review. |
 | `MetadataError::BucketWriteReservationConflict` / `BucketWriteDrainConflict` | durable reservation/drain identity conflict | fail closed unless exact-idempotent retry is proven | Usually indicates wrong or stale proof identity. Do not blanket-map to retryable HTTP without a request-specific idempotency proof. |
 | `MetadataError::BucketNotFound` / `ObjectNotFound` / `NoSuchUpload` / `PartNotFound` | client-visible absence when the operation can reveal it | operation-specific 4xx | Auth paths may intentionally convert missing objects to `AccessDenied`. |
+| `StoreError::StorageRpcResourceExhausted` | storage-node overload before a safe side-effect boundary | `SlowDown` | The storage-node server only emits this for bounded request/session/read-handle limits before accepting the side effect. Generic RPC decode/route/protocol failures remain internal. |
 | `StoreError::StorageRpcShardDeleteInProgress` | expected physical shard reclaim/read-handle contention | operation-specific retry/overload candidate | Needs side-effect-boundary review before exposing as `SlowDown` or another retryable response. |
 | `StoreError::StorageRpc` | transport or remote protocol failure | internal unless structured code says otherwise | Phase 10.9 should split typed overload and typed contention from generic transport failures. |
 | route, epoch, placement, digest, checksum, corruption, IO, DB, EC errors | invariant/storage failure | internal/fail closed | Must emit structured diagnostics rather than being hidden as retryable client contention. |
@@ -114,18 +115,33 @@ Updated in this audit slice:
    expiry and incomplete-MPU abort. Each injects metadata command log conflict
    during the lifecycle-owned command apply and verifies the worker-facing
    result is `OperationAborted` rather than a raw internal store error.
+15. `StorageRpcErrorCode::ResourceExhausted` now decodes to typed
+   `StoreError::StorageRpcResourceExhausted` in the normal Unix client,
+   read-handle session client, and metadata-command session client. Central
+   object-PG, bucket snapshot, bucket-write drain, and read-payload paths
+   convert that pre-side-effect overload outcome to S3 `SlowDown`, including
+   the routed shard-read shape where it is wrapped as
+   `StoreError::ShardStore { source: StorageRpcResourceExhausted, .. }`.
+   Generic `StoreError::StorageRpc` remains an internal transport/protocol
+   failure.
+16. `BucketWriteDraining` was audited across the storage acquire sites. Public
+   create/PUT/stream PUT/MPU object-mutation paths wait for the durable drain
+   and retry before returning to server-core. Lifecycle uses the explicit
+   non-waiting acquire path to stop work for an old bucket incarnation rather
+   than mutating through the drain. Delete-bucket drain ownership paths use the
+   central bucket-write drain mapper. There is still no blanket public HTTP
+   mapping for `BucketWriteDraining`.
 
 Open audit items:
 
-1. classify escaped `BucketWriteDraining` for create/PUT/MPU/copy/delete paths:
-   internal wait/retry is preferred, but any public escape needs an
-   operation-specific S3 shape
-2. split `StoreError::StorageRpc` into typed overload/contention outcomes versus
-   generic transport/protocol failures
-3. add guardrail checks for ad hoc request-path mappings that return
+1. continue splitting `StoreError::StorageRpc` into typed outcomes where the
+   server-side side-effect boundary is proven. `ResourceExhausted` is now typed
+   and maps to `SlowDown`; `StorageRpcShardDeleteInProgress` still needs
+   operation-specific retry/overload review before any public mapping.
+2. add guardrail checks for ad hoc request-path mappings that return
    `ServerError::Store` or `ServerError::Metadata` for expected contention
    (started for production coordinator object-PG mappings)
-4. no remaining request-path-only mapper regressions are known after the
+3. no remaining request-path-only mapper regressions are known after the
    direct PUT, streamed PUT, delete object, bucket metadata, MPU, and lifecycle
    worker coverage above
 

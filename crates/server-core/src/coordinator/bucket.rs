@@ -30,7 +30,7 @@ pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) 
         | storage::BucketWriteDrainError::Metadata(
             storage::MetadataError::StaleBucketMetadataCommand { .. },
         ) => ServerError::OperationAborted,
-        storage::BucketWriteDrainError::Store(other) => ServerError::Store(other),
+        storage::BucketWriteDrainError::Store(other) => super::map_store_error(other),
         storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotEmpty) => {
             ServerError::BucketNotEmpty
         }
@@ -52,7 +52,7 @@ impl Coordinator {
                 storage::StoreError::MetadataCommandLogConflict { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
-            storage::BucketSnapshotLoadError::Store(other) => ServerError::Store(other),
+            storage::BucketSnapshotLoadError::Store(other) => super::map_store_error(other),
             storage::BucketSnapshotLoadError::Metadata(storage::MetadataError::BucketNotEmpty) => {
                 ServerError::BucketNotEmpty
             }

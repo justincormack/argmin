@@ -393,7 +393,7 @@ impl<'a> BucketHandleLoader<'a> {
                 storage::StoreError::MetadataCommandLogConflict { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
-            storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+            storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),
             storage::BucketSnapshotLoadError::Metadata(error) => match error {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),

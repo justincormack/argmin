@@ -64,7 +64,7 @@ pub(super) fn load_bucket_tags_for_policy_action(
                 storage::StoreError::MetadataCommandLogConflict { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
-            storage::BucketSnapshotLoadError::Store(error) => ServerError::Store(error),
+            storage::BucketSnapshotLoadError::Store(error) => super::super::map_store_error(error),
             storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { name },
             ) => ServerError::BucketNotFound {
