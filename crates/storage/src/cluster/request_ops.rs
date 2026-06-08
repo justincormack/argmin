@@ -628,11 +628,7 @@ fn merge_bucket_snapshot_pair_request(
 }
 
 fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshotLoadError {
-    StoreError::Io {
-        context,
-        source: std::io::Error::other("conflicting pending metadata command"),
-    }
-    .into()
+    StoreError::MetadataCommandContention { context }.into()
 }
 
 fn bucket_snapshot_error_to_bucket_write_drain_error(

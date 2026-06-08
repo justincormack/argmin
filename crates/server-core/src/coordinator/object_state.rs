@@ -100,7 +100,7 @@ impl Coordinator {
                     key: key.to_string(),
                 }
             }
-            storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+            storage::ObjectPgActionError::Store(error) => super::map_store_error(error),
             storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
             storage::ObjectPgActionError::InvalidRequest { reason } => {
                 ServerError::InvalidRequest { reason }

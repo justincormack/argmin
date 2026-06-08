@@ -203,6 +203,18 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             candidate_log_index: 4,
         }),
     );
+    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Store(
+        storage::StoreError::MetadataCommandContention {
+            context: "pending command displaced during cleanup",
+        },
+    ));
+    assert_read_snapshot_maps_to_operation_aborted(
+        &bucket,
+        &key,
+        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
+            context: "pending command displaced during cleanup",
+        }),
+    );
     assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::ObjectGenerationReservationConflict {
             reservation_id: "reservation".to_string(),
@@ -289,6 +301,14 @@ fn bucket_write_drain_contention_maps_to_operation_aborted() {
         ServerError::OperationAborted
     ));
     assert!(matches!(
+        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
+            storage::StoreError::MetadataCommandContention {
+                context: "pending bucket command displaced during cleanup",
+            },
+        )),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
         Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Metadata(
             storage::MetadataError::StaleBucketMetadataCommand {
                 name: bucket,
@@ -339,6 +359,23 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         super::map_store_error(nested_delete_in_progress()),
         ServerError::Store(storage::StoreError::ShardStore { source, .. })
             if matches!(*source, storage::StoreError::StorageRpcShardDeleteInProgress { .. })
+    ));
+    assert!(matches!(
+        super::map_store_error(storage::StoreError::MetadataCommandContention {
+            context: "pending command displaced during cleanup",
+        }),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
+        super::map_store_error(storage::StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            source: Box::new(storage::StoreError::MetadataCommandContention {
+                context: "pending command displaced during cleanup",
+            }),
+        }),
+        ServerError::OperationAborted
     ));
     assert!(matches!(
         Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(

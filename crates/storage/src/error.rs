@@ -178,6 +178,9 @@ pub enum StoreError {
         candidate_log_index: u64,
     },
 
+    #[error("metadata command contention during {context}")]
+    MetadataCommandContention { context: &'static str },
+
     #[error(
         "metadata command pending slot for PG {pg_id} epoch {cluster_epoch} exists on local node {node_id}, expected primary node {primary_node_id}"
     )]

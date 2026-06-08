@@ -527,6 +527,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
     match error {
         StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
         StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
+        StoreError::MetadataCommandContention { .. } => "metadata_command_contention",
         StoreError::MetadataCommandPendingOnNonPrimary { .. } => {
             "metadata_command_pending_on_non_primary"
         }
@@ -684,6 +685,14 @@ mod tests {
         assert_eq!(
             pending_conflict.diagnostic_cause_label(),
             "metadata_command_pending_conflict"
+        );
+
+        let contention = ServerError::Store(StoreError::MetadataCommandContention {
+            context: "pending command displaced during cleanup",
+        });
+        assert_eq!(
+            contention.diagnostic_cause_label(),
+            "metadata_command_contention"
         );
 
         let shard_overload = ServerError::Store(StoreError::ShardStore {

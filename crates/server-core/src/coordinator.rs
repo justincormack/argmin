@@ -78,10 +78,20 @@ fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
-    if store_error_is_resource_exhausted(&error) {
+    if store_error_is_command_contention(&error) {
+        ServerError::OperationAborted
+    } else if store_error_is_resource_exhausted(&error) {
         ServerError::SlowDown
     } else {
         ServerError::Store(error)
+    }
+}
+
+fn store_error_is_command_contention(error: &storage::StoreError) -> bool {
+    match error {
+        storage::StoreError::MetadataCommandContention { .. } => true,
+        storage::StoreError::ShardStore { source, .. } => store_error_is_command_contention(source),
+        _ => false,
     }
 }
 

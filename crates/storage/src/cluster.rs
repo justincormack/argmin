@@ -112,10 +112,7 @@ const TRACE_TARGET: &str = "storage";
 type ShardScavengerLocationIdentity = (u32, u32, ShardKey);
 
 fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectPgActionError {
-    ObjectPgActionError::Store(StoreError::Io {
-        context,
-        source: std::io::Error::other("conflicting pending metadata command"),
-    })
+    ObjectPgActionError::Store(StoreError::MetadataCommandContention { context })
 }
 
 #[must_use]
