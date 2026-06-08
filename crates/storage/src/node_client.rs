@@ -18167,6 +18167,84 @@ mod tests {
     }
 
     #[test]
+    fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![0, 1];
+        config.pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: crate::types::PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            },
+            StorageNodePgRoute {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: crate::types::PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            },
+        ];
+        let (bucket, wrong_pg_id) = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let topology = node.pg_topology();
+            let bucket = crate::tests::bucket_name("stream-upload-list-wrong-pg");
+            let key = (0..100)
+                .map(|index| crate::tests::object_key(format!("key-{index}")))
+                .find(|key| topology.object_pg_for(&bucket, key) == 1)
+                .expect("two-PG topology must place a test object on PG 1");
+            let wrong_pg_id = 0;
+            let session_id = crate::SessionId::try_from("ef".repeat(16)).unwrap();
+            let wrong_pg = node.get_pg(wrong_pg_id).unwrap();
+            crate::PgMetadataStore::create_stream_upload(
+                &*wrong_pg,
+                &crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            wrong_pg.refresh_metadata_command_state_digest().unwrap();
+            (bucket, wrong_pg_id)
+        };
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            config.socket_path.clone(),
+        );
+
+        let err = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
+            &client,
+            PgId::new(wrong_pg_id),
+            &bucket,
+            None,
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "object stream uploads list",
+                ..
+            })
+        ));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
     fn unix_payload_reclaim_exists_requires_pg_primary() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);

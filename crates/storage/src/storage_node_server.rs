@@ -3269,6 +3269,16 @@ impl StorageNodeConnectionHandler {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
+        for upload in &page.uploads {
+            if let Err(error) = self.validate_pg_for_object(
+                request.bucket.pg_id,
+                &upload.bucket,
+                &upload.key,
+                "object stream uploads list",
+            ) {
+                return encode_storage_rpc_error_response(&error);
+            }
+        }
         let payload = encode_stream_uploads_list_response(&StorageRpcStreamUploadsListResponse {
             uploads: page.uploads,
             next_session_id_marker: page.next_session_id_marker,

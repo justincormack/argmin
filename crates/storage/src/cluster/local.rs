@@ -14941,6 +14941,212 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "abandoned-stream-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3".to_string()).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &session_id)
+            .unwrap();
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            crate::PgMetadataStore::create_stream_upload(&*pg, &create).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id
+                )
+                .unwrap(),
+                generation_id
+            );
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        cluster
+            .begin_bucket_delete(&bucket)
+            .expect("abandoned direct PUT stream staging must not make bucket non-empty");
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+                    Err(crate::MetadataError::StreamSessionNotFound { .. })
+                ),
+                "DeleteBucket should abort abandoned direct PUT stream staging on node {node_id:?}"
+            );
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_object_generation_reservation(
+                        &*pg,
+                        &bucket,
+                        &key,
+                        &session_id
+                    ),
+                    Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+                ),
+                "DeleteBucket should release abandoned direct PUT generation reservation on node {node_id:?}"
+            );
+        }
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Finalized
+        );
+    }
+
+    #[test]
+    fn bucket_delete_stream_cleanup_tolerates_concurrent_missing_session() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "missing-stream-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4".to_string()).unwrap();
+        cluster
+            .reserve_put_object_generation(&bucket, &key, &session_id)
+            .unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            crate::PgMetadataStore::create_stream_upload(&*pg, &create).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        let removed = Arc::new(AtomicBool::new(false));
+        let removed_for_hook = Arc::clone(&removed);
+        let map_for_hook = Arc::clone(&map);
+        let session_for_hook = session_id.clone();
+        let _hook = cluster.test_install_before_stream_abort_storage_hook(Arc::new(move || {
+            if removed_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            for node_id in node_ids {
+                let pg = map_for_hook
+                    .node(node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(2)
+                    .unwrap();
+                crate::PgMetadataStore::delete_stream_upload(&*pg, &session_for_hook).unwrap();
+                pg.refresh_metadata_command_state_digest().unwrap();
+            }
+        }));
+
+        cluster
+            .begin_bucket_delete(&bucket)
+            .expect("DeleteBucket cleanup should tolerate a concurrently aborted stream session");
+        assert!(removed.load(Ordering::SeqCst));
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &session_id
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn bucket_delete_stream_cleanup_rejects_wrong_pg_stream_row() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "wrong-pg-stream-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        assert_eq!(cluster.object_metadata_pg_id(&bucket, &key), 2);
+
+        let session_id =
+            crate::SessionId::try_from("a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5".to_string()).unwrap();
+        let create = crate::CreateStreamUploadReq {
+            session_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+            crate::PgMetadataStore::create_stream_upload(&*pg, &create).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Store(StoreError::Io { .. })
+            ),
+            "wrong-PG stream row should fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
     fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
         let _guard = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

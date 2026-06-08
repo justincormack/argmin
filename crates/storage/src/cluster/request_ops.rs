@@ -2146,6 +2146,8 @@ impl super::StorageCluster {
                 }
                 self.wait_for_durable_bucket_write_reservations_empty(bucket)?;
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+                self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
+                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
                 if self
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()
@@ -2228,6 +2230,90 @@ impl super::StorageCluster {
                 Err(error)
             }
         }
+    }
+
+    fn abort_abandoned_put_object_stream_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        const STREAM_UPLOAD_DELETE_PAGE_LIMIT: u32 = 128;
+
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
+            let mut marker = None;
+            loop {
+                let node = self
+                    .local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+                let page = node
+                    .object_mutation_metadata_client()
+                    .list_stream_uploads_for_bucket_page(
+                        pg_id,
+                        bucket,
+                        marker.as_ref(),
+                        STREAM_UPLOAD_DELETE_PAGE_LIMIT,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                if page.uploads.is_empty() {
+                    break;
+                }
+
+                let mut aborted_any = false;
+                for upload in page.uploads {
+                    if self.object_metadata_pg_id(&upload.bucket, &upload.key) != raw_pg_id {
+                        return Err(BucketWriteDrainError::Store(StoreError::Io {
+                            context: "bucket delete stream upload cleanup PG validation",
+                            source: std::io::Error::other(format!(
+                                "stream upload session {:?} for bucket {:?} key {:?} is stored on PG {}",
+                                upload.session_id,
+                                upload.bucket,
+                                upload.key,
+                                raw_pg_id
+                            )),
+                        }));
+                    }
+                    if upload.target != crate::StreamUploadTarget::PutObject {
+                        continue;
+                    }
+                    match self.abort_stream_upload_session(
+                        &upload.bucket,
+                        &upload.key,
+                        &upload.session_id,
+                    ) {
+                        Ok(()) => {}
+                        Err(ObjectPgActionError::Metadata(
+                            MetadataError::StreamSessionNotFound { .. },
+                        )) => {}
+                        Err(error) => {
+                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                                super::object_pg_action_error_to_bucket_snapshot_error(error),
+                            ));
+                        }
+                    }
+                    self.release_object_generation_reservation(
+                        &upload.bucket,
+                        &upload.key,
+                        &upload.session_id,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                    aborted_any = true;
+                }
+
+                if aborted_any {
+                    marker = None;
+                    continue;
+                }
+
+                let Some(next_marker) = page.next_session_id_marker else {
+                    break;
+                };
+                marker = Some(next_marker);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn try_finalize_bucket_delete(
