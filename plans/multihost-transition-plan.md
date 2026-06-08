@@ -6082,6 +6082,10 @@ problems:
 3. the multi-process topology adds remote RPC, metadata-command traffic, shard
    writes, and background-worker pressure, but the current backpressure model
    does not make overload visible or pace the S3 test harness consistently
+   (for example, full UAT runs have seen large multipart copy, object
+   attributes, and SSE-C multipart cases fail with AWS SDK
+   `OperationAttempt` timeouts around 30 seconds while focused single-test runs
+   pass quickly and the server logs show no HTTP 500)
 
 The goal of this phase is not to relax S3 behavior or make the harness retry
 through bugs. The goal is to make expected contention and overload explicit,
@@ -6140,6 +6144,10 @@ Work items:
      request-body bytes in flight, per-storage-node RPC concurrency,
      per-PG metadata-command concurrency, shard IO concurrency, and shard bytes
      in flight
+   - measure and diagnose operation-attempt timeout failures as overload
+     symptoms: capture which request stage is waiting (body read, storage-node
+     RPC acquire, metadata-command session, shard write/read, EC
+     reconstruction, or response streaming) before changing harness timeouts
    - make overload decisions before expensive body reads or long shard/RPC work
      where possible
    - propagate storage-node saturation to the frontend as a typed retryable
@@ -6155,6 +6163,10 @@ Work items:
      so background workers cannot starve foreground S3 requests
    - ensure the UAT harness does not hide failures by retrying transport EOFs
      or HTTP 500s; pacing must come from server-side admission/backpressure
+   - do not treat higher `S3_TEST_TIMEOUT_SECS` values as the fix for
+     multihost saturation; timeout increases may be used only as an explicit
+     diagnostic control after server-side queue/wait metrics identify the
+     bottleneck
 5. multihost UAT observability
    - make the UAT harness always preserve a concise metrics/log summary on
      failure: slowest operations, 409/503/500 counts, transport failures, RPC
@@ -6188,14 +6200,19 @@ Required tests:
    state
 9. background lifecycle/reclaim/scavenger load cannot starve a bounded foreground
    S3 PUT/GET/MPU workload
-10. every HTTP 500 in a focused failure-injection test emits a structured cause
+10. full-suite multihost large-object pressure, including multipart copy,
+    checksum/object-attributes MPU completion, and SSE-C multipart PUT/GET,
+    either completes within the configured operation-attempt budget or returns
+    bounded S3-shaped overload responses; it must not fail only as SDK
+    operation-attempt timeouts
+11. every HTTP 500 in a focused failure-injection test emits a structured cause
    label and enough request/RPC/PG context to debug without temporary tracing
-11. diagnostics and flight-recorder dumps redact secrets, payload context,
+12. diagnostics and flight-recorder dumps redact secrets, payload context,
     request headers, SSE-C material, and unbounded names; explicit dump access
     is local/admin-only
-12. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
+13. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
    deterministic diagnostics for the first failing iteration
-13. guardrails fail if a new coordinator request path maps expected
+14. guardrails fail if a new coordinator request path maps expected
     metadata-command contention directly to generic `Store`, `Metadata`, or
     internal errors
 
