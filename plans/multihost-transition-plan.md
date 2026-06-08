@@ -6262,6 +6262,13 @@ Status:
   HTTP failure breadcrumb; per-RPC/per-metadata-command retry events, conflict
   counters by PG/kind, command-session wait counters, and the bounded
   flight-recorder/debug-dump path remain in the diagnostics slice.
+- Added UAT harness support for `--repeat N` / `ARGMIN_UAT_REPEAT=N` so
+  nondeterministic full-suite or focused failures can be rerun under one
+  process group, plus failure diagnostics that grep all frontend/storage-node
+  logs for HTTP 500, cause-label, panic, and abort markers before printing the
+  usual log tails. This does not replace the planned flight recorder, but it
+  makes the next intermittent EOF cascade report the first server-side abort
+  line more directly.
 - Added delete-bucket request-path regression coverage for both
   `MarkBucketDeleting` begin and explicit bucket-finalizer cleanup of completed
   multipart tombstones. Both inject metadata command log conflict and verify

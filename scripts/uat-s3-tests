@@ -19,6 +19,7 @@ Options:
   --bucket-prefix PREFIX Bucket prefix for s3-tests (default: argmin-s3-)
   --timeout-secs SECS    S3 client timeout (default: 30)
   --topology NAME        Test topology: multihost or local (default: multihost)
+  --repeat N            Repeat the selected s3-tests command N times (default: 1)
   --smoke NAME           Run a focused smoke instead of the full suite:
                          storage-node-restart, storage-node-kill-fails-closed
   --binary PATH          Run an already-built argmin-s3-compatible binary
@@ -45,6 +46,7 @@ bucket_prefix="${S3_TEST_BUCKET_PREFIX:-argmin-s3-}"
 timeout_secs="${S3_TEST_TIMEOUT_SECS:-30}"
 topology="${ARGMIN_UAT_TOPOLOGY:-multihost}"
 smoke="${ARGMIN_UAT_SMOKE:-}"
+repeat_count="${ARGMIN_UAT_REPEAT:-1}"
 release=0
 cleanup=0
 keep_temp_data_dir=0
@@ -77,6 +79,11 @@ while (($#)); do
         --topology)
             [[ $# -ge 2 ]] || die "--topology requires a value"
             topology="$2"
+            shift 2
+            ;;
+        --repeat)
+            [[ $# -ge 2 ]] || die "--repeat requires a value"
+            repeat_count="$2"
             shift 2
             ;;
         --smoke)
@@ -136,6 +143,12 @@ if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
 fi
 if [[ -n "$smoke" && ${#cargo_args[@]} -ne 0 ]]; then
     die "--smoke cannot be combined with cargo nextest args"
+fi
+if ! [[ "$repeat_count" =~ ^[1-9][0-9]*$ ]]; then
+    die "--repeat must be a positive integer"
+fi
+if [[ -n "$smoke" && "$repeat_count" != "1" ]]; then
+    die "--repeat cannot be combined with --smoke"
 fi
 if [[ -n "$server_binary" ]]; then
     if [[ "$server_binary" == */* ]]; then
@@ -340,6 +353,31 @@ cleanup_server() {
         wait "$pid" 2>/dev/null || true
     done
     if ((status != 0)); then
+        echo "== argmin-s3 UAT failure diagnostics ==" >&2
+        local found_diagnostics=0
+        for index in "${!server_logs[@]}"; do
+            local log_path="${server_logs[$index]}"
+            local name="${server_names[$index]}"
+            if [[ ! -s "$log_path" ]]; then
+                continue
+            fi
+            local matches
+            matches="$(
+                grep -nE \
+                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=500|cause_label=|panicked at|panic|aborted" \
+                    "$log_path" \
+                    | head -n 40 \
+                    || true
+            )"
+            if [[ -n "$matches" ]]; then
+                found_diagnostics=1
+                echo "== argmin-s3 UAT $name diagnostic matches ==" >&2
+                printf '%s\n' "$matches" >&2
+            fi
+        done
+        if ((found_diagnostics == 0)); then
+            echo "no HTTP 500, cause-label, panic, or abort diagnostics found in server logs" >&2
+        fi
         for index in "${!server_logs[@]}"; do
             local log_path="${server_logs[$index]}"
             local name="${server_names[$index]}"
@@ -454,11 +492,17 @@ run_nextest() {
         cmd+=("$@")
     fi
 
-    echo "== argmin-s3 UAT $label =="
-    printf '+'
-    printf ' %q' "${cmd[@]}"
-    printf '\n'
-    "${cmd[@]}"
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        if ((repeat_count > 1)); then
+            echo "== argmin-s3 UAT $label iteration $iteration/$repeat_count =="
+        else
+            echo "== argmin-s3 UAT $label =="
+        fi
+        printf '+'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+        "${cmd[@]}"
+    done
 }
 
 run_nextest_expect_failure() {
