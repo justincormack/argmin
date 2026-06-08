@@ -785,7 +785,7 @@ fn test_object_copy_versioning_multipart_upload() {
             .send()
             .await
             .unwrap();
-        let src_version = complete.version_id().unwrap().to_string();
+        assert!(complete.version_id().is_some());
 
         // Copy the multipart object
         let dst_key = "mp-dst";
@@ -812,19 +812,10 @@ fn test_object_copy_versioning_multipart_upload() {
         assert_eq!(body.len(), 5 * 1024 * 1024);
         assert!(body.iter().all(|&b| b == b'M'));
 
-        // Clean up: delete both versions
-        let dst_version = copy_resp.version_id().unwrap().to_string();
-        for (key, vid) in [(src_key, src_version), (dst_key, dst_version)] {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key)
-                .version_id(&vid)
-                .send()
-                .await
-                .unwrap();
-        }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        // Clean up every version. CopyObject is not idempotent in a versioned bucket:
+        // a lost successful response followed by an SDK retry can leave an earlier
+        // destination version that is not the version returned to this test.
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
