@@ -9465,6 +9465,7 @@ mod tests {
                 last_modified_millis: 124,
                 stale_payload: None,
                 bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+                stream_create_bucket_write_reservation: None,
             })),
         );
         pg.apply_metadata_command_and_record(7, &replacement_live)

@@ -271,7 +271,8 @@ const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
-const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize = 4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1;
+const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize =
+    4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
     4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
@@ -11250,7 +11251,17 @@ impl<'a> StorageRpcDecoder<'a> {
             created_at: self.read_u64()?,
             encryption: self.read_object_encryption()?,
             next_segment_vid: self.read_generation_id()?,
+            bucket_write_reservation: self.read_optional_bucket_write_reservation_proof()?,
         })
+    }
+
+    fn read_optional_bucket_write_reservation_proof(
+        &mut self,
+    ) -> Result<Option<BucketWriteReservationProof>, StorageRpcPayloadError> {
+        match self.read_bool()? {
+            true => Ok(Some(self.read_bucket_write_reservation_proof()?)),
+            false => Ok(None),
+        }
     }
 
     fn read_stream_upload_segment_record(
@@ -12999,6 +13010,20 @@ fn put_stream_upload_record(out: &mut Vec<u8>, record: &StreamUploadRecord) {
     put_u64(out, record.created_at);
     put_object_encryption(out, &record.encryption);
     put_u64(out, record.next_segment_vid.get());
+    put_optional_bucket_write_reservation_proof(out, record.bucket_write_reservation.as_ref());
+}
+
+fn put_optional_bucket_write_reservation_proof(
+    out: &mut Vec<u8>,
+    proof: Option<&BucketWriteReservationProof>,
+) {
+    match proof {
+        Some(proof) => {
+            put_bool(out, true);
+            put_bucket_write_reservation_proof(out, proof);
+        }
+        None => put_bool(out, false),
+    }
 }
 
 fn put_stream_upload_segment_record(out: &mut Vec<u8>, segment: &StreamUploadSegmentRecord) {

@@ -25,24 +25,25 @@ use rusqlite::{
 };
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
+#[cfg(test)]
+use crate::metadata_command::BucketPropertyMutation;
 use crate::metadata_command::{
     abandoned_command_log_bytes, decode_metadata_command_envelope,
     decode_metadata_command_log_entry_header, metadata_command_log_hash,
     AbortMultipartUploadCommand, AbortStreamUploadCommand,
     AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
-    BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, CommitDirectPutObjectCommand,
-    CommitMultipartObjectCommand, CommitStreamPartCommand, CreateBucketCommand,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteCompletedMultipartUploadCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogEntryKind,
-    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
+    CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
+    CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
+    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandLogEntryKind, MetadataCommandLogIndex,
+    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
-#[cfg(test)]
-use crate::metadata_command::{BucketPropertyMutation, BucketWriteReservationProof};
 use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
@@ -73,6 +74,94 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
        object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets WHERE name = ?1";
+
+const STREAM_UPLOAD_SELECT: &str = "\
+SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state, next_segment_vid, \
+       bucket_write_reservation_id, bucket_write_owner_token, bucket_write_cluster_epoch, bucket_write_execution_generation, \
+       bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context \
+FROM stream_uploads";
+
+fn parse_stream_upload_record(row: &Row<'_>) -> rusqlite::Result<StreamUploadRecord> {
+    let op_kind_raw: u8 = row.get(3)?;
+    let state_raw: u8 = row.get(6)?;
+    let upload_id: Option<UploadId> = row.get(4)?;
+    let part_number: Option<i64> = row.get(5)?;
+    let bucket: BucketName = row.get(1)?;
+    Ok(StreamUploadRecord {
+        session_id: row.get(0)?,
+        bucket: bucket.clone(),
+        key: row.get(2)?,
+        target: PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 3)?,
+        state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid stream state: {state_raw}")),
+            )
+        })?,
+        created_at: row.get::<_, i64>(7)? as u64,
+        encryption: PgStore::parse_object_encryption(
+            row.get::<_, u8>(8)?,
+            row.get::<_, Option<Vec<u8>>>(9)?,
+            8,
+            9,
+        )?,
+        next_segment_vid: PgStore::parse_generation_id(
+            row.get::<_, i64>(10)?,
+            10,
+            "next_segment_vid",
+        )?,
+        bucket_write_reservation: parse_stream_upload_bucket_write_reservation(bucket, row)?,
+    })
+}
+
+fn parse_stream_upload_bucket_write_reservation(
+    bucket: BucketName,
+    row: &Row<'_>,
+) -> rusqlite::Result<Option<BucketWriteReservationProof>> {
+    let Some(reservation_id) = row.get::<_, Option<String>>(11)? else {
+        return Ok(None);
+    };
+    let cluster_epoch_raw: i64 = row.get(13)?;
+    let cluster_epoch = ClusterEpoch::new(u64::try_from(cluster_epoch_raw).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            13,
+            rusqlite::types::Type::Integer,
+            Box::from("invalid stream bucket write reservation cluster epoch"),
+        )
+    })?)
+    .ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            13,
+            rusqlite::types::Type::Integer,
+            Box::from("invalid stream bucket write reservation cluster epoch"),
+        )
+    })?;
+    Ok(Some(BucketWriteReservationProof {
+        bucket,
+        reservation_id,
+        owner_token: row.get(12)?,
+        cluster_epoch,
+        bucket_execution_generation: row.get::<_, i64>(14)? as u64,
+        bucket_incarnation_generation: row.get::<_, i64>(15)? as u64,
+        operation_kind: row.get(16)?,
+        created_at: row.get::<_, i64>(17)? as u64,
+        lease_deadline: row.get::<_, Option<i64>>(18)?.map(|value| value as u64),
+        target_context: row.get(19)?,
+    }))
+}
+
+fn stream_upload_bucket_write_reservation_matches_command(
+    existing: &StreamUploadRecord,
+    command: &CreateStreamUploadCommand,
+) -> bool {
+    match command.session.target {
+        StreamUploadTarget::PutObject => {
+            existing.bucket_write_reservation.as_ref() == Some(&command.bucket_write_reservation)
+        }
+        StreamUploadTarget::UploadPart { .. } => existing.bucket_write_reservation.is_none(),
+    }
+}
 
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
@@ -8052,6 +8141,7 @@ impl PgStore {
         &self,
         session: &StreamUploadCommandRecord,
         initial_next_segment_vid: GenerationId,
+        bucket_write_reservation: Option<&BucketWriteReservationProof>,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -8067,11 +8157,26 @@ impl PgStore {
         let part_number = session.target.part_number().map(|n| n as i64);
         let encryption_type = session.encryption.encryption_type() as u8;
         let encryption_state = session.encryption.encode_state();
+        let reservation_id = bucket_write_reservation.map(|proof| proof.reservation_id.as_str());
+        let owner_token = bucket_write_reservation.map(|proof| proof.owner_token.as_str());
+        let cluster_epoch = bucket_write_reservation.map(|proof| proof.cluster_epoch.get() as i64);
+        let execution_generation =
+            bucket_write_reservation.map(|proof| proof.bucket_execution_generation as i64);
+        let incarnation_generation =
+            bucket_write_reservation.map(|proof| proof.bucket_incarnation_generation as i64);
+        let operation_kind = bucket_write_reservation.map(|proof| proof.operation_kind.as_str());
+        let created_at = bucket_write_reservation.map(|proof| proof.created_at as i64);
+        let lease_deadline = bucket_write_reservation
+            .and_then(|proof| proof.lease_deadline.map(|value| value as i64));
+        let target_context =
+            bucket_write_reservation.and_then(|proof| proof.target_context.as_deref());
         self.conn
             .execute(
                 "INSERT INTO stream_uploads \
-                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state, next_segment_vid) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state, next_segment_vid, \
+                  bucket_write_reservation_id, bucket_write_owner_token, bucket_write_cluster_epoch, bucket_write_execution_generation, \
+                  bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     session.session_id,
                     session.bucket,
@@ -8084,6 +8189,15 @@ impl PgStore {
                     encryption_type,
                     encryption_state,
                     initial_next_segment_vid.get() as i64,
+                    reservation_id,
+                    owner_token,
+                    cluster_epoch,
+                    execution_generation,
+                    incarnation_generation,
+                    operation_kind,
+                    created_at,
+                    lease_deadline,
+                    target_context,
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -8101,7 +8215,10 @@ impl PgStore {
         match self.get_stream_upload(&command.session.session_id) {
             Ok(existing)
                 if StreamUploadCommandRecord::from(&existing) == command.session
-                    && existing.next_segment_vid == command.initial_next_segment_vid =>
+                    && existing.next_segment_vid == command.initial_next_segment_vid
+                    && stream_upload_bucket_write_reservation_matches_command(
+                        &existing, command,
+                    ) =>
             {
                 Ok(())
             }
@@ -8109,8 +8226,16 @@ impl PgStore {
                 context: "create stream upload command existing session mismatch",
                 source: rusqlite::Error::InvalidQuery,
             }),
-            Err(MetadataError::StreamSessionNotFound { .. }) => self
-                .create_stream_upload_explicit(&command.session, command.initial_next_segment_vid),
+            Err(MetadataError::StreamSessionNotFound { .. }) => {
+                let bucket_write_reservation = (command.session.target
+                    == StreamUploadTarget::PutObject)
+                    .then_some(&command.bucket_write_reservation);
+                self.create_stream_upload_explicit(
+                    &command.session,
+                    command.initial_next_segment_vid,
+                    bucket_write_reservation,
+                )
+            }
             Err(error) => Err(error),
         }
     }
@@ -8700,13 +8825,12 @@ impl PgStore {
         &self,
         upload_id: &UploadId,
     ) -> Result<Vec<StreamUploadRecord>, MetadataError> {
+        let sql = format!(
+            "{STREAM_UPLOAD_SELECT} WHERE op_kind = ?1 AND upload_id = ?2 ORDER BY session_id ASC"
+        );
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
-                 WHERE op_kind = ?1 AND upload_id = ?2 ORDER BY session_id ASC",
-            )
+            .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for multipart upload (prepare)",
                 source: e,
@@ -8714,42 +8838,7 @@ impl PgStore {
         let rows = stmt
             .query_map(
                 params![StreamUploadKind::UploadPart as u8, upload_id.as_str()],
-                |row| {
-                    let op_kind_raw: u8 = row.get(3)?;
-                    let state_raw: u8 = row.get(6)?;
-                    let upload_id: Option<UploadId> = row.get(4)?;
-                    let part_number: Option<i64> = row.get(5)?;
-                    Ok(StreamUploadRecord {
-                        session_id: row.get(0)?,
-                        bucket: row.get(1)?,
-                        key: row.get(2)?,
-                        target: PgStore::parse_stream_target(
-                            op_kind_raw,
-                            upload_id,
-                            part_number,
-                            3,
-                        )?,
-                        state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                6,
-                                rusqlite::types::Type::Integer,
-                                Box::from(format!("invalid stream state: {state_raw}")),
-                            )
-                        })?,
-                        created_at: row.get::<_, i64>(7)? as u64,
-                        encryption: Self::parse_object_encryption(
-                            row.get::<_, u8>(8)?,
-                            row.get::<_, Option<Vec<u8>>>(9)?,
-                            8,
-                            9,
-                        )?,
-                        next_segment_vid: Self::parse_generation_id(
-                            row.get::<_, i64>(10)?,
-                            10,
-                            "next_segment_vid",
-                        )?,
-                    })
-                },
+                parse_stream_upload_record,
             )
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for multipart upload (query)",
@@ -16418,7 +16507,7 @@ impl PgMetadataStore for PgStore {
             created_at: PgStore::now_millis(),
             encryption: req.encryption.clone(),
         };
-        self.create_stream_upload_explicit(&session, GenerationId::MIN)
+        self.create_stream_upload_explicit(&session, GenerationId::MIN, None)
     }
 
     fn get_stream_upload(
@@ -16427,45 +16516,9 @@ impl PgMetadataStore for PgStore {
     ) -> Result<StreamUploadRecord, MetadataError> {
         self.conn
             .query_row(
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads WHERE session_id = ?1",
+                &format!("{STREAM_UPLOAD_SELECT} WHERE session_id = ?1"),
                 params![session_id.as_str()],
-                |row| {
-                    let op_kind_raw: u8 = row.get(3)?;
-                    let state_raw: u8 = row.get(6)?;
-                    let upload_id: Option<UploadId> = row.get(4)?;
-                    let part_number: Option<i64> = row.get(5)?;
-                    Ok(StreamUploadRecord {
-                        session_id: row.get(0)?,
-                        bucket: row.get(1)?,
-                        key: row.get(2)?,
-                        target: PgStore::parse_stream_target(
-                            op_kind_raw,
-                            upload_id,
-                            part_number,
-                            3,
-                        )?,
-                        state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                6,
-                                rusqlite::types::Type::Integer,
-                                Box::from(format!("invalid stream state: {state_raw}")),
-                            )
-                        })?,
-                        created_at: row.get::<_, i64>(7)? as u64,
-                        encryption: Self::parse_object_encryption(
-                            row.get::<_, u8>(8)?,
-                            row.get::<_, Option<Vec<u8>>>(9)?,
-                            8,
-                            9,
-                        )?,
-                        next_segment_vid: Self::parse_generation_id(
-                            row.get::<_, i64>(10)?,
-                            10,
-                            "next_segment_vid",
-                        )?,
-                    })
-                },
+                parse_stream_upload_record,
             )
             .optional()
             .map_err(|e| MetadataError::Db {
@@ -16524,46 +16577,13 @@ impl PgMetadataStore for PgStore {
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads",
-            )
+            .prepare_cached(STREAM_UPLOAD_SELECT)
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (prepare)",
                 source: e,
             })?;
         let rows = stmt
-            .query_map([], |row| {
-                let op_kind_raw: u8 = row.get(3)?;
-                let state_raw: u8 = row.get(6)?;
-                let upload_id: Option<UploadId> = row.get(4)?;
-                let part_number: Option<i64> = row.get(5)?;
-                Ok(StreamUploadRecord {
-                    session_id: row.get(0)?,
-                    bucket: row.get(1)?,
-                    key: row.get(2)?,
-                    target: PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 3)?,
-                    state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Integer,
-                            Box::from(format!("invalid stream state: {state_raw}")),
-                        )
-                    })?,
-                    created_at: row.get::<_, i64>(7)? as u64,
-                    encryption: Self::parse_object_encryption(
-                        row.get::<_, u8>(8)?,
-                        row.get::<_, Option<Vec<u8>>>(9)?,
-                        8,
-                        9,
-                    )?,
-                    next_segment_vid: Self::parse_generation_id(
-                        row.get::<_, i64>(10)?,
-                        10,
-                        "next_segment_vid",
-                    )?,
-                })
-            })
+            .query_map([], parse_stream_upload_record)
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (query)",
                 source: e,
@@ -16581,63 +16601,29 @@ impl PgMetadataStore for PgStore {
         limit: u32,
     ) -> Result<StreamUploadRecordPage, MetadataError> {
         let fetch_limit = i64::from(limit) + 1;
-        let (sql, params_vec): (
-            &str,
-            Vec<Box<dyn rusqlite::types::ToSql>>,
-        ) = match session_id_marker {
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            match session_id_marker {
             Some(marker) => (
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
-                 WHERE session_id > ?1 \
-                 ORDER BY session_id ASC LIMIT ?2",
+                format!("{STREAM_UPLOAD_SELECT} WHERE session_id > ?1 ORDER BY session_id ASC LIMIT ?2"),
                 vec![Box::new(marker.clone()), Box::new(fetch_limit)],
             ),
             None => (
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
-                 ORDER BY session_id ASC LIMIT ?1",
+                format!("{STREAM_UPLOAD_SELECT} ORDER BY session_id ASC LIMIT ?1"),
                 vec![Box::new(fetch_limit)],
             ),
         };
         let mut stmt = self
             .conn
-            .prepare_cached(sql)
+            .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads page (prepare)",
                 source: e,
             })?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
-                let op_kind_raw: u8 = row.get(3)?;
-                let state_raw: u8 = row.get(6)?;
-                let upload_id: Option<UploadId> = row.get(4)?;
-                let part_number: Option<i64> = row.get(5)?;
-                Ok(StreamUploadRecord {
-                    session_id: row.get(0)?,
-                    bucket: row.get(1)?,
-                    key: row.get(2)?,
-                    target: PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 3)?,
-                    state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Integer,
-                            Box::from(format!("invalid stream state: {state_raw}")),
-                        )
-                    })?,
-                    created_at: row.get::<_, i64>(7)? as u64,
-                    encryption: Self::parse_object_encryption(
-                        row.get::<_, u8>(8)?,
-                        row.get::<_, Option<Vec<u8>>>(9)?,
-                        8,
-                        9,
-                    )?,
-                    next_segment_vid: Self::parse_generation_id(
-                        row.get::<_, i64>(10)?,
-                        10,
-                        "next_segment_vid",
-                    )?,
-                })
-            })
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter()),
+                parse_stream_upload_record,
+            )
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads page (query)",
                 source: e,
@@ -16667,15 +16653,12 @@ impl PgMetadataStore for PgStore {
         limit: u32,
     ) -> Result<StreamUploadRecordPage, MetadataError> {
         let fetch_limit = i64::from(limit) + 1;
-        let (sql, params_vec): (
-            &str,
-            Vec<Box<dyn rusqlite::types::ToSql>>,
-        ) = match session_id_marker {
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            match session_id_marker {
             Some(marker) => (
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
-                 WHERE bucket = ?1 AND session_id > ?2 \
-                 ORDER BY session_id ASC LIMIT ?3",
+                format!(
+                    "{STREAM_UPLOAD_SELECT} WHERE bucket = ?1 AND session_id > ?2 ORDER BY session_id ASC LIMIT ?3"
+                ),
                 vec![
                     Box::new(bucket.clone()),
                     Box::new(marker.clone()),
@@ -16683,52 +16666,22 @@ impl PgMetadataStore for PgStore {
                 ],
             ),
             None => (
-                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                 created_at, encryption_type, encryption_state, next_segment_vid FROM stream_uploads \
-                 WHERE bucket = ?1 \
-                 ORDER BY session_id ASC LIMIT ?2",
+                format!("{STREAM_UPLOAD_SELECT} WHERE bucket = ?1 ORDER BY session_id ASC LIMIT ?2"),
                 vec![Box::new(bucket.clone()), Box::new(fetch_limit)],
             ),
         };
         let mut stmt = self
             .conn
-            .prepare_cached(sql)
+            .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for bucket page (prepare)",
                 source: e,
             })?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
-                let op_kind_raw: u8 = row.get(3)?;
-                let state_raw: u8 = row.get(6)?;
-                let upload_id: Option<UploadId> = row.get(4)?;
-                let part_number: Option<i64> = row.get(5)?;
-                Ok(StreamUploadRecord {
-                    session_id: row.get(0)?,
-                    bucket: row.get(1)?,
-                    key: row.get(2)?,
-                    target: PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 3)?,
-                    state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Integer,
-                            Box::from(format!("invalid stream state: {state_raw}")),
-                        )
-                    })?,
-                    created_at: row.get::<_, i64>(7)? as u64,
-                    encryption: Self::parse_object_encryption(
-                        row.get::<_, u8>(8)?,
-                        row.get::<_, Option<Vec<u8>>>(9)?,
-                        8,
-                        9,
-                    )?,
-                    next_segment_vid: Self::parse_generation_id(
-                        row.get::<_, i64>(10)?,
-                        10,
-                        "next_segment_vid",
-                    )?,
-                })
-            })
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter()),
+                parse_stream_upload_record,
+            )
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for bucket page (query)",
                 source: e,
@@ -20201,6 +20154,7 @@ mod tests {
                 last_modified_millis: 2,
                 stale_payload: None,
                 bucket_write_reservation: proof,
+                stream_create_bucket_write_reservation: None,
             })),
         );
         let mut malformed_bytes = command.command_bytes();
@@ -21075,6 +21029,7 @@ mod tests {
             created_at: 123,
             encryption: ObjectEncryption::None,
             next_segment_vid: GenerationId::new(2).unwrap(),
+            bucket_write_reservation: None,
         };
         let expected = TerminalStreamCleanupRecord::from(&session);
         let mut replica = session.clone();
@@ -21110,11 +21065,13 @@ mod tests {
             created_at: 456,
             encryption: ObjectEncryption::None,
             next_segment_vid: GenerationId::MIN,
+            bucket_write_reservation: None,
         };
         store
             .create_stream_upload_explicit(
                 &StreamUploadCommandRecord::from(&session),
                 session.next_segment_vid,
+                None,
             )
             .unwrap();
 
@@ -21873,6 +21830,7 @@ mod tests {
                     &key,
                     "replacement-live",
                 ),
+                stream_create_bucket_write_reservation: None,
             })),
         );
         insert_direct_put_terminal_staging(&store, &bucket, &key, &replacement_reservation_id);
@@ -21987,6 +21945,7 @@ mod tests {
                     lease_deadline: Some(2),
                     target_context: Some(key.as_str().to_string()),
                 },
+                stream_create_bucket_write_reservation: None,
             })),
         );
 
@@ -22237,6 +22196,7 @@ mod tests {
                     lease_deadline: Some(2),
                     target_context: Some(key.as_str().to_string()),
                 },
+                stream_create_bucket_write_reservation: None,
             })),
         )
     }

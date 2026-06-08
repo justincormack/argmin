@@ -1251,7 +1251,7 @@ impl super::StorageCluster {
             }
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.release_metadata_command_bucket_write_reservation(&command)?;
+                    self.release_applied_metadata_command_bucket_write_reservations(&command)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
                         command_bucket,
@@ -1934,6 +1934,117 @@ impl super::StorageCluster {
         }
     }
 
+    fn stream_upload_has_live_bucket_write_reservation(
+        &self,
+        upload: &StreamUploadRecord,
+    ) -> Result<bool, BucketWriteDrainError> {
+        let Some(proof) = upload.bucket_write_reservation.as_ref() else {
+            return Ok(false);
+        };
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        match node
+            .bucket_write_reservation_client()
+            .validate_bucket_write_reservation_proof(pg_id, proof)
+        {
+            Ok(()) => Ok(true),
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationNotFound { .. },
+            )) => Ok(false),
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict { .. },
+            )) => Ok(false),
+            Err(error) => Err(bucket_snapshot_error_to_bucket_write_drain_error(error)),
+        }
+    }
+
+    fn active_put_object_stream_upload_source(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketVisibleDataSource>, BucketWriteDrainError> {
+        const STREAM_UPLOAD_SCAN_PAGE_LIMIT: u32 = 128;
+
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
+            let mut marker = None;
+            loop {
+                let node = self
+                    .local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+                let page = node
+                    .object_mutation_metadata_client()
+                    .list_stream_uploads_for_bucket_page(
+                        pg_id,
+                        bucket,
+                        marker.as_ref(),
+                        STREAM_UPLOAD_SCAN_PAGE_LIMIT,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                if page.uploads.is_empty() {
+                    break;
+                }
+
+                for upload in page.uploads {
+                    if self.object_metadata_pg_id(&upload.bucket, &upload.key) != raw_pg_id {
+                        return Err(BucketWriteDrainError::Store(StoreError::Io {
+                            context: "bucket delete active stream upload PG validation",
+                            source: std::io::Error::other(format!(
+                                "stream upload session {:?} for bucket {:?} key {:?} is stored on PG {}",
+                                upload.session_id,
+                                upload.bucket,
+                                upload.key,
+                                raw_pg_id
+                            )),
+                        }));
+                    }
+                    if upload.target != crate::StreamUploadTarget::PutObject {
+                        continue;
+                    }
+                    if self.stream_upload_has_live_bucket_write_reservation(&upload)? {
+                        return Ok(Some(BucketVisibleDataSource::StreamUpload { pg_id }));
+                    }
+                }
+
+                let Some(next_marker) = page.next_session_id_marker else {
+                    break;
+                };
+                marker = Some(next_marker);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn bucket_delete_not_empty_error(
+        &self,
+        bucket: &BucketName,
+        pg_id: PgId,
+        source: BucketVisibleDataSource,
+    ) -> BucketWriteDrainError {
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_not_empty",
+            Some(format_args!(
+                "bucket={:?} pg_id={} source={} source_pg_id={}",
+                bucket,
+                pg_id.get(),
+                source.label(),
+                source.pg_id().get()
+            )),
+        );
+        if bucket_delete_visible_data_diagnostics_enabled() {
+            eprintln!(
+                "bucket delete begin found visible data source={} source_pg_id={}",
+                source.label(),
+                source.pg_id().get()
+            );
+        }
+        crate::error::MetadataError::BucketNotEmpty.into()
+    }
+
     fn drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(
         &self,
         bucket: &BucketName,
@@ -2046,6 +2157,9 @@ impl super::StorageCluster {
                 return Ok(());
             }
         }
+        if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
+            return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+        }
         let durable_drain = match self.begin_durable_bucket_delete_drain(bucket)? {
             super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
             super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
@@ -2144,6 +2258,9 @@ impl super::StorageCluster {
                 {
                     continue;
                 }
+                if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
+                    return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+                }
                 self.wait_for_durable_bucket_write_reservations_empty(bucket)?;
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
@@ -2155,25 +2272,7 @@ impl super::StorageCluster {
                     continue;
                 }
                 if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_begin_not_empty",
-                        Some(format_args!(
-                            "bucket={:?} pg_id={} source={} source_pg_id={}",
-                            bucket,
-                            pg_id.get(),
-                            source.label(),
-                            source.pg_id().get()
-                        )),
-                    );
-                    if bucket_delete_visible_data_diagnostics_enabled() {
-                        eprintln!(
-                            "bucket delete begin found visible data source={} source_pg_id={}",
-                            source.label(),
-                            source.pg_id().get()
-                        );
-                    }
-                    return Err(crate::error::MetadataError::BucketNotEmpty.into());
+                    return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
                 #[cfg(test)]
                 maybe_run_before_bucket_delete_command_id_hook(
@@ -2274,6 +2373,9 @@ impl super::StorageCluster {
                         }));
                     }
                     if upload.target != crate::StreamUploadTarget::PutObject {
+                        continue;
+                    }
+                    if self.stream_upload_has_live_bucket_write_reservation(&upload)? {
                         continue;
                     }
                     match self.abort_stream_upload_session(
@@ -4536,7 +4638,7 @@ impl super::StorageCluster {
         loop {
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.release_metadata_command_bucket_write_reservation(&command)
+                    self.release_applied_metadata_command_bucket_write_reservations(&command)
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,

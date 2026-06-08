@@ -2767,6 +2767,13 @@ fn release_open_metadata_command_bucket_write_reservation(
     pg_routes: &BTreeMap<PgId, LocalPgRoute>,
     command: &MetadataCommandEnvelope,
 ) -> Result<(), ClusterBuildError> {
+    if matches!(
+        command.payload(),
+        crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create)
+            if create.session.target == crate::StreamUploadTarget::PutObject
+    ) {
+        return Ok(());
+    }
     let Some(proof) = command_bucket_write_reservation_proof(command) else {
         return Ok(());
     };
@@ -15022,6 +15029,249 @@ mod tests {
     }
 
     #[test]
+    fn active_put_object_stream_upload_blocks_bucket_delete() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "active-stream-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6".to_string()).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "connected direct PUT stream must make DeleteBucket return BucketNotEmpty: {err:?}"
+        );
+
+        cluster
+            .abort_stream_upload_session(&bucket, &key, &session_id)
+            .unwrap();
+        cluster.begin_bucket_delete(&bucket).unwrap();
+    }
+
+    #[test]
+    fn active_put_object_stream_upload_blocks_bucket_delete_from_independent_frontend() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "active-stream-remote-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let writer_frontend = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let deleting_frontend = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&writer_frontend, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7".to_string()).unwrap();
+        writer_frontend
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        let err = deleting_frontend.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "a connected stream created by another frontend must make DeleteBucket return BucketNotEmpty: {err:?}"
+        );
+        {
+            let object_pg = map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id).expect(
+                "DeleteBucket must not abort a live stream session owned by another frontend",
+            );
+        }
+
+        writer_frontend
+            .abort_stream_upload_session(&bucket, &key, &session_id)
+            .unwrap();
+        deleting_frontend.begin_bucket_delete(&bucket).unwrap();
+    }
+
+    #[test]
+    fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
+        let _serial = lock_bucket_scoped_hook_test();
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "conflicting-stream-proof-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8".to_string()).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+
+        let object_pg = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        let stream_session = crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id)
+            .expect("stream session should exist");
+        let proof = stream_session
+            .bucket_write_reservation
+            .clone()
+            .expect("direct PutObject stream row should carry its create reservation proof");
+        drop(object_pg);
+
+        let bucket_pg = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::release_durable_bucket_write_reservation(
+            &*bucket_pg,
+            &bucket,
+            &proof.reservation_id,
+            &proof.owner_token,
+            proof.cluster_epoch,
+            proof.bucket_execution_generation,
+            proof.bucket_incarnation_generation,
+        )
+        .unwrap();
+        let mismatched_record = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*bucket_pg,
+            &bucket,
+            &proof.reservation_id,
+            "different-stream-owner",
+            proof.cluster_epoch,
+            &proof.operation_kind,
+            proof.created_at,
+            proof.lease_deadline,
+            proof.target_context.as_deref(),
+        )
+        .unwrap();
+        drop(bucket_pg);
+
+        let released_mismatch = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_record = mismatched_record.clone();
+        let released_mismatch_for_hook = Arc::clone(&released_mismatch);
+        let _hook_guard =
+            crate::node::install_bucket_scoped_test_hooks(crate::node::BucketScopedTestHooks {
+                target: Some(hook_bucket.clone()),
+                before_bucket_write_drain_wait: Some(Arc::new(move || {
+                    if released_mismatch_for_hook.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let bucket_pg = hook_map
+                        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+                        .unwrap()
+                        .storage_node()
+                        .get_pg(1)
+                        .unwrap();
+                    crate::PgMetadataStore::release_durable_bucket_write_reservation(
+                        &*bucket_pg,
+                        &hook_bucket,
+                        &hook_record.reservation_id,
+                        &hook_record.owner_token,
+                        hook_record.cluster_epoch,
+                        hook_record.bucket_execution_generation,
+                        hook_record.bucket_incarnation_generation,
+                    )
+                    .unwrap();
+                })),
+                ..crate::node::BucketScopedTestHooks::default()
+            });
+
+        cluster
+            .begin_bucket_delete(&bucket)
+            .expect("stale/conflicting stream proof must not keep bucket non-empty");
+        assert!(
+            released_mismatch.load(Ordering::SeqCst),
+            "DeleteBucket should wait for and release the unrelated mismatched reservation"
+        );
+        let object_pg = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*object_pg,
+                &bucket,
+                &key,
+                &session_id
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+    }
+
+    #[test]
     fn bucket_delete_stream_cleanup_tolerates_concurrent_missing_session() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -18823,10 +19073,16 @@ mod tests {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        assert!(
+        let reservations =
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        let upload = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
+        assert_eq!(
+            upload.bucket_write_reservation.as_ref(),
+            Some(&crate::metadata_command::BucketWriteReservationProof::from(
+                &reservations[0]
+            ))
         );
         let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
@@ -18916,10 +19172,16 @@ mod tests {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        assert!(
+        let reservations =
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        let upload = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
+        assert_eq!(
+            upload.bucket_write_reservation.as_ref(),
+            Some(&crate::metadata_command::BucketWriteReservationProof::from(
+                &reservations[0]
+            ))
         );
         let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
@@ -19033,10 +19295,16 @@ mod tests {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        assert!(
+        let reservations =
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        let upload = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
+        assert_eq!(
+            upload.bucket_write_reservation.as_ref(),
+            Some(&crate::metadata_command::BucketWriteReservationProof::from(
+                &reservations[0]
+            ))
         );
         let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
@@ -19139,7 +19407,7 @@ mod tests {
     }
 
     #[test]
-    fn live_stream_create_terminal_cleanup_keeps_pending_slot_on_reservation_release_failure() {
+    fn live_put_object_stream_create_keeps_reservation_and_clears_pending_slot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -19189,43 +19457,20 @@ mod tests {
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
             .unwrap();
 
-        {
-            let primary_pg = map
-                .node(NodeId::new(1))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            primary_pg
-                .connection()
-                .execute(
-                    "UPDATE bucket_write_reservations \
-                     SET owner_token = ?1 \
-                     WHERE bucket_name = ?2 AND reservation_id = ?3",
-                    rusqlite::params![
-                        "wrong-live-owner-token",
-                        bucket.as_str(),
-                        reservation.record.reservation_id.as_str()
-                    ],
+        assert_eq!(
+            cluster
+                .finish_exact_pending_object_metadata_command(
+                    pg_id,
+                    crate::cluster::ExactPendingObjectMetadataCommand::for_checked_request(
+                        &command
+                    ),
                 )
-                .unwrap();
-        }
-
-        let err = cluster
-            .finish_exact_pending_object_metadata_command(
-                pg_id,
-                crate::cluster::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::ObjectPgActionError::Metadata(
-                crate::MetadataError::BucketWriteReservationConflict { .. }
-            )
-        ));
+                .unwrap(),
+            crate::cluster::PendingMetadataCommandOutcome::Applied
+        );
         assert!(
-            pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
-            "release failure must leave the terminal pending slot as the cleanup retry driver"
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+            "applied live stream create should clear its pending slot"
         );
         {
             let primary_pg = map
@@ -19238,53 +19483,29 @@ mod tests {
                 crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
                     .unwrap()
                     .len(),
-                1
+                1,
+                "live direct PUT stream create must keep its bucket-write proof until abort/finalize"
             );
-            primary_pg
-                .connection()
-                .execute(
-                    "UPDATE bucket_write_reservations \
-                     SET owner_token = ?1 \
-                     WHERE bucket_name = ?2 AND reservation_id = ?3",
-                    rusqlite::params![
-                        reservation.record.owner_token.as_str(),
-                        bucket.as_str(),
-                        reservation.record.reservation_id.as_str()
-                    ],
-                )
-                .unwrap();
         }
-
-        assert_eq!(
-            cluster
-                .finish_exact_pending_object_metadata_command(
-                    pg_id,
-                    crate::cluster::ExactPendingObjectMetadataCommand::for_checked_request(
-                        &command,
-                    ),
-                )
-                .unwrap(),
-            crate::cluster::PendingMetadataCommandOutcome::Applied
-        );
-        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         let primary_pg = map
             .node(NodeId::new(1))
             .unwrap()
             .storage_node()
             .get_pg(1)
             .unwrap();
-        assert!(
-            crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
-                .unwrap()
-                .is_empty()
-        );
         let session = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
         assert_eq!(session.bucket, bucket);
         assert_eq!(session.key, key);
+        assert_eq!(
+            session.bucket_write_reservation.as_ref(),
+            Some(&crate::metadata_command::BucketWriteReservationProof::from(
+                &reservation.record
+            ))
+        );
     }
 
     #[test]
-    fn stream_create_open_time_convergence_releases_bucket_write_reservation() {
+    fn put_object_stream_create_open_time_convergence_preserves_bucket_write_reservation() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -19357,63 +19578,6 @@ mod tests {
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &pending)
             .unwrap();
 
-        {
-            let primary_pg = map
-                .node(NodeId::new(0))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            primary_pg
-                .connection()
-                .execute(
-                    "UPDATE bucket_write_reservations \
-                     SET owner_token = ?1 \
-                     WHERE bucket_name = ?2 AND reservation_id = ?3",
-                    rusqlite::params![
-                        "wrong-owner-token",
-                        bucket.as_str(),
-                        reservation.reservation_id.as_str()
-                    ],
-                )
-                .unwrap();
-        }
-        let err = validate_metadata_command_replay_state(
-            &map.nodes,
-            &map.pg_routes,
-            &[PgId::new(1)],
-            ClusterEpoch::INITIAL,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, ClusterBuildError::OpenLocalNode { .. }),
-            "release failure should fail replay validation before slot cleanup: {err:?}"
-        );
-        assert!(
-            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
-            "failed release must leave pending slot carrying reservation proof"
-        );
-        {
-            let primary_pg = map
-                .node(NodeId::new(0))
-                .unwrap()
-                .storage_node()
-                .get_pg(1)
-                .unwrap();
-            primary_pg
-                .connection()
-                .execute(
-                    "UPDATE bucket_write_reservations \
-                     SET owner_token = ?1 \
-                     WHERE bucket_name = ?2 AND reservation_id = ?3",
-                    rusqlite::params![
-                        reservation.owner_token.as_str(),
-                        bucket.as_str(),
-                        reservation.reservation_id.as_str()
-                    ],
-                )
-                .unwrap();
-        }
         drop(cluster);
         drop(map);
 
@@ -19441,10 +19605,13 @@ mod tests {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        assert!(
+        let reservations =
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        assert_eq!(
+            reservations,
+            vec![reservation],
+            "open-time direct stream-create recovery must preserve the live writer proof"
         );
         drop(primary_pg);
         assert_clean_metadata_command_stream(&reopened, &[1]);
@@ -19736,10 +19903,15 @@ mod tests {
         let primary_pg = primary_node.get_pg(1).unwrap();
         let upload = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
         assert_eq!(upload.bucket, bucket);
-        assert!(
+        let reservations =
             crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(
+            upload.bucket_write_reservation.as_ref(),
+            Some(&crate::metadata_command::BucketWriteReservationProof::from(
+                &reservations[0]
+            ))
         );
         let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     }
@@ -22184,7 +22356,7 @@ mod tests {
             .unwrap();
         cluster
             .create_upload_part_stream_session(
-                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
                 1,
                 &session_id,
             )
@@ -22422,7 +22594,7 @@ mod tests {
             .unwrap();
         cluster
             .create_upload_part_stream_session(
-                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
                 1,
                 &session_id,
             )
@@ -25034,6 +25206,7 @@ mod tests {
                 key: key.clone(),
                 session_id: session_id.clone(),
                 staged_segments: Vec::new(),
+                stream_create_bucket_write_reservation: None,
             })),
         );
         let inserted = Arc::new(AtomicBool::new(false));
@@ -25224,7 +25397,7 @@ mod tests {
                 )
                 .unwrap()
                 .len(),
-                1
+                2
             );
         }
         assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
@@ -25382,10 +25555,17 @@ mod tests {
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
             .unwrap();
         let bucket_pg = bucket_primary.storage_node().get_pg(1).unwrap();
-        assert!(
+        let reservations =
             crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
-                .unwrap()
-                .is_empty()
+                .unwrap();
+        assert_eq!(reservations.len(), 1);
+        let upload = crate::PgMetadataStore::get_stream_upload(&*bucket_pg, &session_id).unwrap();
+        assert_eq!(
+            upload.bucket_write_reservation.as_ref(),
+            Some(&crate::metadata_command::BucketWriteReservationProof::from(
+                &reservations[0]
+            )),
+            "failed finalize should release its caller proof but keep the live stream-create proof"
         );
     }
 
@@ -25529,6 +25709,7 @@ mod tests {
                 last_modified_millis: 123_460,
                 stale_payload: None,
                 bucket_write_reservation: command_proof,
+                stream_create_bucket_write_reservation: None,
             })),
         );
         let inserted = Arc::new(AtomicBool::new(false));
@@ -26007,6 +26188,7 @@ mod tests {
                 &session_id,
             )
             .unwrap();
+        assert_bucket_write_reservations_released(&map, &bucket);
         let payload = b"stream part same pending install race";
         let (_target, segment) = cluster
             .prepare_stream_segment_append(

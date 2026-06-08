@@ -621,6 +621,7 @@ pub(crate) struct CommitDirectPutObjectCommand {
     pub(crate) last_modified_millis: u64,
     pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) stream_create_bucket_write_reservation: Option<BucketWriteReservationProof>,
 }
 
 impl CommitDirectPutObjectCommand {
@@ -943,6 +944,7 @@ pub(crate) struct AbortStreamUploadCommand {
     pub(crate) key: ObjectKey,
     pub(crate) session_id: SessionId,
     pub(crate) staged_segments: Vec<StreamUploadSegmentRecord>,
+    pub(crate) stream_create_bucket_write_reservation: Option<BucketWriteReservationProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1376,7 +1378,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.read_u64()?;
                 self.skip_optional_stale_payload()?;
-                self.skip_required_bucket_write_reservation_proof()
+                self.skip_required_bucket_write_reservation_proof()?;
+                self.skip_optional(Self::skip_required_bucket_write_reservation_proof)
             }
             METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
                 self.skip_str()?;
@@ -1434,7 +1437,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_str()?;
                 self.skip_str()?;
                 self.skip_str()?;
-                self.skip_repeated(Self::skip_stream_upload_segment)
+                self.skip_repeated(Self::skip_stream_upload_segment)?;
+                self.skip_optional(Self::skip_required_bucket_write_reservation_proof)
             }
             METADATA_COMMAND_COMMIT_STREAM_PART => {
                 self.skip_str()?;
@@ -1560,6 +1564,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
                         bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
+                        stream_create_bucket_write_reservation: self
+                            .read_optional_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -1645,6 +1651,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     key: self.read_object_key()?,
                     session_id: self.read_session_id()?,
                     staged_segments: self.read_repeated(Self::read_stream_upload_segment)?,
+                    stream_create_bucket_write_reservation: self
+                        .read_optional_bucket_write_reservation_proof()?,
                 }),
             )),
             METADATA_COMMAND_COMMIT_STREAM_PART => Ok(MetadataCommandPayload::CommitStreamPart(
@@ -2746,6 +2754,12 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         })
     }
 
+    fn read_optional_bucket_write_reservation_proof(
+        &mut self,
+    ) -> Result<Option<BucketWriteReservationProof>, String> {
+        self.read_optional(Self::read_bucket_write_reservation_proof)
+    }
+
     fn skip_object_payload_reclaim_claim_proof(&mut self) -> Result<(), String> {
         self.read_u64()?;
         self.read_u8()?;
@@ -3036,6 +3050,10 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
         }
     }
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+    encode_optional_bucket_write_reservation_proof(
+        out,
+        command.stream_create_bucket_write_reservation.as_ref(),
+    );
 }
 
 fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
@@ -3170,6 +3188,10 @@ fn encode_abort_stream_upload(out: &mut Vec<u8>, command: &AbortStreamUploadComm
     for segment in &command.staged_segments {
         encode_stream_upload_segment(out, segment);
     }
+    encode_optional_bucket_write_reservation_proof(
+        out,
+        command.stream_create_bucket_write_reservation.as_ref(),
+    );
 }
 
 fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartCommand) {
@@ -3689,6 +3711,19 @@ fn encode_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteR
     encode_optional_string(out, proof.target_context.as_deref());
 }
 
+fn encode_optional_bucket_write_reservation_proof(
+    out: &mut Vec<u8>,
+    proof: Option<&BucketWriteReservationProof>,
+) {
+    match proof {
+        Some(proof) => {
+            put_u8(out, 1);
+            encode_bucket_write_reservation_proof(out, proof);
+        }
+        None => put_u8(out, 0),
+    }
+}
+
 fn encode_object_payload_reclaim_claim_proof(
     out: &mut Vec<u8>,
     proof: &ObjectPayloadReclaimClaimProof,
@@ -3927,14 +3962,18 @@ mod tests {
                 last_modified_millis: 2,
                 stale_payload: None,
                 bucket_write_reservation: proof.clone(),
+                stream_create_bucket_write_reservation: None,
             })),
         );
 
         let mut proof_bytes = Vec::new();
         encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
+        let mut required_proof_suffix = proof_bytes;
+        encode_optional_bucket_write_reservation_proof(&mut required_proof_suffix, None);
         let mut proofless_bytes = command.command_bytes();
-        assert!(proofless_bytes.ends_with(&proof_bytes));
-        proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+        assert!(proofless_bytes.ends_with(&required_proof_suffix));
+        proofless_bytes.truncate(proofless_bytes.len() - required_proof_suffix.len());
+        encode_optional_bucket_write_reservation_proof(&mut proofless_bytes, None);
 
         assert!(
             decode_metadata_command_envelope(&proofless_bytes).is_err(),
@@ -4868,6 +4907,7 @@ mod tests {
                 last_modified_millis: 555,
                 stale_payload: Some(segment_reclaim.clone()),
                 bucket_write_reservation: bucket_write_reservation.clone(),
+                stream_create_bucket_write_reservation: None,
             })),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object: object.clone(),
@@ -4877,6 +4917,7 @@ mod tests {
                 last_modified_millis: 556,
                 stale_payload: Some(multipart_reclaim.clone()),
                 bucket_write_reservation: bucket_write_reservation.clone(),
+                stream_create_bucket_write_reservation: None,
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: upload_id.clone(),
@@ -5110,6 +5151,7 @@ mod tests {
                 key: key.clone(),
                 session_id: stream_session_id.clone(),
                 staged_segments: vec![stream_segment.clone()],
+                stream_create_bucket_write_reservation: None,
             })),
             MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
                 bucket: bucket.clone(),
@@ -5195,8 +5237,8 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0x953a2d6c99cdaddb,
-                0xf06b16288bdaeb8e,
+                0xc7362129e5a4a420,
+                0xdee5402ffb12ce7e,
                 0xd44aa9d008b3d4a6,
                 0x903cf2da427ff645,
                 0x22e816661cec7274,
@@ -5215,7 +5257,7 @@ mod tests {
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,
                 0x8d3e5d6cb995e021,
-                0x873424a13234f823,
+                0xa52f8b4c0ffcf759,
                 0x386d1fe2b146db69,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,

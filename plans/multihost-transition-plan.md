@@ -3639,7 +3639,14 @@ Proposed subphases:
            durable drain, wait until durable bucket write reservations are
            empty, drain all object-PG pending commands for the bucket again,
            then re-check visible objects, stream uploads, and MPU state from a
-           fresh snapshot.
+           fresh snapshot. For direct streamed `PutObject`, the durable
+           stream-upload row alone is staging state, not proof of a writer that
+           can still complete: a stream row with a still-valid stream-create
+           bucket-write reservation proof blocks DeleteBucket and must return
+           the normal non-empty outcome, while a row whose proof no longer
+           validates has been abandoned and DeleteBucket may abort that unowned
+           stream session before making the final emptiness decision. This
+           distinction must be explicit; do not use age-based heuristics.
         3. Add a return-boundary audit while reworking `begin_bucket_delete`.
            Keep only waits needed before returning a correct DeleteBucket
            result: admitted writers that can still publish visible data,
@@ -3685,7 +3692,11 @@ Proposed subphases:
           command for the bucket across all metadata PGs
         - one fresh-state predicate for DeleteBucket blocking state, covering
           visible object versions, active stream uploads, and in-progress MPU
-          rows
+          rows. "Active stream uploads" means a direct `PutObject` stream
+          session whose stream-create bucket-write reservation proof still
+          validates and can still commit visible object state; a durable stream
+          row whose proof no longer validates is abandoned cleanup state and
+          must not by itself make the bucket user-visibly non-empty.
       - required test order for this phase:
         1. active durable reservation blocks DeleteBucket; after release, the
            delete sees the writer's published data and returns BucketNotEmpty
@@ -3818,6 +3829,15 @@ Proposed subphases:
           - status: covered by two-handle durable drain/reservation contention
             tests; the production authority is the bucket-PG primary rows, not
             process-local counters or condition variables.
+        - a direct `PutObject` stream session created by one frontend blocks
+          DeleteBucket on another frontend while its stream-create
+          bucket-write reservation proof still validates; after stream abort or
+          finalize releases that proof, DeleteBucket can treat any remaining
+          unowned stream row as abandoned cleanup state
+          - status: covered by the independent-frontend active stream
+            DeleteBucket regression. The authority is the storage-node-owned
+            durable reservation row, not process-local stream ownership or an
+            age threshold.
       - request-level race coverage:
         - DeleteBucket vs direct PUT
         - DeleteBucket vs CopyObject

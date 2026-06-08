@@ -1957,6 +1957,34 @@ impl StorageCluster {
         self.release_bucket_write_reservation_proof(proof)
     }
 
+    fn release_applied_metadata_command_bucket_write_reservations(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let preserve_command_reservation = matches!(
+            command.payload(),
+            MetadataCommandPayload::CreateStreamUpload(create)
+                if create.session.target == StreamUploadTarget::PutObject
+        );
+        if !preserve_command_reservation {
+            self.release_metadata_command_bucket_write_reservation(command)?;
+        }
+        match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                if let Some(proof) = &commit.stream_create_bucket_write_reservation {
+                    self.release_bucket_write_reservation_proof(proof)?;
+                }
+            }
+            MetadataCommandPayload::AbortStreamUpload(abort) => {
+                if let Some(proof) = &abort.stream_create_bucket_write_reservation {
+                    self.release_bucket_write_reservation_proof(proof)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn release_bucket_write_reservation_proof(
         &self,
         proof: &BucketWriteReservationProof,
@@ -2718,7 +2746,7 @@ impl StorageCluster {
             }
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.release_metadata_command_bucket_write_reservation(&command)
+                    self.release_applied_metadata_command_bucket_write_reservations(&command)
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
@@ -3828,6 +3856,7 @@ impl StorageCluster {
             last_modified_millis,
             stale_payload,
             bucket_write_reservation,
+            stream_create_bucket_write_reservation: None,
         };
         Ok(MetadataCommandEnvelope::new(
             command_id,
@@ -4743,17 +4772,16 @@ impl StorageCluster {
             self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
-        {
+        let observed_stream_session =
             match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
-                Ok(_) => {}
+                Ok(_) => true,
                 Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                     ..
                 })) if pending_completed_session => {
                     return Ok(());
                 }
                 Err(error) => return Err(error),
-            }
-        }
+            };
 
         #[cfg(any(test, feature = "test-hooks"))]
         self.maybe_run_before_stream_abort_storage_hook();
@@ -4763,12 +4791,22 @@ impl StorageCluster {
                 self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
+            let stream_session =
+                match mutation_client.load_stream_upload_session(pg_id, bucket, key, session_id) {
+                    Ok(stream_session) => stream_session,
+                    Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                        ..
+                    })) if pending_completed_session || observed_stream_session => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
             let staged_segments =
                 match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
                     Ok(staged_segments) => staged_segments,
                     Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                         ..
-                    })) if pending_completed_session => {
+                    })) if pending_completed_session || observed_stream_session => {
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -4789,6 +4827,9 @@ impl StorageCluster {
                     key: key.clone(),
                     session_id: session_id.clone(),
                     staged_segments,
+                    stream_create_bucket_write_reservation: stream_session
+                        .bucket_write_reservation
+                        .clone(),
                 })),
             );
             if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {

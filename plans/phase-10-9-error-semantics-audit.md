@@ -193,7 +193,13 @@ Updated in this audit slice:
    ahead of an in-flight append, and finalize workers disarm it from the
    worker-side success path. Focused regressions cover the request-side guard
    dropping before worker-side session creation returns for all three streaming
-   request families.
+   request families. DeleteBucket uses the same distinction through
+   storage-node-owned identity: a direct `PutObject` stream row whose
+   stream-create bucket-write reservation proof still validates is active and
+   blocks DeleteBucket with `BucketNotEmpty`; a durable stream row whose proof
+   no longer validates is abandoned staging and may be aborted during
+   DeleteBucket convergence. This must remain identity/lifecycle based, not age
+   based, and it must work across independent frontend processes.
 
 Open audit items:
 

@@ -294,6 +294,19 @@ fn stream_upload_matches_command(
 ) -> bool {
     StreamUploadCommandRecord::from(existing) == create.session
         && existing.next_segment_vid == create.initial_next_segment_vid
+        && stream_upload_bucket_write_reservation_matches_command(existing, create)
+}
+
+fn stream_upload_bucket_write_reservation_matches_command(
+    existing: &StreamUploadRecord,
+    create: &CreateStreamUploadCommand,
+) -> bool {
+    match create.session.target {
+        StreamUploadTarget::PutObject => {
+            existing.bucket_write_reservation.as_ref() == Some(&create.bucket_write_reservation)
+        }
+        StreamUploadTarget::UploadPart { .. } => existing.bucket_write_reservation.is_none(),
+    }
 }
 
 fn multipart_upload_matches_command(
@@ -14180,6 +14193,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 last_modified_millis,
                 stale_payload,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),
+                stream_create_bucket_write_reservation: None,
             })),
         ))
     }
@@ -14304,6 +14318,10 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 last_modified_millis,
                 stale_payload,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),
+                stream_create_bucket_write_reservation: current
+                    .session
+                    .bucket_write_reservation
+                    .clone(),
             })),
         ))
     }
@@ -15049,6 +15067,58 @@ mod tests {
     fn private_socket_dir(path: &std::path::Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
+        let bucket = crate::tests::bucket_name("upload-part-stream-match-bucket");
+        let key = crate::tests::object_key("upload-part-stream-match-key");
+        let upload_id = crate::tests::multipart_upload_id("upload-part-stream-match-upload");
+        let session_id = SessionId::try_from("b6".repeat(16)).unwrap();
+        let request = CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: ObjectEncryption::None,
+        };
+        let proof = crate::metadata_command::BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "upload-part-stream-create-proof".to_string(),
+            owner_token: "upload-part-stream-create-owner".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "upload-part-stream-create".to_string(),
+            created_at: 10,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+            request, 10, proof,
+        );
+        let existing = StreamUploadRecord {
+            session_id,
+            bucket,
+            key,
+            target: StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number: 1,
+            },
+            state: StreamUploadState::InProgress,
+            created_at: command.session.created_at,
+            encryption: ObjectEncryption::None,
+            next_segment_vid: command.initial_next_segment_vid,
+            bucket_write_reservation: None,
+        };
+
+        assert!(
+            stream_upload_matches_command(&existing, &command),
+            "UploadPart stream-create replay must match the applied row without a stored create proof"
+        );
     }
 
     fn test_live_stored_object(
@@ -18860,6 +18930,7 @@ mod tests {
             created_at: 1,
             encryption: ObjectEncryption::None,
             next_segment_vid: GenerationId::new(2).unwrap(),
+            bucket_write_reservation: None,
         };
         client
             .validate_stream_upload_session_response(
@@ -19042,6 +19113,7 @@ mod tests {
                 created_at: 1,
                 encryption: ObjectEncryption::None,
                 next_segment_vid: GenerationId::new(11).unwrap(),
+                bucket_write_reservation: None,
             },
             existing_etag: None,
             generation_id: GenerationId::new(20).unwrap(),
@@ -19106,6 +19178,7 @@ mod tests {
                 last_modified_millis: 1,
                 stale_payload: None,
                 bucket_write_reservation: proof.clone(),
+                stream_create_bucket_write_reservation: None,
             })),
         );
         let request = BuildStreamPutCommitCommandReq {
@@ -19241,6 +19314,7 @@ mod tests {
                     created_at: 1,
                     encryption: ObjectEncryption::None,
                     next_segment_vid: GenerationId::new(31).unwrap(),
+                    bucket_write_reservation: None,
                 },
                 upload: upload.clone(),
                 existing_part_generation: None,

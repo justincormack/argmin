@@ -3447,6 +3447,7 @@ pub struct StreamUploadRecord {
     pub created_at: u64,
     pub encryption: ObjectEncryption,
     pub next_segment_vid: GenerationId,
+    pub bucket_write_reservation: Option<crate::BucketWriteReservationProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

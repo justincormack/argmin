@@ -227,8 +227,38 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
     encryption_state BLOB,
     next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0),
+    bucket_write_reservation_id TEXT,
+    bucket_write_owner_token TEXT,
+    bucket_write_cluster_epoch INTEGER,
+    bucket_write_execution_generation INTEGER,
+    bucket_write_incarnation_generation INTEGER,
+    bucket_write_operation_kind TEXT,
+    bucket_write_created_at INTEGER,
+    bucket_write_lease_deadline INTEGER,
+    bucket_write_target_context TEXT,
     CHECK (op_kind IN (0, 1)),
     CHECK (state IN (0, 1, 2, 3)),
+    CHECK (
+        (
+            bucket_write_reservation_id IS NULL AND
+            bucket_write_owner_token IS NULL AND
+            bucket_write_cluster_epoch IS NULL AND
+            bucket_write_execution_generation IS NULL AND
+            bucket_write_incarnation_generation IS NULL AND
+            bucket_write_operation_kind IS NULL AND
+            bucket_write_created_at IS NULL AND
+            bucket_write_lease_deadline IS NULL AND
+            bucket_write_target_context IS NULL
+        ) OR (
+            bucket_write_reservation_id IS NOT NULL AND
+            bucket_write_owner_token IS NOT NULL AND
+            bucket_write_cluster_epoch IS NOT NULL AND
+            bucket_write_execution_generation IS NOT NULL AND
+            bucket_write_incarnation_generation IS NOT NULL AND
+            bucket_write_operation_kind IS NOT NULL AND
+            bucket_write_created_at IS NOT NULL
+        )
+    ),
     CHECK (
         (op_kind = 0 AND upload_id IS NULL AND part_number IS NULL) OR
         (op_kind = 1 AND upload_id IS NOT NULL AND part_number BETWEEN 1 AND 10000)
