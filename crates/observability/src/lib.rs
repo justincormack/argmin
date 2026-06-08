@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -93,9 +94,43 @@ static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
+static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
 const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+const FLIGHT_RECORDER_CAPACITY: usize = 512;
+const FLIGHT_RECORD_MAX_DETAIL_BYTES: usize = 1_024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlightRecord {
+    pub sequence: u64,
+    pub ts_us: u128,
+    pub trace_id: String,
+    pub request_id: String,
+    pub target: &'static str,
+    pub event: &'static str,
+    pub detail: String,
+}
+
+struct FlightRecorder {
+    records: VecDeque<FlightRecord>,
+}
+
+impl FlightRecorder {
+    fn new() -> Self {
+        Self {
+            records: VecDeque::with_capacity(FLIGHT_RECORDER_CAPACITY),
+        }
+    }
+
+    fn push(&mut self, record: FlightRecord) {
+        if self.records.len() == FLIGHT_RECORDER_CAPACITY {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
+}
 
 struct AsyncTraceSink {
     sender: mpsc::SyncSender<Box<str>>,
@@ -167,6 +202,106 @@ fn write_stderr_line(args: fmt::Arguments<'_>) {
 fn write_stderr_str(line: &str) {
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "{line}");
+}
+
+fn flight_recorder() -> &'static Mutex<FlightRecorder> {
+    FLIGHT_RECORDER.get_or_init(|| Mutex::new(FlightRecorder::new()))
+}
+
+fn truncate_detail(mut detail: String) -> String {
+    if detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES {
+        return detail;
+    }
+
+    let mut end = FLIGHT_RECORD_MAX_DETAIL_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail.truncate(end);
+    detail.push_str("...");
+    detail
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn request_flight_detail(summary: RequestSummary<'_>, suffix: fmt::Arguments<'_>) -> String {
+    truncate_detail(format!(
+        "status={} method={} path_hash={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} {}",
+        summary.status_code,
+        summary.method,
+        stable_hash_hex(summary.path),
+        summary.query.has_query(),
+        summary.query.param_count(),
+        summary.query.has_sigv4_params(),
+        summary.streaming,
+        summary.body_len,
+        summary.bytes_sent,
+        summary.lifetime_us,
+        suffix
+    ))
+}
+
+pub fn record_flight_event(
+    context: &TraceContext,
+    target: &'static str,
+    event: &'static str,
+    detail: impl Into<String>,
+) {
+    let record = FlightRecord {
+        sequence: FLIGHT_RECORD_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ts_us: unix_micros(),
+        trace_id: context.trace_id().to_string(),
+        request_id: context.request_id().to_string(),
+        target,
+        event,
+        detail: truncate_detail(detail.into()),
+    };
+    let mut recorder = flight_recorder()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    recorder.push(record);
+}
+
+#[must_use]
+pub fn flight_recorder_snapshot() -> Vec<FlightRecord> {
+    flight_recorder()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .records
+        .iter()
+        .cloned()
+        .collect()
+}
+
+pub fn dump_flight_recorder_to_stderr(reason: &str) {
+    let records = flight_recorder_snapshot();
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "== argmin flight recorder dump reason={} records={} ==",
+        escaped(reason),
+        records.len()
+    );
+    for record in records {
+        let _ = writeln!(
+            stderr,
+            "flight seq={} ts_us={} trace_id={} request_id={} target={} event={} {}",
+            record.sequence,
+            record.ts_us,
+            record.trace_id,
+            record.request_id,
+            record.target,
+            record.event,
+            record.detail
+        );
+    }
 }
 
 fn trace_config() -> &'static TraceConfig {
@@ -459,6 +594,12 @@ pub fn emit_request_finish(
     outcome: &'static str,
 ) -> bool {
     REQUEST_FINISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+    record_flight_event(
+        context,
+        target,
+        "request_finish",
+        request_flight_detail(summary, format_args!("outcome={outcome}")),
+    );
     event_in_context(
         context,
         target,
@@ -501,6 +642,18 @@ pub fn emit_request_error(
         }
         _ => {}
     }
+    record_flight_event(
+        context,
+        target,
+        "request_error",
+        request_flight_detail(
+            summary,
+            format_args!(
+                "stage={} error_code={} cause_label={}",
+                stage, error_code, cause_label
+            ),
+        ),
+    );
     event_in_context(
         context,
         target,
@@ -532,6 +685,21 @@ pub fn emit_slow_request(
     error_code: Option<&str>,
 ) -> bool {
     SLOW_REQUEST_TOTAL.fetch_add(1, Ordering::Relaxed);
+    record_flight_event(
+        context,
+        target,
+        "slow_request",
+        request_flight_detail(
+            summary,
+            format_args!(
+                "outcome={}{}",
+                outcome,
+                error_code
+                    .map(|code| format!(" error_code={code}"))
+                    .unwrap_or_default()
+            ),
+        ),
+    );
     let error_suffix = error_code
         .map(|code| format!(" error_code={code}"))
         .unwrap_or_default();
@@ -1098,6 +1266,71 @@ mod tests {
             after.slow_down_response_total,
             before.slow_down_response_total + 1
         );
+    }
+
+    #[test]
+    fn request_error_records_redacted_bounded_flight_record() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let ctx = TraceContext::from_ids(
+            "trace-flight-redaction".to_string(),
+            "request-flight-redaction".to_string(),
+        );
+        let summary = RequestSummary {
+            method: "PUT",
+            path: "/secret-bucket/secret-key",
+            query: query_summary("X-Amz-Signature=secret&partNumber=1"),
+            status_code: 500,
+            streaming: false,
+            body_len: 17,
+            bytes_sent: 0,
+            lifetime_us: 123,
+        };
+
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "InternalError",
+            "metadata_command_contention",
+        );
+
+        let records = flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| record.request_id == "request-flight-redaction")
+            .expect("request error should be recorded in flight recorder");
+        assert_eq!(record.event, "request_error");
+        assert!(record.detail.contains("path_hash="));
+        assert!(record.detail.contains("sigv4_query=true"));
+        assert!(record
+            .detail
+            .contains("cause_label=metadata_command_contention"));
+        assert!(!record.detail.contains("secret-bucket"));
+        assert!(!record.detail.contains("secret-key"));
+        assert!(!record.detail.contains("secret"));
+        assert!(record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
+    }
+
+    #[test]
+    fn flight_recorder_is_bounded() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let ctx = TraceContext::from_ids(
+            "trace-flight-bounds".to_string(),
+            "request-flight-bounds".to_string(),
+        );
+
+        for index in 0..(FLIGHT_RECORDER_CAPACITY + 8) {
+            record_flight_event(&ctx, "test", "bounded", format!("index={index}"));
+        }
+
+        let records = flight_recorder_snapshot();
+        assert!(records.len() <= FLIGHT_RECORDER_CAPACITY);
+        assert!(!records.iter().any(|record| record.detail == "index=0"));
+        assert!(records
+            .iter()
+            .any(|record| record.detail == format!("index={}", FLIGHT_RECORDER_CAPACITY + 7)));
     }
 
     #[test]

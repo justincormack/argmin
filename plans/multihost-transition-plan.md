@@ -6302,6 +6302,14 @@ Status:
   preserving shard-delete-in-progress as internal/recoverable only, and adding
   drift guardrails for object-PG mappers, bucket snapshot mappers,
   bucket-write drain mappers, and payload-read storage-error mapping.
+- Continued the permanent diagnostics slice by adding a process-local bounded
+  flight recorder in `observability`. Request finish/error/slow-request
+  emitters now record redacted summaries with stable path hashes, query shape,
+  status, body/byte counts, lifetime, outcome/error code, and cause label.
+  `ARGMIN_ABORT_ON_500` dumps the recent ring before aborting so UAT failures
+  preserve context without enabling deep tracing. Remaining diagnostics work:
+  per-RPC/per-metadata-command wait/conflict events and counters, plus any
+  explicit local/admin-only debug dump trigger.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

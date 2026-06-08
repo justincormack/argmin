@@ -4551,15 +4551,11 @@ pub fn s3_response_to_hyper(
         abort_on_500: bool,
         trace_meta: ResponseTraceMeta,
     ) -> http::Response<S3HyperBody> {
-        fail_on_500_diagnostic(
-            format!(
-                "HTTP response conversion produced InternalError for {} {} (has_query={}): {reason}",
-                trace_meta.method,
-                trace_meta.path,
-                trace_meta.query.has_query()
-            ),
-            panic_on_500,
-            abort_on_500,
+        let diagnostic_message = format!(
+            "HTTP response conversion produced InternalError for {} {} (has_query={}): {reason}",
+            trace_meta.method,
+            trace_meta.path,
+            trace_meta.query.has_query()
         );
         let wire_ids =
             WireResponseIds::new(trace_meta.context.request_id(), trace_meta.host_id.clone());
@@ -4572,6 +4568,14 @@ pub fn s3_response_to_hyper(
             ResponseBodyTrace::new(trace_meta, resp.status_code, resp.body.len() as u64, false);
         if let Some(diagnostic) = error_diagnostic {
             trace.emit_error_diagnostic(diagnostic);
+        }
+        if panic_on_500 || abort_on_500 {
+            observability::dump_flight_recorder_to_stderr(if abort_on_500 {
+                "abort-on-500"
+            } else {
+                "panic-on-500"
+            });
+            fail_on_500_diagnostic(diagnostic_message, panic_on_500, abort_on_500);
         }
         let inflight_requests_guard = permit
             .as_ref()
@@ -4619,6 +4623,32 @@ pub fn s3_response_to_hyper(
             .error_diagnostic
             .map(|diagnostic| format!(" cause_label={}", diagnostic.cause_label))
             .unwrap_or_default();
+        if let Some(diagnostic) = resp.error_diagnostic {
+            let _ = observability::emit_request_error(
+                &trace_meta.context,
+                TRACE_TARGET,
+                observability::RequestSummary {
+                    method: &trace_meta.method,
+                    path: &trace_meta.path,
+                    query: trace_meta.query,
+                    status_code: resp.status_code,
+                    streaming: resp.stream.is_some(),
+                    body_len,
+                    bytes_sent: 0,
+                    lifetime_us: trace_meta.started_at.elapsed().as_micros(),
+                },
+                "response_body",
+                diagnostic.error_code,
+                diagnostic.cause_label,
+            );
+        }
+        if panic_on_500 || abort_on_500 {
+            observability::dump_flight_recorder_to_stderr(if abort_on_500 {
+                "abort-on-500"
+            } else {
+                "panic-on-500"
+            });
+        }
         fail_on_500_diagnostic(
             format!(
                 "server produced HTTP 500 response for {} {} (has_query={}){}: {body}",
@@ -6608,6 +6638,66 @@ mod tests {
             ),
         );
         assert_eq!(hyper_resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn s3_response_to_hyper_invalid_header_records_diagnostic_before_panic() {
+        let mut resp = S3Response {
+            status_code: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            stream: None,
+            error_diagnostic: None,
+        };
+        resp.headers.push((
+            "Content-Type".to_string(),
+            "text/plain\r\nInjected: x".to_string(),
+        ));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = s3_response_to_hyper(
+                resp,
+                None,
+                8192,
+                true,
+                false,
+                ResponseTraceMeta::new(
+                    observability::TraceContext::from_ids(
+                        "trace-conversion-error".to_string(),
+                        "request-conversion-error".to_string(),
+                    ),
+                    Arc::<str>::from("host-id"),
+                    "GET",
+                    "/secret-bucket/secret-key",
+                    "X-Amz-Signature=secret",
+                ),
+            );
+        }));
+
+        let panic_payload =
+            result.expect_err("conversion error should panic when panic-on-500 is enabled");
+        let panic_message = panic_payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+            .expect("panic should carry diagnostic string");
+        assert!(panic_message.contains("HTTP response conversion produced InternalError"));
+
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| record.request_id == "request-conversion-error")
+            .expect("conversion error should be recorded before panic");
+        assert_eq!(record.event, "request_error");
+        assert!(record.detail.contains("status=500"));
+        assert!(record.detail.contains("path_hash="));
+        assert!(record.detail.contains("sigv4_query=true"));
+        assert!(record.detail.contains("error_code=InternalError"));
+        assert!(record.detail.contains("cause_label=internal_error"));
+        assert!(!record.detail.contains("secret-bucket"));
+        assert!(!record.detail.contains("secret-key"));
+        assert!(!record.detail.contains("secret"));
     }
 
     #[test]
