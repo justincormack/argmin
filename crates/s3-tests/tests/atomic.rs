@@ -4,6 +4,9 @@
 //! concurrent readers always see either the complete old object or the
 //! complete new object, never a mix.
 
+use std::time::Duration;
+
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{err_status, unique_bucket, CTX};
 
@@ -11,6 +14,7 @@ const ONE_MIB: usize = 1024 * 1024;
 const FOUR_MIB: usize = 4 * ONE_MIB;
 const EIGHT_MIB: usize = 8 * ONE_MIB;
 const TEN_MIB: usize = 10 * ONE_MIB;
+const CLEANUP_DELETE_BUCKET_ATTEMPTS: usize = 20;
 
 async fn setup_bucket() -> String {
     let client = CTX.client();
@@ -22,9 +26,36 @@ async fn setup_bucket() -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(*key)
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("delete object during atomic cleanup: {err:?}"));
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    delete_bucket_after_object_cleanup(bucket).await;
+}
+
+async fn delete_bucket_after_object_cleanup(bucket: &str) {
+    let client = CTX.client();
+    for attempt in 1..=CLEANUP_DELETE_BUCKET_ATTEMPTS {
+        match client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => return,
+            Err(err)
+                if attempt < CLEANUP_DELETE_BUCKET_ATTEMPTS
+                    && s3_error_code(&err) == Some("BucketNotEmpty") =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => panic!("delete bucket during atomic cleanup: {err:?}"),
+        }
+    }
+    unreachable!("atomic cleanup delete-bucket loop must return or panic");
+}
+
+fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<&str> {
+    err.as_service_error().and_then(ProvideErrorMetadata::code)
 }
 
 fn make_body(ch: u8, size: usize) -> Vec<u8> {
