@@ -13,6 +13,11 @@ The target rule is:
    identity makes retry safe
 3. true invariant, corruption, routing, and storage failures remain fail-closed
    internal errors, with structured diagnostics
+4. cancellation of an async request future must not detach a side-effecting
+   blocking worker after that worker has created durable session/command state;
+   cleanup ownership must be armed from the same worker-side success path that
+   accepts the side effect, and cleanup must wait for in-flight append/finalize
+   workers that can still mutate durable staging state
 
 ## Current HTTP Shapes
 
@@ -172,6 +177,23 @@ Updated in this audit slice:
    call `read_segment_payload_stored_bytes_into(...)` and use `?` without first
    mapping through `map_store_error`. This protects the nested shard-read
    overload shape from drifting back to HTTP 500.
+19. A post-closeout UAT `BucketNotEmpty` failure exposed a missed cancellation
+   class outside the mapper audit: promoted streaming PUT could create a durable
+   stream session in a blocking worker while the async request future was
+   cancelled before it stored the returned session id. The initial fix armed an
+   abort guard after the await, but review found the same cancellation window
+   still existed between worker-side success and async handoff. The corrected
+   rule is now explicit above: side-effecting streaming workers arm cleanup from
+   the worker-side success path. The follow-up audit found the same shape in
+   streaming POST object and streaming UploadPart prepare paths, because those
+   prepare calls also create durable stream sessions before returning their
+   contexts. The server HTTP streaming paths now use a shared typed abort guard
+   for PUT, POST object, and UploadPart sessions; prepare/session-create workers
+   arm it before returning, append workers hold a clone so cleanup cannot race
+   ahead of an in-flight append, and finalize workers disarm it from the
+   worker-side success path. Focused regressions cover the request-side guard
+   dropping before worker-side session creation returns for all three streaming
+   request families.
 
 Open audit items:
 
@@ -215,3 +237,10 @@ coverage above.
   route storage errors through `map_store_error` before `?`, so nested
   `ShardStore { source: StorageRpcResourceExhausted, .. }` continues to map to
   S3 `SlowDown`.
+- The mapper audit missed cancellation-safe cleanup for durable streaming
+  sessions because it looked for wrong HTTP error shapes rather than detached
+  blocking side effects. Future async/blocking request audits should inspect
+  every `spawn_blocking` call that can create, reserve, append, finalize, or
+  otherwise mutate durable state. If the async request future can be dropped
+  while that worker is still running, the worker must either do no side effect
+  before returning, or must publish cleanup/disarm ownership before returning.

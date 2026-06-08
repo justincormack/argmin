@@ -332,46 +332,81 @@ impl Drop for PooledSegmentBuffer {
     }
 }
 
-struct StreamingPutAbortGuard {
+enum StreamingAbortCleanup {
+    Put {
+        ctx: Arc<super::StreamingPutContext>,
+        session_id: SessionId,
+    },
+    Post {
+        ctx: Arc<super::StreamingPostContext>,
+    },
+    Part {
+        ctx: Arc<super::StreamingPartContext>,
+    },
+}
+
+struct StreamingAbortGuard {
     state: Arc<ServerState>,
-    ctx: Arc<super::StreamingPutContext>,
-    session_id: Mutex<Option<SessionId>>,
+    cleanup: Mutex<Option<StreamingAbortCleanup>>,
     disarmed: AtomicBool,
 }
 
-impl StreamingPutAbortGuard {
-    fn new(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPutContext>) -> Arc<Self> {
+impl StreamingAbortGuard {
+    fn new(state: &Arc<ServerState>) -> Arc<Self> {
         Arc::new(Self {
             state: Arc::clone(state),
-            ctx: Arc::clone(ctx),
-            session_id: Mutex::new(None),
+            cleanup: Mutex::new(None),
             disarmed: AtomicBool::new(false),
         })
     }
 
-    fn arm(&self, session_id: &SessionId) {
-        *lock_mutex_unpoisoned(&self.session_id) = Some(session_id.clone());
+    fn arm_put(&self, ctx: &Arc<super::StreamingPutContext>, session_id: &SessionId) {
+        *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Put {
+            ctx: Arc::clone(ctx),
+            session_id: session_id.clone(),
+        });
+    }
+
+    fn arm_post(&self, ctx: &Arc<super::StreamingPostContext>) {
+        *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Post {
+            ctx: Arc::clone(ctx),
+        });
+    }
+
+    fn arm_part(&self, ctx: &Arc<super::StreamingPartContext>) {
+        *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Part {
+            ctx: Arc::clone(ctx),
+        });
     }
 
     fn disarm(&self) {
         self.disarmed.store(true, Ordering::Release);
-        *lock_mutex_unpoisoned(&self.session_id) = None;
+        *lock_mutex_unpoisoned(&self.cleanup) = None;
     }
 }
 
-impl Drop for StreamingPutAbortGuard {
+impl Drop for StreamingAbortGuard {
     fn drop(&mut self) {
         if self.disarmed.load(Ordering::Acquire) {
             return;
         }
-        let Some(session_id) = lock_mutex_unpoisoned(&self.session_id).take() else {
+        let Some(cleanup) = lock_mutex_unpoisoned(&self.cleanup).take() else {
             return;
         };
         let state = Arc::clone(&self.state);
-        let ctx = Arc::clone(&self.ctx);
         tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&state);
-            frontend.abort_streaming_put(&ctx, &session_id);
+            match cleanup {
+                StreamingAbortCleanup::Put { ctx, session_id } => {
+                    frontend.abort_streaming_put(&ctx, &session_id);
+                }
+                StreamingAbortCleanup::Post { ctx } => {
+                    frontend.abort_streaming_post_object(&ctx);
+                }
+                StreamingAbortCleanup::Part { ctx } => {
+                    frontend.abort_streaming_part(&ctx);
+                }
+            }
         });
     }
 }
@@ -1673,6 +1708,7 @@ async fn handle_streaming_post_object(
     let mut fields: Vec<(String, String)> = Vec::new();
     let mut field_budget = StreamingPostFieldBudget::default();
     let mut ctx: Option<Arc<super::StreamingPostContext>> = None;
+    let abort_guard = StreamingAbortGuard::new(&state);
     let mut seen_file = false;
     let mut file_ended = false;
 
@@ -1731,18 +1767,24 @@ async fn handle_streaming_post_object(
                                 let req = Arc::clone(&req_arc);
                                 let bucket_clone = bucket.clone();
                                 let fields_clone = fields.clone();
+                                let abort_guard_for_worker = Arc::clone(&abort_guard);
                                 let ctx_res = spawn_blocking_with_trace(trace.clone(), move || {
                                     let frontend = acquire_frontend(&st);
-                                    frontend.prepare_streaming_post_object(
+                                    let result = frontend.prepare_streaming_post_object(
                                         &req,
                                         bucket_clone.as_str(),
                                         &fields_clone,
                                         file_name.as_deref(),
-                                    )
+                                    );
+                                    result.map(|ctx| {
+                                        let ctx = Arc::new(ctx);
+                                        abort_guard_for_worker.arm_post(&ctx);
+                                        ctx
+                                    })
                                 })
                                 .await;
                                 match ctx_res {
-                                    Ok(Ok(c)) => ctx = Some(Arc::new(c)),
+                                    Ok(Ok(c)) => ctx = Some(c),
                                     Ok(Err(err)) => {
                                         return finish_streaming_post_rejection(
                                             error_response(&err),
@@ -1813,7 +1855,9 @@ async fn handle_streaming_post_object(
                                     segment_index += 1;
                                     let ctx_ref = Arc::clone(c);
                                     let st = Arc::clone(&state);
+                                    let abort_guard_for_append = Arc::clone(&abort_guard);
                                     match tokio::task::spawn_blocking(move || {
+                                        let _abort_guard = abort_guard_for_append;
                                         let frontend = acquire_frontend(&st);
                                         let result = frontend.streaming_append_post_segment(
                                             &ctx_ref,
@@ -1891,7 +1935,9 @@ async fn handle_streaming_post_object(
         let idx = segment_index;
         let st = Arc::clone(&state);
         let ctx_ref = Arc::clone(&ctx);
+        let abort_guard_for_append = Arc::clone(&abort_guard);
         match tokio::task::spawn_blocking(move || {
+            let _abort_guard = abort_guard_for_append;
             let frontend = acquire_frontend(&st);
             let result = frontend.streaming_append_post_segment(&ctx_ref, idx, &upload_buf);
             (result, upload_buf)
@@ -1915,9 +1961,19 @@ async fn handle_streaming_post_object(
     let crc64 = crc64.finalize();
     let st = Arc::clone(&state);
     let ctx_ref = Arc::clone(&ctx);
+    let abort_guard_for_finalize = Arc::clone(&abort_guard);
     match tokio::task::spawn_blocking(move || {
         let frontend = acquire_frontend(&st);
-        frontend.finalize_streaming_post_object(&ctx_ref, crc64, total_size, &actual_sha256_b64)
+        let result = frontend.finalize_streaming_post_object(
+            &ctx_ref,
+            crc64,
+            total_size,
+            &actual_sha256_b64,
+        );
+        if result.is_ok() {
+            abort_guard_for_finalize.disarm();
+        }
+        result
     })
     .await
     {
@@ -2021,7 +2077,7 @@ async fn handle_streaming_put(
 
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
-    let abort_guard = StreamingPutAbortGuard::new(&state, &ctx);
+    let abort_guard = StreamingAbortGuard::new(&state);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut session_id: Option<SessionId> = None;
     let mut segment_index: u32 = 0;
@@ -2296,6 +2352,7 @@ async fn handle_streaming_put(
     );
     let trace = ctx.trace.clone();
     let session_id_for_finalize = active_session_id.clone();
+    let abort_guard_for_finalize = Arc::clone(&abort_guard);
     match spawn_blocking_with_trace(trace, move || {
         emit_streaming_put_event(
             &ctx_ref,
@@ -2320,13 +2377,17 @@ async fn handle_streaming_put(
                 total_size
             ),
         );
-        frontend.finalize_streaming_put(
+        let result = frontend.finalize_streaming_put(
             &ctx_ref,
             &session_id_for_finalize,
             crc64,
             total_size,
             &trailer_checksums,
-        )
+        );
+        if result.is_ok() {
+            abort_guard_for_finalize.disarm();
+        }
+        result
     })
     .await
     {
@@ -2374,14 +2435,14 @@ struct StreamingPutIngestState<'a> {
     segment_index: &'a mut u32,
     body_started_emitted: &'a mut bool,
     timing: &'a mut StreamingBodyTiming,
-    abort_guard: &'a Arc<StreamingPutAbortGuard>,
+    abort_guard: &'a Arc<StreamingAbortGuard>,
 }
 
 struct StreamingPutAppendState<'a> {
     session_id: &'a mut Option<SessionId>,
     segment_index: &'a mut u32,
     timing: &'a mut StreamingBodyTiming,
-    abort_guard: &'a Arc<StreamingPutAbortGuard>,
+    abort_guard: &'a Arc<StreamingAbortGuard>,
 }
 
 fn streaming_put_session_label(session_id: Option<&SessionId>) -> &str {
@@ -2407,11 +2468,11 @@ async fn ensure_streaming_put_session(
     ctx: &Arc<super::StreamingPutContext>,
     session_id: &mut Option<SessionId>,
     body_bytes_received: u64,
-    abort_guard: &Arc<StreamingPutAbortGuard>,
+    abort_guard: &Arc<StreamingAbortGuard>,
 ) -> Result<(), S3Response> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if let Some(existing) = session_id.as_ref() {
-        abort_guard.arm(existing);
+        abort_guard.arm_put(ctx, existing);
         return Ok(());
     }
 
@@ -2443,7 +2504,7 @@ async fn ensure_streaming_put_session(
         );
         let result = frontend.start_streaming_put_session(&ctx_ref);
         if let Ok(session_id) = result.as_ref() {
-            abort_guard_for_worker.arm(session_id);
+            abort_guard_for_worker.arm_put(&ctx_ref, session_id);
         }
         result
     })
@@ -2521,7 +2582,9 @@ async fn append_streaming_put_buffer(
     );
     let trace = ctx.trace.clone();
     let session_id_owned = session_id_value.clone();
+    let abort_guard_for_append = Arc::clone(append.abort_guard);
     match spawn_blocking_with_trace(trace, move || {
+        let _abort_guard = abort_guard_for_append;
         emit_streaming_put_event(
             &ctx_ref,
             "streaming_put_append_worker_start",
@@ -2804,6 +2867,7 @@ async fn handle_streaming_part(
         )
     };
     let mut body = body;
+    let abort_guard = StreamingAbortGuard::new(&state);
 
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
@@ -2820,15 +2884,21 @@ async fn handle_streaming_part(
         }
     }
     let has_auth_attempt = request_has_auth_attempt(&s3req);
+    let abort_guard_for_prepare = Arc::clone(&abort_guard);
     let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
-        frontend.prepare_streaming_part(
+        let result = frontend.prepare_streaming_part(
             &s3req,
             bucket_clone.as_str(),
             &key_clone,
             &upload_id_clone,
             part_number,
-        )
+        );
+        result.map(|ctx| {
+            let ctx = Arc::new(ctx);
+            abort_guard_for_prepare.arm_part(&ctx);
+            ctx
+        })
     })
     .await
     {
@@ -2869,7 +2939,6 @@ async fn handle_streaming_part(
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
     let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
-    let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut segment_index: u32 = 0;
     let mut buf = PooledSegmentBuffer::new(&state);
@@ -2905,6 +2974,7 @@ async fn handle_streaming_part(
                             segment_index: &mut segment_index,
                             body_started_emitted: &mut body_started_emitted,
                             timing: &mut body_timing,
+                            abort_guard: &abort_guard,
                         };
                         if let Err(resp) =
                             ingest_streaming_part_payload(&state, &ctx, &payload, &mut ingest).await
@@ -2922,6 +2992,7 @@ async fn handle_streaming_part(
                             segment_index: &mut segment_index,
                             body_started_emitted: &mut body_started_emitted,
                             timing: &mut body_timing,
+                            abort_guard: &abort_guard,
                         };
                         if let Err(resp) = ingest_streaming_part_payload(
                             &state,
@@ -3093,7 +3164,9 @@ async fn handle_streaming_part(
             ),
         );
         let trace = ctx.trace.clone();
+        let abort_guard_for_append = Arc::clone(&abort_guard);
         match spawn_blocking_with_trace(trace, move || {
+            let _abort_guard = abort_guard_for_append;
             emit_streaming_part_event(
                 &ctx_ref,
                 "streaming_part_append_worker_start",
@@ -3175,6 +3248,7 @@ async fn handle_streaming_part(
         ),
     );
     let trace = ctx.trace.clone();
+    let abort_guard_for_finalize = Arc::clone(&abort_guard);
     match spawn_blocking_with_trace(trace, move || {
         emit_streaming_part_event(
             &ctx_ref,
@@ -3203,13 +3277,17 @@ async fn handle_streaming_part(
                 total_size
             ),
         );
-        frontend.finalize_streaming_part(
+        let result = frontend.finalize_streaming_part(
             &ctx_ref,
             crc64,
             total_size,
             &trailer_checksums,
             computed_checksum,
-        )
+        );
+        if result.is_ok() {
+            abort_guard_for_finalize.disarm();
+        }
+        result
     })
     .await
     {
@@ -3249,6 +3327,7 @@ struct StreamingPartIngestState<'a> {
     segment_index: &'a mut u32,
     body_started_emitted: &'a mut bool,
     timing: &'a mut StreamingBodyTiming,
+    abort_guard: &'a Arc<StreamingAbortGuard>,
 }
 
 fn emit_streaming_part_event(
@@ -3368,7 +3447,9 @@ async fn ingest_streaming_part_payload(
             ),
         );
         let trace = ctx.trace.clone();
+        let abort_guard_for_append = Arc::clone(ingest.abort_guard);
         match spawn_blocking_with_trace(trace, move || {
+            let _abort_guard = abort_guard_for_append;
             emit_streaming_part_event(
                 &ctx_ref,
                 "streaming_part_append_worker_start",
@@ -5164,8 +5245,8 @@ Connection: close\r\n\r\n",
             config: ServeConfig::default(),
         });
 
-        let guard = StreamingPutAbortGuard::new(&state, &ctx);
-        guard.arm(&session_id);
+        let guard = StreamingAbortGuard::new(&state);
+        guard.arm_put(&ctx, &session_id);
         drop(guard);
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5209,7 +5290,7 @@ Connection: close\r\n\r\n",
             config: ServeConfig::default(),
         });
 
-        let guard = StreamingPutAbortGuard::new(&state, &ctx);
+        let guard = StreamingAbortGuard::new(&state);
         let worker_guard = Arc::clone(&guard);
         let worker_frontend = Arc::clone(&frontend);
         let worker_ctx = Arc::clone(&ctx);
@@ -5217,7 +5298,7 @@ Connection: close\r\n\r\n",
             let session_id = worker_frontend
                 .start_streaming_put_session(&worker_ctx)
                 .unwrap();
-            worker_guard.arm(&session_id);
+            worker_guard.arm_put(&worker_ctx, &session_id);
             session_id
         });
         drop(guard);
@@ -5228,6 +5309,107 @@ Connection: close\r\n\r\n",
             frontend.coordinator.scavenge_stale_sessions(0),
             0,
             "streaming PUT abort guard left session {session_id:?} after request-side drop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_post_abort_guard_cleans_session_created_after_request_drop() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let signed = sign_headers("POST", "/mybucket", "localhost", &[], &[]);
+        let req = make_s3req(
+            "POST",
+            "/mybucket",
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+            ],
+        );
+        let state = Arc::new(ServerState {
+            pool: vec![Arc::clone(&frontend)],
+            host_id: frontend.host_id.clone(),
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config: ServeConfig::default(),
+        });
+
+        let guard = StreamingAbortGuard::new(&state);
+        let worker_guard = Arc::clone(&guard);
+        let worker_frontend = Arc::clone(&frontend);
+        let join = tokio::task::spawn_blocking(move || {
+            let ctx = worker_frontend
+                .prepare_streaming_post_object(
+                    &req,
+                    "mybucket",
+                    &[("key".to_string(), "mykey".to_string())],
+                    Some("upload.txt"),
+                )
+                .unwrap();
+            let ctx = Arc::new(ctx);
+            worker_guard.arm_post(&ctx);
+            ctx.session_id().clone()
+        });
+        drop(guard);
+
+        let session_id = join.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming POST abort guard left session {session_id:?} after request-side drop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_part_abort_guard_cleans_session_created_after_request_drop() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let upload_id = create_test_bucket_and_upload(&frontend, "mybucket", "mykey");
+        let uri = format!("/mybucket/mykey?partNumber=1&uploadId={upload_id}");
+        let signed = sign_headers("PUT", &uri, "localhost", b"", &[]);
+        let req = make_s3req(
+            "PUT",
+            &uri,
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+            ],
+        );
+        let state = Arc::new(ServerState {
+            pool: vec![Arc::clone(&frontend)],
+            host_id: frontend.host_id.clone(),
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config: ServeConfig::default(),
+        });
+
+        let guard = StreamingAbortGuard::new(&state);
+        let worker_guard = Arc::clone(&guard);
+        let worker_frontend = Arc::clone(&frontend);
+        let upload_id_for_worker = upload_id.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let ctx = worker_frontend
+                .prepare_streaming_part(&req, "mybucket", "mykey", &upload_id_for_worker, 1)
+                .unwrap();
+            let ctx = Arc::new(ctx);
+            worker_guard.arm_part(&ctx);
+            ctx.session_id().clone()
+        });
+        drop(guard);
+
+        let session_id = join.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming UploadPart abort guard left session {session_id:?} after request-side drop"
         );
     }
 
