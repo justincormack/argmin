@@ -53,6 +53,31 @@ async fn put_object_retrying_operation_aborted(
     }
 }
 
+async fn delete_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> String {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client.delete_object().bucket(bucket).key(key).send().await {
+            Ok(output) => {
+                return output
+                    .version_id()
+                    .expect("delete marker version id")
+                    .to_string();
+            }
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("delete object during versioning setup: {err:?}"),
+        }
+    }
+    panic!("delete object during versioning setup did not complete");
+}
+
 async fn delete_object_version_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1465,25 +1490,10 @@ fn test_versioning_head_delete_marker_version_returns_method_not_allowed() {
         let bucket = setup_versioned_bucket().await;
         let key = "delete-marker-head";
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"payload"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(&client, &bucket, key, b"payload".to_vec()).await;
 
-        let delete_marker_version = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap()
-            .version_id()
-            .expect("delete marker version id")
-            .to_string();
+        let delete_marker_version =
+            delete_object_retrying_operation_aborted(&client, &bucket, key).await;
 
         let url = format!(
             "{}/{bucket}/{key}?versionId={delete_marker_version}",
