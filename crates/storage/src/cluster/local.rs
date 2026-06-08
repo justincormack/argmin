@@ -30471,9 +30471,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::ObjectPgActionError::Store(StoreError::Io {
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
                     context: "conflicting pending command for object metadata update",
-                    ..
                 })
             ),
             "expected conflicting post-image error, got {err:?}"
