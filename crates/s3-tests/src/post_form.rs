@@ -226,7 +226,7 @@ pub fn post_object_to_test_endpoint_with_headers(
 ) -> (u16, String) {
     let url = format!("{}/{}", endpoint, bucket);
     let (content_type, body) = build_multipart(fields, file_data, file_name);
-    let agent = build_test_agent(endpoint, tls_ca_pem, std::time::Duration::from_secs(30));
+    let agent = build_test_agent(endpoint, tls_ca_pem, crate::configured_test_timeout());
     let req = agent.post(&url).header("Content-Type", &content_type);
     let req = headers
         .iter()
@@ -252,7 +252,7 @@ pub fn post_object_raw_to_test_endpoint_with_headers(
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
     let (content_type, body) = build_multipart(&field_refs, file_data, file_name);
-    let agent = build_test_agent(endpoint, tls_ca_pem, std::time::Duration::from_secs(30));
+    let agent = build_test_agent(endpoint, tls_ca_pem, crate::configured_test_timeout());
     let req = agent.post(&url).header("Content-Type", &content_type);
     let req = headers.iter().fold(req, |req, (name, value)| {
         req.header(name.as_str(), value.as_str())
