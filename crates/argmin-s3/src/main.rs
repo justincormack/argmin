@@ -373,7 +373,7 @@ async fn run_frontend_server(
     };
 
     eprintln!(
-        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, region {}, host id {})",
+        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
         scheme,
         config.listen_addr,
         config.ec_k,
@@ -385,6 +385,7 @@ async fn run_frontend_server(
         config.stream_read_chunk_size,
         config.panic_on_500,
         config.abort_on_500,
+        config.local_debug_endpoint,
         config.region,
         host_id
     );
@@ -393,6 +394,7 @@ async fn run_frontend_server(
         stream_read_chunk_size: config.stream_read_chunk_size,
         panic_on_500: config.panic_on_500,
         abort_on_500: config.abort_on_500,
+        local_debug_endpoint: config.local_debug_endpoint,
         ..server_http::http::serve::ServeConfig::default()
     };
     match tls_acceptor {
@@ -455,6 +457,7 @@ mod tests {
             stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
             panic_on_500: false,
             abort_on_500: false,
+            local_debug_endpoint: false,
         }
     }
 

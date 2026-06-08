@@ -6216,7 +6216,7 @@ Required tests:
    label and enough request/RPC/PG context to debug without temporary tracing
 12. diagnostics and flight-recorder dumps redact secrets, payload context,
     request headers, SSE-C material, and unbounded names; explicit dump access
-    is local/admin-only
+    is disabled by default and local/admin-only
 13. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
    deterministic diagnostics for the first failing iteration
 14. guardrails fail if a new coordinator request path maps expected
@@ -6338,6 +6338,13 @@ Status:
   record only node id, PG id, cluster epoch, log index, action, and command
   kind, with tests covering real pending-slot drain and reissue paths and
   asserting bucket names are not included.
+- Continued the permanent diagnostics slice by adding an explicit local debug
+  endpoint gate. `ARGMIN_LOCAL_DEBUG_ENDPOINT` is disabled by default, is
+  accepted only for frontend roles listening on loopback socket addresses, and
+  exposes only bounded counter snapshots over HTTP. The flight-recorder trigger
+  is `POST /__argmin/debug/flight-recorder/dump`; it dumps the already-redacted
+  bounded ring to stderr rather than returning request/RPC details, headers,
+  bucket/key names, payload context, or SSE-C material in the HTTP response.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

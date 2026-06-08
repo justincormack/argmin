@@ -1,5 +1,6 @@
 use ec::EcConfig;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,7 @@ pub(crate) struct ServerConfig {
     pub(crate) stream_read_chunk_size: usize,
     pub(crate) panic_on_500: bool,
     pub(crate) abort_on_500: bool,
+    pub(crate) local_debug_endpoint: bool,
 }
 
 impl ServerConfig {
@@ -105,6 +107,7 @@ impl ServerConfig {
     ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (8388608)
     ///   `ARGMIN_PANIC_ON_500` (false)
     ///   `ARGMIN_ABORT_ON_500` (false)
+    ///   `ARGMIN_LOCAL_DEBUG_ENDPOINT` (false, requires loopback listen addr)
     ///
     /// UAT-only optional credentials for running `s3-tests` against the
     /// standalone binary:
@@ -226,6 +229,10 @@ impl ServerConfig {
             Some(value) => parse_bool_env("ARGMIN_ABORT_ON_500", &value)?,
             None => false,
         };
+        let local_debug_endpoint = match get("ARGMIN_LOCAL_DEBUG_ENDPOINT") {
+            Some(value) => parse_bool_env("ARGMIN_LOCAL_DEBUG_ENDPOINT", &value)?,
+            None => false,
+        };
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -298,6 +305,24 @@ impl ServerConfig {
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
+        if local_debug_endpoint {
+            if !process_role.has_frontend() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a frontend process role".to_string(),
+                );
+            }
+            let listen_socket_addr: SocketAddr = listen_addr.parse().map_err(|e| {
+                format!(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be a loopback socket address: {e}"
+                )
+            })?;
+            if !listen_socket_addr.ip().is_loopback() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback"
+                        .to_string(),
+                );
+            }
+        }
         if let Some(host_id) = &host_id {
             if host_id.is_empty() || !host_id.bytes().all(|b| b.is_ascii_graphic()) {
                 return Err(
@@ -350,6 +375,7 @@ impl ServerConfig {
             stream_read_chunk_size,
             panic_on_500,
             abort_on_500,
+            local_debug_endpoint,
         })
     }
 }
@@ -1389,5 +1415,51 @@ mod tests {
         let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_ABORT_ON_500", "maybe")]))
             .unwrap_err();
         assert!(err.contains("ARGMIN_ABORT_ON_500"));
+    }
+
+    #[test]
+    fn local_debug_endpoint_defaults_to_disabled() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[])).unwrap();
+        assert!(!cfg.local_debug_endpoint);
+    }
+
+    #[test]
+    fn local_debug_endpoint_accepts_loopback_frontend_listener() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_LOCAL_DEBUG_ENDPOINT",
+            "true",
+        )]))
+        .unwrap();
+        assert!(cfg.local_debug_endpoint);
+
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_LOCAL_DEBUG_ENDPOINT", "on"),
+            ("ARGMIN_LISTEN_ADDR", "[::1]:19000"),
+        ]))
+        .unwrap();
+        assert!(cfg.local_debug_endpoint);
+    }
+
+    #[test]
+    fn local_debug_endpoint_rejects_non_loopback_listener() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_LOCAL_DEBUG_ENDPOINT", "true"),
+            ("ARGMIN_LISTEN_ADDR", "0.0.0.0:19000"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_LOCAL_DEBUG_ENDPOINT"));
+        assert!(err.contains("loopback"));
+    }
+
+    #[test]
+    fn local_debug_endpoint_rejects_storage_node_only_role() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "storage-node"),
+            ("ARGMIN_LOCAL_DEBUG_ENDPOINT", "true"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin-node-0.sock"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("frontend process role"));
     }
 }

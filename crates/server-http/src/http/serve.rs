@@ -229,6 +229,13 @@ pub struct ServeConfig {
     /// This is stricter than `panic_on_500`: it makes hidden 500s fail the
     /// whole local test process instead of only dropping one request task.
     pub abort_on_500: bool,
+    /// Enable local operator-only diagnostics endpoints.
+    ///
+    /// The binary config only permits this on loopback listeners. The endpoints
+    /// expose bounded counters and an explicit flight-recorder stderr dump
+    /// trigger; they do not return request headers, payload bytes, keys, or
+    /// recorder details over HTTP.
+    pub local_debug_endpoint: bool,
 }
 
 impl Default for ServeConfig {
@@ -240,6 +247,7 @@ impl Default for ServeConfig {
             stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
             panic_on_500: false,
             abort_on_500: false,
+            local_debug_endpoint: false,
         }
     }
 }
@@ -652,6 +660,19 @@ async fn handle(
         )),
     );
 
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            ));
+        }
+    }
+
     // Acquire request permit before body collection to bound memory.
     let req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
         state.config.request_wait_timeout,
@@ -883,6 +904,88 @@ async fn handle(
         state.config.abort_on_500,
         response_trace,
     ))
+}
+
+fn local_debug_response(method: &http::Method, path: &str) -> Option<S3Response> {
+    match (method, path) {
+        (&http::Method::GET, "/__argmin/debug/metrics") => {
+            let body = local_debug_metrics_body();
+            Some(S3Response {
+                status_code: 200,
+                headers: vec![
+                    (
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    ),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                ],
+                body: body.into_bytes(),
+                stream: None,
+                error_diagnostic: None,
+            })
+        }
+        (&http::Method::POST, "/__argmin/debug/flight-recorder/dump") => {
+            observability::dump_flight_recorder_to_stderr("local-debug-endpoint");
+            Some(S3Response {
+                status_code: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+                stream: None,
+                error_diagnostic: None,
+            })
+        }
+        (_, path) if path.starts_with("/__argmin/debug/") || path == "/__argmin/debug" => {
+            let body = b"not found\n".to_vec();
+            Some(S3Response {
+                status_code: 404,
+                headers: vec![
+                    (
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    ),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                ],
+                body,
+                stream: None,
+                error_diagnostic: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn local_debug_metrics_body() -> String {
+    let snapshot = observability::metrics_snapshot();
+    format!(
+        concat!(
+            "inflight_requests {}\n",
+            "request_finish_total {}\n",
+            "request_error_total {}\n",
+            "http_500_response_total {}\n",
+            "operation_aborted_response_total {}\n",
+            "slow_down_response_total {}\n",
+            "slow_request_total {}\n",
+            "storage_rpc_error_total {}\n",
+            "shard_scavenger_observation_total {}\n",
+            "shard_scavenger_scan_incomplete_total {}\n",
+            "metadata_command_conflict_total {}\n",
+            "metadata_command_pending_slot_action_total {}\n",
+            "metadata_command_session_wait_total {}\n"
+        ),
+        snapshot.inflight_requests,
+        snapshot.request_finish_total,
+        snapshot.request_error_total,
+        snapshot.http_500_response_total,
+        snapshot.operation_aborted_response_total,
+        snapshot.slow_down_response_total,
+        snapshot.slow_request_total,
+        snapshot.storage_rpc_error_total,
+        snapshot.shard_scavenger_observation_total,
+        snapshot.shard_scavenger_scan_incomplete_total,
+        snapshot.metadata_command_conflict_total,
+        snapshot.metadata_command_pending_slot_action_total,
+        snapshot.metadata_command_session_wait_total,
+    )
 }
 
 async fn append_actual_cors_headers(
@@ -3923,20 +4026,28 @@ mod tests {
     }
 
     async fn start_test_server(frontend: Arc<HttpFrontend>) -> (String, ServerGuard) {
+        start_test_server_with_config(frontend, ServeConfig::default(), 8).await
+    }
+
+    async fn start_test_server_with_config(
+        frontend: Arc<HttpFrontend>,
+        config: ServeConfig,
+        request_slots: usize,
+    ) -> (String, ServerGuard) {
         let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = std_listener.local_addr().unwrap().to_string();
         std_listener.set_nonblocking(true).unwrap();
         let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
-        let config = ServeConfig::default();
         let header_read_timeout = config.header_read_timeout;
         let host_id = frontend.host_id.clone();
+        let segment_buffer_pool_slots = request_slots.max(1);
         let state = Arc::new(ServerState {
             pool: vec![frontend],
             host_id,
             counter: AtomicUsize::new(0),
-            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
-            segment_buffer_pool: SegmentBufferPool::new(8),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(request_slots)),
+            segment_buffer_pool: SegmentBufferPool::new(segment_buffer_pool_slots),
             config,
         });
 
@@ -3957,6 +4068,107 @@ mod tests {
         });
 
         (addr, ServerGuard(handle))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_endpoint_is_disabled_by_default() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let (addr, _guard) = start_test_server(frontend).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /__argmin/debug/metrics HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "debug endpoint unexpectedly enabled by default: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_metrics_endpoint_bypasses_request_admission() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /__argmin/debug/metrics HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain; charset=utf-8"));
+        assert!(response.contains("metadata_command_conflict_total "));
+        assert!(response.contains("storage_rpc_error_total "));
+        assert!(!response.contains("bucket_lock_wait_exceeded_total "));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_flight_recorder_dump_endpoint_is_explicit_post_only() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /__argmin/debug/flight-recorder/dump HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "POST /__argmin/debug/flight-recorder/dump HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Length: 0\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
     }
 
     fn response_body_complete(buf: &[u8], header_end: usize, headers: &str) -> bool {

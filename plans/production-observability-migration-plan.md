@@ -67,10 +67,15 @@ Completed:
   - `metadata_command_conflict_total`
   - `metadata_command_pending_slot_action_total`
   - `metadata_command_session_wait_total`
+- `ARGMIN_LOCAL_DEBUG_ENDPOINT` exposes `metrics_snapshot()` through
+  `GET /__argmin/debug/metrics` for explicit local debugging only. The endpoint
+  is disabled by default and startup validation accepts it only on loopback
+  frontend listeners. The companion flight-recorder trigger is a `POST` that
+  dumps the bounded, redacted ring to stderr instead of returning recorder
+  details over HTTP.
 
 Remaining:
 
-- choose how to expose `metrics_snapshot()` for explicit local ops/debugging
 - run the eBPF/OpenTelemetry profiling pilot in staging
 - remove or demote the remaining dense `trace_scope!` callsites in
   coordinator/storage/auth paths that are still compiled for local deep tracing
@@ -304,8 +309,6 @@ Completed in this phase:
 
 Remaining work in this phase:
 
-- decide whether to expose `metrics_snapshot()` via a local debug endpoint,
-  periodic dump, or another explicit local-only path
 - add queue-delay helpers only if/when we introduce queue-pressure summaries
 
 ## Phase 5: Remove Dense Hot-Path Instrumentation
