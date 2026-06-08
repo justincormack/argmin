@@ -1,6 +1,6 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -329,6 +329,50 @@ impl Drop for PooledSegmentBuffer {
         if let Some(buf) = self.buf.take() {
             self.state.segment_buffer_pool.recycle(buf);
         }
+    }
+}
+
+struct StreamingPutAbortGuard {
+    state: Arc<ServerState>,
+    ctx: Arc<super::StreamingPutContext>,
+    session_id: Mutex<Option<SessionId>>,
+    disarmed: AtomicBool,
+}
+
+impl StreamingPutAbortGuard {
+    fn new(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPutContext>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::clone(state),
+            ctx: Arc::clone(ctx),
+            session_id: Mutex::new(None),
+            disarmed: AtomicBool::new(false),
+        })
+    }
+
+    fn arm(&self, session_id: &SessionId) {
+        *lock_mutex_unpoisoned(&self.session_id) = Some(session_id.clone());
+    }
+
+    fn disarm(&self) {
+        self.disarmed.store(true, Ordering::Release);
+        *lock_mutex_unpoisoned(&self.session_id) = None;
+    }
+}
+
+impl Drop for StreamingPutAbortGuard {
+    fn drop(&mut self) {
+        if self.disarmed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(session_id) = lock_mutex_unpoisoned(&self.session_id).take() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        let ctx = Arc::clone(&self.ctx);
+        tokio::task::spawn_blocking(move || {
+            let frontend = acquire_frontend(&state);
+            frontend.abort_streaming_put(&ctx, &session_id);
+        });
     }
 }
 
@@ -1977,6 +2021,7 @@ async fn handle_streaming_put(
 
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
+    let abort_guard = StreamingPutAbortGuard::new(&state, &ctx);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut session_id: Option<SessionId> = None;
     let mut segment_index: u32 = 0;
@@ -2014,6 +2059,7 @@ async fn handle_streaming_put(
                             segment_index: &mut segment_index,
                             body_started_emitted: &mut body_started_emitted,
                             timing: &mut body_timing,
+                            abort_guard: &abort_guard,
                         };
                         if let Err(resp) =
                             ingest_streaming_put_payload(&state, &ctx, &payload, &mut ingest).await
@@ -2032,6 +2078,7 @@ async fn handle_streaming_put(
                             segment_index: &mut segment_index,
                             body_started_emitted: &mut body_started_emitted,
                             timing: &mut body_timing,
+                            abort_guard: &abort_guard,
                         };
                         if let Err(resp) = ingest_streaming_put_payload(
                             &state,
@@ -2204,16 +2251,14 @@ async fn handle_streaming_put(
                 total_size
             ),
         );
-        if let Err(resp) = append_streaming_put_buffer(
-            &state,
-            &ctx,
-            &mut session_id,
-            &mut segment_index,
-            buf,
-            total_size,
-            &mut body_timing,
-        )
-        .await
+        let mut append_state = StreamingPutAppendState {
+            session_id: &mut session_id,
+            segment_index: &mut segment_index,
+            timing: &mut body_timing,
+            abort_guard: &abort_guard,
+        };
+        if let Err(resp) =
+            append_streaming_put_buffer(&state, &ctx, &mut append_state, buf, total_size).await
         {
             return resp;
         }
@@ -2285,7 +2330,10 @@ async fn handle_streaming_put(
     })
     .await
     {
-        Ok(Ok(resp)) => resp,
+        Ok(Ok(resp)) => {
+            abort_guard.disarm();
+            resp
+        }
         Ok(Err(err)) => {
             abort_streaming(&state, &ctx, Some(active_session_id.clone())).await;
             error_response(&err)
@@ -2326,6 +2374,14 @@ struct StreamingPutIngestState<'a> {
     segment_index: &'a mut u32,
     body_started_emitted: &'a mut bool,
     timing: &'a mut StreamingBodyTiming,
+    abort_guard: &'a Arc<StreamingPutAbortGuard>,
+}
+
+struct StreamingPutAppendState<'a> {
+    session_id: &'a mut Option<SessionId>,
+    segment_index: &'a mut u32,
+    timing: &'a mut StreamingBodyTiming,
+    abort_guard: &'a Arc<StreamingPutAbortGuard>,
 }
 
 fn streaming_put_session_label(session_id: Option<&SessionId>) -> &str {
@@ -2351,9 +2407,11 @@ async fn ensure_streaming_put_session(
     ctx: &Arc<super::StreamingPutContext>,
     session_id: &mut Option<SessionId>,
     body_bytes_received: u64,
+    abort_guard: &Arc<StreamingPutAbortGuard>,
 ) -> Result<(), S3Response> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
-    if session_id.is_some() {
+    if let Some(existing) = session_id.as_ref() {
+        abort_guard.arm(existing);
         return Ok(());
     }
 
@@ -2370,6 +2428,7 @@ async fn ensure_streaming_put_session(
     let ctx_ref = Arc::clone(ctx);
     let st = Arc::clone(state);
     let trace = ctx.trace.clone();
+    let abort_guard_for_worker = Arc::clone(abort_guard);
     match spawn_blocking_with_trace(trace, move || {
         emit_streaming_put_event(
             &ctx_ref,
@@ -2382,7 +2441,11 @@ async fn ensure_streaming_put_session(
             "streaming_put_session_start_frontend_acquired",
             format_args!("bucket={:?} key={:?}", ctx_ref.bucket(), ctx_ref.key()),
         );
-        frontend.start_streaming_put_session(&ctx_ref)
+        let result = frontend.start_streaming_put_session(&ctx_ref);
+        if let Ok(session_id) = result.as_ref() {
+            abort_guard_for_worker.arm(session_id);
+        }
+        result
     })
     .await
     {
@@ -2409,18 +2472,24 @@ async fn ensure_streaming_put_session(
 async fn append_streaming_put_buffer(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPutContext>,
-    session_id: &mut Option<SessionId>,
-    segment_index: &mut u32,
+    append: &mut StreamingPutAppendState<'_>,
     flush_data: PooledSegmentBuffer,
     body_bytes_received: u64,
-    timing: &mut StreamingBodyTiming,
 ) -> Result<(), S3Response> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
-    ensure_streaming_put_session(state, ctx, session_id, body_bytes_received).await?;
-    let session_id_value = session_id
+    ensure_streaming_put_session(
+        state,
+        ctx,
+        append.session_id,
+        body_bytes_received,
+        append.abort_guard,
+    )
+    .await?;
+    let session_id_value = append
+        .session_id
         .as_ref()
         .expect("session must exist before appending a promoted segment");
-    let idx = *segment_index;
+    let idx = *append.segment_index;
     emit_streaming_put_event(
         ctx,
         "streaming_put_segment_ready",
@@ -2485,16 +2554,16 @@ async fn append_streaming_put_buffer(
     .await
     {
         Ok((Ok(()), _flush_data)) => {
-            *segment_index += 1;
-            timing.append_wait_us += elapsed_micros(dispatch_start);
+            *append.segment_index += 1;
+            append.timing.append_wait_us += elapsed_micros(dispatch_start);
             Ok(())
         }
         Ok((Err(err), _flush_data)) => {
-            abort_streaming(state, ctx, session_id.clone()).await;
+            abort_streaming(state, ctx, append.session_id.clone()).await;
             Err(error_response(&err, &wire_ids))
         }
         Err(_) => {
-            abort_streaming(state, ctx, session_id.clone()).await;
+            abort_streaming(state, ctx, append.session_id.clone()).await;
             Err(internal_error_response(&wire_ids))
         }
     }
@@ -2555,14 +2624,18 @@ async fn ingest_streaming_put_payload(
         if ingest.buf.len() == crate::coordinator::INTERNAL_SEGMENT_SIZE {
             let mut flush_data = PooledSegmentBuffer::new(state);
             std::mem::swap(ingest.buf, &mut flush_data);
+            let mut append_state = StreamingPutAppendState {
+                session_id: ingest.session_id,
+                segment_index: ingest.segment_index,
+                timing: ingest.timing,
+                abort_guard: ingest.abort_guard,
+            };
             append_streaming_put_buffer(
                 state,
                 ctx,
-                ingest.session_id,
-                ingest.segment_index,
+                &mut append_state,
                 flush_data,
                 *ingest.total_size,
-                ingest.timing,
             )
             .await?;
         }
@@ -5054,6 +5127,107 @@ Connection: close\r\n\r\n",
             frontend.coordinator.scavenge_stale_sessions(0),
             0,
             "streaming session leaked after UploadPart bad checksum"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_put_abort_guard_cleans_promoted_session_on_drop() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let body = vec![b'x'; crate::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+        let signed = sign_headers("PUT", "/mybucket/mykey", "localhost", &body, &[]);
+        let content_length = body.len().to_string();
+        let req = make_s3req(
+            "PUT",
+            "/mybucket/mykey",
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+                ("content-length", &content_length),
+            ],
+        );
+        let ctx = Arc::new(
+            frontend
+                .prepare_streaming_put(&req, "mybucket", "mykey", false)
+                .unwrap(),
+        );
+        let session_id = frontend.start_streaming_put_session(&ctx).unwrap();
+        let state = Arc::new(ServerState {
+            pool: vec![Arc::clone(&frontend)],
+            host_id: frontend.host_id.clone(),
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config: ServeConfig::default(),
+        });
+
+        let guard = StreamingPutAbortGuard::new(&state, &ctx);
+        guard.arm(&session_id);
+        drop(guard);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming PUT abort guard left a durable stream session behind"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_put_abort_guard_cleans_session_created_after_request_drop() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let body = vec![b'x'; crate::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+        let signed = sign_headers("PUT", "/mybucket/mykey", "localhost", &body, &[]);
+        let content_length = body.len().to_string();
+        let req = make_s3req(
+            "PUT",
+            "/mybucket/mykey",
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+                ("content-length", &content_length),
+            ],
+        );
+        let ctx = Arc::new(
+            frontend
+                .prepare_streaming_put(&req, "mybucket", "mykey", false)
+                .unwrap(),
+        );
+        let state = Arc::new(ServerState {
+            pool: vec![Arc::clone(&frontend)],
+            host_id: frontend.host_id.clone(),
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config: ServeConfig::default(),
+        });
+
+        let guard = StreamingPutAbortGuard::new(&state, &ctx);
+        let worker_guard = Arc::clone(&guard);
+        let worker_frontend = Arc::clone(&frontend);
+        let worker_ctx = Arc::clone(&ctx);
+        let join = tokio::task::spawn_blocking(move || {
+            let session_id = worker_frontend
+                .start_streaming_put_session(&worker_ctx)
+                .unwrap();
+            worker_guard.arm(&session_id);
+            session_id
+        });
+        drop(guard);
+
+        let session_id = join.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming PUT abort guard left session {session_id:?} after request-side drop"
         );
     }
 
