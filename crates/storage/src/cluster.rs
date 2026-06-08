@@ -2468,7 +2468,32 @@ impl StorageCluster {
                     let outcome = if matches_request {
                         let exact =
                             ExactPendingObjectMetadataCommand::for_checked_request(&command);
-                        self.finish_exact_pending_object_metadata_command(pg_id, exact)?
+                        match self.finish_exact_pending_object_metadata_command(pg_id, exact) {
+                            Ok(outcome) => outcome,
+                            Err(ObjectPgActionError::Metadata(
+                                MetadataError::ObjectVersionReservationConflict { version_id },
+                            )) if version_id == reserved_version_id => {
+                                self.record_abandoned_metadata_command_to_acting_set(&command)
+                                    .map_err(|error| {
+                                        bucket_snapshot_error_to_object_pg_action_error(
+                                            error.source,
+                                        )
+                                    })?;
+                                let pending =
+                                    self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                                if pending.as_ref() != Some(&command) {
+                                    return Err(conflicting_pending_object_metadata_command(
+                                        "pending version reservation changed before stale cleanup",
+                                    ));
+                                }
+                                self.remove_pending_metadata_command_for_bucket(
+                                    pg_id, bucket, &command,
+                                )
+                                .map_err(ObjectPgActionError::from)?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         self.drain_pending_object_metadata_command(pg_id, &command)?;
                         continue;

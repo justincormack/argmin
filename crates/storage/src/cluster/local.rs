@@ -3328,7 +3328,7 @@ mod tests {
         MarkBucketDeletingCommand, MetadataCommandEnvelope, MetadataCommandId,
         MetadataCommandLogIndex, MetadataCommandPayload, PutBucketAclCommand,
         PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-        PutObjectMetadataMutation, ReserveObjectGenerationCommand,
+        PutObjectMetadataMutation, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
     use crate::storage_node_server::{
         StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
@@ -17499,6 +17499,68 @@ mod tests {
         assert_eq!(reserved, crate::VersionId::from_u64(1));
         assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+    }
+
+    #[test]
+    fn reserve_object_version_abandons_stale_pending_reservation_and_retries() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(object_pg);
+
+        let first = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                crate::VersionId::from_u64(1),
+            )),
+        );
+        cluster
+            .apply_metadata_command_to_acting_set(&first)
+            .unwrap();
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+
+        let stale_pending = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                crate::VersionId::from_u64(1),
+            )),
+        );
+        force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &stale_pending);
+
+        let reserved = cluster
+            .reserve_next_object_version(pg_id, &bucket, &key)
+            .unwrap();
+        assert_eq!(reserved, crate::VersionId::from_u64(2));
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
     }
 
     #[test]
