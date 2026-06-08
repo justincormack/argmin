@@ -34426,9 +34426,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandContention {
                     context: "conflicting pending put bucket acl command",
-                    ..
                 })
             ),
             "expected conflicting pending ACL command, got {err:?}"
