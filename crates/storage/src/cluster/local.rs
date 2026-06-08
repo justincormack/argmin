@@ -3319,6 +3319,7 @@ fn prepare_local_node_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::PendingMetadataCommandOutcome;
     use crate::metadata_command::{
         metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
         AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
@@ -15453,6 +15454,193 @@ mod tests {
     }
 
     #[test]
+    fn pending_slot_drain_records_diagnostic_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "pending-drain-diagnostic-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+        let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+            "trace-pending-slot-drain".to_string(),
+            "request-pending-slot-drain".to_string(),
+        ));
+
+        cluster
+            .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, &bucket)
+            .unwrap();
+
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+        }
+        let records = observability::flight_recorder_snapshot();
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.request_id == "request-pending-slot-drain"
+                    && record.event == "metadata_command_pending_slot_action"
+            })
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let record = matching[0];
+        assert!(record.detail.contains("node_id=1"));
+        assert!(record.detail.contains("pg_id=1"));
+        assert!(record.detail.contains("log_index=1"));
+        assert!(record.detail.contains("action=drain_attempt"));
+        assert!(record.detail.contains("command_kind=CreateBucket"));
+        assert!(!record.detail.contains(bucket.as_str()));
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn fresh_bucket_pg_command_finish_does_not_record_drain_attempt() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "fresh-pending-finish-diagnostic-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+        let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+            "trace-fresh-pending-finish".to_string(),
+            "request-fresh-pending-finish".to_string(),
+        ));
+
+        let outcome = cluster
+            .finish_pending_metadata_command_to_acting_set(pg_id, &bucket, &command, false)
+            .unwrap();
+        assert_eq!(outcome, PendingMetadataCommandOutcome::Applied);
+
+        let records = observability::flight_recorder_snapshot();
+        assert!(
+            !records.iter().any(|record| {
+                record.request_id == "request-fresh-pending-finish"
+                    && record.event == "metadata_command_pending_slot_action"
+            }),
+            "freshly installed bucket commands must not be labelled as drains"
+        );
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn direct_bucket_pg_pending_finish_records_diagnostic_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-pending-finish-diagnostic-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+        let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+            "trace-direct-pending-finish".to_string(),
+            "request-direct-pending-finish".to_string(),
+        ));
+
+        let outcome = cluster
+            .drain_bucket_pg_pending_metadata_command(pg_id, &bucket, &command, false)
+            .unwrap();
+        assert_eq!(outcome, PendingMetadataCommandOutcome::Applied);
+
+        let records = observability::flight_recorder_snapshot();
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.request_id == "request-direct-pending-finish"
+                    && record.event == "metadata_command_pending_slot_action"
+            })
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let record = matching[0];
+        assert!(record.detail.contains("node_id=1"));
+        assert!(record.detail.contains("pg_id=1"));
+        assert!(record.detail.contains("log_index=1"));
+        assert!(record.detail.contains("action=drain_attempt"));
+        assert!(record.detail.contains("command_kind=CreateBucket"));
+        assert!(!record.detail.contains(bucket.as_str()));
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn bucket_pg_pending_slot_helper_records_diagnostic_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "helper-pending-drain-diagnostic-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+        let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+            "trace-helper-pending-drain".to_string(),
+            "request-helper-pending-drain".to_string(),
+        ));
+
+        cluster
+            .drain_pending_metadata_command_pg_slot(pg_id, &bucket, &command)
+            .unwrap();
+
+        let records = observability::flight_recorder_snapshot();
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.request_id == "request-helper-pending-drain"
+                    && record.event == "metadata_command_pending_slot_action"
+            })
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let record = matching[0];
+        assert!(record.detail.contains("node_id=1"));
+        assert!(record.detail.contains("pg_id=1"));
+        assert!(record.detail.contains("log_index=1"));
+        assert!(record.detail.contains("action=drain_attempt"));
+        assert!(record.detail.contains("command_kind=CreateBucket"));
+        assert!(!record.detail.contains(bucket.as_str()));
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
     fn reissue_accepts_terminal_pending_command_after_stale_primary_max_snapshot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -15819,6 +16007,59 @@ mod tests {
             );
         }
         assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn pending_slot_reissue_records_diagnostic_action() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "pending-reissue-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "pending-reissue-second-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let applied = create_bucket_metadata_command(pg_id, 1, first_bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &applied)
+            .unwrap();
+
+        let stale = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
+        force_insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &stale);
+        let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+            "trace-pending-slot-reissue".to_string(),
+            "request-pending-slot-reissue".to_string(),
+        ));
+
+        let reissued = cluster
+            .test_reissue_pending_metadata_command(pg_id, &stale)
+            .unwrap()
+            .expect("stale duplicate pending command should be reissued");
+        assert_eq!(reissued.id().log_index().get(), 2);
+
+        let records = observability::flight_recorder_snapshot();
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.request_id == "request-pending-slot-reissue"
+                    && record.event == "metadata_command_pending_slot_action"
+            })
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let record = matching[0];
+        assert!(record.detail.contains("node_id=1"));
+        assert!(record.detail.contains("pg_id=1"));
+        assert!(record.detail.contains("log_index=1"));
+        assert!(record.detail.contains("action=reissue_attempt"));
+        assert!(record.detail.contains("command_kind=CreateBucket"));
+        assert!(!record.detail.contains(second_bucket.as_str()));
     }
 
     #[test]

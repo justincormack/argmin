@@ -38,10 +38,17 @@ Completed:
 - deep tracing is behind the non-default `deep-tracing` cargo feature and no
   longer part of the default production build path
 - production/local docs now treat deep tracing as local/test-only
-- the always-on production event surface has been reduced to:
+- the request-path production event surface has been reduced to:
   - `request_finish`
   - `request_error`
   - `slow_request`
+- [Multihost transition Phase 10.9](multihost-transition-plan.md#phase-109-stabilization-error-semantics-diagnostics-and-backpressure)
+  adds bounded, redacted storage race diagnostics for:
+  - `metadata_command_conflict`
+  - `metadata_command_pending_slot_action`
+  - `metadata_command_session_wait`
+  - `storage_rpc_error`
+  - `shard_scavenger_observation`
 - dense request/stream/layout observability is now `deep-tracing` only
 - `crates/observability` now provides small helper APIs for the remaining
   production events
@@ -50,7 +57,16 @@ Completed:
   - `inflight_requests`
   - `request_finish_total`
   - `request_error_total`
+  - `http_500_response_total`
+  - `operation_aborted_response_total`
+  - `slow_down_response_total`
   - `slow_request_total`
+  - `storage_rpc_error_total`
+  - `shard_scavenger_observation_total`
+  - `shard_scavenger_scan_incomplete_total`
+  - `metadata_command_conflict_total`
+  - `metadata_command_pending_slot_action_total`
+  - `metadata_command_session_wait_total`
 
 Remaining:
 
@@ -68,7 +84,8 @@ assumed.
 
 - deep tracing is off by default and not documented as a production mechanism
 - always-on semantic telemetry is limited to request summaries, slow-request
-  summaries, and thresholded lock-wait summaries
+  summaries, storage race summaries, storage-RPC error summaries, and shard
+  scavenger observations
 - the production event formatting and metric increments are centralized in
   `crates/observability`
 
@@ -268,7 +285,7 @@ Status: mostly completed in commit `2249c45`.
    that is intended for summary events only.
 4. Add thresholded helpers for:
    - slow requests
-   - lock waits
+   - storage race diagnostics
    - queue delays
 5. Add minimal counters/gauges for the production telemetry surface.
 6. Keep the remaining crate focused on production-safe summary telemetry.
@@ -280,8 +297,9 @@ crate internal and small.
 
 Completed in this phase:
 
-- summary helper APIs now exist for request finish/error, slow requests, and
-  thresholded lock waits
+- summary helper APIs now exist for request finish/error, slow requests,
+  storage race diagnostics, storage-RPC errors, and shard scavenger
+  observations
 - minimal production-safe counters/gauges now exist
 
 Remaining work in this phase:
@@ -356,7 +374,8 @@ production migration.
 - unit tests for any new summary/threshold helpers in `crates/observability`
 - unit tests for the minimal metrics snapshot / guard behavior
 - integration tests proving request summaries remain correctly escaped/redacted
-- regression tests for slow-request and lock-wait event thresholds
+- regression tests for slow-request, storage race, and queue-delay event
+  thresholds
 
 ### Performance validation
 

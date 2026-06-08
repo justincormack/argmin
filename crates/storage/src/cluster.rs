@@ -752,6 +752,49 @@ impl StorageCluster {
         );
     }
 
+    fn emit_metadata_command_pending_slot_action(
+        &self,
+        node_id: Option<NodeId>,
+        pg_id: PgId,
+        log_index: Option<u64>,
+        action: &'static str,
+        command_kind: Option<&'static str>,
+    ) {
+        let _ = observability::emit_metadata_command_pending_slot_action(
+            TRACE_TARGET,
+            observability::MetadataCommandPendingSlotActionSummary {
+                node_id: node_id.map(|node_id| node_id.as_u32()),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch().get(),
+                log_index,
+                action,
+                command_kind,
+            },
+        );
+    }
+
+    fn pending_slot_primary_node_id(&self, pg_id: PgId) -> Option<NodeId> {
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            .ok()
+            .map(|node| node.node_id())
+    }
+
+    fn emit_pending_slot_action_for_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        action: &'static str,
+    ) {
+        self.emit_metadata_command_pending_slot_action(
+            self.pending_slot_primary_node_id(pg_id),
+            pg_id,
+            Some(command.id().log_index().get()),
+            action,
+            Some(command.payload().kind_name()),
+        );
+    }
+
     fn metadata_command_conflict(
         &self,
         node_id: NodeId,
@@ -1176,6 +1219,13 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        self.emit_metadata_command_pending_slot_action(
+            Some(primary.node_id()),
+            pg_id,
+            Some(command.id().log_index().get()),
+            "reissue_attempt",
+            Some(command.payload().kind_name()),
+        );
         let primary_critical_section = primary
             .metadata_command_client()
             .open_metadata_command_critical_section(pg_id, self.operation_epoch())?;
@@ -2626,6 +2676,7 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
+        self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
         match self.finish_object_pg_pending_slot(pg_id, command)? {
             PendingMetadataCommandOutcome::Applied
             | PendingMetadataCommandOutcome::Abandoned
@@ -2874,6 +2925,7 @@ impl StorageCluster {
     ) -> Result<Vec<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mut applied = Vec::new();
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
             if Self::metadata_command_is_bucket_pg_command(&command) {
                 let outcome = self
                     .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
@@ -2909,6 +2961,7 @@ impl StorageCluster {
             if command.bucket_name() != bucket {
                 return Ok(());
             }
+            self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
             if Self::metadata_command_is_bucket_pg_command(&command) {
                 let outcome = self
                     .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(

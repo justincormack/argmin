@@ -6325,6 +6325,12 @@ Status:
   bounded message length, and a stable message hash in the flight recorder
   under the per-frame storage-node trace context. Raw RPC payloads and error
   messages are not written to the flight record.
+- Continued the permanent diagnostics slice by adding a separate
+  metadata-command pending-slot action counter and flight-recorder event for
+  drain and reissue attempts. The central storage-cluster drain/reissue helpers
+  record only node id, PG id, cluster epoch, log index, action, and command
+  kind, with tests covering real pending-slot drain and reissue paths and
+  asserting bucket names are not included.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

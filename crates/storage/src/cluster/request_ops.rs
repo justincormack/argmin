@@ -1305,6 +1305,22 @@ impl super::StorageCluster {
         }
     }
 
+    pub(super) fn drain_bucket_pg_pending_metadata_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+    ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
+        self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
+        self.finish_pending_metadata_command_to_acting_set(
+            pg_id,
+            bucket,
+            command,
+            clear_pending_on_zero_apply,
+        )
+    }
+
     fn metadata_command_bucket_name(command: &MetadataCommandEnvelope) -> &BucketName {
         command.bucket_name()
     }
@@ -1323,13 +1339,14 @@ impl super::StorageCluster {
         Ok(true)
     }
 
-    fn drain_pending_metadata_command_pg_slot(
+    pub(super) fn drain_pending_metadata_command_pg_slot(
         &self,
         pg_id: PgId,
         _pending_bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
+            self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
             let outcome = self
                 .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
                     pg_id, command, false,
@@ -1350,8 +1367,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let _ =
-            self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)?;
+        let _ = self.drain_bucket_pg_pending_metadata_command(pg_id, bucket, command, false)?;
         Ok(())
     }
 
@@ -1474,7 +1490,7 @@ impl super::StorageCluster {
             | MetadataCommandPayload::MarkBucketDeleting(_)
             | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
             | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => self
-                .finish_pending_metadata_command_to_acting_set(pg_id, bucket, command, false)
+                .drain_bucket_pg_pending_metadata_command(pg_id, bucket, command, false)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error),
         }
     }
@@ -2074,7 +2090,7 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
                         let _ = self
-                            .finish_pending_metadata_command_to_acting_set(
+                            .drain_bucket_pg_pending_metadata_command(
                                 pg_id, bucket, &command, false,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
@@ -2088,7 +2104,7 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
                     | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         let _ = self
-                            .finish_pending_metadata_command_to_acting_set(
+                            .drain_bucket_pg_pending_metadata_command(
                                 pg_id, bucket, &command, false,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
@@ -2604,7 +2620,7 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        let _ = self.finish_pending_metadata_command_to_acting_set(
+                        let _ = self.drain_bucket_pg_pending_metadata_command(
                             pg_id,
                             &record.bucket,
                             &command,
@@ -7386,9 +7402,7 @@ impl super::StorageCluster {
                 {
                     let completion_order = advance.completion_order;
                     match self
-                        .finish_pending_metadata_command_to_acting_set(
-                            pg_id, bucket, &command, false,
-                        )
+                        .drain_bucket_pg_pending_metadata_command(pg_id, bucket, &command, false)
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                     {
                         super::PendingMetadataCommandOutcome::Applied => {

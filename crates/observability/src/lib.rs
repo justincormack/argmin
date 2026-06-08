@@ -96,6 +96,7 @@ static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_SESSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -550,6 +551,16 @@ pub struct MetadataCommandConflictSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandPendingSlotActionSummary {
+    pub node_id: Option<u32>,
+    pub pg_id: u32,
+    pub cluster_epoch: u64,
+    pub log_index: Option<u64>,
+    pub action: &'static str,
+    pub command_kind: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetadataCommandSessionWaitSummary {
     pub node_id: u32,
     pub pg_id: u32,
@@ -578,6 +589,7 @@ pub struct MetricsSnapshot {
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
     pub metadata_command_conflict_total: u64,
+    pub metadata_command_pending_slot_action_total: u64,
     pub metadata_command_session_wait_total: u64,
 }
 
@@ -617,6 +629,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         shard_scavenger_scan_incomplete_total: SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL
             .load(Ordering::Relaxed),
         metadata_command_conflict_total: METADATA_COMMAND_CONFLICT_TOTAL.load(Ordering::Relaxed),
+        metadata_command_pending_slot_action_total: METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL
+            .load(Ordering::Relaxed),
         metadata_command_session_wait_total: METADATA_COMMAND_SESSION_WAIT_TOTAL
             .load(Ordering::Relaxed),
     }
@@ -808,6 +822,44 @@ pub fn emit_metadata_command_conflict(
         Some(format_args!(
             "node_id={} pg_id={} cluster_epoch={} log_index={} kind={} command_kind={}",
             node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.kind, command_kind
+        )),
+    )
+}
+
+pub fn emit_metadata_command_pending_slot_action(
+    target: &'static str,
+    summary: MetadataCommandPendingSlotActionSummary,
+) -> bool {
+    METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let node_id = summary
+        .node_id
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let log_index = summary
+        .log_index
+        .map(|log_index| log_index.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_kind = summary.command_kind.unwrap_or("unknown");
+    let detail = format!(
+        "node_id={} pg_id={} cluster_epoch={} log_index={} action={} command_kind={}",
+        node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.action, command_kind
+    );
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_pending_slot_action",
+        detail,
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_pending_slot_action",
+        Some(format_args!(
+            "node_id={} pg_id={} cluster_epoch={} log_index={} action={} command_kind={}",
+            node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.action, command_kind
         )),
     )
 }
@@ -1487,6 +1539,7 @@ mod tests {
             "request-metadata-command".to_string(),
         );
         let _attached = AttachedTrace::new(ctx);
+        let before = metrics_snapshot();
 
         emit_metadata_command_conflict(
             "storage",
@@ -1499,6 +1552,17 @@ mod tests {
                 command_kind: Some("CreateStreamUpload"),
             },
         );
+        emit_metadata_command_pending_slot_action(
+            "storage",
+            MetadataCommandPendingSlotActionSummary {
+                node_id: Some(7),
+                pg_id: 3,
+                cluster_epoch: 1,
+                log_index: Some(10),
+                action: "drain_attempt",
+                command_kind: Some("CommitDirectPutObject"),
+            },
+        );
         emit_metadata_command_session_wait(
             "storage",
             MetadataCommandSessionWaitSummary {
@@ -1506,6 +1570,20 @@ mod tests {
                 pg_id: 3,
                 wait_us: 1234,
             },
+        );
+
+        let after = metrics_snapshot();
+        assert_eq!(
+            after.metadata_command_conflict_total,
+            before.metadata_command_conflict_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_pending_slot_action_total,
+            before.metadata_command_pending_slot_action_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_session_wait_total,
+            before.metadata_command_session_wait_total + 1
         );
 
         let records = flight_recorder_snapshot();
@@ -1522,6 +1600,22 @@ mod tests {
         assert!(conflict.detail.contains("log_index=9"));
         assert!(conflict.detail.contains("kind=pending_slot_conflict"));
         assert!(conflict.detail.contains("command_kind=CreateStreamUpload"));
+
+        let pending_slot = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-metadata-command"
+                    && record.event == "metadata_command_pending_slot_action"
+            })
+            .expect("metadata command pending-slot action should be recorded");
+        assert!(pending_slot.detail.contains("node_id=7"));
+        assert!(pending_slot.detail.contains("pg_id=3"));
+        assert!(pending_slot.detail.contains("log_index=10"));
+        assert!(pending_slot.detail.contains("action=drain_attempt"));
+        assert!(pending_slot
+            .detail
+            .contains("command_kind=CommitDirectPutObject"));
 
         let wait = records
             .iter()
