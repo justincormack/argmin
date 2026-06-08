@@ -17047,9 +17047,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::ObjectPgActionError::Store(StoreError::Io {
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
                     context: "abandoned pending command for direct put commit",
-                    ..
                 })
             ),
             "expected abandoned direct PUT conflict, got {err:?}"
