@@ -1490,10 +1490,10 @@ fn test_versioning_head_delete_marker_version_returns_method_not_allowed() {
         let bucket = setup_versioned_bucket().await;
         let key = "delete-marker-head";
 
-        put_object_retrying_operation_aborted(&client, &bucket, key, b"payload".to_vec()).await;
+        put_object_retrying_operation_aborted(client, &bucket, key, b"payload".to_vec()).await;
 
         let delete_marker_version =
-            delete_object_retrying_operation_aborted(&client, &bucket, key).await;
+            delete_object_retrying_operation_aborted(client, &bucket, key).await;
 
         let url = format!(
             "{}/{bucket}/{key}?versionId={delete_marker_version}",

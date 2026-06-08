@@ -5959,6 +5959,36 @@ impl StorageNodeConnectionHandler {
                     );
                     encode_storage_rpc_success_response(&payload)
                 }
+                Err(BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::StaleObjectWriteCommand {
+                        bucket,
+                        key,
+                        write_sequence,
+                        generation_id,
+                    },
+                )) => {
+                    let generation_id = generation_id
+                        .map(|generation_id| {
+                            GenerationId::new(generation_id).ok_or(
+                                crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                                    "stored stale object generation id is invalid",
+                                ),
+                            )
+                        })
+                        .transpose()?;
+                    let payload = encode_metadata_command_state_outcome_response(
+                        &StorageRpcMetadataCommandStateOutcomeResponse {
+                            outcome:
+                                StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                                    bucket,
+                                    key,
+                                    write_sequence,
+                                    generation_id,
+                                },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
                 Err(BucketSnapshotLoadError::Metadata(error)) => {
                     encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::Internal,
@@ -7334,7 +7364,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::metadata_command::{
-        CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
+        DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
+        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
         MetadataCommandPayload, PutBucketAclCommand, ReserveObjectGenerationCommand,
         ReserveObjectVersionCommand,
     };
@@ -7578,6 +7610,24 @@ mod tests {
                 123,
             )),
         )
+    }
+
+    fn test_bucket_write_reservation_proof(
+        bucket: crate::BucketName,
+        key: &crate::ObjectKey,
+    ) -> BucketWriteReservationProof {
+        BucketWriteReservationProof {
+            bucket,
+            reservation_id: "reservation-id".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "storage-node-rpc-test".to_string(),
+            created_at: 1,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        }
     }
 
     fn read_handle_release_payload(read_operation_id: &str) -> Vec<u8> {
@@ -9195,6 +9245,285 @@ mod tests {
             StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
                 name: bucket,
                 bucket_execution_generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_node_server_preserves_stale_object_write_apply_conflict() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let bucket = crate::tests::bucket_name("stale-object-rpc");
+        let key = crate::tests::object_key("object");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let pg = server._node.get_pg(0).unwrap();
+        let create_config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &crate::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let create = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+            ),
+        );
+        pg.apply_metadata_command_and_record(7, &create).unwrap();
+        let first = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(1),
+                owner: owner.clone(),
+                write_sequence: 1,
+                last_modified_millis: 123,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+            }),
+        );
+        pg.apply_metadata_command_and_record(7, &first).unwrap();
+        drop(pg);
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_u64(2),
+                owner,
+                write_sequence: 1,
+                last_modified_millis: 124,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+            }),
+        );
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command: stale,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert_eq!(
+            decoded.outcome,
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence: 1,
+                generation_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_node_server_preserves_stale_delete_marker_target_conflict() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let bucket = crate::tests::bucket_name("stale-marker-delete-rpc");
+        let key = crate::tests::object_key("object");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let pg = server._node.get_pg(0).unwrap();
+        let create_config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &crate::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let create = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+            ),
+        );
+        pg.apply_metadata_command_and_record(7, &create).unwrap();
+        let first_marker = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: owner.clone(),
+                write_sequence: 1,
+                last_modified_millis: 123,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+            }),
+        );
+        pg.apply_metadata_command_and_record(7, &first_marker)
+            .unwrap();
+
+        let reservation_id = crate::SessionId::try_from("76".repeat(16)).unwrap();
+        let reserve = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                reservation_id.clone(),
+                GenerationId::MIN,
+                124,
+            )),
+        );
+        pg.apply_metadata_command_and_record(7, &reserve).unwrap();
+        let replacement_live = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(4).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: crate::PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: owner.clone(),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: crate::ObjectEtag::single_part(0),
+                    ec: EcShape { k: 2, m: 1 },
+                    layout: crate::ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                },
+                segments: Vec::new(),
+                generation_reservation_id: reservation_id,
+                write_sequence: 2,
+                last_modified_millis: 124,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+            })),
+        );
+        pg.apply_metadata_command_and_record(7, &replacement_live)
+            .unwrap();
+        let newer_marker = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(5).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner,
+                write_sequence: 3,
+                last_modified_millis: 125,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+            }),
+        );
+        pg.apply_metadata_command_and_record(7, &newer_marker)
+            .unwrap();
+        drop(pg);
+
+        let stale = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(6).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 1 },
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+            })),
+        );
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command: stale,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert_eq!(
+            decoded.outcome,
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence: 1,
+                generation_id: None,
             }
         );
     }

@@ -812,7 +812,14 @@ fn delete_command_target_from_stored(
 ) -> Result<Option<DeleteObjectVersionTarget>, MetadataError> {
     match stored {
         None => Ok(None),
-        Some(StoredObject::DeleteMarker(_)) => Ok(Some(DeleteObjectVersionTarget::DeleteMarker)),
+        Some(StoredObject::DeleteMarker(marker)) => {
+            let write_sequence = pg
+                .object_write_sequence(bucket.as_str(), key.as_str(), marker.version_id)?
+                .ok_or(MetadataError::ObjectNotFound)?;
+            Ok(Some(DeleteObjectVersionTarget::DeleteMarker {
+                write_sequence,
+            }))
+        }
         Some(StoredObject::Live(record)) => {
             Ok(Some(live_delete_command_target(pg, bucket, key, record)?))
         }
@@ -3401,6 +3408,12 @@ impl UnixStorageNodeClient {
                     "record abandoned response cannot contain stale bucket metadata command"
                         .to_string(),
                 )),
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stale object write command"
+                        .to_string(),
+                )),
         }
     }
 
@@ -3468,6 +3481,23 @@ impl UnixStorageNodeClient {
                 command,
                 name,
                 bucket_execution_generation,
+                "decode metadata command apply and record response",
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+            },
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
+            } => match stale_object_write_command_error(
+                command,
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
                 "decode metadata command apply and record response",
                 |operation, message| self.rpc_payload_error(operation, message),
             ) {
@@ -4331,6 +4361,65 @@ fn stale_bucket_metadata_command_error(
     Ok(MetadataError::StaleBucketMetadataCommand {
         name,
         bucket_execution_generation,
+    })
+}
+
+fn stale_object_write_command_error(
+    command: &MetadataCommandEnvelope,
+    bucket: BucketName,
+    key: ObjectKey,
+    write_sequence: u64,
+    generation_id: Option<GenerationId>,
+    decode_context: &'static str,
+    rpc_payload_error: impl FnOnce(&'static str, String) -> StoreError,
+) -> Result<MetadataError, StoreError> {
+    let expected = match command.payload() {
+        MetadataCommandPayload::CommitDirectPutObject(command) => Some((
+            &command.object.bucket,
+            &command.object.key,
+            command.write_sequence,
+            Some(command.object.generation_id),
+        )),
+        MetadataCommandPayload::CommitMultipartObject(command) => Some((
+            &command.object.bucket,
+            &command.object.key,
+            command.write_sequence,
+            Some(command.object.generation_id),
+        )),
+        MetadataCommandPayload::InsertDeleteMarker(command) => {
+            Some((&command.bucket, &command.key, command.write_sequence, None))
+        }
+        MetadataCommandPayload::DeleteObjectVersion(command) => match command.target {
+            DeleteObjectVersionTarget::DeleteMarker { write_sequence } => {
+                Some((&command.bucket, &command.key, write_sequence, None))
+            }
+            DeleteObjectVersionTarget::Live { .. } => None,
+        },
+        _ => None,
+    };
+    let Some((expected_bucket, expected_key, expected_write_sequence, expected_generation_id)) =
+        expected
+    else {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stale object write command outcome is impossible for command kind".to_string(),
+        ));
+    };
+    if bucket != *expected_bucket
+        || key != *expected_key
+        || write_sequence != expected_write_sequence
+        || generation_id != expected_generation_id
+    {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stale object write command outcome identity mismatch".to_string(),
+        ));
+    }
+    Ok(MetadataError::StaleObjectWriteCommand {
+        bucket,
+        key,
+        write_sequence,
+        generation_id: generation_id.map(GenerationId::get),
     })
 }
 
@@ -5282,6 +5371,23 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                 Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
                 Err(error) => Err(BucketSnapshotLoadError::Store(error)),
             },
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
+            } => match stale_object_write_command_error(
+                command,
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
+                "decode metadata command apply and record response",
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+            },
         }
     }
 
@@ -5339,6 +5445,12 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                 .rpc_payload_error(
                     "decode metadata command record abandoned response",
                     "record abandoned response cannot contain stale bucket metadata command"
+                        .to_string(),
+                )),
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stale object write command"
                         .to_string(),
                 )),
         }
@@ -10551,7 +10663,7 @@ impl UnixStorageNodeClient {
         context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
         match target {
-            DeleteObjectVersionTarget::DeleteMarker => Ok(()),
+            DeleteObjectVersionTarget::DeleteMarker { .. } => Ok(()),
             DeleteObjectVersionTarget::Live {
                 generation_id,
                 layout,
@@ -10586,7 +10698,7 @@ impl UnixStorageNodeClient {
             (None, None) => true,
             (
                 Some(StoredObject::DeleteMarker(_)),
-                Some(DeleteObjectVersionTarget::DeleteMarker),
+                Some(DeleteObjectVersionTarget::DeleteMarker { .. }),
             ) => true,
             (
                 Some(StoredObject::Live(live)),
@@ -20737,6 +20849,117 @@ mod tests {
         );
         assert!(matches!(
             stale_bucket_mismatch,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode metadata command apply and record response",
+                ..
+            })
+        ));
+
+        let object_bucket = crate::tests::bucket_name("stale-object-rpc");
+        let object_key = crate::tests::object_key("object");
+        let stale_object_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket: object_bucket.clone(),
+                key: object_key.clone(),
+                version_id: VersionId::from_u64(7),
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                write_sequence: 3,
+                last_modified_millis: 123,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    object_bucket.clone(),
+                    &object_key,
+                ),
+            }),
+        );
+        let stale_object = apply_error_from_fake_response_for_command(
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket: object_bucket.clone(),
+                key: object_key.clone(),
+                write_sequence: 3,
+                generation_id: None,
+            },
+            stale_object_command.clone(),
+        );
+        assert!(matches!(
+            stale_object,
+            BucketSnapshotLoadError::Metadata(MetadataError::StaleObjectWriteCommand {
+                ref bucket,
+                ref key,
+                write_sequence: 3,
+                generation_id: None,
+            }) if bucket == &object_bucket && key == &object_key
+        ));
+
+        let stale_delete_marker_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket: object_bucket.clone(),
+                key: object_key.clone(),
+                version_id: VersionId::Null,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 5 },
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    object_bucket.clone(),
+                    &object_key,
+                ),
+            })),
+        );
+        let stale_delete_marker = apply_error_from_fake_response_for_command(
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket: object_bucket.clone(),
+                key: object_key.clone(),
+                write_sequence: 5,
+                generation_id: None,
+            },
+            stale_delete_marker_command.clone(),
+        );
+        assert!(matches!(
+            stale_delete_marker,
+            BucketSnapshotLoadError::Metadata(MetadataError::StaleObjectWriteCommand {
+                ref bucket,
+                ref key,
+                write_sequence: 5,
+                generation_id: None,
+            }) if bucket == &object_bucket && key == &object_key
+        ));
+
+        let stale_delete_marker_generation_mismatch = apply_error_from_fake_response_for_command(
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket: object_bucket.clone(),
+                key: object_key.clone(),
+                write_sequence: 5,
+                generation_id: Some(GenerationId::MIN),
+            },
+            stale_delete_marker_command,
+        );
+        assert!(matches!(
+            stale_delete_marker_generation_mismatch,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                operation: "decode metadata command apply and record response",
+                ..
+            })
+        ));
+
+        let stale_object_mismatch = apply_error_from_fake_response_for_command(
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket: object_bucket,
+                key: object_key,
+                write_sequence: 4,
+                generation_id: None,
+            },
+            stale_object_command,
+        );
+        assert!(matches!(
+            stale_object_mismatch,
             BucketSnapshotLoadError::Store(StoreError::StorageRpc {
                 operation: "decode metadata command apply and record response",
                 ..

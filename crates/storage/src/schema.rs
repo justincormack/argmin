@@ -101,6 +101,16 @@ CREATE TABLE IF NOT EXISTS object_version_counters (
     PRIMARY KEY (bucket, key)
 )";
 
+/// Per-object-key durable write-order fence.
+const CREATE_OBJECT_WRITE_COUNTERS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS object_write_counters (
+    bucket                    TEXT NOT NULL,
+    key                       TEXT NOT NULL,
+    next_write_sequence       INTEGER NOT NULL CHECK (next_write_sequence > 0),
+    max_committed_generation  INTEGER CHECK (max_committed_generation IS NULL OR max_committed_generation > 0),
+    PRIMARY KEY (bucket, key)
+)";
+
 /// In-progress multipart upload tracking table.
 const CREATE_MULTIPART_UPLOADS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_uploads (
@@ -630,6 +640,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_VERSION_COUNTERS_TABLE, [])?;
+    conn.execute(CREATE_OBJECT_WRITE_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_LIST_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_VERSIONS_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;

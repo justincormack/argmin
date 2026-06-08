@@ -354,6 +354,17 @@ const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
         filter: MetadataDigestFilter::AllRows,
     },
     MetadataDigestTable {
+        name: "object_write_counters",
+        columns: &[
+            "bucket",
+            "key",
+            "next_write_sequence",
+            "max_committed_generation",
+        ],
+        order_columns: &["bucket", "key"],
+        filter: MetadataDigestFilter::AllRows,
+    },
+    MetadataDigestTable {
         name: "object_parts",
         columns: &[
             "bucket",
@@ -7186,7 +7197,15 @@ impl PgStore {
             }
             Err(error) => return Err(error),
         };
+        let stored_write_sequence = self
+            .object_write_sequence(
+                command.object.bucket.as_str(),
+                command.object.key.as_str(),
+                command.object.version_id,
+            )?
+            .ok_or(MetadataError::ObjectNotFound)?;
         if stored.generation_id != command.object.generation_id
+            || stored_write_sequence != command.write_sequence
             || stored.size != command.object.size
             || stored.etag != command.object.etag
             || stored.last_modified != command.last_modified_millis
@@ -7311,7 +7330,15 @@ impl PgStore {
             }
             Err(error) => return Err(error),
         };
+        let stored_write_sequence = self
+            .object_write_sequence(
+                command.object.bucket.as_str(),
+                command.object.key.as_str(),
+                command.object.version_id,
+            )?
+            .ok_or(MetadataError::ObjectNotFound)?;
         if stored.generation_id != command.object.generation_id
+            || stored_write_sequence != command.write_sequence
             || stored.size != command.object.size
             || stored.etag != command.object.etag
             || stored.last_modified != command.last_modified_millis
@@ -7789,7 +7816,26 @@ impl PgStore {
                 };
 
                 match (&command.target, stored) {
-                    (DeleteObjectVersionTarget::DeleteMarker, StoredObject::DeleteMarker(_)) => {}
+                    (
+                        DeleteObjectVersionTarget::DeleteMarker { write_sequence },
+                        StoredObject::DeleteMarker(_),
+                    ) => {
+                        let stored_write_sequence = store
+                            .object_write_sequence(
+                                command.bucket.as_str(),
+                                command.key.as_str(),
+                                command.version_id,
+                            )?
+                            .ok_or(MetadataError::ObjectNotFound)?;
+                        if stored_write_sequence != *write_sequence {
+                            return Err(MetadataError::StaleObjectWriteCommand {
+                                bucket: command.bucket.clone(),
+                                key: command.key.clone(),
+                                write_sequence: *write_sequence,
+                                generation_id: None,
+                            });
+                        }
+                    }
                     (
                         DeleteObjectVersionTarget::Live {
                             generation_id,
@@ -7856,7 +7902,12 @@ impl PgStore {
                 match store.get_object_version(&command.bucket, &command.key, command.version_id) {
                     Ok(StoredObject::DeleteMarker(marker))
                         if marker.owner == command.owner
-                            && marker.last_modified == command.last_modified_millis =>
+                            && marker.last_modified == command.last_modified_millis
+                            && store.object_write_sequence(
+                                command.bucket.as_str(),
+                                command.key.as_str(),
+                                command.version_id,
+                            )? == Some(command.write_sequence) =>
                     {
                         return Ok(());
                     }
@@ -8930,6 +8981,7 @@ impl PgStore {
             source: e,
         })?;
         self.advance_object_version_counter_in_open_txn(bucket, key, version_id)?;
+        self.advance_object_write_counter_in_open_txn(bucket, key, write_sequence, None)?;
         let sql = if version_id.is_null() {
             "INSERT OR REPLACE INTO objects \
              (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
@@ -8964,6 +9016,8 @@ impl PgStore {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
+        let write_sequence = self.next_object_write_sequence(bucket.as_str(), key.as_str())?;
+        self.advance_object_write_counter_in_open_txn(bucket, key, write_sequence, None)?;
         let deleted_was_current: bool = self.query_row_cached_metadata(
             "SELECT EXISTS( \
                  SELECT 1 FROM objects \
@@ -9503,6 +9557,24 @@ impl PgStore {
         bucket: &str,
         key: &str,
     ) -> Result<u64, MetadataError> {
+        let stored_next: Option<i64> = self.query_row_cached_optional_metadata(
+            "SELECT next_write_sequence FROM object_write_counters \
+             WHERE bucket = ?1 AND key = ?2",
+            params![bucket, key],
+            "next object write sequence counter",
+            |row| row.get(0),
+        )?;
+        if let Some(value) = stored_next {
+            return u64::try_from(value).map_err(|_| MetadataError::Db {
+                context: "negative object write counter in database",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("negative next_write_sequence: {value}")),
+                ),
+            });
+        }
+
         let max: Option<i64> = self
             .query_row_cached_optional_metadata(
                 "SELECT MAX(write_sequence) FROM objects WHERE bucket = ?1 AND key = ?2",
@@ -9533,6 +9605,140 @@ impl PgStore {
                 })
             }
         }
+    }
+
+    fn current_object_write_counter_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<(u64, Option<u64>), MetadataError> {
+        let stored: Option<(i64, Option<i64>)> = self.query_row_cached_optional_metadata(
+            "SELECT next_write_sequence, max_committed_generation \
+             FROM object_write_counters WHERE bucket = ?1 AND key = ?2",
+            params![bucket, key],
+            "load object write counter",
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some((next_write_sequence, max_committed_generation)) = stored {
+            let next_write_sequence =
+                u64::try_from(next_write_sequence).map_err(|_| MetadataError::Db {
+                    context: "negative object write counter in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!(
+                            "negative next_write_sequence: {next_write_sequence}"
+                        )),
+                    ),
+                })?;
+            let max_committed_generation = max_committed_generation
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| MetadataError::Db {
+                        context: "negative object write generation counter in database",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("negative max_committed_generation: {value}")),
+                        ),
+                    })
+                })
+                .transpose()?;
+            return Ok((next_write_sequence, max_committed_generation));
+        }
+
+        let max: Option<(Option<i64>, Option<i64>)> = self.query_row_cached_optional_metadata(
+            "SELECT MAX(write_sequence), MAX(generation_id) FROM objects \
+             WHERE bucket = ?1 AND key = ?2",
+            params![bucket, key],
+            "bootstrap object write counter",
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (max_write_sequence, max_generation_id) = max.unwrap_or((None, None));
+        let next_write_sequence = match max_write_sequence {
+            None => 1,
+            Some(value) => {
+                let current = u64::try_from(value).map_err(|_| MetadataError::Db {
+                    context: "negative write_sequence in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative MAX(write_sequence): {value}")),
+                    ),
+                })?;
+                current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                    context: "write_sequence overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("MAX(write_sequence) overflow"),
+                    ),
+                })?
+            }
+        };
+        let max_generation_id = max_generation_id
+            .map(|value| {
+                u64::try_from(value).map_err(|_| MetadataError::Db {
+                    context: "negative generation_id in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative MAX(generation_id): {value}")),
+                    ),
+                })
+            })
+            .transpose()?;
+        Ok((next_write_sequence, max_generation_id))
+    }
+
+    fn advance_object_write_counter_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        write_sequence: u64,
+        generation_id: Option<GenerationId>,
+    ) -> Result<(), MetadataError> {
+        let (expected_write_sequence, max_generation_id) =
+            self.current_object_write_counter_in_open_txn(bucket, key)?;
+        if write_sequence != expected_write_sequence {
+            return Err(MetadataError::StaleObjectWriteCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                write_sequence,
+                generation_id: generation_id.map(GenerationId::get),
+            });
+        }
+        let next_write_sequence =
+            write_sequence
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Db {
+                    context: "write_sequence overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("object write counter overflow"),
+                    ),
+                })?;
+        let max_committed_generation = match (max_generation_id, generation_id) {
+            (Some(current), Some(generation_id)) => Some(current.max(generation_id.get())),
+            (None, Some(generation_id)) => Some(generation_id.get()),
+            (current, None) => current,
+        };
+        self.execute_cached_metadata(
+            "INSERT INTO object_write_counters \
+             (bucket, key, next_write_sequence, max_committed_generation) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(bucket, key) DO UPDATE SET \
+                 next_write_sequence = excluded.next_write_sequence, \
+                 max_committed_generation = excluded.max_committed_generation",
+            params![
+                bucket,
+                key,
+                next_write_sequence as i64,
+                max_committed_generation.map(|value| value as i64),
+            ],
+            "advance object write counter",
+        )?;
+        Ok(())
     }
 
     fn advance_object_version_counter_in_open_txn(
@@ -10170,6 +10376,12 @@ impl PgStore {
             source: e,
         })?;
         self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
+        self.advance_object_write_counter_in_open_txn(
+            &obj.bucket,
+            &obj.key,
+            write_sequence,
+            Some(obj.generation_id),
+        )?;
 
         let obj_sql = if obj.version_id.is_null() {
             "INSERT OR REPLACE INTO objects \
@@ -10337,6 +10549,12 @@ impl PgStore {
             source: e,
         })?;
         self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
+        self.advance_object_write_counter_in_open_txn(
+            &obj.bucket,
+            &obj.key,
+            write_sequence,
+            Some(obj.generation_id),
+        )?;
 
         let obj_sql = if obj.version_id.is_null() {
             "INSERT OR REPLACE INTO objects \
@@ -10963,6 +11181,15 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "delete finalized bucket (delete version counters)",
+                        source,
+                    })?;
+                self.conn
+                    .execute(
+                        "DELETE FROM object_write_counters WHERE bucket = ?1",
+                        params![name.as_str()],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "delete finalized bucket (delete write counters)",
                         source,
                     })?;
             }
@@ -11993,6 +12220,12 @@ impl PgMetadataStore for PgStore {
                     &req.bucket,
                     &req.key,
                     req.version_id,
+                )?;
+                self.advance_object_write_counter_in_open_txn(
+                    &req.bucket,
+                    &req.key,
+                    write_sequence,
+                    Some(req.generation_id),
                 )?;
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
@@ -15941,6 +16174,18 @@ impl PgMetadataStore for PgStore {
                         std::io::Error::other(other.to_string()),
                     )),
                 })?;
+            self.advance_object_write_counter_in_open_txn(
+                &obj.bucket,
+                &obj.key,
+                write_sequence,
+                Some(obj.generation_id),
+            )
+            .map_err(|error| match error {
+                MetadataError::Db { source, .. } => source,
+                other => rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    other.to_string(),
+                ))),
+            })?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {
@@ -16677,6 +16922,12 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
             self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
+            self.advance_object_write_counter_in_open_txn(
+                &obj.bucket,
+                &obj.key,
+                write_sequence,
+                Some(obj.generation_id),
+            )?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
@@ -17862,6 +18113,25 @@ mod tests {
                     .unwrap(),
             ),
         )
+    }
+
+    fn test_bucket_write_reservation_proof(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation_kind: &str,
+    ) -> BucketWriteReservationProof {
+        BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: format!("{operation_kind}-proof"),
+            owner_token: format!("{operation_kind}-proof-owner"),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: operation_kind.to_string(),
+            created_at: 1,
+            lease_deadline: Some(2),
+            target_context: Some(key.as_str().to_string()),
+        }
     }
 
     fn create_probe_bucket_direct(store: &PgStore, bucket: &BucketName) {
@@ -19224,6 +19494,37 @@ mod tests {
             )
             .unwrap();
         assert_cached_metadata_digest_matches_materialized(&store);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_write_counters \
+                 (bucket, key, next_write_sequence, max_committed_generation) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![bucket.as_str(), key.as_str(), 2_i64, 1_i64],
+            )
+            .unwrap();
+        assert_cached_metadata_digest_matches_materialized(&store);
+
+        store
+            .conn
+            .execute(
+                "UPDATE object_write_counters \
+                 SET next_write_sequence = ?1, max_committed_generation = ?2 \
+                 WHERE bucket = ?3 AND key = ?4",
+                params![3_i64, 2_i64, bucket.as_str(), key.as_str()],
+            )
+            .unwrap();
+        assert_cached_metadata_digest_matches_materialized(&store);
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM object_write_counters WHERE bucket = ?1 AND key = ?2",
+                params![bucket.as_str(), key.as_str()],
+            )
+            .unwrap();
+        assert_cached_metadata_digest_matches_materialized(&store);
     }
 
     #[test]
@@ -19511,6 +19812,7 @@ mod tests {
                     MetadataDigestFilter::AllRows
                 ),
                 ("object_version_counters", MetadataDigestFilter::AllRows),
+                ("object_write_counters", MetadataDigestFilter::AllRows),
                 ("object_parts", MetadataDigestFilter::AllRows),
                 (
                     "object_segment_reclaim_segments",
@@ -21486,6 +21788,157 @@ mod tests {
     }
 
     #[test]
+    fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("stale-delete-marker-delete");
+        let key = trusted_object_key("object");
+        let owner = test_owner();
+
+        let first_marker = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    &bucket,
+                    &key,
+                    "first-delete-marker",
+                ),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: owner.clone(),
+                write_sequence: 1,
+                last_modified_millis: 10,
+                stale_payload: None,
+            }),
+        );
+        store.apply_metadata_command(&first_marker).unwrap();
+
+        let stale_delete = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    &bucket,
+                    &key,
+                    "stale-delete-marker-delete",
+                ),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 1 },
+            })),
+        );
+
+        let replacement_reservation_id = SessionId::try_from("75".repeat(16)).unwrap();
+        let replacement_live = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: owner.clone(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 2, m: 1 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments: Vec::new(),
+                generation_reservation_id: replacement_reservation_id.clone(),
+                write_sequence: 2,
+                last_modified_millis: 20,
+                stale_payload: None,
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    &bucket,
+                    &key,
+                    "replacement-live",
+                ),
+            })),
+        );
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &replacement_reservation_id);
+        store.apply_metadata_command(&replacement_live).unwrap();
+
+        let newer_marker = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(4).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    &bucket,
+                    &key,
+                    "newer-delete-marker",
+                ),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: owner.clone(),
+                write_sequence: 3,
+                last_modified_millis: 30,
+                stale_payload: None,
+            }),
+        );
+        store.apply_metadata_command(&newer_marker).unwrap();
+
+        let stale_replay = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(5).unwrap(),
+            ),
+            stale_delete.payload().clone(),
+        );
+        let err = store.apply_metadata_command(&stale_replay).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::StaleObjectWriteCommand {
+                    ref bucket,
+                    ref key,
+                    write_sequence: 1,
+                    generation_id: None,
+                } if bucket.as_str() == "stale-delete-marker-delete"
+                    && key.as_str() == "object"
+            ),
+            "expected stale delete-marker target rejection, got {err:?}"
+        );
+        assert_eq!(
+            store
+                .object_write_sequence(bucket.as_str(), key.as_str(), VersionId::Null)
+                .unwrap(),
+            Some(3)
+        );
+        let stored = store
+            .get_object_version(&bucket, &key, VersionId::Null)
+            .unwrap();
+        let StoredObject::DeleteMarker(marker) = stored else {
+            panic!("expected newer delete marker to remain, got {stored:?}");
+        };
+        assert_eq!(marker.last_modified, 30);
+    }
+
+    #[test]
     fn already_applied_direct_put_command_cleans_terminal_staging_on_apply() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -21551,6 +22004,61 @@ mod tests {
             store.get_object_generation_reservation(&bucket, &key, &reservation_id),
             Err(MetadataError::ObjectGenerationReservationNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn direct_put_already_applied_requires_matching_write_sequence() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("direct-put-stale-write-sequence");
+        let key = trusted_object_key("object");
+        let reservation_id = SessionId::try_from("76".repeat(16)).unwrap();
+
+        let first = direct_put_terminal_cleanup_command_with_write_sequence(
+            &bucket,
+            &key,
+            &reservation_id,
+            1,
+        );
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        store.apply_metadata_command(&first).unwrap();
+
+        let newer = direct_put_terminal_cleanup_command_with_write_sequence(
+            &bucket,
+            &key,
+            &reservation_id,
+            2,
+        );
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        store.apply_metadata_command(&newer).unwrap();
+
+        let stale_same_image = direct_put_terminal_cleanup_command_with_write_sequence(
+            &bucket,
+            &key,
+            &reservation_id,
+            1,
+        );
+        insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+        let err = store.apply_metadata_command(&stale_same_image).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MetadataError::StaleObjectWriteCommand {
+                    ref bucket,
+                    ref key,
+                    write_sequence: 1,
+                    generation_id: Some(1),
+                } if bucket.as_str() == "direct-put-stale-write-sequence"
+                    && key.as_str() == "object"
+            ),
+            "expected stale write-sequence rejection, got {err:?}"
+        );
+        assert_eq!(
+            store
+                .object_write_sequence(bucket.as_str(), key.as_str(), VersionId::Null)
+                .unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -21678,6 +22186,15 @@ mod tests {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> MetadataCommandEnvelope {
+        direct_put_terminal_cleanup_command_with_write_sequence(bucket, key, reservation_id, 1)
+    }
+
+    fn direct_put_terminal_cleanup_command_with_write_sequence(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+        write_sequence: u64,
+    ) -> MetadataCommandEnvelope {
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -21705,7 +22222,7 @@ mod tests {
                 },
                 segments: Vec::new(),
                 generation_reservation_id: reservation_id.clone(),
-                write_sequence: 1,
+                write_sequence,
                 last_modified_millis: 2,
                 stale_payload: None,
                 bucket_write_reservation: BucketWriteReservationProof {

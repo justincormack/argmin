@@ -4602,7 +4602,9 @@ impl super::StorageCluster {
         target: &DeleteObjectVersionTarget,
     ) -> DeletedSpecificObjectVersion {
         match target {
-            DeleteObjectVersionTarget::DeleteMarker => DeletedSpecificObjectVersion::DeleteMarker,
+            DeleteObjectVersionTarget::DeleteMarker { .. } => {
+                DeletedSpecificObjectVersion::DeleteMarker
+            }
             DeleteObjectVersionTarget::Live {
                 generation_id,
                 layout,
@@ -4618,7 +4620,7 @@ impl super::StorageCluster {
         target: &DeleteObjectVersionTarget,
     ) -> DeletedCurrentObject {
         match target {
-            DeleteObjectVersionTarget::DeleteMarker => DeletedCurrentObject::DeleteMarker,
+            DeleteObjectVersionTarget::DeleteMarker { .. } => DeletedCurrentObject::DeleteMarker,
             DeleteObjectVersionTarget::Live {
                 generation_id,
                 layout,
@@ -5576,7 +5578,10 @@ impl super::StorageCluster {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, expected_version_id)
-                        && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
+                        && matches!(
+                            delete.target,
+                            DeleteObjectVersionTarget::DeleteMarker { .. }
+                        )
                     {
                         if !metadata_command_matches_bucket_incarnation(
                             &command,

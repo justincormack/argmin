@@ -50,11 +50,12 @@ impl Coordinator {
             storage::ObjectPgActionError::Store(
                 storage::StoreError::MetadataCommandLogConflict { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
-            )
-            | storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::ObjectGenerationReservationConflict { .. }
-                | storage::MetadataError::ObjectVersionReservationConflict { .. },
             ) => ServerError::OperationAborted,
+            storage::ObjectPgActionError::Metadata(ref error)
+                if super::metadata_error_is_command_contention(error) =>
+            {
+                ServerError::OperationAborted
+            }
             storage::ObjectPgActionError::Store(error) => super::map_store_error(error),
             storage::ObjectPgActionError::InvalidRequest { reason } => {
                 ServerError::InvalidRequest { reason }

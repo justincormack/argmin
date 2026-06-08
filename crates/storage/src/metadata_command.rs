@@ -751,7 +751,9 @@ impl DeleteObjectPayloadReclaimCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeleteObjectVersionTarget {
-    DeleteMarker,
+    DeleteMarker {
+        write_sequence: u64,
+    },
     Live {
         generation_id: GenerationId,
         layout: ObjectLayout,
@@ -1398,7 +1400,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_str()?;
                 self.read_u64()?;
                 match self.read_u8()? {
-                    1 => Ok(()),
+                    1 => self.read_u64().map(|_| ()),
                     2 => {
                         self.read_nonzero_u64("deleted object generation")?;
                         self.skip_object_layout()?;
@@ -1591,7 +1593,9 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     key: self.read_object_key()?,
                     version_id: self.read_version_id()?,
                     target: match self.read_u8()? {
-                        1 => DeleteObjectVersionTarget::DeleteMarker,
+                        1 => DeleteObjectVersionTarget::DeleteMarker {
+                            write_sequence: self.read_u64()?,
+                        },
                         2 => DeleteObjectVersionTarget::Live {
                             generation_id: self.read_generation_id("deleted object generation")?,
                             layout: self.read_object_layout()?,
@@ -3092,7 +3096,10 @@ fn encode_delete_object_version(out: &mut Vec<u8>, command: &DeleteObjectVersion
     put_str(out, command.key.as_str());
     encode_version_id(out, command.version_id);
     match &command.target {
-        DeleteObjectVersionTarget::DeleteMarker => put_u8(out, 1),
+        DeleteObjectVersionTarget::DeleteMarker { write_sequence } => {
+            put_u8(out, 1);
+            put_u64(out, *write_sequence);
+        }
         DeleteObjectVersionTarget::Live {
             generation_id,
             layout,
@@ -4161,7 +4168,7 @@ mod tests {
                 bucket,
                 key,
                 version_id: VersionId::from_u64(7),
-                target: DeleteObjectVersionTarget::DeleteMarker,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 9 },
             })),
         );
 
@@ -4904,7 +4911,7 @@ mod tests {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(7),
-                target: DeleteObjectVersionTarget::DeleteMarker,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 49 },
             })),
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
                 bucket_write_reservation: bucket_write_reservation.clone(),
@@ -5191,7 +5198,7 @@ mod tests {
                 0x953a2d6c99cdaddb,
                 0xf06b16288bdaeb8e,
                 0xd44aa9d008b3d4a6,
-                0x70c0e0b11a697a0f,
+                0x903cf2da427ff645,
                 0x22e816661cec7274,
                 0xe7353d51b6609ac8,
                 0x58f5eb1a4f60971b,

@@ -93,6 +93,7 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
         storage::MetadataError::ObjectGenerationReservationConflict { .. }
             | storage::MetadataError::ObjectVersionReservationConflict { .. }
             | storage::MetadataError::StaleBucketMetadataCommand { .. }
+            | storage::MetadataError::StaleObjectWriteCommand { .. }
     )
 }
 

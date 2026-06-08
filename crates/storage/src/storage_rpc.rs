@@ -1675,7 +1675,7 @@ fn delete_target_matches_object(
     key: &ObjectKey,
 ) -> bool {
     match target {
-        DeleteObjectVersionTarget::DeleteMarker => true,
+        DeleteObjectVersionTarget::DeleteMarker { .. } => true,
         DeleteObjectVersionTarget::Live { payload, .. } => {
             object_payload_reclaim_matches_object(payload, bucket, key)
         }
@@ -2421,6 +2421,12 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
     StaleBucketMetadataCommand {
         name: BucketName,
         bucket_execution_generation: u64,
+    },
+    StaleObjectWriteCommand {
+        bucket: BucketName,
+        key: ObjectKey,
+        write_sequence: u64,
+        generation_id: Option<GenerationId>,
     },
 }
 
@@ -7728,6 +7734,24 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_string(&mut out, name.as_str());
             put_u64(&mut out, bucket_execution_generation);
         }
+        StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+            ref bucket,
+            ref key,
+            write_sequence,
+            generation_id,
+        } => {
+            put_u8(&mut out, 5);
+            put_string(&mut out, bucket.as_str());
+            put_string(&mut out, key.as_str());
+            put_u64(&mut out, write_sequence);
+            match generation_id {
+                Some(generation_id) => {
+                    put_u8(&mut out, 1);
+                    put_u64(&mut out, generation_id.get());
+                }
+                None => put_u8(&mut out, 0),
+            }
+        }
     }
     out
 }
@@ -7760,6 +7784,26 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
             name: decoder.read_bucket_name()?,
             bucket_execution_generation: decoder.read_u64()?,
         },
+        5 => {
+            let bucket = decoder.read_bucket_name()?;
+            let key = decoder.read_object_key()?;
+            let write_sequence = decoder.read_u64()?;
+            let generation_id = match decoder.read_u8()? {
+                0 => None,
+                1 => Some(decoder.read_generation_id()?),
+                _ => {
+                    return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                        "invalid stale object write command generation presence tag",
+                    ));
+                }
+            };
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
+            }
+        }
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown metadata command state outcome tag",
@@ -11542,7 +11586,9 @@ impl<'a> StorageRpcDecoder<'a> {
         &mut self,
     ) -> Result<DeleteObjectVersionTarget, StorageRpcPayloadError> {
         match self.read_u8()? {
-            0 => Ok(DeleteObjectVersionTarget::DeleteMarker),
+            0 => Ok(DeleteObjectVersionTarget::DeleteMarker {
+                write_sequence: self.read_u64()?,
+            }),
             1 => Ok(DeleteObjectVersionTarget::Live {
                 generation_id: GenerationId::new(self.read_u64()?).ok_or(
                     StorageRpcPayloadError::InvalidObjectMetadataRequest(
@@ -13368,7 +13414,10 @@ fn put_optional_delete_object_version_target(
 
 fn put_delete_object_version_target(out: &mut Vec<u8>, target: &DeleteObjectVersionTarget) {
     match target {
-        DeleteObjectVersionTarget::DeleteMarker => put_u8(out, 0),
+        DeleteObjectVersionTarget::DeleteMarker { write_sequence } => {
+            put_u8(out, 0);
+            put_u64(out, *write_sequence);
+        }
         DeleteObjectVersionTarget::Live {
             generation_id,
             layout,

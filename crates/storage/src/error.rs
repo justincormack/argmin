@@ -735,6 +735,16 @@ pub enum MetadataError {
         bucket_execution_generation: u64,
     },
 
+    #[error(
+        "stale object write metadata command for {bucket}/{key} at write sequence {write_sequence}"
+    )]
+    StaleObjectWriteCommand {
+        bucket: crate::types::BucketName,
+        key: crate::types::ObjectKey,
+        write_sequence: u64,
+        generation_id: Option<u64>,
+    },
+
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },
 

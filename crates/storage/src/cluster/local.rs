@@ -12635,6 +12635,158 @@ mod tests {
     }
 
     #[test]
+    fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stale-direct-put-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let stale_payload = b"stale direct put";
+        let stale_reservation_id =
+            crate::SessionId::try_from("61616161616161616161616161616161".to_string()).unwrap();
+        let stale_generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &stale_reservation_id)
+            .unwrap();
+        let stale_written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                stale_generation_id,
+                0,
+                &[0xa1; 16],
+                stale_payload,
+            )
+            .unwrap();
+        let stale_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: stale_reservation_id,
+                generation_id: stale_generation_id,
+                payload: stale_payload,
+                segment_okh: [0xa1; 16],
+                written: &stale_written,
+            },
+        );
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap();
+        let object_pg_store = primary.storage_node().get_pg(2).unwrap();
+        let stale_command = cluster
+            .prepare_commit_direct_put_object_command(
+                PgId::new(2),
+                &object_pg_store,
+                &stale_req,
+                crate::VersionId::Null,
+                stale_req.bucket_write_reservation.clone(),
+            )
+            .unwrap();
+        drop(object_pg_store);
+
+        for (label, payload, segment_byte) in [
+            ("newer-a", b"newer direct put a".as_slice(), 0xa2),
+            ("newer-b", b"newer direct put b".as_slice(), 0xa3),
+        ] {
+            let reservation_id =
+                crate::SessionId::try_from(format!("{segment_byte:02x}").repeat(16)).unwrap();
+            let generation_id = cluster
+                .reserve_put_object_generation(&bucket, &key, &reservation_id)
+                .unwrap();
+            let written = cluster
+                .write_direct_put_segment_payload_shards(
+                    &bucket,
+                    &key,
+                    generation_id,
+                    0,
+                    &[segment_byte; 16],
+                    payload,
+                )
+                .unwrap();
+            let req = direct_put_commit_req(
+                &cluster,
+                DirectPutCommitReqFixture {
+                    bucket: &bucket,
+                    key: &key,
+                    reservation_id,
+                    generation_id,
+                    payload,
+                    segment_okh: [segment_byte; 16],
+                    written: &written,
+                },
+            );
+            let outcome = cluster
+                .commit_direct_put_object_from_payload_shards(&req, &written.written_shards, |_| {
+                    Ok::<_, ()>(())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                outcome.live_size,
+                payload.len() as u64,
+                "{label} commit should be live before cleanup"
+            );
+        }
+
+        cluster
+            .delete_current_object_if(&bucket, &key, |_| Ok::<_, ()>(()))
+            .unwrap()
+            .unwrap();
+
+        let stale_late_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(2),
+                map.test_next_metadata_command_log_index(PgId::new(2)),
+            ),
+            stale_command.payload().clone(),
+        );
+        let stale_result = cluster.test_apply_metadata_command_to_acting_set_from_origin(
+            primary.node_id(),
+            &stale_late_command,
+        );
+        assert!(
+            matches!(
+                stale_result,
+                Err(crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::StaleObjectWriteCommand {
+                        ref bucket,
+                        ref key,
+                        write_sequence: 1,
+                        generation_id: Some(1),
+                    }
+                )) if bucket == &stale_req.bucket && key == &stale_req.key
+            ),
+            "expected stale object write command after newer writes and delete, got {stale_result:?}"
+        );
+        assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                    Err(crate::MetadataError::ObjectNotFound)
+                ),
+                "stale direct PUT must not resurrect object on node {node_id:?}"
+            );
+        }
+    }
+
+    #[test]
     fn direct_put_pre_command_route_error_releases_bucket_write_proof() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -38379,7 +38531,10 @@ mod tests {
                         if delete.bucket == hook_bucket
                             && delete.key == hook_key
                             && delete.version_id == marker_version
-                            && matches!(delete.target, DeleteObjectVersionTarget::DeleteMarker)
+                            && matches!(
+                                delete.target,
+                                DeleteObjectVersionTarget::DeleteMarker { .. }
+                            )
                             && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {

@@ -150,7 +150,7 @@ fn delete_object_version_reclaim_generation(
     target: &DeleteObjectVersionTarget,
 ) -> Option<GenerationId> {
     match target {
-        DeleteObjectVersionTarget::DeleteMarker => None,
+        DeleteObjectVersionTarget::DeleteMarker { .. } => None,
         DeleteObjectVersionTarget::Live { generation_id, .. } => Some(*generation_id),
     }
 }

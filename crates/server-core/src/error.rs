@@ -569,6 +569,7 @@ fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str 
             "object_version_reservation_conflict"
         }
         MetadataError::StaleBucketMetadataCommand { .. } => "stale_bucket_metadata_command",
+        MetadataError::StaleObjectWriteCommand { .. } => "stale_object_write_command",
         MetadataError::Db { .. } => "metadata_db_error",
         _ => "metadata_error",
     }
@@ -717,6 +718,17 @@ mod tests {
         assert_eq!(
             stale_bucket.diagnostic_cause_label(),
             "stale_bucket_metadata_command"
+        );
+
+        let stale_object = ServerError::Metadata(MetadataError::StaleObjectWriteCommand {
+            bucket: storage::BucketName::try_from("bucket".to_string()).unwrap(),
+            key: storage::ObjectKey::try_from("key".to_string()).unwrap(),
+            write_sequence: 3,
+            generation_id: Some(9),
+        });
+        assert_eq!(
+            stale_object.diagnostic_cause_label(),
+            "stale_object_write_command"
         );
     }
 

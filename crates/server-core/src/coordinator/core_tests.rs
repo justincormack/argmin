@@ -245,6 +245,24 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             },
         ),
     );
+    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
+        storage::MetadataError::StaleObjectWriteCommand {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            write_sequence: 11,
+            generation_id: None,
+        },
+    ));
+    assert_read_snapshot_maps_to_operation_aborted(
+        &bucket,
+        &key,
+        storage::ObjectPgActionError::Metadata(storage::MetadataError::StaleObjectWriteCommand {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            write_sequence: 12,
+            generation_id: Some(13),
+        }),
+    );
 }
 
 #[test]
