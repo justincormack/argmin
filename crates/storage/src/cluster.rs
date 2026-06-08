@@ -2677,7 +2677,7 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
         self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
-        match self.finish_object_pg_pending_slot(pg_id, command)? {
+        match self.finish_object_pg_pending_slot_inner(pg_id, command, true)? {
             PendingMetadataCommandOutcome::Applied
             | PendingMetadataCommandOutcome::Abandoned
             | PendingMetadataCommandOutcome::RetryPartialExactConflict => Ok(()),
@@ -2688,6 +2688,15 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.finish_object_pg_pending_slot_inner(pg_id, command, false)
+    }
+
+    fn finish_object_pg_pending_slot_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        abandon_zero_apply_stale_reservation: bool,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         let mut command = command.clone();
         loop {
@@ -2744,6 +2753,32 @@ impl StorageCluster {
                         return Ok(PendingMetadataCommandOutcome::Abandoned);
                     };
                     command = reissued;
+                }
+                Err(error)
+                    if abandon_zero_apply_stale_reservation
+                        && error.applied_nodes == 0
+                        && (Self::reserve_object_generation_conflict_matches(
+                            &command,
+                            &error.source,
+                        ) || Self::reserve_object_version_conflict_matches(
+                            &command,
+                            &error.source,
+                        )) =>
+                {
+                    self.record_abandoned_metadata_command_to_acting_set(&command)
+                        .map_err(|error| {
+                            bucket_snapshot_error_to_object_pg_action_error(error.source)
+                        })?;
+                    self.release_metadata_command_bucket_write_reservation(&command)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                    self.remove_pending_metadata_command_for_bucket(
+                        pg_id,
+                        command_bucket,
+                        &command,
+                    )
+                    .map_err(ObjectPgActionError::from)?;
+                    self.after_object_metadata_command_abandoned(&command)?;
+                    return Ok(PendingMetadataCommandOutcome::Abandoned);
                 }
                 Err(error) => {
                     return Err(bucket_snapshot_error_to_object_pg_action_error(

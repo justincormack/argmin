@@ -2193,7 +2193,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 2 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:exact-command-match
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
-2 crates/storage/src/cluster.rs:finish_object_pg_pending_slot:exact-command-match
+2 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:exact-command-match
 1 crates/storage/src/cluster.rs:install_snapshot_sensitive_metadata_command_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match

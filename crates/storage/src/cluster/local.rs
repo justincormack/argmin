@@ -19929,6 +19929,80 @@ mod tests {
     }
 
     #[test]
+    fn object_version_reservation_drains_stale_other_bucket_pending_reserve() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (first_bucket, first_key, second_bucket, second_key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let first_bucket = bucket_for_pg(topology, 1, "pending-version-first-");
+            let second_bucket = bucket_for_pg(topology, 1, "pending-version-second-");
+            let object_pg = 2;
+            let first_key = key_for_object_pg(topology, &first_bucket, object_pg, "key-");
+            let second_key = key_for_object_pg(topology, &second_bucket, object_pg, "key-");
+            (
+                first_bucket,
+                first_key,
+                second_bucket,
+                second_key,
+                object_pg,
+            )
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &first_bucket);
+        create_test_bucket(&cluster, &second_bucket);
+
+        let pg_id = PgId::new(object_pg);
+        let first_version = cluster
+            .reserve_next_object_version(pg_id, &first_bucket, &first_key)
+            .unwrap();
+        assert_eq!(first_version, crate::VersionId::from_u64(1));
+
+        let stale = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                first_bucket.clone(),
+                first_key.clone(),
+                first_version,
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &first_bucket, &stale);
+
+        let second_version = cluster
+            .reserve_next_object_version(pg_id, &second_bucket, &second_key)
+            .unwrap();
+        assert_eq!(second_version, crate::VersionId::from_u64(1));
+        assert!(pending_metadata_command_for_test(&map, pg_id, &second_bucket).is_none());
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::next_version_id(&*pg, &first_bucket, &first_key).unwrap(),
+                crate::VersionId::from_u64(first_version.to_u64() + 1)
+            );
+            assert_eq!(
+                crate::PgMetadataStore::next_version_id(&*pg, &second_bucket, &second_key).unwrap(),
+                crate::VersionId::from_u64(second_version.to_u64() + 1)
+            );
+        }
+    }
+
+    #[test]
     fn release_object_generation_reservation_drains_intervening_pg_slot_without_stealing_it() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
