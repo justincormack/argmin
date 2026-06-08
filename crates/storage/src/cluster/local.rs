@@ -14655,6 +14655,139 @@ mod tests {
     }
 
     #[test]
+    fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanup() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-overwrite-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let first_session =
+            crate::SessionId::try_from("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1".to_string()).unwrap();
+        let second_session =
+            crate::SessionId::try_from("a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2".to_string()).unwrap();
+
+        for (session_id, payload, segment_okh) in [
+            (
+                &first_session,
+                b"first streamed object".as_slice(),
+                [0xa1; 16],
+            ),
+            (
+                &second_session,
+                b"second streamed object".as_slice(),
+                [0xa2; 16],
+            ),
+        ] {
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    session_id,
+                    crate::ObjectEncryption::None,
+                )
+                .unwrap();
+            let crc64 = checksum::crc64::checksum(payload);
+            let (_target, segment) = cluster
+                .prepare_stream_segment_append(
+                    &bucket,
+                    &key,
+                    &crate::PrepareStreamUploadSegmentAppendReq {
+                        session_id: session_id.clone(),
+                        segment_index: 0,
+                        size: payload.len() as u64,
+                        segment_crc64: Some(crc64),
+                        segment_okh,
+                    },
+                )
+                .unwrap();
+            let written = cluster
+                .write_stream_segment_payload_shards(&segment, payload)
+                .unwrap();
+            let shard_batch = written
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect::<Vec<_>>();
+            cluster
+                .commit_stream_segment_append(
+                    &bucket,
+                    &key,
+                    session_id,
+                    segment.segment_index,
+                    &segment,
+                    &shard_batch,
+                )
+                .unwrap();
+            cluster
+                .finalize_put_object_stream(
+                    &bucket,
+                    &key,
+                    session_id,
+                    payload.len() as u64,
+                    acquire_test_bucket_write_proof(
+                        &cluster,
+                        &bucket,
+                        "streamed-overwrite-cleanup-test",
+                        Some(key.as_str()),
+                    ),
+                    |_| {
+                        Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                            value: (),
+                            versioning: crate::BucketVersioningState::Disabled,
+                            owner: crate::OwnerIdentity::from_principal("owner"),
+                            acl_grants: crate::AclGrants::default(),
+                            public_read: false,
+                            size: payload.len() as u64,
+                            etag_crc64: crc64,
+                            tags: None,
+                            metadata_blob: crate::SerializedMetadataBlob::default(),
+                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                            object_lock: crate::ObjectLockState::default(),
+                            encryption: crate::ObjectEncryption::None,
+                        })
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            let stream_uploads = crate::PgMetadataStore::list_all_stream_uploads(&*pg).unwrap();
+            assert!(
+                stream_uploads.is_empty(),
+                "successful streamed overwrites must not leave stream_uploads rows on node {node_id:?}: {stream_uploads:?}"
+            );
+        }
+
+        let outcome = cluster
+            .delete_current_object_if(&bucket, &key, |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome.deleted,
+            crate::DeletedCurrentObject::Live { .. }
+        ));
+        cluster.begin_bucket_delete(&bucket).unwrap();
+    }
+
+    #[test]
     fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
         let _guard = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();

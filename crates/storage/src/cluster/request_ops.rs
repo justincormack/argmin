@@ -60,6 +60,35 @@ enum AbortMultipartUploadDrainMode {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketVisibleDataSource {
+    ObjectVersion { pg_id: PgId },
+    MultipartUpload { pg_id: PgId },
+    StreamUpload { pg_id: PgId },
+}
+
+impl BucketVisibleDataSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ObjectVersion { .. } => "object_version",
+            Self::MultipartUpload { .. } => "multipart_upload",
+            Self::StreamUpload { .. } => "stream_upload",
+        }
+    }
+
+    fn pg_id(self) -> PgId {
+        match self {
+            Self::ObjectVersion { pg_id }
+            | Self::MultipartUpload { pg_id }
+            | Self::StreamUpload { pg_id } => pg_id,
+        }
+    }
+}
+
+fn bucket_delete_visible_data_diagnostics_enabled() -> bool {
+    std::env::var_os("ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS").is_some()
+}
+
 fn metadata_command_is_matching_multipart_abort(
     command: &MetadataCommandEnvelope,
     bucket: &BucketName,
@@ -2111,12 +2140,25 @@ impl super::StorageCluster {
                 {
                     continue;
                 }
-                if self.bucket_has_visible_data(bucket, true)? {
+                if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_delete_begin_not_empty",
-                        Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} source={} source_pg_id={}",
+                            bucket,
+                            pg_id.get(),
+                            source.label(),
+                            source.pg_id().get()
+                        )),
                     );
+                    if bucket_delete_visible_data_diagnostics_enabled() {
+                        eprintln!(
+                            "bucket delete begin found visible data source={} source_pg_id={}",
+                            source.label(),
+                            source.pg_id().get()
+                        );
+                    }
                     return Err(crate::error::MetadataError::BucketNotEmpty.into());
                 }
                 #[cfg(test)]
@@ -2302,12 +2344,25 @@ impl super::StorageCluster {
         bucket_pg_id: u32,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         loop {
-            if self.bucket_has_visible_data(bucket, false)? {
+            if let Some(source) = self.bucket_visible_data_source(bucket, false)? {
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_finalize_pending_visible_data",
-                    Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} source={} source_pg_id={}",
+                        bucket,
+                        bucket_pg_id,
+                        source.label(),
+                        source.pg_id().get()
+                    )),
                 );
+                if bucket_delete_visible_data_diagnostics_enabled() {
+                    eprintln!(
+                        "bucket delete finalize found visible data source={} source_pg_id={}",
+                        source.label(),
+                        source.pg_id().get()
+                    );
+                }
                 return Ok(BucketDeleteFinalizeOutcome::Pending);
             }
 
@@ -2371,11 +2426,11 @@ impl super::StorageCluster {
         self.delete_bucket_from_acting_set(PgId::new(bucket_pg_id), bucket)
     }
 
-    fn bucket_has_visible_data(
+    fn bucket_visible_data_source(
         &self,
         bucket: &BucketName,
         include_stream_uploads: bool,
-    ) -> Result<bool, BucketWriteDrainError> {
+    ) -> Result<Option<BucketVisibleDataSource>, BucketWriteDrainError> {
         for pg_id in self.metadata_pg_ids() {
             {
                 let pg_id = PgId::new(pg_id);
@@ -2394,7 +2449,7 @@ impl super::StorageCluster {
                     )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                 if !versions.versions.is_empty() {
-                    return Ok(true);
+                    return Ok(Some(BucketVisibleDataSource::ObjectVersion { pg_id }));
                 }
 
                 let uploads = listing_client
@@ -2410,7 +2465,7 @@ impl super::StorageCluster {
                     )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                 if !uploads.uploads.is_empty() {
-                    return Ok(true);
+                    return Ok(Some(BucketVisibleDataSource::MultipartUpload { pg_id }));
                 }
             }
 
@@ -2431,11 +2486,11 @@ impl super::StorageCluster {
                     }
                 };
                 if !page.uploads.is_empty() {
-                    return Ok(true);
+                    return Ok(Some(BucketVisibleDataSource::StreamUpload { pg_id }));
                 }
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn bucket_payload_reclaim_roots(

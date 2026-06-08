@@ -364,7 +364,7 @@ cleanup_server() {
             local matches
             matches="$(
                 grep -nE \
-                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=500|cause_label=|panicked at|panic|aborted" \
+                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=500|cause_label=|bucket delete (begin|finalize) found visible data|panicked at|panic|aborted" \
                     "$log_path" \
                     | head -n 40 \
                     || true
@@ -434,6 +434,7 @@ if [[ "$topology" == "local" ]]; then
         -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
         -u ARGMIN_STORAGE_NODE_SOCKETS \
         ARGMIN_PROCESS_ROLE=legacy-local \
+        ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
         ARGMIN_DATA_DIR="$data_dir" \
         ARGMIN_LISTEN_ADDR="$listen_addr" \
         "${server_cmd[@]}"
@@ -462,6 +463,7 @@ else
         -u ARGMIN_STORAGE_NODE_DATA_DIR \
         -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
         ARGMIN_PROCESS_ROLE=frontend \
+        ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
         ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
         ARGMIN_DATA_DIR="$data_dir/frontend" \
         "${server_cmd[@]}"
