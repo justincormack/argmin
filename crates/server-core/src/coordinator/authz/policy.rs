@@ -65,14 +65,16 @@ pub(super) fn load_bucket_tags_for_policy_action(
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => super::super::map_store_error(error),
+            storage::BucketSnapshotLoadError::Metadata(ref error)
+                if super::super::metadata_error_is_command_contention(error) =>
+            {
+                ServerError::OperationAborted
+            }
             storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { name },
             ) => ServerError::BucketNotFound {
                 name: name.to_string(),
             },
-            storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::StaleBucketMetadataCommand { .. },
-            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
         })?;
     match tags {

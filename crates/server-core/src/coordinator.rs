@@ -87,6 +87,15 @@ pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
     }
 }
 
+pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataError) -> bool {
+    matches!(
+        error,
+        storage::MetadataError::ObjectGenerationReservationConflict { .. }
+            | storage::MetadataError::ObjectVersionReservationConflict { .. }
+            | storage::MetadataError::StaleBucketMetadataCommand { .. }
+    )
+}
+
 fn store_error_is_command_contention(error: &storage::StoreError) -> bool {
     match error {
         storage::StoreError::MetadataCommandContention { .. } => true,

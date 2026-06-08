@@ -607,20 +607,28 @@ async fn create_bucket_in_region_accepting_verified_lost_success(
     label: &str,
 ) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
 {
-    match create_bucket_in_region(client, bucket, region).await {
-        Ok(()) => Ok(()),
-        Err(err) if is_create_bucket_lost_success_retry(&err) => {
-            match client.head_bucket().bucket(bucket).send().await {
-                Ok(_) => Ok(()),
-                Err(head_err) => {
-                    eprintln!(
-                        "create {label} returned BucketAlreadyOwnedByYou but HeadBucket failed for {bucket}: {head_err:?}"
-                    );
-                    Err(err)
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + configured_test_timeout();
+
+    loop {
+        match create_bucket_in_region(client, bucket, region).await {
+            Ok(()) => return Ok(()),
+            Err(err) if is_create_bucket_operation_aborted(&err) && Instant::now() < deadline => {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) if is_create_bucket_lost_success_retry(&err) => {
+                match client.head_bucket().bucket(bucket).send().await {
+                    Ok(_) => return Ok(()),
+                    Err(head_err) => {
+                        eprintln!(
+                            "create {label} returned BucketAlreadyOwnedByYou but HeadBucket failed for {bucket}: {head_err:?}"
+                        );
+                        return Err(err);
+                    }
                 }
             }
-        }
-        Err(err) => Err(err),
+            Err(err) => return Err(err),
+        };
     }
 }
 
@@ -652,6 +660,12 @@ fn is_create_bucket_lost_success_retry(
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
 ) -> bool {
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("BucketAlreadyOwnedByYou")
+}
+
+fn is_create_bucket_operation_aborted(
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
+) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
 }
 
 pub fn test_agent() -> Agent {

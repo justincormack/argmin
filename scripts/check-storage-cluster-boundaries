@@ -2615,8 +2615,7 @@ raw_coordinator_bucket_snapshot_metadata_mappers=$(
         in_bucket_snapshot_mapper = 0
         mapper_depth = 0
         brace_depth = 0
-        stale_bucket_command_seen = 0
-        fallback_count = 0
+        command_contention_mapper_seen = 0
     }
     function brace_delta(line,    opens, closes, tmp) {
         tmp = line
@@ -2625,17 +2624,10 @@ raw_coordinator_bucket_snapshot_metadata_mappers=$(
         closes = gsub(/\}/, "}", tmp)
         return opens - closes
     }
-    function flush_mapper(    i) {
-        if (in_bucket_snapshot_mapper && fallback_count > 0 && !stale_bucket_command_seen) {
-            for (i = 1; i <= fallback_count; i++) {
-                print fallback_line[i]
-            }
-        }
+    function flush_mapper() {
         in_bucket_snapshot_mapper = 0
         mapper_depth = 0
-        stale_bucket_command_seen = 0
-        fallback_count = 0
-        delete fallback_line
+        command_contention_mapper_seen = 0
     }
     function flush_function() {
         if (!in_test_cfg) {
@@ -2643,9 +2635,7 @@ raw_coordinator_bucket_snapshot_metadata_mappers=$(
         }
         in_bucket_snapshot_mapper = 0
         mapper_depth = 0
-        stale_bucket_command_seen = 0
-        fallback_count = 0
-        delete fallback_line
+        command_contention_mapper_seen = 0
     }
     /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
         pending_test_cfg = 1
@@ -2681,12 +2671,13 @@ raw_coordinator_bucket_snapshot_metadata_mappers=$(
                 mapper_depth++
             }
         }
-        if (in_bucket_snapshot_mapper && $0 ~ /StaleBucketMetadataCommand/) {
-            stale_bucket_command_seen = 1
+        if (in_bucket_snapshot_mapper && $0 ~ /metadata_error_is_command_contention/) {
+            command_contention_mapper_seen = 1
         }
         if (in_bucket_snapshot_mapper && $0 ~ /ServerError::Metadata[[:space:]]*\(/) {
-            fallback_count++
-            fallback_line[fallback_count] = FILENAME ":" FNR ":" $0
+            if (!command_contention_mapper_seen) {
+                print FILENAME ":" FNR ":" $0
+            }
         }
         brace_depth += brace_delta($0)
         if (in_bucket_snapshot_mapper && brace_depth < mapper_depth) {
@@ -2702,7 +2693,7 @@ raw_coordinator_bucket_snapshot_metadata_mappers=$(
         | sort)
 )
 fail_with_matches \
-    "Production coordinator bucket snapshot mappers must handle StaleBucketMetadataCommand before raw Metadata fallback" \
+    "Production coordinator bucket snapshot mappers must handle metadata command contention before raw Metadata fallback" \
     "$raw_coordinator_bucket_snapshot_metadata_mappers"
 
 if [[ "$failed" -ne 0 ]]; then

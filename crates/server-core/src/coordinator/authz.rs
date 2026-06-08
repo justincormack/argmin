@@ -912,14 +912,16 @@ impl Coordinator {
                     | storage::StoreError::MetadataCommandPendingConflict { .. },
                 ) => ServerError::OperationAborted,
                 storage::BucketSnapshotLoadError::Store(other) => super::map_store_error(other),
+                storage::BucketSnapshotLoadError::Metadata(ref error)
+                    if super::metadata_error_is_command_contention(error) =>
+                {
+                    ServerError::OperationAborted
+                }
                 storage::BucketSnapshotLoadError::Metadata(
                     storage::MetadataError::BucketNotFound { name },
                 ) => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::StaleBucketMetadataCommand { .. },
-                ) => ServerError::OperationAborted,
                 storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
             })?;
         let parsed_policy = match raw_policy {

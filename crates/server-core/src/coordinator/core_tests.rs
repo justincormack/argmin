@@ -275,6 +275,30 @@ fn stale_bucket_metadata_command_maps_to_operation_aborted() {
 }
 
 #[test]
+fn bucket_snapshot_object_reservation_conflicts_map_to_operation_aborted() {
+    let version_conflict = storage::BucketSnapshotLoadError::Metadata(
+        storage::MetadataError::ObjectVersionReservationConflict {
+            version_id: storage::VersionId::from_u64(9),
+        },
+    );
+    assert!(matches!(
+        Coordinator::map_bucket_snapshot_load_error(version_conflict),
+        ServerError::OperationAborted
+    ));
+
+    let generation_conflict = storage::BucketSnapshotLoadError::Metadata(
+        storage::MetadataError::ObjectGenerationReservationConflict {
+            reservation_id: "reservation".to_string(),
+            generation_id: 17,
+        },
+    );
+    assert!(matches!(
+        BucketHandleLoader::map_bucket_snapshot_error(generation_conflict),
+        ServerError::OperationAborted
+    ));
+}
+
+#[test]
 fn bucket_write_drain_contention_maps_to_operation_aborted() {
     let bucket = trusted_bucket_name("bucket-write-drain-contention");
     let epoch = storage::ClusterEpoch::INITIAL;
@@ -313,6 +337,14 @@ fn bucket_write_drain_contention_maps_to_operation_aborted() {
             storage::MetadataError::StaleBucketMetadataCommand {
                 name: bucket,
                 bucket_execution_generation: 5,
+            },
+        )),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
+        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Metadata(
+            storage::MetadataError::ObjectVersionReservationConflict {
+                version_id: storage::VersionId::from_u64(11),
             },
         )),
         ServerError::OperationAborted
