@@ -94,6 +94,8 @@ static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CONFLICT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_SESSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -536,6 +538,23 @@ pub struct ShardScavengerObservationSummary<'a> {
     pub last_error: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandConflictSummary {
+    pub node_id: Option<u32>,
+    pub pg_id: u32,
+    pub cluster_epoch: u64,
+    pub log_index: Option<u64>,
+    pub kind: &'static str,
+    pub command_kind: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandSessionWaitSummary {
+    pub node_id: u32,
+    pub pg_id: u32,
+    pub wait_us: u128,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub inflight_requests: u64,
@@ -548,6 +567,8 @@ pub struct MetricsSnapshot {
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
+    pub metadata_command_conflict_total: u64,
+    pub metadata_command_session_wait_total: u64,
 }
 
 pub struct InflightRequestsGuard {
@@ -583,6 +604,9 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),
         shard_scavenger_scan_incomplete_total: SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_conflict_total: METADATA_COMMAND_CONFLICT_TOTAL.load(Ordering::Relaxed),
+        metadata_command_session_wait_total: METADATA_COMMAND_SESSION_WAIT_TOTAL
             .load(Ordering::Relaxed),
     }
 }
@@ -740,6 +764,67 @@ pub fn emit_bucket_lock_wait_exceeded<T: fmt::Debug>(
         Some(format_args!(
             "bucket={:?} stripe={} wait_us={}",
             bucket, stripe, wait_us
+        )),
+    )
+}
+
+pub fn emit_metadata_command_conflict(
+    target: &'static str,
+    summary: MetadataCommandConflictSummary,
+) -> bool {
+    METADATA_COMMAND_CONFLICT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let node_id = summary
+        .node_id
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let log_index = summary
+        .log_index
+        .map(|log_index| log_index.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_kind = summary.command_kind.unwrap_or("unknown");
+    let detail = format!(
+        "node_id={} pg_id={} cluster_epoch={} log_index={} kind={} command_kind={}",
+        node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.kind, command_kind
+    );
+    record_flight_event(&context, target, "metadata_command_conflict", detail);
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_conflict",
+        Some(format_args!(
+            "node_id={} pg_id={} cluster_epoch={} log_index={} kind={} command_kind={}",
+            node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.kind, command_kind
+        )),
+    )
+}
+
+pub fn emit_metadata_command_session_wait(
+    target: &'static str,
+    summary: MetadataCommandSessionWaitSummary,
+) -> bool {
+    METADATA_COMMAND_SESSION_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_session_wait",
+        format!(
+            "node_id={} pg_id={} wait_us={}",
+            summary.node_id, summary.pg_id, summary.wait_us
+        ),
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_session_wait",
+        Some(format_args!(
+            "node_id={} pg_id={} wait_us={}",
+            summary.node_id, summary.pg_id, summary.wait_us
         )),
     )
 }
@@ -1148,6 +1233,25 @@ mod tests {
         );
         emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
+        emit_metadata_command_conflict(
+            "storage",
+            MetadataCommandConflictSummary {
+                node_id: Some(7),
+                pg_id: 11,
+                cluster_epoch: 1,
+                log_index: Some(13),
+                kind: "log_conflict",
+                command_kind: Some("CommitDirectPutObject"),
+            },
+        );
+        emit_metadata_command_session_wait(
+            "storage",
+            MetadataCommandSessionWaitSummary {
+                node_id: 7,
+                pg_id: 11,
+                wait_us: 55,
+            },
+        );
         emit_shard_scavenger_observation(
             "storage",
             ShardScavengerObservationSummary {
@@ -1181,6 +1285,14 @@ mod tests {
         assert_eq!(
             after.bucket_lock_wait_exceeded_total,
             before.bucket_lock_wait_exceeded_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_conflict_total,
+            before.metadata_command_conflict_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_session_wait_total,
+            before.metadata_command_session_wait_total + 1
         );
         assert_eq!(
             after.shard_scavenger_observation_total,
@@ -1311,6 +1423,63 @@ mod tests {
         assert!(!record.detail.contains("secret-key"));
         assert!(!record.detail.contains("secret"));
         assert!(record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
+    }
+
+    #[test]
+    fn metadata_command_diagnostics_record_bounded_pg_context() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let ctx = TraceContext::from_ids(
+            "trace-metadata-command".to_string(),
+            "request-metadata-command".to_string(),
+        );
+        let _attached = AttachedTrace::new(ctx);
+
+        emit_metadata_command_conflict(
+            "storage",
+            MetadataCommandConflictSummary {
+                node_id: Some(7),
+                pg_id: 3,
+                cluster_epoch: 1,
+                log_index: Some(9),
+                kind: "pending_slot_conflict",
+                command_kind: Some("CreateStreamUpload"),
+            },
+        );
+        emit_metadata_command_session_wait(
+            "storage",
+            MetadataCommandSessionWaitSummary {
+                node_id: 7,
+                pg_id: 3,
+                wait_us: 1234,
+            },
+        );
+
+        let records = flight_recorder_snapshot();
+        let conflict = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-metadata-command"
+                    && record.event == "metadata_command_conflict"
+            })
+            .expect("metadata command conflict should be recorded");
+        assert!(conflict.detail.contains("node_id=7"));
+        assert!(conflict.detail.contains("pg_id=3"));
+        assert!(conflict.detail.contains("log_index=9"));
+        assert!(conflict.detail.contains("kind=pending_slot_conflict"));
+        assert!(conflict.detail.contains("command_kind=CreateStreamUpload"));
+
+        let wait = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-metadata-command"
+                    && record.event == "metadata_command_session_wait"
+            })
+            .expect("metadata command session wait should be recorded");
+        assert!(wait.detail.contains("node_id=7"));
+        assert!(wait.detail.contains("pg_id=3"));
+        assert!(wait.detail.contains("wait_us=1234"));
     }
 
     #[test]

@@ -6310,6 +6310,15 @@ Status:
   preserve context without enabling deep tracing. Remaining diagnostics work:
   per-RPC/per-metadata-command wait/conflict events and counters, plus any
   explicit local/admin-only debug dump trigger.
+- Added the first storage-side race diagnostics for that remaining slice:
+  metadata-command log and pending-slot conflicts now increment a counter and,
+  when a trace context is attached, record redacted PG/node/epoch/log-index and
+  command-kind context in the flight recorder. Storage-node-owned
+  metadata-command critical-section waits now likewise increment a wait counter
+  and record node/PG/wait duration without bucket/key names. Storage-node RPC
+  handlers attach a local per-frame trace context so these records are present
+  in multihost storage-node processes even when the frontend trace context is
+  not propagated over the storage RPC frame.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

@@ -3279,14 +3279,33 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
             payload,
         )?;
-        decode_metadata_command_bool_response(&response)
-            .map(|response| response.value)
-            .map_err(|error| {
+        let response =
+            decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command matching applied response",
                     error.to_string(),
                 )
-            })
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandBoolOutcome::Value(value) => Ok(value),
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command matching applied response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
     }
 
     pub(crate) fn metadata_command_abandoned(
@@ -3297,14 +3316,33 @@ impl UnixStorageNodeClient {
         let payload = self.encode_metadata_command_request(pg_id, command)?;
         let response =
             self.rpc_request(StorageRpcMessageKind::MetadataCommandAbandoned, payload)?;
-        decode_metadata_command_bool_response(&response)
-            .map(|response| response.value)
-            .map_err(|error| {
+        let response =
+            decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command abandoned response",
                     error.to_string(),
                 )
-            })
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandBoolOutcome::Value(value) => Ok(value),
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command abandoned response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
     }
 
     pub(crate) fn record_metadata_command_abandoned(
@@ -5145,14 +5183,33 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
             payload,
         )?;
-        decode_metadata_command_bool_response(&response)
-            .map(|response| response.value)
-            .map_err(|error| {
+        let response =
+            decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command matching applied response",
                     error.to_string(),
                 )
-            })
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandBoolOutcome::Value(value) => Ok(value),
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command matching applied response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
     }
 
     fn apply_metadata_command_and_record(
@@ -5295,14 +5352,33 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         let payload = self.encode_metadata_command_request(pg_id, command)?;
         let response =
             self.rpc_request(StorageRpcMessageKind::MetadataCommandAbandoned, payload)?;
-        decode_metadata_command_bool_response(&response)
-            .map(|response| response.value)
-            .map_err(|error| {
+        let response =
+            decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command abandoned response",
                     error.to_string(),
                 )
-            })
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandBoolOutcome::Value(value) => Ok(value),
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command abandoned response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
     }
 }
 
@@ -20771,6 +20847,121 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unix_storage_node_client_preserves_bool_metadata_command_log_conflicts() {
+        fn bool_metadata_error_from_fake_response(
+            kind: StorageRpcMessageKind,
+            outcome: StorageRpcMetadataCommandBoolOutcome,
+        ) -> StoreError {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("sock").join("storage.sock");
+            private_socket_dir(socket_path.parent().unwrap());
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let join = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+                let payload = encode_metadata_command_bool_outcome_response(
+                    &StorageRpcMetadataCommandBoolOutcomeResponse { outcome },
+                );
+                let response = StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                };
+                write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+            });
+            let client = UnixStorageNodeClient::new(
+                NodeId::new(7),
+                ClusterEpoch::new(1).unwrap(),
+                socket_path,
+            );
+            let command = test_metadata_command(0, 1);
+
+            let err = match kind {
+                StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
+                    MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
+                        &client,
+                        PgId::new(0),
+                        &command,
+                        0,
+                    )
+                    .unwrap_err()
+                }
+                StorageRpcMessageKind::MetadataCommandAbandoned => {
+                    MetadataCommandNodeClient::metadata_command_abandoned(
+                        &client,
+                        PgId::new(0),
+                        &command,
+                    )
+                    .unwrap_err()
+                }
+                _ => panic!("unsupported bool metadata command test kind"),
+            };
+
+            join.join().unwrap();
+            err
+        }
+
+        for kind in [
+            StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
+            StorageRpcMessageKind::MetadataCommandAbandoned,
+        ] {
+            let conflict = bool_metadata_error_from_fake_response(
+                kind,
+                StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    log_index: 1,
+                },
+            );
+            assert!(matches!(
+                conflict,
+                StoreError::MetadataCommandLogConflict {
+                    pg_id: 0,
+                    log_index: 1,
+                    ..
+                }
+            ));
+
+            let wrong_route = bool_metadata_error_from_fake_response(
+                kind,
+                StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    log_index: 1,
+                },
+            );
+            assert!(matches!(
+                wrong_route,
+                StoreError::StorageRpc {
+                    operation: "decode metadata command matching applied response"
+                        | "decode metadata command abandoned response",
+                    ..
+                }
+            ));
+
+            let zero_index = bool_metadata_error_from_fake_response(
+                kind,
+                StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    log_index: 0,
+                },
+            );
+            assert!(matches!(
+                zero_index,
+                StoreError::StorageRpc {
+                    operation: "decode metadata command matching applied response"
+                        | "decode metadata command abandoned response",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

@@ -266,6 +266,36 @@ pub(crate) enum MetadataCommandPayload {
 }
 
 impl MetadataCommandPayload {
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            Self::CreateBucket(_) => "CreateBucket",
+            Self::PutBucketVersioning(_) => "PutBucketVersioning",
+            Self::PutBucketAcl(_) => "PutBucketAcl",
+            Self::PutBucketProperty(_) => "PutBucketProperty",
+            Self::PutBucketSubresource(_) => "PutBucketSubresource",
+            Self::MarkBucketDeleting(_) => "MarkBucketDeleting",
+            Self::ReserveObjectGeneration(_) => "ReserveObjectGeneration",
+            Self::ReleaseObjectGeneration(_) => "ReleaseObjectGeneration",
+            Self::ReserveObjectVersion(_) => "ReserveObjectVersion",
+            Self::CommitDirectPutObject(_) => "CommitDirectPutObject",
+            Self::CommitMultipartObject(_) => "CommitMultipartObject",
+            Self::DeleteObjectVersion(_) => "DeleteObjectVersion",
+            Self::InsertDeleteMarker(_) => "InsertDeleteMarker",
+            Self::PutObjectMetadata(_) => "PutObjectMetadata",
+            Self::CreateStreamUpload(_) => "CreateStreamUpload",
+            Self::AppendStreamSegment(_) => "AppendStreamSegment",
+            Self::AbortStreamUpload(_) => "AbortStreamUpload",
+            Self::CommitStreamPart(_) => "CommitStreamPart",
+            Self::CreateMultipartUpload(_) => "CreateMultipartUpload",
+            Self::AbortMultipartUpload(_) => "AbortMultipartUpload",
+            Self::DeleteObjectPayloadReclaim(_) => "DeleteObjectPayloadReclaim",
+            Self::DeleteCompletedMultipartUpload(_) => "DeleteCompletedMultipartUpload",
+            Self::AdvanceCompletedMultipartUploadSequence(_) => {
+                "AdvanceCompletedMultipartUploadSequence"
+            }
+        }
+    }
+
     fn kind_id(&self) -> u16 {
         match self {
             Self::CreateBucket(_) => METADATA_COMMAND_CREATE_BUCKET,

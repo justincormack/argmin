@@ -229,6 +229,9 @@ use crate::{
     ShardLocation,
 };
 
+#[cfg(test)]
+type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
+
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
@@ -259,6 +262,53 @@ pub struct StorageNodePgRoute {
     pub state: PgState,
     pub primary_node_id: NodeId,
     pub acting_set: Vec<NodeId>,
+}
+
+fn storage_node_rpc_trace_context(node_id: NodeId, request_id: u64) -> observability::TraceContext {
+    observability::TraceContext::from_ids(
+        format!("storage-node-{}-rpc-{}", node_id.as_u32(), request_id),
+        format!("storage-node-{}-rpc-{}", node_id.as_u32(), request_id),
+    )
+}
+
+fn emit_storage_node_metadata_command_log_conflict(
+    node_id: u32,
+    pg_id: u32,
+    cluster_epoch: ClusterEpoch,
+    log_index: u64,
+    command_kind: Option<&'static str>,
+) {
+    let _ = observability::emit_metadata_command_conflict(
+        "storage",
+        observability::MetadataCommandConflictSummary {
+            node_id: Some(node_id),
+            pg_id,
+            cluster_epoch: cluster_epoch.get(),
+            log_index: Some(log_index),
+            kind: "log_conflict",
+            command_kind,
+        },
+    );
+}
+
+fn emit_storage_node_metadata_command_pending_conflict(
+    node_id: u32,
+    pg_id: u32,
+    cluster_epoch: ClusterEpoch,
+    candidate_log_index: u64,
+    command_kind: Option<&'static str>,
+) {
+    let _ = observability::emit_metadata_command_conflict(
+        "storage",
+        observability::MetadataCommandConflictSummary {
+            node_id: Some(node_id),
+            pg_id,
+            cluster_epoch: cluster_epoch.get(),
+            log_index: Some(candidate_log_index),
+            kind: "pending_slot_conflict",
+            command_kind,
+        },
+    );
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -493,14 +543,46 @@ struct StorageNodeMetadataCommandLocks {
 }
 
 impl StorageNodeMetadataCommandLocks {
-    fn acquire(&self, pg_id: PgId) -> StorageNodeMetadataCommandGuard {
+    #[cfg(test)]
+    fn set_before_wait_hook(&self, hook: MetadataCommandBeforeWaitHook) {
+        *self
+            .state
+            .before_wait_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    fn acquire(&self, node_id: NodeId, pg_id: PgId) -> StorageNodeMetadataCommandGuard {
+        let started_at = std::time::Instant::now();
+        let mut waited = false;
         let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
         while held.contains(&pg_id) {
+            waited = true;
+            #[cfg(test)]
+            if let Some(hook) = self
+                .state
+                .before_wait_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                hook(pg_id);
+            }
             held = self
                 .state
                 .available
                 .wait(held)
                 .unwrap_or_else(|e| e.into_inner());
+        }
+        if waited {
+            let _ = observability::emit_metadata_command_session_wait(
+                "storage",
+                observability::MetadataCommandSessionWaitSummary {
+                    node_id: node_id.as_u32(),
+                    pg_id: pg_id.get(),
+                    wait_us: started_at.elapsed().as_micros(),
+                },
+            );
         }
         held.insert(pg_id);
         StorageNodeMetadataCommandGuard {
@@ -522,6 +604,8 @@ impl StorageNodeMetadataCommandLocks {
 struct StorageNodeMetadataCommandLockState {
     held: Mutex<BTreeSet<PgId>>,
     available: Condvar,
+    #[cfg(test)]
+    before_wait_hook: Mutex<Option<MetadataCommandBeforeWaitHook>>,
 }
 
 struct StorageNodeMetadataCommandGuard {
@@ -562,7 +646,10 @@ impl StorageNodeConnectionHandler {
         if session.holds_metadata_command_pg_lock(pg_id) {
             None
         } else {
-            Some(self.metadata_command_locks.acquire(pg_id))
+            Some(
+                self.metadata_command_locks
+                    .acquire(self.config.node_id, pg_id),
+            )
         }
     }
 
@@ -587,6 +674,10 @@ impl StorageNodeConnectionHandler {
                 }
                 Err(error) => return Err(rpc_stream_error(error)),
             };
+            let _rpc_trace = observability::AttachedTrace::new(storage_node_rpc_trace_context(
+                self.config.node_id,
+                frame.request_id,
+            ));
             let response = self.dispatch_frame(&mut session, &frame)?;
             write_storage_rpc_frame_to(stream, &response).map_err(rpc_stream_error)?;
         }
@@ -2658,6 +2749,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             })) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    None,
+                );
                 let payload = encode_direct_put_command_build_response(
                     &StorageRpcDirectPutCommandBuildResponse {
                         outcome: StorageRpcDirectPutCommandBuildOutcome::LogConflict {
@@ -5399,6 +5497,13 @@ impl StorageNodeConnectionHandler {
                     cluster_epoch,
                     log_index,
                 }) => {
+                    emit_storage_node_metadata_command_log_conflict(
+                        node_id,
+                        pg_id,
+                        cluster_epoch,
+                        log_index,
+                        None,
+                    );
                     let payload = encode_metadata_command_next_id_response(
                         &StorageRpcMetadataCommandNextIdResponse {
                             outcome: StorageRpcMetadataCommandNextIdOutcome::LogConflict {
@@ -5542,6 +5647,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_applied_hashes_response(
                     &StorageRpcMetadataCommandAppliedHashesResponse {
                         outcome: StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
@@ -5578,10 +5690,36 @@ impl StorageNodeConnectionHandler {
             )
         }) {
             Ok(value) => {
-                let payload =
-                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
-                        value,
-                    });
+                let payload = encode_metadata_command_bool_outcome_response(
+                    &StorageRpcMetadataCommandBoolOutcomeResponse {
+                        outcome: StorageRpcMetadataCommandBoolOutcome::Value(value),
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
+                let payload = encode_metadata_command_bool_outcome_response(
+                    &StorageRpcMetadataCommandBoolOutcomeResponse {
+                        outcome: StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                );
                 encode_storage_rpc_success_response(&payload)
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
@@ -5604,10 +5742,36 @@ impl StorageNodeConnectionHandler {
             pg.metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
         }) {
             Ok(value) => {
-                let payload =
-                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
-                        value,
-                    });
+                let payload = encode_metadata_command_bool_outcome_response(
+                    &StorageRpcMetadataCommandBoolOutcomeResponse {
+                        outcome: StorageRpcMetadataCommandBoolOutcome::Value(value),
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
+                let payload = encode_metadata_command_bool_outcome_response(
+                    &StorageRpcMetadataCommandBoolOutcomeResponse {
+                        outcome: StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                );
                 encode_storage_rpc_success_response(&payload)
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
@@ -5643,6 +5807,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_state_outcome_response(
                     &StorageRpcMetadataCommandStateOutcomeResponse {
                         outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
@@ -5689,6 +5860,13 @@ impl StorageNodeConnectionHandler {
                     cluster_epoch,
                     log_index,
                 })) => {
+                    emit_storage_node_metadata_command_log_conflict(
+                        node_id,
+                        pg_id,
+                        cluster_epoch,
+                        log_index,
+                        Some(request.command.payload().kind_name()),
+                    );
                     let payload = encode_metadata_command_state_outcome_response(
                         &StorageRpcMetadataCommandStateOutcomeResponse {
                             outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
@@ -5800,6 +5978,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_acceptance_response(
                     &StorageRpcMetadataCommandAcceptanceResponse {
                         outcome: StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
@@ -5845,6 +6030,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_acceptance_response(
                     &StorageRpcMetadataCommandAcceptanceResponse {
                         outcome: StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
@@ -5905,6 +6097,13 @@ impl StorageNodeConnectionHandler {
                 existing_log_index,
                 candidate_log_index,
             }) => {
+                emit_storage_node_metadata_command_pending_conflict(
+                    self.config.node_id.as_u32(),
+                    pg_id,
+                    cluster_epoch,
+                    candidate_log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_pending_slot_insert_response(
                     &StorageRpcMetadataCommandPendingSlotInsertResponse {
                         outcome:
@@ -5924,6 +6123,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_pending_slot_insert_response(
                     &StorageRpcMetadataCommandPendingSlotInsertResponse {
                         outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
@@ -6004,6 +6210,13 @@ impl StorageNodeConnectionHandler {
                 cluster_epoch,
                 log_index,
             }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
                 let payload = encode_metadata_command_bool_outcome_response(
                     &StorageRpcMetadataCommandBoolOutcomeResponse {
                         outcome: StorageRpcMetadataCommandBoolOutcome::LogConflict {
@@ -6105,7 +6318,11 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        session.acquire_metadata_command_pg_lock(&self.metadata_command_locks, request.pg_id);
+        session.acquire_metadata_command_pg_lock(
+            &self.metadata_command_locks,
+            self.config.node_id,
+            request.pg_id,
+        );
         Ok(encode_storage_rpc_success_response(&[]))
     }
 
@@ -6664,12 +6881,13 @@ impl<'a> StorageNodeSession<'a> {
     fn acquire_metadata_command_pg_lock(
         &mut self,
         locks: &StorageNodeMetadataCommandLocks,
+        node_id: NodeId,
         pg_id: PgId,
     ) {
         if self.metadata_command_guards.contains_key(&pg_id) {
             return;
         }
-        let guard = locks.acquire(pg_id);
+        let guard = locks.acquire(node_id, pg_id);
         self.metadata_command_guards.insert(pg_id, guard);
     }
 
@@ -6827,12 +7045,21 @@ fn object_metadata_command_build_error_outcome(
             pg_id,
             cluster_epoch,
             log_index,
-        }) => Ok(StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
-            node_id,
-            pg_id,
-            cluster_epoch,
-            log_index,
-        }),
+        }) => {
+            emit_storage_node_metadata_command_log_conflict(
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+                None,
+            );
+            Ok(StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            })
+        }
         error => Err(object_pg_error_response(error)),
     }
 }
@@ -7093,7 +7320,8 @@ mod tests {
     use crate::storage_rpc::{
         decode_bucket_mark_deleting_command_build_response, decode_health_response,
         decode_metadata_command_acceptance_response,
-        decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_response,
+        decode_metadata_command_applied_hashes_response,
+        decode_metadata_command_bool_outcome_response,
         decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
         decode_metadata_command_pending_envelope_response,
         decode_metadata_command_pending_slot_insert_response,
@@ -7157,6 +7385,118 @@ mod tests {
             primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }
+    }
+
+    #[test]
+    fn metadata_command_lock_wait_emits_diagnostic() {
+        let locks = StorageNodeMetadataCommandLocks::default();
+        let pg_id = PgId::new(0);
+        let first = locks.acquire(NodeId::new(7), pg_id);
+        let before = observability::metrics_snapshot();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        locks.set_before_wait_hook(Arc::new(move |actual_pg_id| {
+            assert_eq!(actual_pg_id, pg_id);
+            let _ = wait_tx.send(());
+        }));
+        let waiting_locks = locks.clone();
+
+        let waiter = thread::spawn(move || {
+            let _attached =
+                observability::AttachedTrace::new(observability::TraceContext::from_ids(
+                    "trace-metadata-command-lock-wait".to_string(),
+                    "request-metadata-command-lock-wait".to_string(),
+                ));
+            let _guard = waiting_locks.acquire(NodeId::new(7), pg_id);
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter should enter metadata-command lock wait");
+        drop(first);
+        waiter
+            .join()
+            .expect("waiter should acquire and release lock");
+
+        let after = observability::metrics_snapshot();
+        assert!(
+            after.metadata_command_session_wait_total > before.metadata_command_session_wait_total
+        );
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| record.request_id == "request-metadata-command-lock-wait")
+            .expect("lock wait should be recorded in flight recorder");
+        assert_eq!(record.event, "metadata_command_session_wait");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("wait_us="));
+    }
+
+    #[test]
+    fn storage_node_rpc_metadata_command_wait_records_frame_trace() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+            command: command.clone(),
+            scope_bucket: Some(command.bucket_name().clone()),
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let pg_guard = server
+            .metadata_command_locks
+            .acquire(NodeId::new(7), PgId::new(0));
+        let (wait_tx, wait_rx) = mpsc::channel();
+        server
+            .metadata_command_locks
+            .set_before_wait_hook(Arc::new(move |actual_pg_id| {
+                assert_eq!(actual_pg_id, PgId::new(0));
+                let _ = wait_tx.send(());
+            }));
+        let socket_path = config.socket_path.clone();
+        let accept = thread::spawn(move || server.accept_one().unwrap());
+        let before = observability::metrics_snapshot();
+
+        let client = thread::spawn(move || {
+            let mut client = UnixStream::connect(socket_path).unwrap();
+            send_frame(
+                &mut client,
+                11,
+                StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
+                encode_metadata_command_pending_slot_request(&request).unwrap(),
+            )
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("RPC handler should enter metadata-command lock wait");
+        drop(pg_guard);
+        let response = client.join().expect("client should receive response");
+        accept.join().unwrap();
+        decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+
+        let after = observability::metrics_snapshot();
+        assert!(
+            after.metadata_command_session_wait_total > before.metadata_command_session_wait_total
+        );
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "storage-node-7-rpc-11"
+                    && record.event == "metadata_command_session_wait"
+            })
+            .expect("storage-node RPC wait should be recorded without caller-attached trace");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("wait_us="));
     }
 
     fn private_socket_dir(path: &Path) {
@@ -8586,8 +8926,11 @@ mod tests {
         let matching_payload = decode_storage_rpc_response_payload(&matching_response.payload)
             .unwrap()
             .unwrap();
-        let matching = decode_metadata_command_bool_response(&matching_payload).unwrap();
-        assert!(matching.value);
+        let matching = decode_metadata_command_bool_outcome_response(&matching_payload).unwrap();
+        assert_eq!(
+            matching.outcome,
+            StorageRpcMetadataCommandBoolOutcome::Value(true)
+        );
 
         let abandoned_response = send_frame(
             &mut client,
@@ -8597,16 +8940,20 @@ mod tests {
                 node_id: NodeId::new(7),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 pg_id: PgId::new(0),
-                command: first,
+                command: first.clone(),
             })
             .unwrap(),
         );
         let abandoned_payload = decode_storage_rpc_response_payload(&abandoned_response.payload)
             .unwrap()
             .unwrap();
-        let abandoned = decode_metadata_command_bool_response(&abandoned_payload).unwrap();
-        assert!(abandoned.value);
+        let abandoned = decode_metadata_command_bool_outcome_response(&abandoned_payload).unwrap();
+        assert_eq!(
+            abandoned.outcome,
+            StorageRpcMetadataCommandBoolOutcome::Value(true)
+        );
 
+        let before_conflict = observability::metrics_snapshot();
         let next_response = send_frame(
             &mut client,
             7,
@@ -8631,6 +8978,24 @@ mod tests {
                 log_index: 3,
             }
         );
+        let after_conflict = observability::metrics_snapshot();
+        assert!(
+            after_conflict.metadata_command_conflict_total
+                > before_conflict.metadata_command_conflict_total
+        );
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "storage-node-7-rpc-7"
+                    && record.event == "metadata_command_conflict"
+            })
+            .expect("storage-node RPC conflict should be recorded without caller-attached trace");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("log_index=3"));
+        assert!(record.detail.contains("kind=log_conflict"));
         drop(client);
         join.join().unwrap();
     }
@@ -8858,7 +9223,7 @@ mod tests {
             command: command.clone(),
             scope_bucket: Some(command.bucket_name().clone()),
         };
-        let pg_guard = server.metadata_command_locks.acquire(pg_id);
+        let pg_guard = server.metadata_command_locks.acquire(NodeId::new(7), pg_id);
         let (tx, rx) = mpsc::channel();
         let handler_for_thread = handler.clone();
         let join = thread::spawn(move || {
@@ -9137,12 +9502,36 @@ mod tests {
             command: test_metadata_command(0, 2),
             ..request
         };
+        let before_conflict = observability::metrics_snapshot();
         let conflict_response = send_frame(
             &mut client,
             3,
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
             encode_metadata_command_pending_slot_request(&conflict).unwrap(),
         );
+        let after_conflict = observability::metrics_snapshot();
+        assert!(
+            after_conflict.metadata_command_conflict_total
+                > before_conflict.metadata_command_conflict_total
+        );
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "storage-node-7-rpc-3"
+                    && record.event == "metadata_command_conflict"
+            })
+            .expect(
+                "storage-node pending conflict should be recorded without caller-attached trace",
+            );
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("log_index=2"));
+        assert!(record.detail.contains("kind=pending_slot_conflict"));
+        assert!(record
+            .detail
+            .contains("command_kind=ReserveObjectGeneration"));
         drop(client);
         join.join().unwrap();
 

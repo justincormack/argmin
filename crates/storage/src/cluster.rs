@@ -731,12 +731,40 @@ fn decide_reissued_pending_command(
 }
 
 impl StorageCluster {
+    fn emit_metadata_command_conflict(
+        &self,
+        node_id: Option<NodeId>,
+        pg_id: PgId,
+        log_index: Option<u64>,
+        kind: &'static str,
+        command_kind: Option<&'static str>,
+    ) {
+        let _ = observability::emit_metadata_command_conflict(
+            TRACE_TARGET,
+            observability::MetadataCommandConflictSummary {
+                node_id: node_id.map(|node_id| node_id.as_u32()),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch().get(),
+                log_index,
+                kind,
+                command_kind,
+            },
+        );
+    }
+
     fn metadata_command_conflict(
         &self,
         node_id: NodeId,
         pg_id: PgId,
         log_index: u64,
     ) -> StoreError {
+        self.emit_metadata_command_conflict(
+            Some(node_id),
+            pg_id,
+            Some(log_index),
+            "log_conflict",
+            None,
+        );
         StoreError::MetadataCommandLogConflict {
             node_id: node_id.as_u32(),
             pg_id: pg_id.get(),
@@ -1583,7 +1611,16 @@ impl StorageCluster {
             .try_insert_pending_metadata_command_slot(pg_id, command, Some(bucket))
         {
             Ok(()) => Ok(Some(())),
-            Err(StoreError::MetadataCommandPendingConflict { .. }) => Ok(None),
+            Err(StoreError::MetadataCommandPendingConflict { .. }) => {
+                self.emit_metadata_command_conflict(
+                    Some(primary.node_id()),
+                    pg_id,
+                    Some(command.id().log_index().get()),
+                    "pending_slot_conflict",
+                    Some(command.payload().kind_name()),
+                );
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
     }
