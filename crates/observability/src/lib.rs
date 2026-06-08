@@ -91,6 +91,7 @@ static HTTP_500_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OPERATION_ABORTED_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_DOWN_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -555,6 +556,14 @@ pub struct MetadataCommandSessionWaitSummary {
     pub wait_us: u128,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRpcErrorSummary<'a> {
+    pub node_id: u32,
+    pub rpc_kind: &'a str,
+    pub error_code: &'a str,
+    pub message: &'a str,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub inflight_requests: u64,
@@ -564,6 +573,7 @@ pub struct MetricsSnapshot {
     pub operation_aborted_response_total: u64,
     pub slow_down_response_total: u64,
     pub slow_request_total: u64,
+    pub storage_rpc_error_total: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
@@ -600,6 +610,7 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         operation_aborted_response_total: OPERATION_ABORTED_RESPONSE_TOTAL.load(Ordering::Relaxed),
         slow_down_response_total: SLOW_DOWN_RESPONSE_TOTAL.load(Ordering::Relaxed),
         slow_request_total: SLOW_REQUEST_TOTAL.load(Ordering::Relaxed),
+        storage_rpc_error_total: STORAGE_RPC_ERROR_TOTAL.load(Ordering::Relaxed),
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),
@@ -825,6 +836,36 @@ pub fn emit_metadata_command_session_wait(
         Some(format_args!(
             "node_id={} pg_id={} wait_us={}",
             summary.node_id, summary.pg_id, summary.wait_us
+        )),
+    )
+}
+
+pub fn emit_storage_rpc_error(target: &'static str, summary: StorageRpcErrorSummary<'_>) -> bool {
+    STORAGE_RPC_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let message_hash = stable_hash_hex(summary.message);
+    let detail = format!(
+        "node_id={} rpc_kind={} error_code={} message_len={} message_hash={}",
+        summary.node_id,
+        summary.rpc_kind,
+        summary.error_code,
+        summary.message.len(),
+        message_hash
+    );
+    record_flight_event(&context, target, "storage_rpc_error", detail);
+    event_in_context(
+        &context,
+        target,
+        "storage_rpc_error",
+        Some(format_args!(
+            "node_id={} rpc_kind={} error_code={} message_len={} message_hash={}",
+            summary.node_id,
+            summary.rpc_kind,
+            summary.error_code,
+            summary.message.len(),
+            message_hash
         )),
     )
 }
@@ -1252,6 +1293,15 @@ mod tests {
                 wait_us: 55,
             },
         );
+        emit_storage_rpc_error(
+            "storage",
+            StorageRpcErrorSummary {
+                node_id: 7,
+                rpc_kind: "ShardReadRange",
+                error_code: "ResourceExhausted",
+                message: "read handle limit exceeded for secret bucket",
+            },
+        );
         emit_shard_scavenger_observation(
             "storage",
             ShardScavengerObservationSummary {
@@ -1293,6 +1343,10 @@ mod tests {
         assert_eq!(
             after.metadata_command_session_wait_total,
             before.metadata_command_session_wait_total + 1
+        );
+        assert_eq!(
+            after.storage_rpc_error_total,
+            before.storage_rpc_error_total + 1
         );
         assert_eq!(
             after.shard_scavenger_observation_total,
@@ -1480,6 +1534,52 @@ mod tests {
         assert!(wait.detail.contains("node_id=7"));
         assert!(wait.detail.contains("pg_id=3"));
         assert!(wait.detail.contains("wait_us=1234"));
+    }
+
+    #[test]
+    fn storage_rpc_error_records_bounded_redacted_context() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let ctx = TraceContext::from_ids(
+            "trace-storage-rpc-error".to_string(),
+            "request-storage-rpc-error".to_string(),
+        );
+        let _attached = AttachedTrace::new(ctx);
+        let before = metrics_snapshot();
+
+        emit_storage_rpc_error(
+            "storage",
+            StorageRpcErrorSummary {
+                node_id: 7,
+                rpc_kind: "ObjectStreamSegmentAppendPrepare",
+                error_code: "PayloadDecode",
+                message: "bad payload for /secret-bucket/secret-key",
+            },
+        );
+
+        let after = metrics_snapshot();
+        assert_eq!(
+            after.storage_rpc_error_total,
+            before.storage_rpc_error_total + 1
+        );
+        let records = flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-storage-rpc-error"
+                    && record.event == "storage_rpc_error"
+            })
+            .expect("storage RPC error should be recorded");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record
+            .detail
+            .contains("rpc_kind=ObjectStreamSegmentAppendPrepare"));
+        assert!(record.detail.contains("error_code=PayloadDecode"));
+        assert!(record.detail.contains("message_len="));
+        assert!(record.detail.contains("message_hash="));
+        assert!(!record.detail.contains("secret-bucket"));
+        assert!(!record.detail.contains("secret-key"));
+        assert!(record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
     }
 
     #[test]

@@ -6319,6 +6319,12 @@ Status:
   handlers attach a local per-frame trace context so these records are present
   in multihost storage-node processes even when the frontend trace context is
   not propagated over the storage RPC frame.
+- Continued the permanent diagnostics slice by adding storage-node RPC error
+  diagnostics at the central response boundary. Every typed storage-RPC error
+  response now increments a counter and records node id, RPC kind, error code,
+  bounded message length, and a stable message hash in the flight recorder
+  under the per-frame storage-node trace context. Raw RPC payloads and error
+  messages are not written to the flight record.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

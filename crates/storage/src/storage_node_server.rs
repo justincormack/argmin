@@ -311,6 +311,26 @@ fn emit_storage_node_metadata_command_pending_conflict(
     );
 }
 
+fn maybe_emit_storage_rpc_error(node_id: NodeId, kind: StorageRpcMessageKind, payload: &[u8]) {
+    if !matches!(payload.first(), Some(1)) {
+        return;
+    }
+    let Ok(Err(error)) = crate::storage_rpc::decode_storage_rpc_response_payload(payload) else {
+        return;
+    };
+    let rpc_kind = format!("{kind:?}");
+    let error_code = format!("{:?}", error.code);
+    let _ = observability::emit_storage_rpc_error(
+        "storage",
+        observability::StorageRpcErrorSummary {
+            node_id: node_id.as_u32(),
+            rpc_kind: &rpc_kind,
+            error_code: &error_code,
+            message: &error.message,
+        },
+    );
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageNodeServerError {
     #[error("storage-node PG set must not be empty")]
@@ -1756,6 +1776,7 @@ impl StorageNodeConnectionHandler {
         .map_err(|error| StorageNodeServerError::ResponsePayload {
             message: error.to_string(),
         })?;
+        maybe_emit_storage_rpc_error(self.config.node_id, frame.kind, &payload);
         Ok(StorageRpcFrame {
             request_id: frame.request_id,
             kind: frame.kind,
@@ -8001,6 +8022,7 @@ mod tests {
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();
         let join = thread::spawn(move || server.accept_one().unwrap());
+        let before = observability::metrics_snapshot();
 
         let mut client = UnixStream::connect(socket_path).unwrap();
         let frame_bytes =
@@ -8014,6 +8036,21 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::UnsupportedOperation);
+        let after = observability::metrics_snapshot();
+        assert!(after.storage_rpc_error_total > before.storage_rpc_error_total);
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "storage-node-7-rpc-9" && record.event == "storage_rpc_error"
+            })
+            .expect("storage-node RPC error should be recorded");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("rpc_kind=ClaimHeartbeat"));
+        assert!(record.detail.contains("error_code=UnsupportedOperation"));
+        assert!(record.detail.contains("message_len="));
+        assert!(record.detail.contains("message_hash="));
     }
 
     #[test]
