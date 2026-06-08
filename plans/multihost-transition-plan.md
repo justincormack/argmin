@@ -6159,6 +6159,13 @@ Work items:
    - fail closed instead of returning retryable overload if the server cannot
      prove whether a non-idempotent shard write, shard ack, metadata command,
      reservation, read handle, or cleanup side effect was accepted
+   - investigate and cap durable object-version reservation retry storms: a
+     retained UAT failure showed one versioned PUT sequence burning thousands
+     of `ReserveObjectVersion` commands for the same bucket/key before a small
+     number of live commits. Phase 10.9 backpressure must distinguish expected
+     opaque version-id gaps from an unbounded allocator loop, surface the wait
+     stage in diagnostics, and ensure client-visible retries after a committed
+     non-idempotent PUT do not look like harness cleanup corruption.
    - reserve lower-priority budgets for lifecycle, reclaim, and scavenger work
      so background workers cannot starve foreground S3 requests
    - ensure the UAT harness does not hide failures by retrying transport EOFs

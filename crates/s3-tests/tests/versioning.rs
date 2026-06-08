@@ -633,6 +633,7 @@ fn test_versioning_obj_create_versions_remove_special_names() {
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
         let num = 10;
+        let mut deleted_versions = Vec::new();
 
         for key in &["_testobj", "_", ":", "foo bar"] {
             let (version_ids, contents) = create_multiple_versions(&bucket, key, num).await;
@@ -647,10 +648,47 @@ fn test_versioning_obj_create_versions_remove_special_names() {
                     .send()
                     .await
                     .unwrap();
+                deleted_versions.push(((*key).to_string(), version_ids[i].clone()));
             }
         }
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        loop {
+            let mut req = client.list_object_versions().bucket(&bucket);
+            if let Some(ref key_marker) = key_marker {
+                req = req.key_marker(key_marker);
+            }
+            if let Some(ref version_id_marker) = version_id_marker {
+                req = req.version_id_marker(version_id_marker);
+            }
+
+            let resp = req.send().await.unwrap();
+            assert!(
+                resp.delete_markers().is_empty(),
+                "expected no delete markers after deleting explicit special-name versions"
+            );
+            for version in resp.versions() {
+                let listed_key = version.key().unwrap_or_default();
+                let listed_version_id = version.version_id().unwrap_or_default();
+                assert!(
+                    !deleted_versions
+                        .iter()
+                        .any(|(key, version_id)| key == listed_key && version_id == listed_version_id),
+                    "deleted version still listed: key={listed_key:?} version_id={listed_version_id:?}"
+                );
+            }
+
+            if resp.is_truncated() != Some(true) {
+                break;
+            }
+            key_marker = resp.next_key_marker().map(str::to_string);
+            version_id_marker = resp.next_version_id_marker().map(str::to_string);
+            assert!(key_marker.is_some());
+            assert!(version_id_marker.is_some());
+        }
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
