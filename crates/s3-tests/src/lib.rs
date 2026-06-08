@@ -28,7 +28,7 @@ pub use raw_http_client::{Agent, Response};
 pub use server::TestServer;
 
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
@@ -567,20 +567,18 @@ pub async fn create_bucket_retrying_reuse(
     bucket: &str,
 ) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
 {
-    const MAX_ATTEMPTS: usize = 20;
     const RETRY_DELAY: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + configured_test_timeout();
 
-    for attempt in 0..MAX_ATTEMPTS {
+    loop {
         match create_bucket_in_region(client, bucket, CTX.region()).await {
             Ok(()) => return Ok(()),
-            Err(err) if is_retryable_bucket_reuse_error(&err) && attempt + 1 < MAX_ATTEMPTS => {
+            Err(err) if is_retryable_bucket_reuse_error(&err) && Instant::now() < deadline => {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
             Err(err) => return Err(err),
         }
     }
-
-    unreachable!("bucket recreate retry loop must return before exhausting attempts")
 }
 
 pub fn create_bucket_request(
