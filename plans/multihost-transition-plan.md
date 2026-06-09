@@ -6146,7 +6146,7 @@ Work items:
    - add guardrail coverage that rejects new coordinator request paths which
      directly map expected storage contention to generic `Store`, `Metadata`,
      or internal errors
-3. permanent race diagnostics
+3. permanent race diagnostics [done]
    - add structured request/RPC/metadata-command events for contention and
      retry paths: request id, operation, stable bucket/key hashes where
      possible, PG id, node id, RPC kind, command id/log index, retry attempt,
@@ -6160,9 +6160,11 @@ Work items:
      ordinary request logs where they are already part of the configured access
      log policy
    - add one compact cause-chain event for every HTTP 500
-   - add counters for HTTP 500s, `OperationAborted`, overload/`SlowDown`,
-     storage-RPC failures by kind/code, metadata-command conflicts by PG/kind,
-     pending-slot drain/reissue attempts, and storage-node command-session wait
+   - add aggregate counters for HTTP 500s, `OperationAborted`,
+     overload/`SlowDown`, storage-RPC failures, metadata-command conflicts,
+     pending-slot drain/reissue attempts, and storage-node command-session
+     wait; keep the kind/code/PG dimensions in bounded flight-recorder records
+     instead of unbounded metric labels
    - add a bounded in-memory flight-recorder ring buffer per process that can
      be dumped on abort-on-500, panic, or explicit debug endpoint/trigger
    - make any explicit debug dump endpoint or trigger local/admin-only and
@@ -6311,9 +6313,9 @@ Status:
   diagnostics with `error_code` plus `cause_label` for immediate error
   responses and streaming body errors. Added counters for exact HTTP 500
   responses, `OperationAborted`, and `SlowDown`. This covers the first compact
-  HTTP failure breadcrumb; per-RPC/per-metadata-command retry events, conflict
-  counters by PG/kind, command-session wait counters, and the bounded
-  flight-recorder/debug-dump path remain in the diagnostics slice.
+  HTTP failure breadcrumb; the later permanent-diagnostics status bullets close
+  out RPC, metadata-command, command-session wait, and bounded
+  flight-recorder/debug-dump coverage.
 - Added UAT harness support for `--repeat N` / `ARGMIN_UAT_REPEAT=N` so
   nondeterministic full-suite or focused failures can be rerun under one
   process group, plus failure diagnostics that grep all frontend/storage-node
@@ -6386,6 +6388,13 @@ Status:
   The chain uses stable diagnostic labels only, preserving nested storage
   causes without exposing bucket names, keys, request headers, policy text, or
   backend error strings.
+- Closed Phase 10.9 part 3, permanent race diagnostics. The implemented shape
+  uses aggregate always-on counters for the abnormal classes and stores
+  dimensional context such as RPC kind/code, PG id, node id, log index, command
+  kind, action, status, and cause label in bounded redacted flight-recorder
+  records. That keeps production metrics cardinality controlled while still
+  making intermittent race failures diagnosable from abort-on-500, panic, and
+  explicit local debug dumps.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
