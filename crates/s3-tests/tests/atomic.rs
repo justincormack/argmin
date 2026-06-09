@@ -24,6 +24,10 @@ async fn setup_bucket() -> String {
 }
 
 async fn cleanup(bucket: &str, keys: &[&str]) {
+    delete_bucket_after_object_cleanup(bucket, keys).await;
+}
+
+async fn delete_test_keys(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
         client
@@ -34,12 +38,12 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
             .await
             .unwrap_or_else(|err| panic!("delete object during atomic cleanup: {err:?}"));
     }
-    delete_bucket_after_object_cleanup(bucket).await;
 }
 
-async fn delete_bucket_after_object_cleanup(bucket: &str) {
+async fn delete_bucket_after_object_cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for attempt in 1..=CLEANUP_DELETE_BUCKET_ATTEMPTS {
+        delete_test_keys(bucket, keys).await;
         match client.delete_bucket().bucket(bucket).send().await {
             Ok(_) => return,
             Err(err)
