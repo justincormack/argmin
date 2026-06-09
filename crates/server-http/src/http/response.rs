@@ -139,11 +139,12 @@ pub struct S3Response {
     pub(crate) error_diagnostic: Option<ErrorDiagnostic>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ErrorDiagnostic {
     pub status_code: u16,
     pub error_code: &'static str,
     pub cause_label: &'static str,
+    pub cause_chain: String,
 }
 
 pub struct CreateMultipartUploadResponseContext<'a> {
@@ -739,6 +740,7 @@ impl S3Response {
             status_code: err.http_status(),
             error_code: err.s3_error_code(),
             cause_label: err.diagnostic_cause_label(),
+            cause_chain: err.diagnostic_cause_chain(),
         });
         self
     }

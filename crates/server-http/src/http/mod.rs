@@ -657,27 +657,39 @@ impl ResponseBodyTrace {
     }
 
     fn emit_error(&mut self, err: &ServerError) {
-        self.emit_error_diagnostic(ErrorDiagnostic {
+        let diagnostic = ErrorDiagnostic {
             status_code: err.http_status(),
             error_code: err.s3_error_code(),
             cause_label: err.diagnostic_cause_label(),
-        });
+            cause_chain: err.diagnostic_cause_chain(),
+        };
+        self.emit_error_diagnostic(&diagnostic);
     }
 
-    fn emit_error_diagnostic(&mut self, diagnostic: ErrorDiagnostic) {
+    fn emit_error_diagnostic(&mut self, diagnostic: &ErrorDiagnostic) {
         if self.terminal_event_emitted {
             return;
         }
         self.terminal_event_emitted = true;
         self.emit_slow_request_if_needed("error", Some(diagnostic.error_code));
+        let summary = self.request_summary();
         let _ = observability::emit_request_error(
             &self.meta.context,
             TRACE_TARGET,
-            self.request_summary(),
+            summary,
             "response_body",
             diagnostic.error_code,
             diagnostic.cause_label,
         );
+        if summary.status_code == 500 {
+            let _ = observability::emit_http_500_cause_chain(
+                &self.meta.context,
+                TRACE_TARGET,
+                summary,
+                diagnostic.cause_label,
+                &diagnostic.cause_chain,
+            );
+        }
     }
 }
 
@@ -4575,10 +4587,10 @@ pub fn s3_response_to_hyper(
             S3Response::error_with_ids(&ServerError::InternalError { reason }, "", &wire_ids);
         let status = http::StatusCode::from_u16(resp.status_code)
             .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-        let error_diagnostic = resp.error_diagnostic;
+        let error_diagnostic = resp.error_diagnostic.clone();
         let mut trace =
             ResponseBodyTrace::new(trace_meta, resp.status_code, resp.body.len() as u64, false);
-        if let Some(diagnostic) = error_diagnostic {
+        if let Some(diagnostic) = &error_diagnostic {
             trace.emit_error_diagnostic(diagnostic);
         }
         if panic_on_500 || abort_on_500 {
@@ -4633,25 +4645,39 @@ pub fn s3_response_to_hyper(
         let body = String::from_utf8_lossy(&resp.body);
         let diagnostic_suffix = resp
             .error_diagnostic
-            .map(|diagnostic| format!(" cause_label={}", diagnostic.cause_label))
+            .as_ref()
+            .map(|diagnostic| {
+                format!(
+                    " cause_label={} cause_chain={}",
+                    diagnostic.cause_label, diagnostic.cause_chain
+                )
+            })
             .unwrap_or_default();
-        if let Some(diagnostic) = resp.error_diagnostic {
+        if let Some(diagnostic) = resp.error_diagnostic.as_ref() {
+            let summary = observability::RequestSummary {
+                method: &trace_meta.method,
+                path: &trace_meta.path,
+                query: trace_meta.query,
+                status_code: resp.status_code,
+                streaming: resp.stream.is_some(),
+                body_len,
+                bytes_sent: 0,
+                lifetime_us: trace_meta.started_at.elapsed().as_micros(),
+            };
             let _ = observability::emit_request_error(
                 &trace_meta.context,
                 TRACE_TARGET,
-                observability::RequestSummary {
-                    method: &trace_meta.method,
-                    path: &trace_meta.path,
-                    query: trace_meta.query,
-                    status_code: resp.status_code,
-                    streaming: resp.stream.is_some(),
-                    body_len,
-                    bytes_sent: 0,
-                    lifetime_us: trace_meta.started_at.elapsed().as_micros(),
-                },
+                summary,
                 "response_body",
                 diagnostic.error_code,
                 diagnostic.cause_label,
+            );
+            let _ = observability::emit_http_500_cause_chain(
+                &trace_meta.context,
+                TRACE_TARGET,
+                summary,
+                diagnostic.cause_label,
+                &diagnostic.cause_chain,
             );
         }
         if panic_on_500 || abort_on_500 {
@@ -4751,7 +4777,7 @@ pub fn s3_response_to_hyper(
         body_len,
         resp.stream.is_some(),
     );
-    let error_diagnostic = resp.error_diagnostic;
+    let error_diagnostic = resp.error_diagnostic.clone();
     let inflight_requests_guard = permit
         .as_ref()
         .map(|_| observability::inflight_requests_guard());
@@ -4765,7 +4791,7 @@ pub fn s3_response_to_hyper(
         ),
         None => S3HyperBody::buffered(resp.body, permit, inflight_requests_guard, trace),
     };
-    if let Some(diagnostic) = error_diagnostic {
+    if let Some(diagnostic) = &error_diagnostic {
         if let Some(trace) = body.trace.as_mut() {
             trace.emit_error_diagnostic(diagnostic);
         }
@@ -6696,20 +6722,46 @@ mod tests {
         assert!(panic_message.contains("HTTP response conversion produced InternalError"));
 
         let records = observability::flight_recorder_snapshot();
-        let record = records
+        let request_error_record = records
             .iter()
             .rev()
-            .find(|record| record.request_id == "request-conversion-error")
+            .find(|record| {
+                record.request_id == "request-conversion-error" && record.event == "request_error"
+            })
             .expect("conversion error should be recorded before panic");
-        assert_eq!(record.event, "request_error");
-        assert!(record.detail.contains("status=500"));
-        assert!(record.detail.contains("path_hash="));
-        assert!(record.detail.contains("sigv4_query=true"));
-        assert!(record.detail.contains("error_code=InternalError"));
-        assert!(record.detail.contains("cause_label=internal_error"));
-        assert!(!record.detail.contains("secret-bucket"));
-        assert!(!record.detail.contains("secret-key"));
-        assert!(!record.detail.contains("secret"));
+        assert!(request_error_record.detail.contains("status=500"));
+        assert!(request_error_record.detail.contains("path_hash="));
+        assert!(request_error_record.detail.contains("sigv4_query=true"));
+        assert!(request_error_record
+            .detail
+            .contains("error_code=InternalError"));
+        assert!(request_error_record
+            .detail
+            .contains("cause_label=internal_error"));
+        assert!(!request_error_record.detail.contains("secret-bucket"));
+        assert!(!request_error_record.detail.contains("secret-key"));
+        assert!(!request_error_record.detail.contains("secret"));
+
+        let cause_chain_record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-conversion-error"
+                    && record.event == "request_500_cause_chain"
+            })
+            .expect("conversion error cause chain should be recorded before panic");
+        assert!(cause_chain_record.detail.contains("status=500"));
+        assert!(cause_chain_record.detail.contains("path_hash="));
+        assert!(cause_chain_record.detail.contains("sigv4_query=true"));
+        assert!(cause_chain_record
+            .detail
+            .contains("cause_label=internal_error"));
+        assert!(cause_chain_record
+            .detail
+            .contains("cause_chain=\"server_error>internal_error\""));
+        assert!(!cause_chain_record.detail.contains("secret-bucket"));
+        assert!(!cause_chain_record.detail.contains("secret-key"));
+        assert!(!cause_chain_record.detail.contains("secret"));
     }
 
     #[test]
@@ -6876,6 +6928,22 @@ mod tests {
 
         assert_eq!(trace.status_code, 206);
         assert!(trace.terminal_event_emitted);
+
+        let records = observability::flight_recorder_snapshot();
+        let request_error_record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "2VG1X5NNMZ52HKC0" && record.event == "request_error"
+            })
+            .expect("streaming body error should record request error");
+        assert!(request_error_record.detail.contains("status=206"));
+        assert!(request_error_record
+            .detail
+            .contains("error_code=InternalError"));
+        assert!(!records.iter().any(|record| {
+            record.request_id == "2VG1X5NNMZ52HKC0" && record.event == "request_500_cause_chain"
+        }));
     }
 
     #[test]

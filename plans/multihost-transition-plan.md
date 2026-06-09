@@ -6381,6 +6381,11 @@ Status:
   frontends and requests a flight-recorder dump before teardown on failed runs,
   while gating extra metadata-command conflict stderr diagnostics behind
   `ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS`.
+- Continued the permanent diagnostics slice by emitting a separate bounded,
+  redacted `request_500_cause_chain` flight-recorder event for every HTTP 500.
+  The chain uses stable diagnostic labels only, preserving nested storage
+  causes without exposing bucket names, keys, request headers, policy text, or
+  backend error strings.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

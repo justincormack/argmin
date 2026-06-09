@@ -181,7 +181,7 @@ These still provide value that profiling cannot:
 - request transport/body error summary
 - response status, total latency, and body size summary
 - slow-request summaries
-- lock wait summaries when a threshold is exceeded
+- metadata-command/session wait summaries when a threshold is exceeded
 - cheap in-process counters/gauges for inflight request count and key abnormal
   event totals
 - queue-pressure or background-work delay summaries when a threshold is exceeded
@@ -347,9 +347,11 @@ still exist in coordinator/storage/auth code.
   - streaming PUT and UploadPart detail events are now `deep-tracing` only
 - `crates/server-http/src/http/mod.rs`
   - response lifecycle has been collapsed to request-level summaries
-- `crates/storage/src/node.rs`
-  - keep lock wait reporting only above threshold
-  - lock acquire/release chatter has been removed
+- `crates/storage/src/cluster.rs` and storage-node RPC paths
+  - keep metadata-command conflict, pending-slot action, and session-wait
+    summaries above diagnostic thresholds
+  - bucket-lock acquire/release chatter has been removed from production
+    telemetry; legacy bucket-lock probes remain test-only
 
 ### Validation
 

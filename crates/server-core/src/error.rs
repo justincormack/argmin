@@ -321,6 +321,25 @@ impl ServerError {
         }
     }
 
+    /// Stable, redacted cause chain for server-side diagnostics.
+    ///
+    /// This intentionally uses only the same bounded labels as
+    /// `diagnostic_cause_label`, preserving nesting that is useful when a 500
+    /// crosses multiple subsystems.
+    pub fn diagnostic_cause_chain(&self) -> String {
+        match self {
+            Self::Store(error) => format!(
+                "server_error>store_error>{}",
+                store_error_diagnostic_cause_chain(error)
+            ),
+            Self::Metadata(error) => format!(
+                "server_error>metadata_error>{}",
+                metadata_error_diagnostic_cause_chain(error)
+            ),
+            _ => format!("server_error>{}", self.diagnostic_cause_label()),
+        }
+    }
+
     /// Map to S3 error code string.
     pub fn s3_error_code(&self) -> &'static str {
         match self {
@@ -556,6 +575,15 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
     }
 }
 
+fn store_error_diagnostic_cause_chain(error: &StoreError) -> String {
+    match error {
+        StoreError::ShardStore { source, .. } => {
+            format!("shard_store>{}", store_error_diagnostic_cause_chain(source))
+        }
+        _ => store_error_diagnostic_cause_label(error).to_string(),
+    }
+}
+
 fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str {
     match error {
         MetadataError::BucketWriteDraining => "bucket_write_draining",
@@ -573,6 +601,10 @@ fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str 
         MetadataError::Db { .. } => "metadata_db_error",
         _ => "metadata_error",
     }
+}
+
+fn metadata_error_diagnostic_cause_chain(error: &MetadataError) -> String {
+    metadata_error_diagnostic_cause_label(error).to_string()
 }
 
 impl From<MetadataError> for ServerError {
@@ -713,6 +745,10 @@ mod tests {
             shard_overload.diagnostic_cause_label(),
             "shard_store_storage_rpc_resource_exhausted"
         );
+        assert_eq!(
+            shard_overload.diagnostic_cause_chain(),
+            "server_error>store_error>shard_store>storage_rpc_resource_exhausted"
+        );
 
         let stale_bucket = ServerError::Metadata(MetadataError::StaleBucketMetadataCommand {
             name: storage::BucketName::try_from("bucket".to_string()).unwrap(),
@@ -732,6 +768,10 @@ mod tests {
         assert_eq!(
             stale_object.diagnostic_cause_label(),
             "stale_object_write_command"
+        );
+        assert_eq!(
+            stale_object.diagnostic_cause_chain(),
+            "server_error>metadata_error>stale_object_write_command"
         );
     }
 

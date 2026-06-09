@@ -737,6 +737,48 @@ pub fn emit_request_error(
     )
 }
 
+pub fn emit_http_500_cause_chain(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestSummary<'_>,
+    cause_label: &'static str,
+    cause_chain: &str,
+) -> bool {
+    record_flight_event(
+        context,
+        target,
+        "request_500_cause_chain",
+        request_flight_detail(
+            summary,
+            format_args!(
+                "cause_label={} cause_chain={}",
+                cause_label,
+                escaped(cause_chain)
+            ),
+        ),
+    );
+    event_in_context(
+        context,
+        target,
+        "request_500_cause_chain",
+        Some(format_args!(
+            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} cause_label={} cause_chain={}",
+            summary.status_code,
+            summary.method,
+            summary.path,
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.streaming,
+            summary.body_len,
+            summary.bytes_sent,
+            summary.lifetime_us,
+            cause_label,
+            escaped(cause_chain)
+        )),
+    )
+}
+
 pub fn emit_slow_request(
     context: &TraceContext,
     target: &'static str,
@@ -1523,12 +1565,21 @@ mod tests {
             "InternalError",
             "metadata_command_contention",
         );
+        emit_http_500_cause_chain(
+            &ctx,
+            "server_http",
+            summary,
+            "metadata_command_contention",
+            "server_error>store_error>metadata_command_contention",
+        );
 
         let records = flight_recorder_snapshot();
         let record = records
             .iter()
             .rev()
-            .find(|record| record.request_id == "request-flight-redaction")
+            .find(|record| {
+                record.request_id == "request-flight-redaction" && record.event == "request_error"
+            })
             .expect("request error should be recorded in flight recorder");
         assert_eq!(record.event, "request_error");
         assert!(record.detail.contains("path_hash="));
@@ -1540,6 +1591,27 @@ mod tests {
         assert!(!record.detail.contains("secret-key"));
         assert!(!record.detail.contains("secret"));
         assert!(record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
+
+        let cause_chain_record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-flight-redaction"
+                    && record.event == "request_500_cause_chain"
+            })
+            .expect("500 cause chain should be recorded in flight recorder");
+        assert!(cause_chain_record.detail.contains("path_hash="));
+        assert!(cause_chain_record.detail.contains("sigv4_query=true"));
+        assert!(cause_chain_record
+            .detail
+            .contains("cause_label=metadata_command_contention"));
+        assert!(cause_chain_record
+            .detail
+            .contains("cause_chain=\"server_error>store_error>metadata_command_contention\""));
+        assert!(!cause_chain_record.detail.contains("secret-bucket"));
+        assert!(!cause_chain_record.detail.contains("secret-key"));
+        assert!(!cause_chain_record.detail.contains("secret"));
+        assert!(cause_chain_record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
     }
 
     #[test]
