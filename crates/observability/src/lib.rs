@@ -91,6 +91,9 @@ static HTTP_500_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OPERATION_ABORTED_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_DOWN_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ADMISSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ADMISSION_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ADMISSION_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -540,6 +543,15 @@ pub struct RequestSummary<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestAdmissionSummary<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: QuerySummary,
+    pub wait_us: u128,
+    pub timeout_us: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShardScavengerObservationSummary<'a> {
     pub node_id: u32,
     pub data_pg_id: u32,
@@ -595,6 +607,9 @@ pub struct MetricsSnapshot {
     pub operation_aborted_response_total: u64,
     pub slow_down_response_total: u64,
     pub slow_request_total: u64,
+    pub request_admission_wait_total: u64,
+    pub request_admission_wait_us_total: u64,
+    pub request_admission_timeout_total: u64,
     pub storage_rpc_error_total: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
@@ -633,6 +648,9 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         operation_aborted_response_total: OPERATION_ABORTED_RESPONSE_TOTAL.load(Ordering::Relaxed),
         slow_down_response_total: SLOW_DOWN_RESPONSE_TOTAL.load(Ordering::Relaxed),
         slow_request_total: SLOW_REQUEST_TOTAL.load(Ordering::Relaxed),
+        request_admission_wait_total: REQUEST_ADMISSION_WAIT_TOTAL.load(Ordering::Relaxed),
+        request_admission_wait_us_total: REQUEST_ADMISSION_WAIT_US_TOTAL.load(Ordering::Relaxed),
+        request_admission_timeout_total: REQUEST_ADMISSION_TIMEOUT_TOTAL.load(Ordering::Relaxed),
         storage_rpc_error_total: STORAGE_RPC_ERROR_TOTAL.load(Ordering::Relaxed),
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
@@ -823,6 +841,86 @@ pub fn emit_slow_request(
             summary.lifetime_us,
             outcome,
             error_suffix
+        )),
+    )
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+pub fn emit_request_admission_wait(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestAdmissionSummary<'_>,
+) -> bool {
+    REQUEST_ADMISSION_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    REQUEST_ADMISSION_WAIT_US_TOTAL
+        .fetch_add(saturating_u128_to_u64(summary.wait_us), Ordering::Relaxed);
+    record_flight_event(
+        context,
+        target,
+        "request_admission_wait",
+        truncate_detail(format!(
+            "method={} path_hash={} has_query={} query_params={} sigv4_query={} wait_us={}",
+            summary.method,
+            stable_hash_hex(summary.path),
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.wait_us
+        )),
+    );
+    event_in_context(
+        context,
+        target,
+        "request_admission_wait",
+        Some(format_args!(
+            "method={} path_hash={} has_query={} query_params={} sigv4_query={} wait_us={}",
+            summary.method,
+            stable_hash_hex(summary.path),
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.wait_us
+        )),
+    )
+}
+
+pub fn emit_request_admission_timeout(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestAdmissionSummary<'_>,
+) -> bool {
+    REQUEST_ADMISSION_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    record_flight_event(
+        context,
+        target,
+        "request_admission_timeout",
+        truncate_detail(format!(
+            "method={} path_hash={} has_query={} query_params={} sigv4_query={} wait_us={} timeout_us={}",
+            summary.method,
+            stable_hash_hex(summary.path),
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.wait_us,
+            summary.timeout_us.unwrap_or_default()
+        )),
+    );
+    event_in_context(
+        context,
+        target,
+        "request_admission_timeout",
+        Some(format_args!(
+            "method={} path_hash={} has_query={} query_params={} sigv4_query={} wait_us={} timeout_us={}",
+            summary.method,
+            stable_hash_hex(summary.path),
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.wait_us,
+            summary.timeout_us.unwrap_or_default()
         )),
     )
 }
@@ -1378,6 +1476,28 @@ mod tests {
             "storage_rpc_resource_exhausted",
         );
         emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
+        emit_request_admission_wait(
+            &ctx,
+            "server_http",
+            RequestAdmissionSummary {
+                method: "PUT",
+                path: "/bucket/key",
+                query: query_summary("X-Amz-Signature=secret"),
+                wait_us: 123,
+                timeout_us: Some(5_000_000),
+            },
+        );
+        emit_request_admission_timeout(
+            &ctx,
+            "server_http",
+            RequestAdmissionSummary {
+                method: "PUT",
+                path: "/bucket/key",
+                query: query_summary("X-Amz-Signature=secret"),
+                wait_us: 5_000_000,
+                timeout_us: Some(5_000_000),
+            },
+        );
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
         emit_metadata_command_conflict(
             "storage",
@@ -1437,6 +1557,18 @@ mod tests {
             before.slow_down_response_total
         );
         assert_eq!(after.slow_request_total, before.slow_request_total + 1);
+        assert_eq!(
+            after.request_admission_wait_total,
+            before.request_admission_wait_total + 1
+        );
+        assert_eq!(
+            after.request_admission_wait_us_total,
+            before.request_admission_wait_us_total + 123
+        );
+        assert_eq!(
+            after.request_admission_timeout_total,
+            before.request_admission_timeout_total + 1
+        );
         assert_eq!(
             after.bucket_lock_wait_exceeded_total,
             before.bucket_lock_wait_exceeded_total + 1
@@ -1612,6 +1744,43 @@ mod tests {
         assert!(!cause_chain_record.detail.contains("secret-key"));
         assert!(!cause_chain_record.detail.contains("secret"));
         assert!(cause_chain_record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
+    }
+
+    #[test]
+    fn request_admission_records_redacted_bounded_flight_records() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let ctx = TraceContext::from_ids(
+            "trace-admission-redaction".to_string(),
+            "request-admission-redaction".to_string(),
+        );
+        let summary = RequestAdmissionSummary {
+            method: "PUT",
+            path: "/secret-bucket/secret-key",
+            query: query_summary("X-Amz-Signature=secret&partNumber=1"),
+            wait_us: 42_000,
+            timeout_us: Some(5_000_000),
+        };
+
+        emit_request_admission_wait(&ctx, "server_http", summary);
+        emit_request_admission_timeout(&ctx, "server_http", summary);
+
+        let records = flight_recorder_snapshot();
+        for event in ["request_admission_wait", "request_admission_timeout"] {
+            let record = records
+                .iter()
+                .rev()
+                .find(|record| {
+                    record.request_id == "request-admission-redaction" && record.event == event
+                })
+                .expect("admission event should be recorded in flight recorder");
+            assert!(record.detail.contains("path_hash="));
+            assert!(record.detail.contains("sigv4_query=true"));
+            assert!(record.detail.contains("wait_us=42000"));
+            assert!(!record.detail.contains("secret-bucket"));
+            assert!(!record.detail.contains("secret-key"));
+            assert!(!record.detail.contains("secret"));
+            assert!(record.detail.len() <= FLIGHT_RECORD_MAX_DETAIL_BYTES + 3);
+        }
     }
 
     #[test]

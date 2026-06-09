@@ -29,10 +29,10 @@ use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 use storage::{BucketName, ObjectKey, SessionId};
 
-#[cfg(feature = "deep-tracing")]
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
 const MAX_STREAMING_POST_NON_FILE_FORM_BYTES: usize = MAX_BUFFERED_CONTROL_BODY_SIZE;
+const REQUEST_ADMISSION_WAIT_EVENT_THRESHOLD_US: u128 = 10_000;
 #[cfg(not(test))]
 const STREAMING_PUT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -735,23 +735,53 @@ async fn handle(
     }
 
     // Acquire request permit before body collection to bound memory.
-    let req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
+    let admission_started_at = Instant::now();
+    let req_permit = match tokio::time::timeout(
         state.config.request_wait_timeout,
         Arc::clone(&state.request_semaphore).acquire_owned(),
     )
     .await
     {
-        permit
-    } else {
-        let resp = S3Response::error_with_ids(&ServerError::SlowDown, "", &wire_ids);
-        return Ok(s3_response_to_hyper(
-            resp,
-            None,
-            state.config.stream_read_chunk_size,
-            state.config.panic_on_500,
-            state.config.abort_on_500,
-            response_trace,
-        ));
+        Ok(Ok(permit)) => {
+            let wait_us = admission_started_at.elapsed().as_micros();
+            if wait_us >= REQUEST_ADMISSION_WAIT_EVENT_THRESHOLD_US {
+                let _ = observability::emit_request_admission_wait(
+                    &response_trace.context,
+                    TRACE_TARGET,
+                    observability::RequestAdmissionSummary {
+                        method: response_trace.method.as_str(),
+                        path: response_trace.path.as_str(),
+                        query: response_trace.query,
+                        wait_us,
+                        timeout_us: Some(state.config.request_wait_timeout.as_micros()),
+                    },
+                );
+            }
+            permit
+        }
+        _ => {
+            let wait_us = admission_started_at.elapsed().as_micros();
+            let _ = observability::emit_request_admission_timeout(
+                &response_trace.context,
+                TRACE_TARGET,
+                observability::RequestAdmissionSummary {
+                    method: response_trace.method.as_str(),
+                    path: response_trace.path.as_str(),
+                    query: response_trace.query,
+                    wait_us,
+                    timeout_us: Some(state.config.request_wait_timeout.as_micros()),
+                },
+            );
+            let resp = S3Response::error_with_ids(&ServerError::SlowDown, "", &wire_ids);
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            ));
+        }
     };
 
     let (parts, body) = req.into_parts();
@@ -1026,6 +1056,9 @@ fn local_debug_metrics_body() -> String {
             "operation_aborted_response_total {}\n",
             "slow_down_response_total {}\n",
             "slow_request_total {}\n",
+            "request_admission_wait_total {}\n",
+            "request_admission_wait_us_total {}\n",
+            "request_admission_timeout_total {}\n",
             "storage_rpc_error_total {}\n",
             "shard_scavenger_observation_total {}\n",
             "shard_scavenger_scan_incomplete_total {}\n",
@@ -1040,6 +1073,9 @@ fn local_debug_metrics_body() -> String {
         snapshot.operation_aborted_response_total,
         snapshot.slow_down_response_total,
         snapshot.slow_request_total,
+        snapshot.request_admission_wait_total,
+        snapshot.request_admission_wait_us_total,
+        snapshot.request_admission_timeout_total,
         snapshot.storage_rpc_error_total,
         snapshot.shard_scavenger_observation_total,
         snapshot.shard_scavenger_scan_incomplete_total,
@@ -4189,6 +4225,8 @@ mod tests {
             .contains("content-type: text/plain; charset=utf-8"));
         assert!(response.contains("metadata_command_conflict_total "));
         assert!(response.contains("storage_rpc_error_total "));
+        assert!(response.contains("request_admission_wait_total "));
+        assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));
     }
 

@@ -6170,6 +6170,18 @@ Work items:
    - make any explicit debug dump endpoint or trigger local/admin-only and
      disabled by default unless an operator enables it deliberately
 4. backpressure and admission control
+   - start measurement-first on the hosts that reproduce UAT operation-attempt
+     timeouts: sample local debug metrics continuously, preserve the time
+     series in the UAT data dir, and use flight-recorder records to identify
+     the stage that consumed timeout budget before changing timeout values
+   - add stage-level wait/timeout diagnostics before changing behavior:
+     frontend request admission, request body read, storage-node RPC acquire,
+     metadata-command session acquire, pending-slot drain/reissue, shard
+     write/read, EC reconstruction, and response streaming
+   - address internal retry storms before widening budgets: one contender per
+     PG/pending slot should perform drain/reissue work while other contenders
+     wait briefly or return the correct retryable S3 response, with bounded
+     jittered retry budgets instead of unbounded disk-writing loops
    - define explicit foreground budgets for frontend request admission,
      request-body bytes in flight, per-storage-node RPC concurrency,
      per-PG metadata-command concurrency, shard IO concurrency, and shard bytes
@@ -6204,6 +6216,9 @@ Work items:
      multihost saturation; timeout increases may be used only as an explicit
      diagnostic control after server-side queue/wait metrics identify the
      bottleneck
+   - use deterministic local pressure injection where possible so faster
+     developer hosts can reproduce slow-disk/slow-CPU queueing without relying
+     on host-specific timing
 5. multihost UAT observability
    - make the UAT harness always preserve a concise metrics/log summary on
      failure: slowest operations, 409/503/500 counts, transport failures, RPC
@@ -6395,6 +6410,13 @@ Status:
   records. That keeps production metrics cardinality controlled while still
   making intermittent race failures diagnosable from abort-on-500, panic, and
   explicit local debug dumps.
+- Started Phase 10.9 part 4 with measurement-first admission diagnostics.
+  Frontend request-semaphore waits over a small threshold now emit bounded,
+  redacted `request_admission_wait` records and aggregate wait counters; permit
+  acquisition timeouts emit `request_admission_timeout` records before returning
+  S3 `SlowDown`. The local debug metrics endpoint exposes the new counters, and
+  the UAT wrapper samples that endpoint once per second into the retained log
+  directory so slow-host timeout runs preserve the pressure ramp.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

@@ -257,6 +257,7 @@ storage_node_pids=()
 storage_node_logs=()
 frontend_pid=""
 frontend_log=""
+metrics_sampler_pid=""
 
 print_command() {
     printf '+'
@@ -348,6 +349,10 @@ kill_storage_node() {
 
 cleanup_server() {
     local status=$?
+    if [[ -n "${metrics_sampler_pid:-}" ]] && kill -0 "$metrics_sampler_pid" 2>/dev/null; then
+        kill "$metrics_sampler_pid" 2>/dev/null || true
+        wait "$metrics_sampler_pid" 2>/dev/null || true
+    fi
     if ((status != 0)) && [[ -n "${frontend_pid:-}" ]] && kill -0 "$frontend_pid" 2>/dev/null; then
         echo "== argmin-s3 UAT frontend flight recorder dump request ==" >&2
         if ! curl -k -sS -X POST "$endpoint/__argmin/debug/flight-recorder/dump" >/dev/null 2>&1; then
@@ -374,7 +379,7 @@ cleanup_server() {
             local matches
             matches="$(
                 grep -nE \
-                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=(409|500)|OperationAborted|cause_label=|metadata_command_conflict|metadata_command_pending_slot_action|storage_rpc_error|flight .*request_error|bucket delete (begin|finalize) found visible data|panicked at|panic|aborted" \
+                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=(409|500)|OperationAborted|cause_label=|request_admission_(wait|timeout)|metadata_command_conflict|metadata_command_pending_slot_action|storage_rpc_error|flight .*request_error|bucket delete (begin|finalize) found visible data|panicked at|panic|aborted" \
                     "$log_path" \
                     | head -n 120 \
                     || true
@@ -387,6 +392,11 @@ cleanup_server() {
         done
         if ((found_diagnostics == 0)); then
             echo "no HTTP error, cause-label, metadata-command, panic, or abort diagnostics found in server logs" >&2
+        fi
+        local metrics_log="$logs_dir/frontend-metrics-samples.log"
+        if [[ -s "$metrics_log" ]]; then
+            echo "== argmin-s3 UAT frontend metrics sample tail ==" >&2
+            tail -n 120 "$metrics_log" >&2 || true
         fi
         for index in "${!server_logs[@]}"; do
             local log_path="${server_logs[$index]}"
@@ -505,6 +515,27 @@ if ! curl -k -sS "$readiness_url" >/dev/null 2>&1; then
     cat "$frontend_log" >&2 || true
     die "argmin-s3 did not become ready at $endpoint"
 fi
+
+start_metrics_sampler() {
+    local metrics_url="$endpoint/__argmin/debug/metrics"
+    local metrics_log="$logs_dir/frontend-metrics-samples.log"
+    (
+        while true; do
+            printf 'ts=%(%s)T\n' -1
+            curl -k -sS "$metrics_url" || true
+            printf '\n'
+            sleep 1
+        done
+    ) >"$metrics_log" 2>&1 &
+    metrics_sampler_pid="$!"
+    echo "== argmin-s3 UAT frontend metrics samples: $metrics_log =="
+}
+
+case "$uat_local_debug_endpoint" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+        start_metrics_sampler
+        ;;
+esac
 
 run_nextest() {
     local label="$1"
