@@ -857,23 +857,6 @@ pub(crate) trait PgMetadataStore {
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError>;
 
-    /// Atomically finalize a streaming PutObject.
-    ///
-    /// In a single transaction:
-    /// 1. Transition session to Completing
-    /// 2. Write/overwrite the object metadata row
-    /// 3. Delete any prior object_segments for this version_id
-    /// 4. Insert committed object segment rows
-    /// 5. Delete the stream_uploads + stream_upload_segments staging rows
-    /// 6. Mark session Completed (implicitly via deletion)
-    #[cfg(test)]
-    fn commit_stream_put(
-        &self,
-        session_id: &SessionId,
-        obj: &CommitStreamPutReq,
-        segments: &[ObjectSegmentRecord],
-    ) -> Result<(), MetadataError>;
-
     /// Atomically write or replace a live standard segmented object.
     ///
     /// In a single transaction:

@@ -1972,17 +1972,33 @@ impl StorageCluster {
         match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
                 if let Some(proof) = &commit.stream_create_bucket_write_reservation {
-                    self.release_bucket_write_reservation_proof(proof)?;
+                    self.release_stream_create_bucket_write_reservation_proof(proof)?;
                 }
             }
             MetadataCommandPayload::AbortStreamUpload(abort) => {
                 if let Some(proof) = &abort.stream_create_bucket_write_reservation {
-                    self.release_bucket_write_reservation_proof(proof)?;
+                    self.release_stream_create_bucket_write_reservation_proof(proof)?;
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn release_stream_create_bucket_write_reservation_proof(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        match self.release_bucket_write_reservation_proof(proof) {
+            Ok(()) => Ok(()),
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationNotFound { .. },
+            )) => Ok(()),
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict { .. },
+            )) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn release_bucket_write_reservation_proof(

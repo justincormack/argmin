@@ -2261,6 +2261,7 @@ impl super::StorageCluster {
                 if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
+                self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
                 self.wait_for_durable_bucket_write_reservations_empty(bucket)?;
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;

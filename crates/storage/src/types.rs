@@ -2756,34 +2756,6 @@ pub struct CommitMultipartReq {
     pub encryption: ObjectEncryption,
 }
 
-/// Request to finalize a streaming PutObject into a live object.
-///
-/// Layout is always the standard segmented layout — no parts_count field.
-/// The ETag is a single-part CRC64; the storage layer constructs the
-/// `SinglePart` variant, so the caller cannot produce a variant mismatch.
-pub struct CommitStreamPutReq {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub version_id: VersionId,
-    pub owner: OwnerIdentity,
-    pub acl_grants: AclGrants,
-    pub public_read: bool,
-    pub generation_id: GenerationId,
-    pub size: u64,
-    /// CRC64-NVME of the object data.
-    pub etag_crc64: u64,
-    pub ec: EcShape,
-    /// Serialized tagging XML (None = no tags).
-    pub tags: Option<SerializedTagSet>,
-    /// Serialized user metadata headers.
-    pub metadata_blob: Option<SerializedMetadataBlob>,
-    /// Serialized system metadata headers.
-    pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
-    /// Per-version Object Lock state to persist on the committed version.
-    pub object_lock: ObjectLockState,
-    pub encryption: ObjectEncryption,
-}
-
 #[derive(Debug, Clone)]
 pub struct StreamPutFinalizeSnapshot {
     pub session: StreamUploadRecord,

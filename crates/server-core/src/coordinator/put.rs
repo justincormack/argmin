@@ -407,9 +407,8 @@ impl Coordinator {
 
     /// Finalize a streaming PutObject session.
     ///
-    /// Locks the metadata PG, allocates a version_id, builds committed segment
-    /// metadata from staging rows, and atomically commits the object via
-    /// `commit_stream_put`.
+    /// Builds committed segment metadata from staging rows and atomically
+    /// commits the object through the storage metadata-command finalizer.
     ///
     /// The caller passes the running CRC64 checksum, total size, and metadata
     /// blob computed during the append phase. No segment data is re-read.

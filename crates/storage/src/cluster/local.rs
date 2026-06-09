@@ -15076,6 +15076,82 @@ mod tests {
     }
 
     #[test]
+    fn old_empty_put_object_stream_with_live_proof_blocks_bucket_delete() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stale-empty-stream-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9".to_string()).unwrap();
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        cluster
+            .test_force_stream_upload_created_at(&bucket, &key, &session_id, 0)
+            .unwrap();
+
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "valid direct PUT stream proof must block DeleteBucket regardless of stream age: {err:?}"
+        );
+
+        for node_id in node_ids {
+            let object_pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id)
+                .expect("live stream row must remain after blocked DeleteBucket");
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*object_pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .expect("live stream generation reservation must remain after blocked DeleteBucket");
+        }
+        let bucket_pg_primary = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            !crate::PgMetadataStore::durable_bucket_write_reservations(
+                &*bucket_pg_primary,
+                &bucket
+            )
+            .unwrap()
+            .is_empty(),
+            "valid stream-create bucket reservation must remain on the bucket PG primary after blocked DeleteBucket"
+        );
+
+        // Do not terminalize this synthetic stream after forcing created_at:
+        // terminal commands intentionally validate the exact create image.
+    }
+
+    #[test]
     fn active_put_object_stream_upload_blocks_bucket_delete_from_independent_frontend() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

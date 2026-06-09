@@ -57,8 +57,8 @@ fn tagging(tags: Vec<Tag>) -> Tagging {
 // ── 1. Large object round-trip (multi-segment) ────────────────────────
 
 /// PUT an object larger than one internal segment, GET it back, verify
-/// byte-for-byte. Exercises commit_stream_put with multiple segments and
-/// multi-segment shard reads on GET.
+/// byte-for-byte. Exercises streaming PutObject finalization with multiple
+/// segments and multi-segment shard reads on GET.
 #[test]
 fn test_large_object_round_trip_multisegment() {
     s3_tests::run(async {
@@ -920,9 +920,9 @@ fn test_delete_tagging_nonexistent_key() {
 
 // ── 14. Versioned streaming PutObject (large object on versioned bucket) ─
 
-/// PUT an 8 MiB object on a versioned bucket. Exercises the `INSERT INTO`
-/// (versioned) SQL branch in commit_stream_put instead of `INSERT OR REPLACE`
-/// (unversioned).
+/// PUT an 8 MiB object on a versioned bucket. Exercises streaming PutObject
+/// finalization on versioned buckets rather than the unversioned overwrite
+/// path.
 #[test]
 fn test_large_put_versioned_bucket() {
     s3_tests::run(async {
