@@ -2446,6 +2446,29 @@ impl PgStore {
         Ok(Some((previous_log_hash, log_hash)))
     }
 
+    pub(crate) fn metadata_command_log_entry_command_kind_name(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    ) -> Result<Option<&'static str>, StoreError> {
+        let Some(log_index) = MetadataCommandLogIndex::new(log_index) else {
+            return Ok(None);
+        };
+        let Some(entry) = self.load_metadata_command_log_entry(
+            "load metadata command log entry for conflict diagnostics",
+            cluster_epoch,
+            PgId::new(self.pg_id),
+            log_index,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Ok(header) = decode_metadata_command_log_entry_header(&entry.command_bytes) else {
+            return Ok(None);
+        };
+        Ok(header.command_kind_name())
+    }
+
     pub(crate) fn pending_metadata_command_slot(
         &self,
         node_id: u32,

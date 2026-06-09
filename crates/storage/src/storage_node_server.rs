@@ -300,6 +300,45 @@ fn emit_storage_node_metadata_command_log_conflict(
     );
 }
 
+fn metadata_command_log_conflict_kind_from_pg(
+    pg: &crate::PgStore,
+    node_id: u32,
+    cluster_epoch: ClusterEpoch,
+    log_index: u64,
+) -> Option<&'static str> {
+    pg.metadata_command_log_entry_command_kind_name(cluster_epoch, log_index)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            pg.pending_metadata_command_envelope(node_id, cluster_epoch)
+                .ok()
+                .flatten()
+                .and_then(|command| {
+                    (command.id().log_index().get() == log_index)
+                        .then(|| command.payload().kind_name())
+                })
+        })
+}
+
+fn emit_storage_node_metadata_command_log_conflict_for_pg(
+    pg: &crate::PgStore,
+    node_id: u32,
+    pg_id: u32,
+    cluster_epoch: ClusterEpoch,
+    log_index: u64,
+    command_kind: Option<&'static str>,
+) {
+    emit_storage_node_metadata_command_log_conflict(
+        node_id,
+        pg_id,
+        cluster_epoch,
+        log_index,
+        command_kind.or_else(|| {
+            metadata_command_log_conflict_kind_from_pg(pg, node_id, cluster_epoch, log_index)
+        }),
+    );
+}
+
 fn emit_storage_node_metadata_command_pending_conflict(
     node_id: u32,
     pg_id: u32,
@@ -2854,7 +2893,7 @@ impl StorageNodeConnectionHandler {
                     pg_id,
                     cluster_epoch,
                     log_index,
-                    None,
+                    Some("CommitDirectPutObject"),
                 );
                 let payload = encode_direct_put_command_build_response(
                     &StorageRpcDirectPutCommandBuildResponse {
@@ -2943,10 +2982,13 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(error) => {
+                match object_metadata_command_build_error_outcome(error, Some("PutObjectMetadata"))
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -3092,7 +3134,10 @@ impl StorageNodeConnectionHandler {
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
                 }
-                Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Err(error) => match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("DeleteObjectVersion"),
+                ) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
                 },
@@ -3134,7 +3179,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
+            Err(error) => match object_metadata_command_build_error_outcome(
+                error,
+                Some("DeleteObjectVersion"),
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => return encode_storage_rpc_error_response(&error),
             },
@@ -3184,10 +3232,13 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(error) => {
+                match object_metadata_command_build_error_outcome(error, Some("InsertDeleteMarker"))
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -4048,10 +4099,13 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(error) => {
+                match object_metadata_command_build_error_outcome(error, Some("CreateStreamUpload"))
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -4085,7 +4139,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
+            Err(error) => match object_metadata_command_build_error_outcome(
+                error,
+                Some("CreateMultipartUpload"),
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => return encode_storage_rpc_error_response(&error),
             },
@@ -4164,7 +4221,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
+            Err(error) => match object_metadata_command_build_error_outcome(
+                error,
+                Some("CommitDirectPutObject"),
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => return encode_storage_rpc_error_response(&error),
             },
@@ -4247,10 +4307,12 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(error) => {
+                match object_metadata_command_build_error_outcome(error, Some("CommitStreamPart")) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -4318,7 +4380,10 @@ impl StorageNodeConnectionHandler {
                 Err(ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
                     StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
                 }
-                Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Err(error) => match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("CommitMultipartObject"),
+                ) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
                 },
@@ -4396,7 +4461,10 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
-            Err(error) => match object_metadata_command_build_error_outcome(error) {
+            Err(error) => match object_metadata_command_build_error_outcome(
+                error,
+                Some("AbortMultipartUpload"),
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => return encode_storage_rpc_error_response(&error),
             },
@@ -4479,7 +4547,10 @@ impl StorageNodeConnectionHandler {
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
                 }
-                Err(error) => match object_metadata_command_build_error_outcome(error) {
+                Err(error) => match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("AbortMultipartUpload"),
+                ) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
                 },
@@ -5585,49 +5656,52 @@ impl StorageNodeConnectionHandler {
             });
         };
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
-        let response =
-            match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-                self.next_metadata_command_id_from_pg(request.pg_id, &pg, min_log_index)
-            }) {
-                Ok(id) => {
-                    let payload = encode_metadata_command_next_id_response(
-                        &StorageRpcMetadataCommandNextIdResponse {
-                            outcome: StorageRpcMetadataCommandNextIdOutcome::Allocated {
-                                cluster_epoch: id.cluster_epoch(),
-                                pg_id: id.pg_id(),
-                                log_index: id.log_index().get(),
+        let response = match self.node.get_pg(request.pg_id.get()) {
+            Ok(pg) => {
+                match self.next_metadata_command_id_from_pg(request.pg_id, &pg, min_log_index) {
+                    Ok(id) => {
+                        let payload = encode_metadata_command_next_id_response(
+                            &StorageRpcMetadataCommandNextIdResponse {
+                                outcome: StorageRpcMetadataCommandNextIdOutcome::Allocated {
+                                    cluster_epoch: id.cluster_epoch(),
+                                    pg_id: id.pg_id(),
+                                    log_index: id.log_index().get(),
+                                },
                             },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(StoreError::MetadataCommandLogConflict {
-                    node_id,
-                    pg_id,
-                    cluster_epoch,
-                    log_index,
-                }) => {
-                    emit_storage_node_metadata_command_log_conflict(
+                        );
+                        encode_storage_rpc_success_response(&payload)
+                    }
+                    Err(StoreError::MetadataCommandLogConflict {
                         node_id,
                         pg_id,
                         cluster_epoch,
                         log_index,
-                        None,
-                    );
-                    let payload = encode_metadata_command_next_id_response(
-                        &StorageRpcMetadataCommandNextIdResponse {
-                            outcome: StorageRpcMetadataCommandNextIdOutcome::LogConflict {
-                                node_id,
-                                pg_id,
-                                cluster_epoch,
-                                log_index,
+                    }) => {
+                        emit_storage_node_metadata_command_log_conflict_for_pg(
+                            &pg,
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                            None,
+                        );
+                        let payload = encode_metadata_command_next_id_response(
+                            &StorageRpcMetadataCommandNextIdResponse {
+                                outcome: StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+                                    node_id,
+                                    pg_id,
+                                    cluster_epoch,
+                                    log_index,
+                                },
                             },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
+                        );
+                        encode_storage_rpc_success_response(&payload)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
                 }
-                Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
-            };
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
         Ok(response)
     }
 
@@ -7190,6 +7264,7 @@ fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorRespon
 
 fn object_metadata_command_build_error_outcome(
     error: ObjectPgActionError,
+    command_kind: Option<&'static str>,
 ) -> Result<StorageRpcObjectMetadataCommandBuildOutcome, StorageRpcErrorResponse> {
     match error {
         ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
@@ -7203,7 +7278,7 @@ fn object_metadata_command_build_error_outcome(
                 pg_id,
                 cluster_epoch,
                 log_index,
-                None,
+                command_kind,
             );
             Ok(StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
                 node_id,
@@ -9184,6 +9259,9 @@ mod tests {
         assert!(record.detail.contains("pg_id=0"));
         assert!(record.detail.contains("log_index=3"));
         assert!(record.detail.contains("kind=log_conflict"));
+        assert!(record
+            .detail
+            .contains("command_kind=ReserveObjectGeneration"));
         drop(client);
         join.join().unwrap();
     }

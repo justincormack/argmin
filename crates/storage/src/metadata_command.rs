@@ -80,6 +80,7 @@ pub(crate) enum MetadataCommandLogEntryKind {
 pub(crate) struct MetadataCommandLogEntryHeader {
     id: MetadataCommandId,
     kind: MetadataCommandLogEntryKind,
+    command_kind_name: Option<&'static str>,
 }
 
 impl MetadataCommandLogEntryHeader {
@@ -89,6 +90,10 @@ impl MetadataCommandLogEntryHeader {
 
     pub(crate) fn kind(self) -> MetadataCommandLogEntryKind {
         self.kind
+    }
+
+    pub(crate) fn command_kind_name(self) -> Option<&'static str> {
+        self.command_kind_name
     }
 }
 
@@ -267,33 +272,8 @@ pub(crate) enum MetadataCommandPayload {
 
 impl MetadataCommandPayload {
     pub(crate) fn kind_name(&self) -> &'static str {
-        match self {
-            Self::CreateBucket(_) => "CreateBucket",
-            Self::PutBucketVersioning(_) => "PutBucketVersioning",
-            Self::PutBucketAcl(_) => "PutBucketAcl",
-            Self::PutBucketProperty(_) => "PutBucketProperty",
-            Self::PutBucketSubresource(_) => "PutBucketSubresource",
-            Self::MarkBucketDeleting(_) => "MarkBucketDeleting",
-            Self::ReserveObjectGeneration(_) => "ReserveObjectGeneration",
-            Self::ReleaseObjectGeneration(_) => "ReleaseObjectGeneration",
-            Self::ReserveObjectVersion(_) => "ReserveObjectVersion",
-            Self::CommitDirectPutObject(_) => "CommitDirectPutObject",
-            Self::CommitMultipartObject(_) => "CommitMultipartObject",
-            Self::DeleteObjectVersion(_) => "DeleteObjectVersion",
-            Self::InsertDeleteMarker(_) => "InsertDeleteMarker",
-            Self::PutObjectMetadata(_) => "PutObjectMetadata",
-            Self::CreateStreamUpload(_) => "CreateStreamUpload",
-            Self::AppendStreamSegment(_) => "AppendStreamSegment",
-            Self::AbortStreamUpload(_) => "AbortStreamUpload",
-            Self::CommitStreamPart(_) => "CommitStreamPart",
-            Self::CreateMultipartUpload(_) => "CreateMultipartUpload",
-            Self::AbortMultipartUpload(_) => "AbortMultipartUpload",
-            Self::DeleteObjectPayloadReclaim(_) => "DeleteObjectPayloadReclaim",
-            Self::DeleteCompletedMultipartUpload(_) => "DeleteCompletedMultipartUpload",
-            Self::AdvanceCompletedMultipartUploadSequence(_) => {
-                "AdvanceCompletedMultipartUploadSequence"
-            }
-        }
+        metadata_command_payload_kind_name(self.kind_id())
+            .expect("every metadata command payload kind must have a diagnostic name")
     }
 
     fn kind_id(&self) -> u16 {
@@ -354,6 +334,39 @@ impl MetadataCommandPayload {
             Self::DeleteCompletedMultipartUpload(delete) => &delete.record.bucket,
             Self::AdvanceCompletedMultipartUploadSequence(advance) => &advance.bucket,
         }
+    }
+}
+
+fn metadata_command_payload_kind_name(kind_id: u16) -> Option<&'static str> {
+    match kind_id {
+        METADATA_COMMAND_CREATE_BUCKET => Some("CreateBucket"),
+        METADATA_COMMAND_PUT_BUCKET_VERSIONING => Some("PutBucketVersioning"),
+        METADATA_COMMAND_PUT_BUCKET_ACL => Some("PutBucketAcl"),
+        METADATA_COMMAND_PUT_BUCKET_PROPERTY => Some("PutBucketProperty"),
+        METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE => Some("PutBucketSubresource"),
+        METADATA_COMMAND_MARK_BUCKET_DELETING => Some("MarkBucketDeleting"),
+        METADATA_COMMAND_RESERVE_OBJECT_GENERATION => Some("ReserveObjectGeneration"),
+        METADATA_COMMAND_RELEASE_OBJECT_GENERATION => Some("ReleaseObjectGeneration"),
+        METADATA_COMMAND_RESERVE_OBJECT_VERSION => Some("ReserveObjectVersion"),
+        METADATA_COMMAND_COMMIT_DIRECT_PUT_OBJECT => Some("CommitDirectPutObject"),
+        METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => Some("CommitMultipartObject"),
+        METADATA_COMMAND_DELETE_OBJECT_VERSION => Some("DeleteObjectVersion"),
+        METADATA_COMMAND_INSERT_DELETE_MARKER => Some("InsertDeleteMarker"),
+        METADATA_COMMAND_PUT_OBJECT_METADATA => Some("PutObjectMetadata"),
+        METADATA_COMMAND_CREATE_STREAM_UPLOAD => Some("CreateStreamUpload"),
+        METADATA_COMMAND_APPEND_STREAM_SEGMENT => Some("AppendStreamSegment"),
+        METADATA_COMMAND_ABORT_STREAM_UPLOAD => Some("AbortStreamUpload"),
+        METADATA_COMMAND_COMMIT_STREAM_PART => Some("CommitStreamPart"),
+        METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => Some("CreateMultipartUpload"),
+        METADATA_COMMAND_ABORT_MULTIPART_UPLOAD => Some("AbortMultipartUpload"),
+        METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM => Some("DeleteObjectPayloadReclaim"),
+        METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
+            Some("DeleteCompletedMultipartUpload")
+        }
+        METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE => {
+            Some("AdvanceCompletedMultipartUploadSequence")
+        }
+        _ => None,
     }
 }
 
@@ -1137,6 +1150,7 @@ pub(crate) fn decode_metadata_command_log_entry_header(
         return Ok(MetadataCommandLogEntryHeader {
             id,
             kind: MetadataCommandLogEntryKind::Applied,
+            command_kind_name: metadata_command_payload_kind_name(payload_kind),
         });
     }
     if magic == ABANDONED_METADATA_COMMAND_MAGIC {
@@ -1154,6 +1168,7 @@ pub(crate) fn decode_metadata_command_log_entry_header(
             kind: MetadataCommandLogEntryKind::Abandoned {
                 original_command_checksum,
             },
+            command_kind_name: None,
         });
     }
     Err("unknown metadata command log entry magic".to_string())
@@ -4350,6 +4365,7 @@ mod tests {
             .expect("applied command bytes decode");
         assert_eq!(applied_header.id(), id);
         assert_eq!(applied_header.kind(), MetadataCommandLogEntryKind::Applied);
+        assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
         applied_with_trailing_bytes.push(0);
@@ -4377,6 +4393,7 @@ mod tests {
                 original_command_checksum: envelope.checksum_crc64()
             }
         );
+        assert_eq!(abandoned_header.command_kind_name(), None);
     }
 
     #[test]
