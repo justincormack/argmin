@@ -35,6 +35,8 @@ static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
 > = OnceLock::new();
+
+const RECLAIM_DEFERRED_RETRY_SLEEP: Duration = Duration::from_millis(10);
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 
@@ -103,11 +105,18 @@ impl ReclaimSweeper {
                 while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
                     match work {
                         ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
-                            let _ = runtime.try_reclaim_object_payload_for(
+                            let result = runtime.try_reclaim_object_payload_for(
                                 &bucket,
                                 &key,
                                 generation_id,
                             );
+                            if matches!(
+                                result,
+                                Ok(false)
+                                    | Err(ServerError::OperationAborted | ServerError::SlowDown)
+                            ) {
+                                std::thread::sleep(RECLAIM_DEFERRED_RETRY_SLEEP);
+                            }
                         }
                         ReclaimWorkItem::BucketDelete(bucket) => {
                             let _ = runtime.try_finalize_bucket_delete_for(&bucket);
@@ -1178,11 +1187,10 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<(), ServerError> {
+    ) -> Result<bool, ServerError> {
         self.storage_node
             .reclaim_object_payload_if_unleased(bucket, key, generation_id)
-            .map_err(Coordinator::map_object_pg_action_error)?;
-        Ok(())
+            .map_err(Coordinator::map_object_pg_action_error)
     }
 
     #[cfg(test)]
@@ -1191,7 +1199,7 @@ impl ReadRuntime {
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-    ) -> Result<(), ServerError> {
+    ) -> Result<bool, ServerError> {
         self.try_reclaim_object_payload_for(
             &trusted_bucket_name(bucket),
             &trusted_object_key(key),

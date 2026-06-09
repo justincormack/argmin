@@ -6230,7 +6230,8 @@ impl super::StorageCluster {
                     | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
                 }
             }
-            self.drain_pending_object_metadata_command(pg_id, &command)?;
+            self.emit_pending_slot_action_for_command(pg_id, &command, "reclaim_defer");
+            return Ok(false);
         }
 
         let reclaim = {

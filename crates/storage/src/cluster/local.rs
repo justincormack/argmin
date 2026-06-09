@@ -33343,6 +33343,90 @@ mod tests {
     }
 
     #[test]
+    fn object_payload_reclaim_defers_behind_unrelated_pending_object_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, data_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+        set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let old = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Disabled,
+            [31; 16],
+            [32; 16],
+            b"old payload",
+        );
+        let _new = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Disabled,
+            [33; 16],
+            [34; 16],
+            b"new payload",
+        );
+        assert!(
+            cluster
+                .payload_reclaim_exists(&bucket, &key, old.generation_id)
+                .unwrap(),
+            "overwrite should create stale-payload reclaim metadata"
+        );
+
+        let pg_id = PgId::new(object_pg);
+        let command_id = cluster.next_object_metadata_command_id(pg_id).unwrap();
+        let pending = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                crate::SessionId::try_from("ab".repeat(16)).unwrap(),
+                GenerationId::new(100).unwrap(),
+                crate::clock::current_time_millis(),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+
+        assert!(
+            !cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, old.generation_id)
+                .unwrap(),
+            "background reclaim should defer instead of draining foreground object metadata"
+        );
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(pending),
+            "deferred reclaim must leave the existing pending command for foreground drain"
+        );
+        assert_eq!(
+            object_payload_reclaim_claim_count_for_test(&map, pg_id),
+            0,
+            "deferred reclaim must not acquire a durable claim before it owns cleanup"
+        );
+        assert!(
+            cluster
+                .payload_reclaim_exists(&bucket, &key, old.generation_id)
+                .unwrap(),
+            "deferred reclaim root must remain retryable"
+        );
+    }
+
+    #[test]
     fn object_payload_reclaim_acquires_and_releases_durable_claim() {
         let _serial = lock_metadata_command_apply_hook_test();
         let tmp = test_util::tempdir();
