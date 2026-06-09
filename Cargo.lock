@@ -20,6 +20,7 @@ version = "0.1.0"
 dependencies = [
  "auth",
  "ec",
+ "observability",
  "rustls",
  "server-core",
  "server-http",

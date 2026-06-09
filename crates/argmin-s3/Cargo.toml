@@ -11,6 +11,7 @@ path = "src/main.rs"
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",
+    "observability/deep-tracing",
     "server-core/deep-tracing",
     "server-http/deep-tracing",
     "storage/deep-tracing",
@@ -19,6 +20,7 @@ deep-tracing = [
 [dependencies]
 auth = { path = "../auth" }
 ec = { path = "../ec", default-features = false }
+observability = { path = "../observability" }
 server-core = { path = "../server-core", default-features = false }
 server-http = { path = "../server-http", default-features = false }
 storage = { path = "../storage", default-features = false }

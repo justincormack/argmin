@@ -6373,6 +6373,14 @@ Status:
   is `POST /__argmin/debug/flight-recorder/dump`; it dumps the already-redacted
   bounded ring to stderr rather than returning request/RPC details, headers,
   bucket/key names, payload context, or SSE-C material in the HTTP response.
+- Continued the permanent diagnostics slice by having `argmin-s3` install a
+  process-wide panic hook after configuration succeeds. Any frontend,
+  storage-node, or legacy-local panic now dumps the same bounded, redacted
+  flight-recorder ring to stderr before delegating to the normal Rust panic
+  hook. The UAT wrapper also enables the local-only debug endpoint on loopback
+  frontends and requests a flight-recorder dump before teardown on failed runs,
+  while gating extra metadata-command conflict stderr diagnostics behind
+  `ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS`.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

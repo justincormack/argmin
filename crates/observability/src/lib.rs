@@ -6,7 +6,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread;
 #[cfg(feature = "deep-tracing")]
 use std::time::Instant;
@@ -99,6 +99,7 @@ static METADATA_COMMAND_CONFLICT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_SESSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
+static PANIC_FLIGHT_RECORDER_HOOK: Once = Once::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
@@ -306,6 +307,16 @@ pub fn dump_flight_recorder_to_stderr(reason: &str) {
             record.detail
         );
     }
+}
+
+pub fn install_panic_flight_recorder_hook() {
+    PANIC_FLIGHT_RECORDER_HOOK.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            dump_flight_recorder_to_stderr("panic");
+            previous_hook(info);
+        }));
+    });
 }
 
 fn trace_config() -> &'static TraceConfig {

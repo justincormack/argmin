@@ -112,6 +112,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    observability::install_panic_flight_recorder_hook();
     let host_id = config
         .host_id
         .clone()
