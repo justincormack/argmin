@@ -153,6 +153,16 @@ Publisher classes:
   top-of-loop matching branch; generic drain can delete the session before the
   retry can validate or finish the matching command.
 
+Direct streamed `PutObject` session liveness is represented by the
+stream-create bucket-write reservation proof, not by the stream row age. A live
+frontend refreshes that proof while the request can still append or finalize.
+`DeleteBucket` must treat a direct `PutObject` stream row with a validating
+proof as live bucket contents and return the normal non-empty result; if the
+proof is missing, mismatched, or expired, the stream is abandoned staging and
+may be aborted during DeleteBucket's synchronous drain. The background stream
+session sweeper uses the same proof-validation rule so abandoned sessions are
+eventually cleaned even without a DeleteBucket request.
+
 Current production pending-command publishers:
 
 | Publisher path | Command kind | Class | Required contention shape |

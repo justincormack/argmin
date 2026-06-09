@@ -632,4 +632,13 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         self.abort_stream_put_for(bucket, key, session_id)
     }
+
+    pub fn heartbeat_stream_put_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        self.heartbeat_stream_put_for(bucket, key, session_id)
+    }
 }

@@ -36,8 +36,9 @@ use crate::storage_rpc::{
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
     decode_bucket_subresource_get_request, decode_bucket_write_drain_begin_request,
     decode_bucket_write_drain_clear_expired_request, decode_bucket_write_drain_record_request,
-    decode_bucket_write_reservation_acquire_request, decode_bucket_write_reservation_proof_request,
-    decode_bucket_write_reservation_record_request,
+    decode_bucket_write_reservation_acquire_request,
+    decode_bucket_write_reservation_heartbeat_request,
+    decode_bucket_write_reservation_proof_request, decode_bucket_write_reservation_record_request,
     decode_complete_multipart_command_build_request,
     decode_completed_multipart_order_command_build_request,
     decode_completed_multipart_uploads_list_request, decode_create_bucket_command_build_request,
@@ -141,9 +142,9 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteDrainBeginResponse, StorageRpcBucketWriteDrainClearExpiredRequest,
     StorageRpcBucketWriteDrainOptionalRecordResponse, StorageRpcBucketWriteDrainRecordRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
-    StorageRpcBucketWriteReservationProofRequest, StorageRpcBucketWriteReservationRecordRequest,
-    StorageRpcBucketWriteReservationRecordResponse, StorageRpcBucketWriteReservationsListResponse,
-    StorageRpcCompleteMultipartCommandBuildRequest,
+    StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcBucketWriteReservationProofRequest,
+    StorageRpcBucketWriteReservationRecordRequest, StorageRpcBucketWriteReservationRecordResponse,
+    StorageRpcBucketWriteReservationsListResponse, StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildResponse,
     StorageRpcCompletedMultipartUploadsListRequest,
@@ -764,6 +765,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketWriteReservationValidate => {
                 match decode_bucket_write_reservation_proof_request(&frame.payload) {
                     Ok(request) => self.bucket_write_reservation_validate_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketWriteReservationHeartbeat => {
+                match decode_bucket_write_reservation_heartbeat_request(&frame.payload) {
+                    Ok(request) => self.bucket_write_reservation_heartbeat_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1981,6 +1991,41 @@ impl StorageNodeConnectionHandler {
             &request.proof,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_write_reservation_heartbeat_response(
+        &self,
+        request: StorageRpcBucketWriteReservationHeartbeatRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.proof.bucket,
+            "bucket write reservation heartbeat",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
+            &local_client,
+            request.pg_id,
+            &request.proof,
+            request.lease_deadline,
+        ) {
+            Ok(record) => {
+                let payload = encode_bucket_write_reservation_record_response(
+                    &StorageRpcBucketWriteReservationRecordResponse {
+                        outcome: StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record),
+                    },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
         }
     }
@@ -5995,6 +6040,18 @@ impl StorageNodeConnectionHandler {
                                     write_sequence,
                                     generation_id,
                                 },
+                        },
+                    );
+                    encode_storage_rpc_success_response(&payload)
+                }
+                Err(BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::StreamSegmentConflict { segment_index },
+                )) => {
+                    let payload = encode_metadata_command_state_outcome_response(
+                        &StorageRpcMetadataCommandStateOutcomeResponse {
+                            outcome: StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict {
+                                segment_index,
+                            },
                         },
                     );
                     encode_storage_rpc_success_response(&payload)

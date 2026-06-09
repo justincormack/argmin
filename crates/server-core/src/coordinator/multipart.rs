@@ -84,6 +84,11 @@ impl Coordinator {
                 storage::MetadataError::NoSuchUpload { upload_id } => {
                     ServerError::NoSuchUpload { upload_id }
                 }
+                storage::MetadataError::StreamSegmentConflict { .. } => {
+                    ServerError::InvalidRequest {
+                        reason: "stream segment index already exists".to_string(),
+                    }
+                }
                 other => ServerError::Metadata(other),
             },
         }

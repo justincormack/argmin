@@ -54,7 +54,9 @@ pub use self::request_types::*;
 use self::request_types::{AuthorizedWriteTags, BucketCreateOutcome};
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
-use self::runtime::{LifecycleSweeper, ReclaimSweeper, ShardScavengerSweeper};
+use self::runtime::{
+    LifecycleSweeper, ReclaimSweeper, ShardScavengerSweeper, StreamSessionSweeper,
+};
 #[cfg(test)]
 use self::test_hooks::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -185,6 +187,11 @@ const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
 const SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS: u64 = 50;
 #[cfg(not(test))]
 const SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS: u64 = 60_000;
+#[cfg(test)]
+const STREAM_SESSION_SWEEP_INTERVAL_MILLIS: u64 = 50;
+#[cfg(not(test))]
+const STREAM_SESSION_SWEEP_INTERVAL_MILLIS: u64 = 10_000;
+const STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS: u64 = 60_000;
 const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;
 #[cfg(test)]
 const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 50;
@@ -455,6 +462,7 @@ pub struct Coordinator {
     managed_key_provider: Option<StaticManagedKeyProvider>,
     _reclaim_sweeper: ReclaimSweeper,
     _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,
+    _stream_session_sweeper: Arc<StreamSessionSweeper>,
     _lifecycle_sweeper: Arc<LifecycleSweeper>,
 }
 

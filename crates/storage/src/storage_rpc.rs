@@ -293,6 +293,8 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
         + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
+const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
@@ -455,6 +457,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketWriteReservationAcquire = 38,
     BucketWriteReservationValidate = 39,
     BucketWriteReservationRelease = 40,
+    BucketWriteReservationHeartbeat = 123,
     BucketSnapshotLoad = 41,
     BucketSnapshotPairLoad = 42,
     DirectPutCommitSnapshotLoad = 43,
@@ -636,6 +639,7 @@ impl StorageRpcMessageKind {
             Self::BucketWriteReservationAcquire => "bucket write reservation acquire",
             Self::BucketWriteReservationValidate => "bucket write reservation validate",
             Self::BucketWriteReservationRelease => "bucket write reservation release",
+            Self::BucketWriteReservationHeartbeat => "bucket write reservation heartbeat",
             Self::BucketSnapshotLoad => "bucket snapshot load",
             Self::BucketSnapshotPairLoad => "bucket snapshot pair load",
             Self::DirectPutCommitSnapshotLoad => "direct PUT commit snapshot load",
@@ -768,6 +772,7 @@ impl StorageRpcMessageKind {
             38 => Ok(Self::BucketWriteReservationAcquire),
             39 => Ok(Self::BucketWriteReservationValidate),
             40 => Ok(Self::BucketWriteReservationRelease),
+            123 => Ok(Self::BucketWriteReservationHeartbeat),
             41 => Ok(Self::BucketSnapshotLoad),
             42 => Ok(Self::BucketSnapshotPairLoad),
             43 => Ok(Self::DirectPutCommitSnapshotLoad),
@@ -2429,6 +2434,9 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
         write_sequence: u64,
         generation_id: Option<GenerationId>,
     },
+    StreamSegmentConflict {
+        segment_index: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2633,6 +2641,15 @@ pub(crate) struct StorageRpcBucketWriteReservationProofRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteReservationHeartbeatRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) proof: BucketWriteReservationProof,
+    pub(crate) lease_deadline: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3083,6 +3100,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketWriteReservationValidate => {
             STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteReservationHeartbeat => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketWriteReservationRelease => {
             STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN
@@ -7753,6 +7773,10 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
                 None => put_u8(&mut out, 0),
             }
         }
+        StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => {
+            put_u8(&mut out, 6);
+            put_u32(&mut out, segment_index);
+        }
     }
     out
 }
@@ -7805,6 +7829,9 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
                 generation_id,
             }
         }
+        6 => StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict {
+            segment_index: decoder.read_u32()?,
+        },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown metadata command state outcome tag",
@@ -8890,6 +8917,41 @@ pub(crate) fn decode_bucket_write_reservation_proof_request(
         cluster_epoch: request.cluster_epoch,
         pg_id: request.pg_id,
         proof: request.proof,
+    })
+}
+
+pub(crate) fn encode_bucket_write_reservation_heartbeat_request(
+    request: &StorageRpcBucketWriteReservationHeartbeatRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_write_reservation_proof_request(
+        &StorageRpcBucketWriteReservationProofRequest {
+            node_id: request.node_id,
+            cluster_epoch: request.cluster_epoch,
+            pg_id: request.pg_id,
+            proof: request.proof.clone(),
+        },
+    )?;
+    put_u64(&mut out, request.lease_deadline);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_reservation_heartbeat_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcPayloadError> {
+    if bytes.len() < 8 {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let proof_len = bytes.len() - 8;
+    let proof_request = decode_bucket_write_reservation_proof_request(&bytes[..proof_len])?;
+    let mut decoder = StorageRpcDecoder::new(&bytes[proof_len..]);
+    let lease_deadline = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketWriteReservationHeartbeatRequest {
+        node_id: proof_request.node_id,
+        cluster_epoch: proof_request.cluster_epoch,
+        pg_id: proof_request.pg_id,
+        proof: proof_request.proof,
+        lease_deadline,
     })
 }
 

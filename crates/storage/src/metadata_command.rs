@@ -897,7 +897,6 @@ impl BucketWriteReservationProof {
             && self.bucket_incarnation_generation == record.bucket_incarnation_generation
             && self.operation_kind == record.operation_kind
             && self.created_at == record.created_at
-            && self.lease_deadline == record.lease_deadline
             && self.target_context == record.target_context
     }
 }

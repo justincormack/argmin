@@ -3645,8 +3645,16 @@ Proposed subphases:
            bucket-write reservation proof blocks DeleteBucket and must return
            the normal non-empty outcome, while a row whose proof no longer
            validates has been abandoned and DeleteBucket may abort that unowned
-           stream session before making the final emptiness decision. This
-           distinction must be explicit; do not use age-based heuristics.
+           stream session before making the final emptiness decision. Direct
+           `PutObject` stream-create proofs are renewable durable leases: a live
+           frontend refreshes the lease while the request can still append or
+           finalize, and disconnect/crash stops renewal so the proof eventually
+           fails validation. DeleteBucket performs this abandoned-session cleanup
+           synchronously before failing a bucket as non-empty, and a shared
+           background stream-session sweeper periodically applies the same
+           proof-validation rule so cleanup is eventually reliable even without
+           a DeleteBucket request. This distinction must be explicit; do not use
+           age-based heuristics as the liveness authority.
         3. Add a return-boundary audit while reworking `begin_bucket_delete`.
            Keep only waits needed before returning a correct DeleteBucket
            result: admitted writers that can still publish visible data,

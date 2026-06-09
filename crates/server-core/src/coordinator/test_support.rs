@@ -149,6 +149,7 @@ pub(crate) fn setup_coordinator_with_pg_count_without_background_sweepers(
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
+            |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
     .unwrap()
@@ -229,6 +230,7 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_backgr
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
+            |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
     .unwrap()

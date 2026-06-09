@@ -583,6 +583,9 @@ impl From<MetadataError> for ServerError {
                 ServerError::InvalidBucketName { reason }
             }
             MetadataError::InvalidObjectKey { reason } => ServerError::InvalidArgument { reason },
+            MetadataError::StreamSegmentConflict { .. } => ServerError::InvalidRequest {
+                reason: "stream segment index already exists".to_string(),
+            },
             other => ServerError::Metadata(other),
         }
     }

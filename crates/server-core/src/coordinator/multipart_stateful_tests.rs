@@ -975,7 +975,9 @@ fn scavenging_stale_sessions_removes_abandoned_streaming_state() {
         .unwrap();
 
     state.force_stream_session_created_at("bucket", "key", &session_id, 0);
-    let count = coord.scavenge_stale_sessions(1);
+    let scavenge_time = storage::clock::current_time_millis().saturating_add(61_000);
+    let count =
+        storage::clock::with_time_override(scavenge_time, || coord.scavenge_stale_sessions(1));
     assert_eq!(
         count, 1,
         "{invariant}: expected exactly one stale session scavenged"
@@ -1553,7 +1555,9 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
     state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
 
     state.force_stream_session_created_at("bucket", "key", &session_id, 0);
-    let count = coord.scavenge_stale_sessions(1);
+    let scavenge_time = storage::clock::current_time_millis().saturating_add(61_000);
+    let count =
+        storage::clock::with_time_override(scavenge_time, || coord.scavenge_stale_sessions(1));
     assert_eq!(
         count, 1,
         "{invariant}: expected stale-session scavenging to clean the failed finalize session"
@@ -1565,11 +1569,11 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
 }
 
 #[test]
-fn failed_stream_part_finalize_is_scavenged_without_visible_part_or_orphans() {
+fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
     let invariant =
-        "a failed stream-part finalize leaves no visible multipart part, and stale-session scavenging removes the abandoned staged shards";
+        "a failed stream-part finalize leaves no visible multipart part, and abort cleanup removes the staged shards";
     let state = InvariantHarness::new(&coord);
 
     coord
@@ -1636,15 +1640,16 @@ fn failed_stream_part_finalize_is_scavenged_without_visible_part_or_orphans() {
     assert_eq!(
         sessions.len(),
         1,
-        "{invariant}: failed part finalize should leave exactly one stale session to scavenge"
+        "{invariant}: failed part finalize should leave exactly one active session for the request abort guard"
     );
 
-    state.force_stream_session_created_at("bucket", "key", &session_id, 0);
-    let count = coord.scavenge_stale_sessions(1);
-    assert_eq!(
-        count, 1,
-        "{invariant}: expected stale-session scavenging to clean the failed stream-part session"
-    );
+    coord
+        .abort_stream_part_session(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &session_id,
+        )
+        .expect("abort failed stream-part session");
 
     state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
     assert!(
@@ -1653,7 +1658,7 @@ fn failed_stream_part_finalize_is_scavenged_without_visible_part_or_orphans() {
             .is_empty(),
         "{invariant}: failed finalize should leave no committed multipart part segments"
     );
-    assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after scavenging");
+    assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after abort cleanup");
 }
 
 #[test]

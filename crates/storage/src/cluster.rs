@@ -4052,11 +4052,9 @@ impl StorageCluster {
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
         loop {
-            let reservation = match self.acquire_durable_bucket_write_reservation(
-                bucket,
-                "put-object-stream-create",
-                Some(key.as_str()),
-            ) {
+            let reservation = match self
+                .acquire_durable_put_object_stream_write_reservation(bucket, key)
+            {
                 Ok(reservation) => reservation,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
                     self.wait_for_durable_bucket_write_drain(bucket)
@@ -4892,6 +4890,52 @@ impl StorageCluster {
             }
         }
         sessions
+    }
+
+    pub fn scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
+        let cutoff = crate::clock::current_time_millis().saturating_sub(max_age_ms);
+        let mut count = 0;
+
+        for session in self.list_stream_upload_sessions_best_effort() {
+            if session.created_at >= cutoff {
+                continue;
+            }
+            if session.target != StreamUploadTarget::PutObject {
+                continue;
+            }
+            match self.stream_upload_has_live_bucket_write_reservation(&session) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => continue,
+            }
+            match self.abort_stream_upload_session(
+                &session.bucket,
+                &session.key,
+                &session.session_id,
+            ) {
+                Ok(()) => {
+                    let _ = self.release_object_generation_reservation(
+                        &session.bucket,
+                        &session.key,
+                        &session.session_id,
+                    );
+                    count += 1;
+                }
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) => {
+                    let _ = self.release_object_generation_reservation(
+                        &session.bucket,
+                        &session.key,
+                        &session.session_id,
+                    );
+                    count += 1;
+                }
+                Err(_) => {}
+            }
+        }
+
+        count
     }
 
     pub fn read_segment_payload_stored_bytes_into(

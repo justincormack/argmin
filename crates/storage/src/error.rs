@@ -713,6 +713,9 @@ pub enum MetadataError {
     #[error("stream session not in InProgress state (current: {state})")]
     StreamSessionNotInProgress { state: u8 },
 
+    #[error("stream segment already exists at index {segment_index}")]
+    StreamSegmentConflict { segment_index: u32 },
+
     #[error("object generation reservation not found: {reservation_id}")]
     ObjectGenerationReservationNotFound { reservation_id: String },
 

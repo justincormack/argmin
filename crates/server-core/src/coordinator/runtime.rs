@@ -32,6 +32,9 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleS
 static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
 > = OnceLock::new();
+static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
+> = OnceLock::new();
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 
@@ -49,6 +52,12 @@ pub(super) struct LifecycleSweeper {
 }
 
 pub(super) struct ShardScavengerSweeper {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
+    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(super) struct StreamSessionSweeper {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
@@ -137,6 +146,17 @@ impl Drop for LifecycleSweeper {
 }
 
 impl Drop for ShardScavengerSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        *lock_mutex_unpoisoned(&self.wake.0) = true;
+        self.wake.1.notify_all();
+        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StreamSessionSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         *lock_mutex_unpoisoned(&self.wake.0) = true;
@@ -270,6 +290,80 @@ impl ShardScavengerSweeper {
             })
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start shard scavenger worker: {e}"),
+            })?;
+        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
+        Ok(sweeper)
+    }
+
+    pub(super) fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new((Mutex::new(true), Condvar::new())),
+            handle: Mutex::new(None),
+        })
+    }
+}
+
+impl StreamSessionSweeper {
+    pub(super) fn acquire_shared(
+        storage_cluster: &Arc<StorageCluster>,
+    ) -> Result<Arc<Self>, ServerError> {
+        let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<StreamSessionSweeper>>> =
+            lock_mutex_unpoisoned(registry);
+        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+
+        let key = storage_cluster.process_local_registry_key();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(Arc::clone(storage_cluster))?;
+        registry.insert(key, Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let sweeper = Arc::new(Self {
+            stop: Arc::clone(&stop),
+            wake: Arc::clone(&wake),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-stream-session-sweeper".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let count = storage_cluster.scavenge_abandoned_stream_sessions(
+                        super::STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS,
+                    );
+                    if count > 0 {
+                        let _ = observability::event(
+                            TRACE_TARGET,
+                            "stream_session_sweep_abandoned",
+                            Some(format_args!("aborted_sessions={count}")),
+                        );
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
+                    if *stop_guard {
+                        break;
+                    }
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(
+                            stop_guard,
+                            Duration::from_millis(super::STREAM_SESSION_SWEEP_INTERVAL_MILLIS),
+                            |stop_requested| !*stop_requested,
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start stream session sweeper: {e}"),
             })?;
         *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
         Ok(sweeper)

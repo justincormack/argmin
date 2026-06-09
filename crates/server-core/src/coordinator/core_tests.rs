@@ -868,6 +868,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
             object_reclaim_and_bucket_finalize: true,
             lifecycle: true,
             shard_scavenger: true,
+            stream_session: true,
         }
     );
 }

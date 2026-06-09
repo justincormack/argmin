@@ -1,7 +1,7 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -27,12 +27,16 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
-use storage::{BucketName, SessionId};
+use storage::{BucketName, ObjectKey, SessionId};
 
 #[cfg(feature = "deep-tracing")]
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
 const MAX_STREAMING_POST_NON_FILE_FORM_BYTES: usize = MAX_BUFFERED_CONTROL_BODY_SIZE;
+#[cfg(not(test))]
+const STREAMING_PUT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STREAMING_PUT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_STREAMING_POST_DEFAULT_FIELD_BYTES: usize = 8 * 1024;
 const MAX_STREAMING_POST_KEY_FIELD_BYTES: usize = 2 * 1024;
 const MAX_STREAMING_POST_POLICY_FIELD_BYTES: usize = 256 * 1024;
@@ -357,6 +361,7 @@ struct StreamingAbortGuard {
     state: Arc<ServerState>,
     cleanup: Mutex<Option<StreamingAbortCleanup>>,
     disarmed: AtomicBool,
+    put_heartbeat_started: AtomicBool,
 }
 
 impl StreamingAbortGuard {
@@ -365,6 +370,7 @@ impl StreamingAbortGuard {
             state: Arc::clone(state),
             cleanup: Mutex::new(None),
             disarmed: AtomicBool::new(false),
+            put_heartbeat_started: AtomicBool::new(false),
         })
     }
 
@@ -375,10 +381,65 @@ impl StreamingAbortGuard {
         });
     }
 
-    fn arm_post(&self, ctx: &Arc<super::StreamingPostContext>) {
+    fn start_put_object_heartbeat(
+        self: &Arc<Self>,
+        trace: observability::TraceContext,
+        bucket: BucketName,
+        key: ObjectKey,
+        session_id: SessionId,
+    ) {
+        if self.put_heartbeat_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let guard: Weak<Self> = Arc::downgrade(self);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STREAMING_PUT_HEARTBEAT_INTERVAL).await;
+                let Some(guard) = guard.upgrade() else {
+                    break;
+                };
+                if guard.disarmed.load(Ordering::Acquire) {
+                    break;
+                }
+                drop(guard);
+                let state = Arc::clone(&state);
+                let trace = trace.clone();
+                let bucket = bucket.clone();
+                let key = key.clone();
+                let session_id = session_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let frontend = acquire_frontend(&state);
+                    frontend.heartbeat_streaming_put_object(&trace, &bucket, &key, &session_id)
+                })
+                .await;
+            }
+        });
+    }
+
+    fn start_put_heartbeat(
+        self: &Arc<Self>,
+        ctx: &Arc<super::StreamingPutContext>,
+        session_id: &SessionId,
+    ) {
+        self.start_put_object_heartbeat(
+            ctx.trace.clone(),
+            ctx.bucket().clone(),
+            ctx.key().clone(),
+            session_id.clone(),
+        );
+    }
+
+    fn arm_post(self: &Arc<Self>, ctx: &Arc<super::StreamingPostContext>) {
         *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Post {
             ctx: Arc::clone(ctx),
         });
+        self.start_put_object_heartbeat(
+            ctx.trace.clone(),
+            ctx.bucket().clone(),
+            ctx.key().clone(),
+            ctx.session_id().clone(),
+        );
     }
 
     fn arm_part(&self, ctx: &Arc<super::StreamingPartContext>) {
@@ -2576,6 +2637,7 @@ async fn ensure_streaming_put_session(
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if let Some(existing) = session_id.as_ref() {
         abort_guard.arm_put(ctx, existing);
+        abort_guard.start_put_heartbeat(ctx, existing);
         return Ok(());
     }
 
@@ -2625,6 +2687,7 @@ async fn ensure_streaming_put_session(
                     body_bytes_received
                 ),
             );
+            abort_guard.start_put_heartbeat(ctx, &new_session_id);
             *session_id = Some(new_session_id);
             Ok(())
         }
@@ -5563,11 +5626,18 @@ Connection: close\r\n\r\n",
                 .unwrap();
             let ctx = Arc::new(ctx);
             worker_guard.arm_post(&ctx);
-            ctx.session_id().clone()
+            (
+                ctx.session_id().clone(),
+                worker_guard.put_heartbeat_started.load(Ordering::Acquire),
+            )
         });
         drop(guard);
 
-        let session_id = join.await.unwrap();
+        let (session_id, heartbeat_started) = join.await.unwrap();
+        assert!(
+            heartbeat_started,
+            "streaming POST must renew the PutObject stream proof while the request is active"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             frontend.coordinator.scavenge_stale_sessions(0),

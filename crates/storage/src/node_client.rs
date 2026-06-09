@@ -78,8 +78,9 @@ use crate::storage_rpc::{
     encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_subresource_get_request, encode_bucket_write_drain_begin_request,
     encode_bucket_write_drain_clear_expired_request, encode_bucket_write_drain_record_request,
-    encode_bucket_write_reservation_acquire_request, encode_bucket_write_reservation_proof_request,
-    encode_bucket_write_reservation_record_request,
+    encode_bucket_write_reservation_acquire_request,
+    encode_bucket_write_reservation_heartbeat_request,
+    encode_bucket_write_reservation_proof_request, encode_bucket_write_reservation_record_request,
     encode_complete_multipart_command_build_request,
     encode_completed_multipart_order_command_build_request,
     encode_completed_multipart_uploads_list_request, encode_create_bucket_command_build_request,
@@ -130,7 +131,8 @@ use crate::storage_rpc::{
     StorageRpcBucketSubresourceGetRequest, StorageRpcBucketWriteDrainBeginOutcome,
     StorageRpcBucketWriteDrainBeginRequest, StorageRpcBucketWriteDrainClearExpiredRequest,
     StorageRpcBucketWriteDrainRecordRequest, StorageRpcBucketWriteReservationAcquireOutcome,
-    StorageRpcBucketWriteReservationAcquireRequest, StorageRpcBucketWriteReservationProofRequest,
+    StorageRpcBucketWriteReservationAcquireRequest,
+    StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcBucketWriteReservationProofRequest,
     StorageRpcBucketWriteReservationRecordRequest, StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCompletedMultipartUploadsListRequest, StorageRpcCreateBucketCommandBuildOutcome,
@@ -180,7 +182,7 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
     StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsPgListRequest,
 };
-use crate::traits::{PgMetadataStore, ShardStore};
+use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
 use crate::types::{
     AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord,
     BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot,
@@ -1192,6 +1194,13 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
 
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+
     fn delete_finalized_bucket(
         &self,
         pg_id: PgId,
@@ -2085,6 +2094,13 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
+
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &crate::BucketWriteReservationProof,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn load_bucket_snapshot(
         &self,
@@ -3427,6 +3443,11 @@ impl UnixStorageNodeClient {
                     "record abandoned response cannot contain stale object write command"
                         .to_string(),
                 )),
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stream segment conflict".to_string(),
+                )),
         }
     }
 
@@ -3517,6 +3538,11 @@ impl UnixStorageNodeClient {
                 Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
                 Err(error) => Err(BucketSnapshotLoadError::Store(error)),
             },
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => {
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::StreamSegmentConflict { segment_index },
+                ))
+            }
         }
     }
 
@@ -5401,6 +5427,11 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                 Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
                 Err(error) => Err(BucketSnapshotLoadError::Store(error)),
             },
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => {
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::StreamSegmentConflict { segment_index },
+                ))
+            }
         }
     }
 
@@ -5465,6 +5496,11 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                     "decode metadata command record abandoned response",
                     "record abandoned response cannot contain stale object write command"
                         .to_string(),
+                )),
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stream segment conflict".to_string(),
                 )),
         }
     }
@@ -6077,6 +6113,20 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::durable_bucket_write_reservations(self, pg_id, bucket)
+    }
+
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::heartbeat_durable_bucket_write_reservation(
+            self,
+            pg_id,
+            proof,
+            lease_deadline,
+        )
     }
 
     fn delete_finalized_bucket(
@@ -7743,6 +7793,58 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             "decode bucket write reservation validate response",
             &response,
         )
+    }
+
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &BucketWriteReservationProof,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteReservationHeartbeatRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            proof: proof.clone(),
+            lease_deadline,
+        };
+        let payload =
+            encode_bucket_write_reservation_heartbeat_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write reservation heartbeat request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketWriteReservationHeartbeat,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_write_reservation_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket write reservation heartbeat response",
+                    error.to_string(),
+                ))
+            })?;
+        let record = match response.outcome {
+            StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) => record,
+            StorageRpcBucketWriteReservationAcquireOutcome::Draining
+            | StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { .. } => {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket write reservation heartbeat response",
+                    "heartbeat response returned non-record outcome".to_string(),
+                )));
+            }
+        };
+        if !proof.matches_record(&record) || record.lease_deadline != Some(lease_deadline) {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket write reservation heartbeat response",
+                "heartbeat response identity does not match request".to_string(),
+            )));
+        }
+        Ok(record)
     }
 
     fn release_durable_bucket_write_reservation(
@@ -12766,6 +12868,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
             }
             .into());
         }
+        if record
+            .lease_deadline
+            .is_some_and(|deadline| deadline <= crate::clock::current_time_millis())
+        {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        }
         let current_bucket = PgMetadataStore::head_bucket_raw(&*pg, &proof.bucket)?;
         if current_bucket.state == BucketState::Active
             && current_bucket.bucket_incarnation_generation == proof.bucket_incarnation_generation
@@ -12885,6 +12996,27 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::durable_bucket_write_reservations(
             &*pg, bucket,
+        )?)
+    }
+
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        proof: &crate::BucketWriteReservationProof,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::heartbeat_durable_bucket_write_reservation(
+            &*pg,
+            DurableBucketWriteReservationHeartbeat {
+                name: &proof.bucket,
+                reservation_id: &proof.reservation_id,
+                owner_token: &proof.owner_token,
+                cluster_epoch: proof.cluster_epoch,
+                bucket_execution_generation: proof.bucket_execution_generation,
+                bucket_incarnation_generation: proof.bucket_incarnation_generation,
+                lease_deadline,
+            },
         )?)
     }
 
@@ -16373,7 +16505,7 @@ mod tests {
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..3)
+        let server_threads: Vec<_> = (0..4)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -16385,6 +16517,7 @@ mod tests {
             config.socket_path.clone(),
         );
 
+        let lease_deadline = crate::clock::current_time_millis().saturating_add(60_000);
         let record = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
             &client,
             PgId::new(0),
@@ -16394,7 +16527,7 @@ mod tests {
             ClusterEpoch::new(1).unwrap(),
             "put-object",
             10,
-            Some(20),
+            Some(lease_deadline),
             Some("key=a"),
         )
         .unwrap();
@@ -16407,10 +16540,19 @@ mod tests {
             &BucketWriteReservationProof::from(&record),
         )
         .unwrap();
+        let renewed_deadline = lease_deadline.saturating_add(60_000);
+        let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
+            &client,
+            PgId::new(0),
+            &BucketWriteReservationProof::from(&record),
+            renewed_deadline,
+        )
+        .unwrap();
+        assert_eq!(renewed.lease_deadline, Some(renewed_deadline));
         BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
             &client,
             PgId::new(0),
-            &record,
+            &renewed,
         )
         .unwrap();
         for thread in server_threads {

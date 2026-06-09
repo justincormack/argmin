@@ -519,6 +519,17 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)
     }
 
+    pub(super) fn heartbeat_stream_put_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        self.storage_node
+            .heartbeat_put_object_stream_session(bucket, key, session_id)
+            .map_err(Self::map_object_pg_action_error)
+    }
+
     #[cfg(test)]
     pub fn abort_stream_put(
         &self,
@@ -534,23 +545,7 @@ impl Coordinator {
     }
 
     pub fn scavenge_stale_sessions(&self, max_age_ms: u64) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let cutoff = now.saturating_sub(max_age_ms);
-        let mut count = 0;
-
-        for session in self.storage_node.list_stream_upload_sessions_best_effort() {
-            if session.created_at < cutoff
-                && self
-                    .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)
-                    .is_ok()
-            {
-                count += 1;
-            }
-        }
-
-        count
+        self.storage_node
+            .scavenge_abandoned_stream_sessions(max_age_ms)
     }
 }

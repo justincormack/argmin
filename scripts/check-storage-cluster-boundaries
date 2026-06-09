@@ -724,7 +724,7 @@ migrated_bucket_write_coordination_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if ($0 ~ /PgMetadataStore::(acquire_durable_bucket_write_reservation|durable_bucket_write_reservation|durable_bucket_write_reservations|release_durable_bucket_write_reservation|release_metadata_command_bucket_write_reservation|begin_durable_bucket_write_drain|durable_bucket_write_drain|clear_durable_bucket_write_drain|clear_expired_durable_bucket_write_drain)/) {
+        if ($0 ~ /PgMetadataStore::(acquire_durable_bucket_write_reservation|durable_bucket_write_reservation|durable_bucket_write_reservations|heartbeat_durable_bucket_write_reservation|release_durable_bucket_write_reservation|release_metadata_command_bucket_write_reservation|begin_durable_bucket_write_drain|durable_bucket_write_drain|clear_durable_bucket_write_drain|clear_expired_durable_bucket_write_drain)/) {
             print FILENAME ":" FNR ":" $0
         }
     }
@@ -1951,6 +1951,7 @@ production_metadata_methods=$(
             || name == "acquire_durable_bucket_write_reservation" \
             || name == "durable_bucket_write_reservation" \
             || name == "durable_bucket_write_reservations" \
+            || name == "heartbeat_durable_bucket_write_reservation" \
             || name == "release_durable_bucket_write_reservation" \
             || name == "release_metadata_command_bucket_write_reservation" \
             || name == "begin_durable_bucket_write_drain" \
@@ -2260,8 +2261,26 @@ fail_with_matches \
     "$stream_create_runtime_record_payloads"
 
 optional_bucket_write_proof_fields=$(
-    rg -n --color=never \
-        'bucket_write_reservation:[[:space:]]*Option<([^>]*::)?BucketWriteReservationProof>' \
+    awk '
+    FNR == 1 {
+        in_stream_upload_record = 0
+    }
+    /^[[:space:]]*pub struct StreamUploadRecord[[:space:]]*\{/ {
+        in_stream_upload_record = 1
+    }
+    in_stream_upload_record && /^[[:space:]]*\}/ {
+        in_stream_upload_record = 0
+    }
+    /bucket_write_reservation:[[:space:]]*Option<([^>]*::)?BucketWriteReservationProof>/ {
+        if (FILENAME ~ /types\.rs$/ && in_stream_upload_record) {
+            next
+        }
+        if ($0 ~ /stream_create_bucket_write_reservation/) {
+            next
+        }
+        print FILENAME ":" FNR ":" $0
+    }
+    ' \
         crates/storage/src/types.rs \
         crates/storage/src/metadata_command.rs \
         crates/storage/src/cluster.rs \

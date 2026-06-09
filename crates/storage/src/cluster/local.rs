@@ -15152,6 +15152,261 @@ mod tests {
     }
 
     #[test]
+    fn expired_put_object_stream_proof_allows_bucket_delete_cleanup() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "expired-stream-delete-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let session_id =
+            crate::SessionId::try_from("abababababababababababababababab".to_string()).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    crate::ObjectEncryption::None,
+                )
+                .unwrap();
+        });
+
+        crate::clock::with_time_override(62_000, || {
+            cluster
+                .begin_bucket_delete(&bucket)
+                .expect("expired direct PUT stream proof should be abandoned cleanup");
+        });
+
+        for node_id in node_ids {
+            let object_pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id),
+                    Err(crate::MetadataError::StreamSessionNotFound { .. })
+                ),
+                "expired stream row should be aborted during DeleteBucket cleanup on node {node_id:?}"
+            );
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_object_generation_reservation(
+                        &*object_pg,
+                        &bucket,
+                        &key,
+                        &session_id
+                    ),
+                    Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+                ),
+                "expired stream generation reservation should be released on node {node_id:?}"
+            );
+        }
+        let bucket_pg_primary = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg_primary, &bucket)
+                .unwrap()
+                .is_empty(),
+            "expired stream-create bucket reservation should be released"
+        );
+    }
+
+    #[test]
+    fn stream_session_scavenger_aborts_only_expired_put_object_proofs() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let live_bucket = bucket_for_pg(topology, 1, "live-scavenge-stream-");
+        let live_key = key_for_object_pg(topology, &live_bucket, 2, "object-");
+        let expired_bucket = bucket_for_pg(topology, 1, "expired-scavenge-stream-");
+        let expired_key = key_for_object_pg(topology, &expired_bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &live_bucket);
+        create_test_bucket(&cluster, &expired_bucket);
+
+        let live_session =
+            crate::SessionId::try_from("acacacacacacacacacacacacacacacac".to_string()).unwrap();
+        let expired_session =
+            crate::SessionId::try_from("adadadadadadadadadadadadadadadad".to_string()).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            cluster
+                .create_put_object_stream_session_record(
+                    &expired_bucket,
+                    &expired_key,
+                    &expired_session,
+                    crate::ObjectEncryption::None,
+                )
+                .unwrap();
+        });
+        crate::clock::with_time_override(61_500, || {
+            cluster
+                .create_put_object_stream_session_record(
+                    &live_bucket,
+                    &live_key,
+                    &live_session,
+                    crate::ObjectEncryption::None,
+                )
+                .unwrap();
+            assert_eq!(
+                cluster.scavenge_abandoned_stream_sessions(0),
+                1,
+                "scavenger should abort only the expired proof"
+            );
+        });
+
+        let object_pg = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*object_pg, &live_session)
+            .expect("live stream proof must survive scavenger");
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*object_pg, &expired_session),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn stream_session_scavenger_does_not_age_abort_upload_part_sessions() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "upload-part-scavenge-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        set_route_primary(&mut map, 2, NodeId::new(2));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let upload_id = upload_id_from_label("scavengeuploadpart");
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>((
+                        (),
+                        crate::CreateMultipartUploadReq {
+                            upload_id: upload_id.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            tags: None,
+                            metadata_blob: crate::SerializedMetadataBlob::default(),
+                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                            initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+                            owner: crate::OwnerIdentity::from_principal("owner"),
+                            acl_grants: crate::AclGrants::default(),
+                            public_read: false,
+                            object_lock: crate::ObjectLockState::default(),
+                            checksum: None,
+                            encryption: crate::ObjectEncryption::None,
+                        },
+                    ))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let session_id =
+            crate::SessionId::try_from("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            let reservation = cluster
+                .acquire_durable_bucket_write_reservation(
+                    &bucket,
+                    "begin-upload-part-scavenge-test",
+                    Some(key.as_str()),
+                )
+                .unwrap();
+            let proof =
+                crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
+            cluster
+                .begin_upload_part_stream_session(
+                    crate::BeginUploadPartStreamSessionReq {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                        session_id: session_id.clone(),
+                        bucket_write_reservation: proof,
+                    },
+                    |upload| {
+                        Ok::<_, ()>((
+                            crate::AuthorizedMultipartUploadRecord::assume_authorized(
+                                upload.clone(),
+                            ),
+                            (),
+                        ))
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        });
+
+        crate::clock::with_time_override(121_000, || {
+            assert_eq!(
+                cluster.scavenge_abandoned_stream_sessions(60_000),
+                0,
+                "periodic scavenger must not age-abort UploadPart sessions without durable liveness"
+            );
+        });
+
+        let object_pg = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        let upload = crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id)
+            .expect("active UploadPart stream session must survive periodic scavenger");
+        assert_eq!(
+            upload.target,
+            crate::StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number: 1,
+            }
+        );
+    }
+
+    #[test]
     fn active_put_object_stream_upload_blocks_bucket_delete_from_independent_frontend() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

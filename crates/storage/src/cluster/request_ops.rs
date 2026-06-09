@@ -39,6 +39,7 @@ const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
+const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
@@ -1768,6 +1769,76 @@ impl super::StorageCluster {
         })
     }
 
+    pub(super) fn acquire_durable_put_object_stream_write_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
+        let pg_id = self.bucket_metadata_pg_id(bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        let reservation_id = self.next_bucket_write_reservation_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let record = node
+            .bucket_write_reservation_client()
+            .acquire_durable_bucket_write_reservation(
+                PgId::new(pg_id),
+                bucket,
+                &reservation_id,
+                &owner_token,
+                self.operation_epoch(),
+                "put-object-stream-create",
+                crate::clock::current_time_millis(),
+                Some(self.put_object_stream_create_lease_deadline()),
+                Some(key.as_str()),
+            )?;
+        Ok(super::DurableBucketWriteReservation {
+            node: Arc::clone(node.bucket_metadata_client()),
+            pg_id,
+            record,
+        })
+    }
+
+    pub(super) fn put_object_stream_create_lease_deadline(&self) -> u64 {
+        crate::clock::current_time_millis().saturating_add(PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS)
+    }
+
+    pub fn heartbeat_put_object_stream_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let object_pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let upload = self
+            .object_mutation_metadata_primary_client(bucket, key)?
+            .load_stream_upload_session(object_pg_id, bucket, key, session_id)?;
+        if upload.target != StreamUploadTarget::PutObject {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "stream session is not a PutObject session".to_string(),
+            });
+        }
+        let Some(proof) = upload.bucket_write_reservation.as_ref() else {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "PutObject stream session is missing bucket write proof".to_string(),
+            });
+        };
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            .map_err(ObjectPgActionError::from)?;
+        node.bucket_write_reservation_client()
+            .heartbeat_durable_bucket_write_reservation(
+                pg_id,
+                proof,
+                self.put_object_stream_create_lease_deadline(),
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        Ok(())
+    }
+
     pub(super) fn release_durable_bucket_write_reservation(
         &self,
         reservation: super::DurableBucketWriteReservation,
@@ -1934,7 +2005,7 @@ impl super::StorageCluster {
         }
     }
 
-    fn stream_upload_has_live_bucket_write_reservation(
+    pub(super) fn stream_upload_has_live_bucket_write_reservation(
         &self,
         upload: &StreamUploadRecord,
     ) -> Result<bool, BucketWriteDrainError> {
@@ -6621,18 +6692,15 @@ impl super::StorageCluster {
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let reservation = match self.acquire_durable_bucket_write_reservation(
-                bucket,
-                "put-object-stream-create",
-                Some(key.as_str()),
-            ) {
-                Ok(reservation) => reservation,
-                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
-                    self.wait_for_durable_bucket_write_drain(bucket)?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let reservation =
+                match self.acquire_durable_put_object_stream_write_reservation(bucket, key) {
+                    Ok(reservation) => reservation,
+                    Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                        self.wait_for_durable_bucket_write_drain(bucket)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             let proof = BucketWriteReservationProof::from(&reservation.record);
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {

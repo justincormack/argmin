@@ -3970,6 +3970,18 @@ impl HttpFrontend {
         )
     }
 
+    fn heartbeat_streaming_put_object(
+        &self,
+        trace: &observability::TraceContext,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        let _trace = observability::AttachedTrace::new(trace.clone());
+        self.coordinator
+            .heartbeat_stream_put_session(bucket, key, session_id)
+    }
+
     /// Commit a single-segment `PutObject` without creating a stream session.
     fn put_single_segment_object(
         &self,

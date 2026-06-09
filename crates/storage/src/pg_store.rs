@@ -45,7 +45,7 @@ use crate::metadata_command::{
     ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
-use crate::traits::{PgMetadataStore, ShardStore};
+use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
 use crate::types::*;
 
 const TRACE_TARGET: &str = "storage";
@@ -8322,9 +8322,8 @@ impl PgStore {
                             &command.segment.session_id,
                             command.segment.segment_vid,
                         ),
-                    Some(_) => Err(MetadataError::Db {
-                        context: "append stream segment command existing segment mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                    Some(_) => Err(MetadataError::StreamSegmentConflict {
+                        segment_index: command.segment.segment_index,
                     }),
                     None => {
                         store.append_stream_segment_direct(&command.segment)?;
@@ -11627,6 +11626,63 @@ impl PgMetadataStore for PgStore {
             .map_err(|source| MetadataError::Db {
                 context: "collect durable bucket write reservations",
                 source,
+            })
+    }
+
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        heartbeat: DurableBucketWriteReservationHeartbeat<'_>,
+    ) -> Result<BucketWriteReservationRecord, MetadataError> {
+        let generation =
+            i64::try_from(heartbeat.bucket_execution_generation).map_err(|source| {
+                MetadataError::Db {
+                    context: "heartbeat durable bucket write reservation generation",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                }
+            })?;
+        let incarnation =
+            i64::try_from(heartbeat.bucket_incarnation_generation).map_err(|source| {
+                MetadataError::Db {
+                    context: "heartbeat durable bucket write reservation incarnation",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                }
+            })?;
+        let lease_deadline =
+            i64::try_from(heartbeat.lease_deadline).map_err(|source| MetadataError::Db {
+                context: "heartbeat durable bucket write reservation lease deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bucket_write_reservations \
+                 SET lease_deadline = ?7 \
+                 WHERE bucket_name = ?1 AND reservation_id = ?2 \
+                   AND owner_token = ?3 AND cluster_epoch = ?4 \
+                   AND bucket_execution_generation = ?5 \
+                   AND bucket_incarnation_generation = ?6",
+                params![
+                    heartbeat.name.as_str(),
+                    heartbeat.reservation_id,
+                    heartbeat.owner_token,
+                    heartbeat.cluster_epoch.get(),
+                    generation,
+                    incarnation,
+                    lease_deadline,
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "heartbeat durable bucket write reservation",
+                source,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketWriteReservationNotFound {
+                reservation_id: heartbeat.reservation_id.to_string(),
+            });
+        }
+        self.durable_bucket_write_reservation(heartbeat.name, heartbeat.reservation_id)?
+            .ok_or_else(|| MetadataError::BucketWriteReservationNotFound {
+                reservation_id: heartbeat.reservation_id.to_string(),
             })
     }
 

@@ -29,6 +29,16 @@ pub trait ShardStore {
     fn stat_shard(&self, key: &ShardKey) -> Result<ShardStat, StoreError>;
 }
 
+pub(crate) struct DurableBucketWriteReservationHeartbeat<'a> {
+    pub name: &'a BucketName,
+    pub reservation_id: &'a str,
+    pub owner_token: &'a str,
+    pub cluster_epoch: ClusterEpoch,
+    pub bucket_execution_generation: u64,
+    pub bucket_incarnation_generation: u64,
+    pub lease_deadline: u64,
+}
+
 /// Per-PG object metadata store.
 ///
 /// Tracks S3 object records within a single placement group.
@@ -114,6 +124,13 @@ pub(crate) trait PgMetadataStore {
         &self,
         name: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, MetadataError>;
+
+    /// Extend a durable write reservation's mutable lease deadline.
+    #[allow(dead_code)]
+    fn heartbeat_durable_bucket_write_reservation(
+        &self,
+        heartbeat: DurableBucketWriteReservationHeartbeat<'_>,
+    ) -> Result<BucketWriteReservationRecord, MetadataError>;
 
     /// Release a durable bucket write reservation by exact identity.
     #[allow(dead_code)]
