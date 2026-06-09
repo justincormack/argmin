@@ -4325,6 +4325,23 @@ impl HttpFrontend {
         let _ =
             self.coordinator
                 .abort_stream_part_session(ctx.bucket(), ctx.key(), ctx.session_id());
+        let _ = observability::emit_stream_upload_phase(
+            &ctx.trace,
+            TRACE_TARGET,
+            observability::StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: "session_aborted",
+                bucket: ctx.bucket().as_str(),
+                key: ctx.key().as_str(),
+                upload_id: Some(ctx.upload_id().as_str()),
+                part_number: Some(ctx.part_number()),
+                session_id: Some(ctx.session_id().as_str()),
+                segment_index: None,
+                body_bytes_received: None,
+                segment_bytes: None,
+                segment_count: None,
+            },
+        );
     }
 }
 

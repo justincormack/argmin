@@ -84,6 +84,7 @@ enum TraceSink {
 
 static TRACE_SINK: OnceLock<TraceSink> = OnceLock::new();
 static TRACE_SINK_OVERRIDE: OnceLock<TraceSink> = OnceLock::new();
+static REQUEST_START_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static REQUEST_FINISH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +102,21 @@ static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_SESSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
+    OnceLock::new();
+static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
+    Mutex<Vec<MetadataCommandDimensionCounter>>,
+> = OnceLock::new();
+static STREAM_UPLOAD_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_SESSION_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_SESSION_ABORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_SESSION_FINALIZED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_BODY_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_BODY_READ_COMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_SEGMENT_APPEND_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_FINALIZE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static PANIC_FLIGHT_RECORDER_HOOK: Once = Once::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -109,6 +125,7 @@ const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
 const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const FLIGHT_RECORDER_CAPACITY: usize = 512;
 const FLIGHT_RECORD_MAX_DETAIL_BYTES: usize = 1_024;
+const METADATA_COMMAND_DIMENSION_CAPACITY: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlightRecord {
@@ -123,6 +140,21 @@ pub struct FlightRecord {
 
 struct FlightRecorder {
     records: VecDeque<FlightRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataCommandDimensionSample {
+    pub pg_id: u32,
+    pub classifier: &'static str,
+    pub command_kind: &'static str,
+    pub count: u64,
+}
+
+struct MetadataCommandDimensionCounter {
+    pg_id: u32,
+    classifier: &'static str,
+    command_kind: &'static str,
+    count: u64,
 }
 
 impl FlightRecorder {
@@ -214,6 +246,67 @@ fn write_stderr_str(line: &str) {
 
 fn flight_recorder() -> &'static Mutex<FlightRecorder> {
     FLIGHT_RECORDER.get_or_init(|| Mutex::new(FlightRecorder::new()))
+}
+
+fn metadata_command_conflict_dimensions() -> &'static Mutex<Vec<MetadataCommandDimensionCounter>> {
+    METADATA_COMMAND_CONFLICT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn metadata_command_pending_slot_action_dimensions(
+) -> &'static Mutex<Vec<MetadataCommandDimensionCounter>> {
+    METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn increment_metadata_command_dimension(
+    counters: &Mutex<Vec<MetadataCommandDimensionCounter>>,
+    pg_id: u32,
+    classifier: &'static str,
+    command_kind: &'static str,
+) {
+    let mut counters = counters.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters.iter_mut().find(|counter| {
+        counter.pg_id == pg_id
+            && counter.classifier == classifier
+            && counter.command_kind == command_kind
+    }) {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(MetadataCommandDimensionCounter {
+            pg_id,
+            classifier,
+            command_kind,
+            count: 1,
+        });
+    }
+}
+
+fn metadata_command_dimension_snapshot(
+    counters: &Mutex<Vec<MetadataCommandDimensionCounter>>,
+) -> Vec<MetadataCommandDimensionSample> {
+    counters
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| MetadataCommandDimensionSample {
+            pg_id: counter.pg_id,
+            classifier: counter.classifier,
+            command_kind: counter.command_kind,
+            count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDimensionSample> {
+    metadata_command_dimension_snapshot(metadata_command_conflict_dimensions())
+}
+
+#[must_use]
+pub fn metadata_command_pending_slot_action_dimension_snapshot(
+) -> Vec<MetadataCommandDimensionSample> {
+    metadata_command_dimension_snapshot(metadata_command_pending_slot_action_dimensions())
 }
 
 fn truncate_detail(mut detail: String) -> String {
@@ -543,12 +636,34 @@ pub struct RequestSummary<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestStartSummary<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: QuerySummary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestAdmissionSummary<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub query: QuerySummary,
     pub wait_us: u128,
     pub timeout_us: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamUploadPhaseSummary<'a> {
+    pub operation: &'static str,
+    pub phase: &'static str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: Option<&'a str>,
+    pub part_number: Option<u32>,
+    pub session_id: Option<&'a str>,
+    pub segment_index: Option<u32>,
+    pub body_bytes_received: Option<u64>,
+    pub segment_bytes: Option<u64>,
+    pub segment_count: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -600,6 +715,7 @@ pub struct StorageRpcErrorSummary<'a> {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
+    pub request_start_total: u64,
     pub inflight_requests: u64,
     pub request_finish_total: u64,
     pub request_error_total: u64,
@@ -617,9 +733,23 @@ pub struct MetricsSnapshot {
     pub metadata_command_conflict_total: u64,
     pub metadata_command_pending_slot_action_total: u64,
     pub metadata_command_session_wait_total: u64,
+    pub stream_upload_active_sessions: u64,
+    pub stream_upload_session_created_total: u64,
+    pub stream_upload_session_aborted_total: u64,
+    pub stream_upload_session_finalized_total: u64,
+    pub stream_upload_body_started_total: u64,
+    pub stream_upload_body_read_complete_total: u64,
+    pub stream_upload_segment_append_started_total: u64,
+    pub stream_upload_segment_append_finished_total: u64,
+    pub stream_upload_segment_append_error_total: u64,
+    pub stream_upload_finalize_error_total: u64,
 }
 
 pub struct InflightRequestsGuard {
+    active: bool,
+}
+
+pub struct StreamUploadActiveSessionGuard {
     active: bool,
 }
 
@@ -632,6 +762,15 @@ impl Drop for InflightRequestsGuard {
     }
 }
 
+impl Drop for StreamUploadActiveSessionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            STREAM_UPLOAD_ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            self.active = false;
+        }
+    }
+}
+
 #[must_use]
 pub fn inflight_requests_guard() -> InflightRequestsGuard {
     INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -639,8 +778,15 @@ pub fn inflight_requests_guard() -> InflightRequestsGuard {
 }
 
 #[must_use]
+pub fn stream_upload_active_session_guard() -> StreamUploadActiveSessionGuard {
+    STREAM_UPLOAD_ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+    StreamUploadActiveSessionGuard { active: true }
+}
+
+#[must_use]
 pub fn metrics_snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
+        request_start_total: REQUEST_START_TOTAL.load(Ordering::Relaxed),
         inflight_requests: INFLIGHT_REQUESTS.load(Ordering::Relaxed),
         request_finish_total: REQUEST_FINISH_TOTAL.load(Ordering::Relaxed),
         request_error_total: REQUEST_ERROR_TOTAL.load(Ordering::Relaxed),
@@ -662,7 +808,59 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         metadata_command_session_wait_total: METADATA_COMMAND_SESSION_WAIT_TOTAL
             .load(Ordering::Relaxed),
+        stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
+        stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_session_aborted_total: STREAM_UPLOAD_SESSION_ABORTED_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_session_finalized_total: STREAM_UPLOAD_SESSION_FINALIZED_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_body_started_total: STREAM_UPLOAD_BODY_STARTED_TOTAL.load(Ordering::Relaxed),
+        stream_upload_body_read_complete_total: STREAM_UPLOAD_BODY_READ_COMPLETE_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_segment_append_started_total: STREAM_UPLOAD_SEGMENT_APPEND_STARTED_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_segment_append_finished_total: STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_segment_append_error_total: STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_finalize_error_total: STREAM_UPLOAD_FINALIZE_ERROR_TOTAL
+            .load(Ordering::Relaxed),
     }
+}
+
+pub fn emit_request_start(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestStartSummary<'_>,
+) -> bool {
+    REQUEST_START_TOTAL.fetch_add(1, Ordering::Relaxed);
+    record_flight_event(
+        context,
+        target,
+        "request_start",
+        truncate_detail(format!(
+            "method={} path_hash={} has_query={} query_params={} sigv4_query={}",
+            summary.method,
+            stable_hash_hex(summary.path),
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params()
+        )),
+    );
+    event_in_context(
+        context,
+        target,
+        "request_start",
+        Some(format_args!(
+            "method={} path={:?} has_query={} query_params={} sigv4_query={}",
+            summary.method,
+            summary.path,
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params()
+        )),
+    )
 }
 
 pub fn emit_request_finish(
@@ -925,6 +1123,109 @@ pub fn emit_request_admission_timeout(
     )
 }
 
+fn update_stream_upload_phase_metrics(summary: StreamUploadPhaseSummary<'_>) {
+    match summary.phase {
+        "session_created" => {
+            STREAM_UPLOAD_SESSION_CREATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "session_aborted" => {
+            STREAM_UPLOAD_SESSION_ABORTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "session_finalized" => {
+            STREAM_UPLOAD_SESSION_FINALIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "body_started" => {
+            STREAM_UPLOAD_BODY_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "body_read_complete" => {
+            STREAM_UPLOAD_BODY_READ_COMPLETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "segment_append_started" => {
+            STREAM_UPLOAD_SEGMENT_APPEND_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "segment_append_finished" => {
+            STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "segment_append_error" => {
+            STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "finalize_error" => {
+            STREAM_UPLOAD_FINALIZE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+pub fn emit_stream_upload_phase(
+    context: &TraceContext,
+    target: &'static str,
+    summary: StreamUploadPhaseSummary<'_>,
+) -> bool {
+    update_stream_upload_phase_metrics(summary);
+    let upload_id_hash = summary
+        .upload_id
+        .map(stable_hash_hex)
+        .unwrap_or_else(|| "none".to_string());
+    let session_id_hash = summary
+        .session_id
+        .map(stable_hash_hex)
+        .unwrap_or_else(|| "none".to_string());
+    let part_number = summary
+        .part_number
+        .map(|part_number| part_number.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let segment_index = summary
+        .segment_index
+        .map(|segment_index| segment_index.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let body_bytes_received = summary
+        .body_bytes_received
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let segment_bytes = summary
+        .segment_bytes
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let segment_count = summary
+        .segment_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let detail = truncate_detail(format!(
+        "operation={} phase={} bucket_hash={} key_hash={} upload_id_hash={} part_number={} session_id_hash={} segment_index={} body_bytes_received={} segment_bytes={} segment_count={}",
+        summary.operation,
+        summary.phase,
+        stable_hash_hex(summary.bucket),
+        stable_hash_hex(summary.key),
+        upload_id_hash,
+        part_number,
+        session_id_hash,
+        segment_index,
+        body_bytes_received,
+        segment_bytes,
+        segment_count
+    ));
+    record_flight_event(context, target, "stream_upload_phase", detail);
+    event_in_context(
+        context,
+        target,
+        "stream_upload_phase",
+        Some(format_args!(
+            "operation={} phase={} bucket_hash={} key_hash={} upload_id_hash={} part_number={} session_id_hash={} segment_index={} body_bytes_received={} segment_bytes={} segment_count={}",
+            summary.operation,
+            summary.phase,
+            stable_hash_hex(summary.bucket),
+            stable_hash_hex(summary.key),
+            upload_id_hash,
+            part_number,
+            session_id_hash,
+            segment_index,
+            body_bytes_received,
+            segment_bytes,
+            segment_count
+        )),
+    )
+}
+
 pub fn emit_bucket_lock_wait_exceeded<T: fmt::Debug>(
     context: &TraceContext,
     target: &'static str,
@@ -949,6 +1250,12 @@ pub fn emit_metadata_command_conflict(
     summary: MetadataCommandConflictSummary,
 ) -> bool {
     METADATA_COMMAND_CONFLICT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    increment_metadata_command_dimension(
+        metadata_command_conflict_dimensions(),
+        summary.pg_id,
+        summary.kind,
+        summary.command_kind.unwrap_or("unknown"),
+    );
     let Some(context) = current_context() else {
         return false;
     };
@@ -982,6 +1289,12 @@ pub fn emit_metadata_command_pending_slot_action(
     summary: MetadataCommandPendingSlotActionSummary,
 ) -> bool {
     METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    increment_metadata_command_dimension(
+        metadata_command_pending_slot_action_dimensions(),
+        summary.pg_id,
+        summary.action,
+        summary.command_kind.unwrap_or("unknown"),
+    );
     let Some(context) = current_context() else {
         return false;
     };
@@ -1466,6 +1779,15 @@ mod tests {
             lifetime_us: 42,
         };
 
+        emit_request_start(
+            &ctx,
+            "server_http",
+            RequestStartSummary {
+                method: "GET",
+                path: "/bucket/key",
+                query: query_summary("partNumber=1"),
+            },
+        );
         emit_request_finish(&ctx, "server_http", summary, "complete");
         emit_request_error(
             &ctx,
@@ -1510,6 +1832,17 @@ mod tests {
                 command_kind: Some("CommitDirectPutObject"),
             },
         );
+        emit_metadata_command_pending_slot_action(
+            "storage",
+            MetadataCommandPendingSlotActionSummary {
+                node_id: Some(7),
+                pg_id: 11,
+                cluster_epoch: 1,
+                log_index: Some(14),
+                action: "drain_attempt",
+                command_kind: Some("AppendStreamSegment"),
+            },
+        );
         emit_metadata_command_session_wait(
             "storage",
             MetadataCommandSessionWaitSummary {
@@ -1540,8 +1873,118 @@ mod tests {
                 last_error: Some("scan failed"),
             },
         );
+        {
+            let _active = stream_upload_active_session_guard();
+            emit_stream_upload_phase(
+                &ctx,
+                "server_http",
+                StreamUploadPhaseSummary {
+                    operation: "UploadPart",
+                    phase: "session_created",
+                    bucket: "bucket",
+                    key: "key",
+                    upload_id: Some("upload"),
+                    part_number: Some(1),
+                    session_id: Some("session"),
+                    segment_index: None,
+                    body_bytes_received: None,
+                    segment_bytes: None,
+                    segment_count: None,
+                },
+            );
+            assert_eq!(
+                metrics_snapshot().stream_upload_active_sessions,
+                before.stream_upload_active_sessions + 1
+            );
+        }
+        emit_stream_upload_phase(
+            &ctx,
+            "server_http",
+            StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: "body_started",
+                bucket: "bucket",
+                key: "key",
+                upload_id: Some("upload"),
+                part_number: Some(1),
+                session_id: Some("session"),
+                segment_index: None,
+                body_bytes_received: Some(8),
+                segment_bytes: Some(8),
+                segment_count: None,
+            },
+        );
+        emit_stream_upload_phase(
+            &ctx,
+            "server_http",
+            StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: "segment_append_started",
+                bucket: "bucket",
+                key: "key",
+                upload_id: Some("upload"),
+                part_number: Some(1),
+                session_id: Some("session"),
+                segment_index: Some(0),
+                body_bytes_received: Some(8),
+                segment_bytes: Some(8),
+                segment_count: None,
+            },
+        );
+        emit_stream_upload_phase(
+            &ctx,
+            "server_http",
+            StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: "segment_append_finished",
+                bucket: "bucket",
+                key: "key",
+                upload_id: Some("upload"),
+                part_number: Some(1),
+                session_id: Some("session"),
+                segment_index: Some(0),
+                body_bytes_received: Some(8),
+                segment_bytes: Some(8),
+                segment_count: None,
+            },
+        );
+        emit_stream_upload_phase(
+            &ctx,
+            "server_http",
+            StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: "body_read_complete",
+                bucket: "bucket",
+                key: "key",
+                upload_id: Some("upload"),
+                part_number: Some(1),
+                session_id: Some("session"),
+                segment_index: None,
+                body_bytes_received: Some(8),
+                segment_bytes: None,
+                segment_count: Some(1),
+            },
+        );
+        emit_stream_upload_phase(
+            &ctx,
+            "server_http",
+            StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: "session_finalized",
+                bucket: "bucket",
+                key: "key",
+                upload_id: Some("upload"),
+                part_number: Some(1),
+                session_id: Some("session"),
+                segment_index: None,
+                body_bytes_received: Some(8),
+                segment_bytes: None,
+                segment_count: Some(1),
+            },
+        );
 
         let after = metrics_snapshot();
+        assert_eq!(after.request_start_total, before.request_start_total + 1);
         assert_eq!(after.request_finish_total, before.request_finish_total + 1);
         assert_eq!(after.request_error_total, before.request_error_total + 1);
         assert_eq!(
@@ -1578,6 +2021,10 @@ mod tests {
             before.metadata_command_conflict_total + 1
         );
         assert_eq!(
+            after.metadata_command_pending_slot_action_total,
+            before.metadata_command_pending_slot_action_total + 1
+        );
+        assert_eq!(
             after.metadata_command_session_wait_total,
             before.metadata_command_session_wait_total + 1
         );
@@ -1592,6 +2039,34 @@ mod tests {
         assert_eq!(
             after.shard_scavenger_scan_incomplete_total,
             before.shard_scavenger_scan_incomplete_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_active_sessions,
+            before.stream_upload_active_sessions
+        );
+        assert_eq!(
+            after.stream_upload_session_created_total,
+            before.stream_upload_session_created_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_body_started_total,
+            before.stream_upload_body_started_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_body_read_complete_total,
+            before.stream_upload_body_read_complete_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_segment_append_started_total,
+            before.stream_upload_segment_append_started_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_segment_append_finished_total,
+            before.stream_upload_segment_append_finished_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_session_finalized_total,
+            before.stream_upload_session_finalized_total + 1
         );
     }
 

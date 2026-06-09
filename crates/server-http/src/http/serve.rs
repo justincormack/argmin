@@ -354,6 +354,7 @@ enum StreamingAbortCleanup {
     },
     Part {
         ctx: Arc<super::StreamingPartContext>,
+        _active_session: observability::StreamUploadActiveSessionGuard,
     },
 }
 
@@ -443,8 +444,11 @@ impl StreamingAbortGuard {
     }
 
     fn arm_part(&self, ctx: &Arc<super::StreamingPartContext>) {
+        let active_session = observability::stream_upload_active_session_guard();
+        emit_streaming_part_phase(ctx, "session_created", None, None, None, None);
         *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Part {
             ctx: Arc::clone(ctx),
+            _active_session: active_session,
         });
     }
 
@@ -472,7 +476,7 @@ impl Drop for StreamingAbortGuard {
                 StreamingAbortCleanup::Post { ctx } => {
                     frontend.abort_streaming_post_object(&ctx);
                 }
-                StreamingAbortCleanup::Part { ctx } => {
+                StreamingAbortCleanup::Part { ctx, .. } => {
                     frontend.abort_streaming_part(&ctx);
                 }
             }
@@ -733,6 +737,16 @@ async fn handle(
             ));
         }
     }
+
+    let _ = observability::emit_request_start(
+        &trace,
+        TRACE_TARGET,
+        observability::RequestStartSummary {
+            method: &method,
+            path: &path,
+            query: response_trace.query,
+        },
+    );
 
     // Acquire request permit before body collection to bound memory.
     let admission_started_at = Instant::now();
@@ -1046,9 +1060,12 @@ fn local_debug_response(method: &http::Method, path: &str) -> Option<S3Response>
 }
 
 fn local_debug_metrics_body() -> String {
+    use std::fmt::Write as _;
+
     let snapshot = observability::metrics_snapshot();
-    format!(
+    let mut body = format!(
         concat!(
+            "request_start_total {}\n",
             "inflight_requests {}\n",
             "request_finish_total {}\n",
             "request_error_total {}\n",
@@ -1064,8 +1081,19 @@ fn local_debug_metrics_body() -> String {
             "shard_scavenger_scan_incomplete_total {}\n",
             "metadata_command_conflict_total {}\n",
             "metadata_command_pending_slot_action_total {}\n",
-            "metadata_command_session_wait_total {}\n"
+            "metadata_command_session_wait_total {}\n",
+            "stream_upload_active_sessions {}\n",
+            "stream_upload_session_created_total {}\n",
+            "stream_upload_session_aborted_total {}\n",
+            "stream_upload_session_finalized_total {}\n",
+            "stream_upload_body_started_total {}\n",
+            "stream_upload_body_read_complete_total {}\n",
+            "stream_upload_segment_append_started_total {}\n",
+            "stream_upload_segment_append_finished_total {}\n",
+            "stream_upload_segment_append_error_total {}\n",
+            "stream_upload_finalize_error_total {}\n"
         ),
+        snapshot.request_start_total,
         snapshot.inflight_requests,
         snapshot.request_finish_total,
         snapshot.request_error_total,
@@ -1082,7 +1110,32 @@ fn local_debug_metrics_body() -> String {
         snapshot.metadata_command_conflict_total,
         snapshot.metadata_command_pending_slot_action_total,
         snapshot.metadata_command_session_wait_total,
-    )
+        snapshot.stream_upload_active_sessions,
+        snapshot.stream_upload_session_created_total,
+        snapshot.stream_upload_session_aborted_total,
+        snapshot.stream_upload_session_finalized_total,
+        snapshot.stream_upload_body_started_total,
+        snapshot.stream_upload_body_read_complete_total,
+        snapshot.stream_upload_segment_append_started_total,
+        snapshot.stream_upload_segment_append_finished_total,
+        snapshot.stream_upload_segment_append_error_total,
+        snapshot.stream_upload_finalize_error_total,
+    );
+    for sample in observability::metadata_command_conflict_dimension_snapshot() {
+        let _ = writeln!(
+            body,
+            "metadata_command_conflict_by_pg_command_total{{pg_id=\"{}\",kind=\"{}\",command_kind=\"{}\"}} {}",
+            sample.pg_id, sample.classifier, sample.command_kind, sample.count
+        );
+    }
+    for sample in observability::metadata_command_pending_slot_action_dimension_snapshot() {
+        let _ = writeln!(
+            body,
+            "metadata_command_pending_slot_action_by_pg_command_total{{pg_id=\"{}\",action=\"{}\",command_kind=\"{}\"}} {}",
+            sample.pg_id, sample.classifier, sample.command_kind, sample.count
+        );
+    }
+    body
 }
 
 async fn append_actual_cors_headers(
@@ -3244,6 +3297,14 @@ async fn handle_streaming_part(
             body_timing.append_wait_us
         ),
     );
+    emit_streaming_part_phase(
+        &ctx,
+        "body_read_complete",
+        None,
+        Some(total_size),
+        None,
+        Some(segment_index),
+    );
 
     // Verify chunked decoding completed and validate post-decode conditions.
     // Extract checksum trailers from aws-chunked body.
@@ -3365,6 +3426,14 @@ async fn handle_streaming_part(
                 total_size
             ),
         );
+        emit_streaming_part_phase(
+            &ctx,
+            "segment_append_started",
+            Some(idx),
+            Some(total_size),
+            Some(buf.len() as u64),
+            None,
+        );
         let trace = ctx.trace.clone();
         let abort_guard_for_append = Arc::clone(&abort_guard);
         match spawn_blocking_with_trace(trace, move || {
@@ -3403,12 +3472,37 @@ async fn handle_streaming_part(
         })
         .await
         {
-            Ok((Ok(()), _buf)) => {}
+            Ok((Ok(()), _buf)) => {
+                emit_streaming_part_phase(
+                    &ctx,
+                    "segment_append_finished",
+                    Some(idx),
+                    Some(total_size),
+                    None,
+                    None,
+                );
+            }
             Ok((Err(err), _buf)) => {
+                emit_streaming_part_phase(
+                    &ctx,
+                    "segment_append_error",
+                    Some(idx),
+                    Some(total_size),
+                    None,
+                    None,
+                );
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return error_response(&err);
             }
             Err(_) => {
+                emit_streaming_part_phase(
+                    &ctx,
+                    "segment_append_error",
+                    Some(idx),
+                    Some(total_size),
+                    None,
+                    None,
+                );
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return internal_error_response();
             }
@@ -3448,6 +3542,14 @@ async fn handle_streaming_part(
             segment_index + u32::from(had_tail),
             trailer_checksums.len()
         ),
+    );
+    emit_streaming_part_phase(
+        &ctx,
+        "finalize_started",
+        None,
+        Some(total_size),
+        None,
+        Some(segment_index + u32::from(had_tail)),
     );
     let trace = ctx.trace.clone();
     let abort_guard_for_finalize = Arc::clone(&abort_guard);
@@ -3493,12 +3595,38 @@ async fn handle_streaming_part(
     })
     .await
     {
-        Ok(Ok(resp)) => resp,
+        Ok(Ok(resp)) => {
+            emit_streaming_part_phase(
+                &ctx,
+                "session_finalized",
+                None,
+                Some(total_size),
+                None,
+                Some(segment_index + u32::from(had_tail)),
+            );
+            resp
+        }
         Ok(Err(err)) => {
+            emit_streaming_part_phase(
+                &ctx,
+                "finalize_error",
+                None,
+                Some(total_size),
+                None,
+                Some(segment_index + u32::from(had_tail)),
+            );
             abort_streaming_part_ctx(&state, &ctx).await;
             error_response(&err)
         }
         Err(_) => {
+            emit_streaming_part_phase(
+                &ctx,
+                "finalize_error",
+                None,
+                Some(total_size),
+                None,
+                Some(segment_index + u32::from(had_tail)),
+            );
             abort_streaming_part_ctx(&state, &ctx).await;
             internal_error_response()
         }
@@ -3544,6 +3672,33 @@ fn emit_streaming_part_event(
 
     #[cfg(feature = "deep-tracing")]
     let _ = observability::event_in_context(&ctx.trace, TRACE_TARGET, name, Some(fields));
+}
+
+fn emit_streaming_part_phase(
+    ctx: &Arc<super::StreamingPartContext>,
+    phase: &'static str,
+    segment_index: Option<u32>,
+    body_bytes_received: Option<u64>,
+    segment_bytes: Option<u64>,
+    segment_count: Option<u32>,
+) {
+    let _ = observability::emit_stream_upload_phase(
+        &ctx.trace,
+        TRACE_TARGET,
+        observability::StreamUploadPhaseSummary {
+            operation: "UploadPart",
+            phase,
+            bucket: ctx.bucket().as_str(),
+            key: ctx.key().as_str(),
+            upload_id: Some(ctx.upload_id().as_str()),
+            part_number: Some(ctx.part_number()),
+            session_id: Some(ctx.session_id().as_str()),
+            segment_index,
+            body_bytes_received,
+            segment_bytes,
+            segment_count,
+        },
+    );
 }
 
 async fn ingest_streaming_part_payload(
@@ -3595,6 +3750,14 @@ async fn ingest_streaming_part_payload(
                 *ingest.total_size
             ),
         );
+        emit_streaming_part_phase(
+            ctx,
+            "body_started",
+            None,
+            Some(*ingest.total_size),
+            Some(payload.len() as u64),
+            None,
+        );
     }
     ingest.timing.ingest_local_us += elapsed_micros(accounting_start);
 
@@ -3633,6 +3796,7 @@ async fn ingest_streaming_part_payload(
         let ctx_ref = Arc::clone(ctx);
         let st = Arc::clone(state);
         let dispatch_start = Instant::now();
+        let segment_bytes = flush_data.len() as u64;
         emit_streaming_part_event(
             ctx,
             "streaming_part_append_dispatch",
@@ -3647,6 +3811,14 @@ async fn ingest_streaming_part_payload(
                 flush_data.len(),
                 *ingest.total_size
             ),
+        );
+        emit_streaming_part_phase(
+            ctx,
+            "segment_append_started",
+            Some(idx),
+            Some(*ingest.total_size),
+            Some(segment_bytes),
+            None,
         );
         let trace = ctx.trace.clone();
         let abort_guard_for_append = Arc::clone(ingest.abort_guard);
@@ -3686,12 +3858,37 @@ async fn ingest_streaming_part_payload(
         })
         .await
         {
-            Ok((Ok(()), _flush_data)) => {}
+            Ok((Ok(()), _flush_data)) => {
+                emit_streaming_part_phase(
+                    ctx,
+                    "segment_append_finished",
+                    Some(idx),
+                    Some(*ingest.total_size),
+                    Some(segment_bytes),
+                    None,
+                );
+            }
             Ok((Err(err), _flush_data)) => {
+                emit_streaming_part_phase(
+                    ctx,
+                    "segment_append_error",
+                    Some(idx),
+                    Some(*ingest.total_size),
+                    Some(segment_bytes),
+                    None,
+                );
                 abort_streaming_part_ctx(state, ctx).await;
                 return Err(error_response(&err, &wire_ids));
             }
             Err(_) => {
+                emit_streaming_part_phase(
+                    ctx,
+                    "segment_append_error",
+                    Some(idx),
+                    Some(*ingest.total_size),
+                    Some(segment_bytes),
+                    None,
+                );
                 abort_streaming_part_ctx(state, ctx).await;
                 return Err(internal_error_response(&wire_ids));
             }
