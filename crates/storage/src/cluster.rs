@@ -750,6 +750,20 @@ impl StorageCluster {
                 command_kind,
             },
         );
+        if std::env::var_os("ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS").is_some() {
+            let node = node_id
+                .map(|node_id| node_id.as_u32().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let log = log_index
+                .map(|log_index| log_index.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            eprintln!(
+                "metadata command conflict source=frontend kind={kind} node_id={node} pg_id={} cluster_epoch={} log_index={log} command_kind={}",
+                pg_id.get(),
+                self.operation_epoch().get(),
+                command_kind.unwrap_or("unknown")
+            );
+        }
     }
 
     fn emit_metadata_command_pending_slot_action(

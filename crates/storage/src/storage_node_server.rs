@@ -279,6 +279,14 @@ fn emit_storage_node_metadata_command_log_conflict(
     log_index: u64,
     command_kind: Option<&'static str>,
 ) {
+    maybe_print_storage_node_metadata_command_conflict_diagnostic(
+        "log_conflict",
+        node_id,
+        pg_id,
+        cluster_epoch,
+        log_index,
+        command_kind,
+    );
     let _ = observability::emit_metadata_command_conflict(
         "storage",
         observability::MetadataCommandConflictSummary {
@@ -299,6 +307,14 @@ fn emit_storage_node_metadata_command_pending_conflict(
     candidate_log_index: u64,
     command_kind: Option<&'static str>,
 ) {
+    maybe_print_storage_node_metadata_command_conflict_diagnostic(
+        "pending_slot_conflict",
+        node_id,
+        pg_id,
+        cluster_epoch,
+        candidate_log_index,
+        command_kind,
+    );
     let _ = observability::emit_metadata_command_conflict(
         "storage",
         observability::MetadataCommandConflictSummary {
@@ -309,6 +325,24 @@ fn emit_storage_node_metadata_command_pending_conflict(
             kind: "pending_slot_conflict",
             command_kind,
         },
+    );
+}
+
+fn maybe_print_storage_node_metadata_command_conflict_diagnostic(
+    kind: &'static str,
+    node_id: u32,
+    pg_id: u32,
+    cluster_epoch: ClusterEpoch,
+    log_index: u64,
+    command_kind: Option<&'static str>,
+) {
+    if std::env::var_os("ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS").is_none() {
+        return;
+    }
+    eprintln!(
+        "metadata command conflict source=storage-node kind={kind} node_id={node_id} pg_id={pg_id} cluster_epoch={} log_index={log_index} command_kind={}",
+        cluster_epoch.get(),
+        command_kind.unwrap_or("unknown")
     );
 }
 

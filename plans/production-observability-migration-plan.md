@@ -72,7 +72,10 @@ Completed:
   is disabled by default and startup validation accepts it only on loopback
   frontend listeners. The companion flight-recorder trigger is a `POST` that
   dumps the bounded, redacted ring to stderr instead of returning recorder
-  details over HTTP.
+  details over HTTP. The standalone UAT wrapper enables this local-only endpoint
+  for the frontend and requests the dump before teardown on failed runs so
+  intermittent full-suite races retain request-error and metadata-command
+  conflict context.
 
 Remaining:
 

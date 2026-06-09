@@ -216,6 +216,7 @@ export ARGMIN_EC_M="${ARGMIN_EC_M:-2}"
 export ARGMIN_LOCAL_NODE_COUNT="${ARGMIN_LOCAL_NODE_COUNT:-$((ARGMIN_EC_K + ARGMIN_EC_M))}"
 export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-16}"
 export ARGMIN_STORAGE_CLUSTER_EPOCH="${ARGMIN_STORAGE_CLUSTER_EPOCH:-1}"
+uat_local_debug_endpoint="${ARGMIN_LOCAL_DEBUG_ENDPOINT:-1}"
 
 if [[ -n "${S3_TEST_TRACE:-}" && -z "${ARGMIN_TRACE:-}" ]]; then
     export ARGMIN_TRACE="$S3_TEST_TRACE"
@@ -254,6 +255,8 @@ server_logs=()
 server_names=()
 storage_node_pids=()
 storage_node_logs=()
+frontend_pid=""
+frontend_log=""
 
 print_command() {
     printf '+'
@@ -286,6 +289,7 @@ start_storage_node() {
         ARGMIN_STORAGE_NODE_ID="$node_id" \
         ARGMIN_STORAGE_NODE_DATA_DIR="$node_data_dir" \
         ARGMIN_STORAGE_NODE_SOCKET_PATH="$socket_path" \
+        ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
         ARGMIN_DATA_DIR="$data_dir" \
         ARGMIN_LISTEN_ADDR="$listen_addr" \
         "${server_cmd[@]}"
@@ -344,6 +348,12 @@ kill_storage_node() {
 
 cleanup_server() {
     local status=$?
+    if ((status != 0)) && [[ -n "${frontend_pid:-}" ]] && kill -0 "$frontend_pid" 2>/dev/null; then
+        echo "== argmin-s3 UAT frontend flight recorder dump request ==" >&2
+        if ! curl -k -sS -X POST "$endpoint/__argmin/debug/flight-recorder/dump" >/dev/null 2>&1; then
+            echo "frontend flight recorder dump request failed" >&2
+        fi
+    fi
     for pid in "${server_pids[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
@@ -364,9 +374,9 @@ cleanup_server() {
             local matches
             matches="$(
                 grep -nE \
-                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=500|cause_label=|bucket delete (begin|finalize) found visible data|panicked at|panic|aborted" \
+                    "server produced HTTP 500|HTTP response conversion produced InternalError|dispatch_internal_error|request_error .*status=(409|500)|OperationAborted|cause_label=|metadata_command_conflict|metadata_command_pending_slot_action|storage_rpc_error|flight .*request_error|bucket delete (begin|finalize) found visible data|panicked at|panic|aborted" \
                     "$log_path" \
-                    | head -n 40 \
+                    | head -n 120 \
                     || true
             )"
             if [[ -n "$matches" ]]; then
@@ -376,7 +386,7 @@ cleanup_server() {
             fi
         done
         if ((found_diagnostics == 0)); then
-            echo "no HTTP 500, cause-label, panic, or abort diagnostics found in server logs" >&2
+            echo "no HTTP error, cause-label, metadata-command, panic, or abort diagnostics found in server logs" >&2
         fi
         for index in "${!server_logs[@]}"; do
             local log_path="${server_logs[$index]}"
@@ -435,6 +445,8 @@ if [[ "$topology" == "local" ]]; then
         -u ARGMIN_STORAGE_NODE_SOCKETS \
         ARGMIN_PROCESS_ROLE=legacy-local \
         ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
+        ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
+        ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \
         ARGMIN_DATA_DIR="$data_dir" \
         ARGMIN_LISTEN_ADDR="$listen_addr" \
         "${server_cmd[@]}"
@@ -464,6 +476,8 @@ else
         -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
         ARGMIN_PROCESS_ROLE=frontend \
         ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
+        ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
+        ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \
         ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
         ARGMIN_DATA_DIR="$data_dir/frontend" \
         "${server_cmd[@]}"
@@ -472,16 +486,22 @@ fi
 frontend_index=$((${#server_pids[@]} - 1))
 frontend_pid="${server_pids[$frontend_index]}"
 frontend_log="${server_logs[$frontend_index]}"
+readiness_url="$endpoint/"
+case "$uat_local_debug_endpoint" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+        readiness_url="$endpoint/__argmin/debug/metrics"
+        ;;
+esac
 
 for _ in {1..200}; do
     wait_for_process "$frontend_pid" "$frontend_log" "frontend"
-    if curl -k -sS "$endpoint/" >/dev/null 2>&1; then
+    if curl -k -sS "$readiness_url" >/dev/null 2>&1; then
         break
     fi
     sleep 0.1
 done
 
-if ! curl -k -sS "$endpoint/" >/dev/null 2>&1; then
+if ! curl -k -sS "$readiness_url" >/dev/null 2>&1; then
     cat "$frontend_log" >&2 || true
     die "argmin-s3 did not become ready at $endpoint"
 fi
