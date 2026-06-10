@@ -1235,3 +1235,21 @@ pub fn err_status<T, E: std::fmt::Debug>(
             .unwrap_or_else(|| panic!("error has no raw HTTP response: {:?}", sdk_err)),
     }
 }
+
+/// Return true for SDK errors caused by the server closing an in-flight request body.
+///
+/// Some tests intentionally race a streaming request against a server-side state
+/// transition that can reject the request after the client has started writing.
+/// In that shape there may be no S3 error response for the SDK to expose.
+pub fn is_sdk_stream_disconnect<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    if err.raw_response().is_some() {
+        return false;
+    }
+    let message = format!("{err:?}");
+    message.contains("DispatchFailure")
+        && (message.contains("BodyWrite")
+            || message.contains("BrokenPipe")
+            || message.contains("Broken pipe")
+            || message.contains("Connection reset")
+            || message.contains("IncompleteMessage"))
+}
