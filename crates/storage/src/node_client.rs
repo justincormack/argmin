@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use placement::NodeId;
 use s3_types::{AclGrants, BucketVersioningState};
@@ -209,6 +209,8 @@ use crate::types::{
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
     UploadId, UploadState, VersionId, WriteAck,
 };
+
+const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT: usize = 1024;
 
 fn merge_bucket_snapshot_pair_request(
     source: BucketSnapshotRequest,
@@ -2689,17 +2691,90 @@ pub(crate) struct UnixStorageNodeClient {
     cluster_epoch: ClusterEpoch,
     socket_path: PathBuf,
     next_request_id: AtomicU64,
+    rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
+}
+
+struct UnixStorageNodeRpcAdmission {
+    limit: usize,
+    active: Mutex<usize>,
+}
+
+struct UnixStorageNodeRpcAdmissionPermit {
+    admission: Arc<UnixStorageNodeRpcAdmission>,
+}
+
+type UnixStorageNodeRpcAdmissionKey = (u32, PathBuf);
+type UnixStorageNodeRpcAdmissionRegistry =
+    Mutex<BTreeMap<UnixStorageNodeRpcAdmissionKey, Weak<UnixStorageNodeRpcAdmission>>>;
+
+impl UnixStorageNodeRpcAdmission {
+    fn new(limit: usize) -> Self {
+        assert!(
+            limit > 0,
+            "Unix storage-node RPC admission limit must be > 0"
+        );
+        Self {
+            limit,
+            active: Mutex::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<UnixStorageNodeRpcAdmissionPermit> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active >= self.limit {
+            return None;
+        }
+        *active += 1;
+        Some(UnixStorageNodeRpcAdmissionPermit {
+            admission: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for UnixStorageNodeRpcAdmissionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .admission
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *active = active
+            .checked_sub(1)
+            .expect("Unix storage-node RPC admission release without acquire");
+    }
+}
+
+fn shared_unix_storage_node_rpc_admission(
+    node_id: NodeId,
+    socket_path: &std::path::Path,
+    limit: usize,
+) -> Arc<UnixStorageNodeRpcAdmission> {
+    static ADMISSIONS: OnceLock<UnixStorageNodeRpcAdmissionRegistry> = OnceLock::new();
+
+    let key = (node_id.as_u32(), socket_path.to_path_buf());
+    let mut admissions = ADMISSIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(admission) = admissions.get(&key).and_then(Weak::upgrade) {
+        return admission;
+    }
+    let admission = Arc::new(UnixStorageNodeRpcAdmission::new(limit));
+    admissions.insert(key, Arc::downgrade(&admission));
+    admission
 }
 
 pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
     stream: UnixStream,
     next_request_id: u64,
+    _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
 }
 
 pub(crate) struct UnixStorageNodeMetadataCommandSession {
     node_id: NodeId,
     cluster_epoch: ClusterEpoch,
+    _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     inner: Mutex<UnixStorageNodeMetadataCommandSessionInner>,
 }
 
@@ -2725,12 +2800,42 @@ impl UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         socket_path: impl Into<PathBuf>,
     ) -> Self {
+        let socket_path = socket_path.into();
+        let rpc_admission = shared_unix_storage_node_rpc_admission(
+            node_id,
+            &socket_path,
+            UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+        );
+        Self::with_rpc_admission(node_id, cluster_epoch, socket_path, rpc_admission)
+    }
+
+    fn with_rpc_admission(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        socket_path: PathBuf,
+        rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
+    ) -> Self {
         Self {
             node_id,
             cluster_epoch,
-            socket_path: socket_path.into(),
+            socket_path,
             next_request_id: AtomicU64::new(1),
+            rpc_admission,
         }
+    }
+
+    fn with_rpc_admission_limit(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        socket_path: impl Into<PathBuf>,
+        rpc_admission_limit: usize,
+    ) -> Self {
+        Self::with_rpc_admission(
+            node_id,
+            cluster_epoch,
+            socket_path.into(),
+            Arc::new(UnixStorageNodeRpcAdmission::new(rpc_admission_limit)),
+        )
     }
 
     pub(crate) fn node_id(&self) -> NodeId {
@@ -2740,6 +2845,7 @@ impl UnixStorageNodeClient {
     pub(crate) fn open_read_handle_session(
         &self,
     ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+        let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ReadHandlesAcquire)?;
         let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
             context: "connect storage-node read-handle RPC socket",
             source,
@@ -2748,6 +2854,7 @@ impl UnixStorageNodeClient {
             node_id: self.node_id,
             stream,
             next_request_id: 1,
+            _rpc_permit: rpc_permit,
         })
     }
 
@@ -2755,6 +2862,8 @@ impl UnixStorageNodeClient {
         &self,
         pg_id: PgId,
     ) -> Result<UnixStorageNodeMetadataCommandSession, StoreError> {
+        let rpc_permit =
+            self.acquire_rpc_admission(StorageRpcMessageKind::MetadataCommandPgLockAcquire)?;
         let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
             context: "connect storage-node metadata command RPC socket",
             source,
@@ -2762,6 +2871,7 @@ impl UnixStorageNodeClient {
         let session = UnixStorageNodeMetadataCommandSession {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
+            _rpc_permit: rpc_permit,
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream,
                 next_request_id: 1,
@@ -2780,6 +2890,7 @@ impl UnixStorageNodeClient {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
+        let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ShardWrite)?;
         let expected_size = data.len() as u64;
         let expected_crc64 = checksum::crc64::checksum(data);
         let request = StorageRpcShardWriteRequest {
@@ -2792,7 +2903,8 @@ impl UnixStorageNodeClient {
         let payload = encode_shard_write_request(&request).map_err(|error| {
             self.rpc_payload_error("encode shard write request", error.to_string())
         })?;
-        let response = self.rpc_request(StorageRpcMessageKind::ShardWrite, payload)?;
+        let response =
+            self.rpc_request_with_permit(StorageRpcMessageKind::ShardWrite, payload, rpc_permit)?;
         decode_shard_write_ack(&response, expected_size, expected_crc64).map_err(|error| {
             self.rpc_payload_error("decode shard write response", error.to_string())
         })
@@ -3953,7 +4065,17 @@ impl UnixStorageNodeClient {
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, StoreError> {
-        match self.rpc_request_result(kind, payload)? {
+        let rpc_permit = self.acquire_rpc_admission(kind)?;
+        self.rpc_request_with_permit(kind, payload, rpc_permit)
+    }
+
+    fn rpc_request_with_permit(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        rpc_permit: UnixStorageNodeRpcAdmissionPermit,
+    ) -> Result<Vec<u8>, StoreError> {
+        match self.rpc_request_result_with_permit(kind, payload, rpc_permit)? {
             Ok(payload) => Ok(payload),
             Err(error) => Err(self.rpc_response_error(kind, error)),
         }
@@ -3963,6 +4085,16 @@ impl UnixStorageNodeClient {
         &self,
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        let rpc_permit = self.acquire_rpc_admission(kind)?;
+        self.rpc_request_result_with_permit(kind, payload, rpc_permit)
+    }
+
+    fn rpc_request_result_with_permit(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let mut stream =
@@ -3993,6 +4125,22 @@ impl UnixStorageNodeClient {
         decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
             self.rpc_payload_error("decode storage RPC response", error.to_string())
         })
+    }
+
+    fn acquire_rpc_admission(
+        &self,
+        kind: StorageRpcMessageKind,
+    ) -> Result<UnixStorageNodeRpcAdmissionPermit, StoreError> {
+        self.rpc_admission
+            .try_acquire()
+            .ok_or_else(|| StoreError::StorageRpcResourceExhausted {
+                node_id: self.node_id.as_u32(),
+                operation: kind.operation_name(),
+                message: format!(
+                    "storage-node client RPC admission limit {} is exhausted",
+                    self.rpc_admission.limit
+                ),
+            })
     }
 
     fn shard_location(
@@ -15496,6 +15644,12 @@ mod tests {
         )
     }
 
+    fn test_rpc_admission_permit() -> UnixStorageNodeRpcAdmissionPermit {
+        Arc::new(UnixStorageNodeRpcAdmission::new(1))
+            .try_acquire()
+            .unwrap()
+    }
+
     fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -21661,6 +21815,7 @@ mod tests {
             node_id: NodeId::new(8),
             stream: read_stream,
             next_request_id: 1,
+            _rpc_permit: test_rpc_admission_permit(),
         };
         let err = StorageRpcErrorResponse {
             code: StorageRpcErrorCode::ResourceExhausted,
@@ -21679,6 +21834,7 @@ mod tests {
         let metadata_session = UnixStorageNodeMetadataCommandSession {
             node_id: NodeId::new(9),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            _rpc_permit: test_rpc_admission_permit(),
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream: metadata_stream,
                 next_request_id: 1,
@@ -21698,6 +21854,141 @@ mod tests {
                 operation: "metadata command PG lock acquire",
                 ref message,
             } if message.contains("session limit")
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_exhaustion_is_typed_before_connect() {
+        let client = UnixStorageNodeClient::with_rpc_admission_limit(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            "/tmp/unopened-storage-node.sock",
+            1,
+        );
+        let _held = client
+            .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+            .unwrap();
+
+        let err = client
+            .rpc_request_result(StorageRpcMessageKind::ShardWrite, Vec::new())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 7,
+                operation: "shard write",
+                ref message,
+            } if message.contains("admission limit 1")
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_is_shared_by_node_and_socket() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("missing.sock");
+        let client_a = UnixStorageNodeClient::new(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            socket_path.clone(),
+        );
+        let client_b =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+        let _held: Vec<_> = (0..UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT)
+            .map(|_| {
+                client_a
+                    .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+                    .unwrap()
+            })
+            .collect();
+
+        let err = client_b
+            .rpc_request_result(StorageRpcMessageKind::ShardWrite, Vec::new())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 7,
+                operation: "shard write",
+                ref message,
+            } if message.contains("admission limit")
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_shard_write_admission_exhausts_before_socket_write() {
+        let client = UnixStorageNodeClient::with_rpc_admission_limit(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            "/tmp/unopened-storage-node.sock",
+            1,
+        );
+        let _held = client
+            .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+            .unwrap();
+        let key = ShardKey::new(&[0x55; 16], 55, 0);
+        let err = client
+            .write_placed_shard(DataPgId::new(PgId::new(0)), &key, &[0x5a; 4096])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 7,
+                operation: "shard write",
+                ref message,
+            } if message.contains("admission limit 1")
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_read_handle_session_admission_exhausts_before_connect() {
+        let client = UnixStorageNodeClient::with_rpc_admission_limit(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            "/tmp/unopened-storage-node.sock",
+            1,
+        );
+        let _held = client
+            .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+            .unwrap();
+        let err = match client.open_read_handle_session() {
+            Ok(_) => panic!("read-handle session admission unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 7,
+                operation: "read handles acquire",
+                ref message,
+            } if message.contains("admission limit 1")
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_metadata_session_admission_exhausts_before_connect() {
+        let client = UnixStorageNodeClient::with_rpc_admission_limit(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            "/tmp/unopened-storage-node.sock",
+            1,
+        );
+        let _held = client
+            .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+            .unwrap();
+        let err = match client.open_metadata_command_critical_section(PgId::new(0)) {
+            Ok(_) => panic!("metadata-command session admission unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            StoreError::StorageRpcResourceExhausted {
+                node_id: 7,
+                operation: "metadata command PG lock acquire",
+                ref message,
+            } if message.contains("admission limit 1")
         ));
     }
 

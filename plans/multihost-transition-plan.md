@@ -6571,6 +6571,15 @@ Status:
   pacing, single-flight pending-command recovery, bounded object-version
   reservation retries, foreground/background budget separation, and only then a
   bounded adaptive controller.
+- Started the first client-side node-admission implementation slice. Unix
+  storage-node clients now share a static per `(node_id, socket_path)` RPC
+  admission gate before opening request sockets or writing frames. Long-lived
+  read-handle and metadata-command session opens hold a permit for the session
+  lifetime, and `ShardWrite` acquires the gate before checksum/RPC payload
+  encoding so a saturated client does not build or upload a large shard-write
+  frame. This is intentionally a fixed-limit first step; runtime configuration,
+  per-resource byte budgets, and adaptive control remain follow-up work in this
+  phase.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
