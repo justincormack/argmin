@@ -6580,6 +6580,12 @@ Status:
   frame. This is intentionally a fixed-limit first step; runtime configuration,
   per-resource byte budgets, and adaptive control remain follow-up work in this
   phase.
+- Added the first storage-node defensive fallback for active-session pressure:
+  the server now reserves an active-session slot before accepting a socket and
+  waits for release when the limit is reached. That keeps excess connections in
+  the Unix socket backlog instead of accepting and silently dropping them. A
+  framed/handshaked overload protocol is still a later phase item, but this
+  removes the immediate EOF/drop behavior from the main `serve_forever` path.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

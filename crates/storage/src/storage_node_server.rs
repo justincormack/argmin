@@ -520,7 +520,7 @@ pub struct StorageNodeServer {
     _node: Arc<SharedStorageNode>,
     listener: UnixListener,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
-    active_sessions: Arc<Mutex<StorageNodeActiveSessionState>>,
+    active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
 }
 
@@ -549,12 +549,13 @@ impl StorageNodeServer {
             _node: Arc::new(node),
             listener,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
-            active_sessions: Arc::new(Mutex::new(StorageNodeActiveSessionState::default())),
+            active_sessions: Arc::new(StorageNodeActiveSessions::default()),
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
         })
     }
 
     pub fn accept_one(&self) -> Result<(), StorageNodeServerError> {
+        let session_guard = self.acquire_session();
         let (mut stream, _) =
             self.listener
                 .accept()
@@ -562,11 +563,6 @@ impl StorageNodeServer {
                     context: "accept storage-node connection",
                     path: self.config.socket_path.clone(),
                     source,
-                })?;
-        let session_guard =
-            self.try_acquire_session()
-                .ok_or(StorageNodeServerError::TooManyActiveSessions {
-                    limit: STORAGE_NODE_MAX_ACTIVE_SESSIONS,
                 })?;
         self.connection_handler()
             .handle_session(&mut stream, session_guard)
@@ -579,6 +575,7 @@ impl StorageNodeServer {
     }
 
     fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
+        let session_guard = self.acquire_session();
         let (mut stream, _) =
             self.listener
                 .accept()
@@ -588,9 +585,6 @@ impl StorageNodeServer {
                     source,
                 })?;
         let handler = self.connection_handler();
-        let Some(session_guard) = self.try_acquire_session() else {
-            return Ok(());
-        };
         thread::spawn(move || {
             if let Err(error) = handler.handle_session(&mut stream, session_guard) {
                 eprintln!("storage-node connection failed: {error}");
@@ -608,18 +602,9 @@ impl StorageNodeServer {
         }
     }
 
-    fn try_acquire_session(&self) -> Option<StorageNodeActiveSessionGuard> {
-        let mut active_sessions = self
-            .active_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if active_sessions.try_acquire(STORAGE_NODE_MAX_ACTIVE_SESSIONS) {
-            Some(StorageNodeActiveSessionGuard {
-                active_sessions: Arc::clone(&self.active_sessions),
-            })
-        } else {
-            None
-        }
+    fn acquire_session(&self) -> StorageNodeActiveSessionGuard {
+        self.active_sessions
+            .acquire(STORAGE_NODE_MAX_ACTIVE_SESSIONS)
     }
 
     #[cfg(test)]
@@ -6880,6 +6865,47 @@ struct StorageNodeActiveSessionState {
     active: usize,
 }
 
+#[derive(Debug, Default)]
+struct StorageNodeActiveSessions {
+    state: Mutex<StorageNodeActiveSessionState>,
+    available: Condvar,
+}
+
+impl StorageNodeActiveSessions {
+    fn acquire(self: &Arc<Self>, limit: usize) -> StorageNodeActiveSessionGuard {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.try_acquire(limit) {
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        StorageNodeActiveSessionGuard {
+            active_sessions: Arc::clone(self),
+        }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(self: &Arc<Self>, limit: usize) -> Option<StorageNodeActiveSessionGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.try_acquire(limit) {
+            Some(StorageNodeActiveSessionGuard {
+                active_sessions: Arc::clone(self),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn release(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release();
+        self.available.notify_one();
+    }
+}
+
 impl StorageNodeActiveSessionState {
     fn try_acquire(&mut self, limit: usize) -> bool {
         if self.active >= limit {
@@ -6898,15 +6924,12 @@ impl StorageNodeActiveSessionState {
 }
 
 struct StorageNodeActiveSessionGuard {
-    active_sessions: Arc<Mutex<StorageNodeActiveSessionState>>,
+    active_sessions: Arc<StorageNodeActiveSessions>,
 }
 
 impl Drop for StorageNodeActiveSessionGuard {
     fn drop(&mut self) {
-        self.active_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .release();
+        self.active_sessions.release();
     }
 }
 
@@ -10475,6 +10498,16 @@ mod tests {
         assert!(!active_sessions.try_acquire(2));
         active_sessions.release();
         assert!(active_sessions.try_acquire(2));
+    }
+
+    #[test]
+    fn storage_node_active_sessions_release_notifies_capacity() {
+        let active_sessions = Arc::new(StorageNodeActiveSessions::default());
+        let first = active_sessions.try_acquire(1).unwrap();
+        assert!(active_sessions.try_acquire(1).is_none());
+
+        drop(first);
+        assert!(active_sessions.try_acquire(1).is_some());
     }
 
     #[test]
