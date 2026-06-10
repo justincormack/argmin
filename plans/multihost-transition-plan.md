@@ -6170,56 +6170,160 @@ Work items:
    - make any explicit debug dump endpoint or trigger local/admin-only and
      disabled by default unless an operator enables it deliberately
 4. backpressure and admission control
-   - start measurement-first on the hosts that reproduce UAT operation-attempt
-     timeouts: sample local debug metrics continuously, preserve the time
-     series in the UAT data dir, and use flight-recorder records to identify
-     the stage that consumed timeout budget before changing timeout values
-   - add stage-level wait/timeout diagnostics before changing behavior:
-     frontend request admission, request body read, storage-node RPC acquire,
-     metadata-command session acquire, pending-slot drain/reissue, shard
-     write/read, EC reconstruction, and response streaming
-   - address internal retry storms before widening budgets: one contender per
-     PG/pending slot should perform drain/reissue work while other contenders
-     wait briefly or return the correct retryable S3 response, with bounded
-     jittered retry budgets instead of unbounded disk-writing loops
-   - define explicit foreground budgets for frontend request admission,
-     request-body bytes in flight, per-storage-node RPC concurrency,
-     per-PG metadata-command concurrency, shard IO concurrency, and shard bytes
-     in flight
-   - measure and diagnose operation-attempt timeout failures as overload
-     symptoms: capture which request stage is waiting (body read, storage-node
-     RPC acquire, metadata-command session, shard write/read, EC
-     reconstruction, or response streaming) before changing harness timeouts
-   - make overload decisions before expensive body reads or long shard/RPC work
-     where possible
-   - propagate storage-node saturation to the frontend as a typed retryable
-     overload response
-   - enforce a side-effect boundary for overload responses: return overload
-     before accepting a side-effecting operation, or only after the operation has
-     a durable idempotent command/session/reservation identity that makes client
-     retry safe
-   - fail closed instead of returning retryable overload if the server cannot
-     prove whether a non-idempotent shard write, shard ack, metadata command,
-     reservation, read handle, or cleanup side effect was accepted
-   - investigate and cap durable object-version reservation retry storms: a
-     retained UAT failure showed one versioned PUT sequence burning thousands
-     of `ReserveObjectVersion` commands for the same bucket/key before a small
-     number of live commits. Phase 10.9 backpressure must distinguish expected
-     opaque version-id gaps from an unbounded allocator loop, surface the wait
-     stage in diagnostics, and ensure client-visible retries after a committed
-     non-idempotent PUT do not look like harness cleanup corruption.
-   - reserve lower-priority budgets for lifecycle, reclaim, and scavenger work
-     so background workers cannot starve foreground S3 requests
+   - treat backpressure as a capacity protocol, not as extra
+     `CommandAborted` paths. The server must either hold capacity for the next
+     side effect, stop reading client body bytes so TCP applies natural
+     backpressure, or return S3 `SlowDown` before doing more work. A timeout or
+     EOF is a backpressure bug unless the client disappears first.
+   - introduce a shared capacity-admission abstraction used by frontend,
+     storage-cluster, and storage-node code. Each lease records:
+     resource kind, operation class, estimated work units, wait start/end,
+     timeout budget, queue depth at acquire, and release outcome. Initial
+     resources are frontend requests, streaming body segment buffers, internal
+     copy bytes, per-storage-node RPC sessions, per-storage-node shard reads,
+     per-storage-node shard writes, per-storage-node bytes in flight, per-PG
+     metadata command apply, and pending-command recovery work.
+   - define an operation cost model before reading or generating large bodies.
+     Metadata-only operations charge metadata/RPC units. Reads charge read RPCs
+     and response bytes. Direct PUT, streamed PUT, `UploadPart`, multipart
+     completion, `CopyObject`, and `UploadPartCopy` charge mutating request
+     units plus per-segment shard write/read bytes. Unknown-size streaming
+     writes acquire one segment of body/shard capacity at a time before reading
+     that segment from the client.
+   - make mutating requests side-effect aware:
+     - before durable command/session/reservation identity exists, capacity
+       failure returns `SlowDown` and must leave no metadata command, shard ack,
+       bucket-write reservation, generation reservation, read handle, or reclaim
+       fence behind
+     - after staging has started but before publish, capacity failure aborts the
+       staging session through the normal cleanup path and returns `SlowDown`
+       only after the server knows no visible object mutation committed
+     - after publish/commit is known durable, the server must return the
+       committed result or fail closed if the commit result is unknown; it must
+       not return retryable overload for an ambiguous non-idempotent write
+   - add typed storage-node admission instead of connection drops. A saturated
+     storage-node must produce a framed `ResourceExhausted` response for the
+     RPC, and the storage client/coordinator mapper must convert that to S3
+     `SlowDown`. The current `accept_and_spawn` path that silently returns when
+     `STORAGE_NODE_MAX_ACTIVE_SESSIONS` is exhausted is not acceptable for UAT
+     or production backpressure because it appears upstream as EOF/timeout.
+     Because active-session exhaustion happens before the server has read an RPC
+     frame, the protocol must explicitly support one of these shapes:
+     a connection-level overload frame before request upload that carries no
+     request id/kind; a client/protocol handshake where the client sends a small
+     header first, waits for either continue or `ResourceExhausted`, and only
+     then streams a large payload; or an explicit bounded close-and-retry signal
+     that the storage client maps to typed resource exhaustion only before any
+     request payload side effect could have been accepted. A server-only
+     header-reader is not sufficient with the current synchronous client,
+     because the client writes the full encoded frame before reading a response.
+     If a header-first responder is used, it may read only the fixed frame
+     header, request id, kind, declared payload length, and checksum outside the
+     active work budget, and must reply before the client sends a large payload;
+     it must not allocate, drain, or ask the client to upload the full declared
+     payload while saturated. If payload draining is chosen for a small subset
+     of requests, it must be behind a tiny overload-responder byte cap and must
+     reject large payload-bearing requests such as `ShardWrite` before
+     allocation. The overload path must also have its own small hard cap so
+     overload reporting cannot become an unbounded worker pool or
+     body-bandwidth sink.
+   - add client-side node admission before opening storage-node RPC work. The
+     frontend process has the cluster map and placement result, so it can avoid
+     launching more RPCs to a node than the configured per-node budget can
+     sustain. The storage-node server remains the final authority and still
+     returns typed overload if the local process is saturated or the frontend
+     estimate is stale.
+   - isolate foreground and background work with separate weights/reservations.
+     Lifecycle, reclaim, delete finalization, scavenger, repair, and scrub may
+     use spare capacity, but they must not consume the reserved foreground
+     budget for PUT/GET/HEAD/list/control-plane requests. Background workers
+     that cannot acquire their low-priority lease should back off and keep the
+     durable row as the source of truth rather than spinning.
+   - replace internal retry storms with single-flight recovery and bounded retry
+     budgets. For a given `(node, pg, cluster_epoch, pending slot/log index)`,
+     at most one worker performs drain/reissue/recovery. Other contenders wait
+     on that single-flight result for a short bounded budget, then return the
+     operation-appropriate retryable S3 response (`OperationAborted` for
+     same-key metadata contention, `SlowDown` for capacity exhaustion) instead
+     of installing more durable commands. Every waiter must revalidate the
+     recovered pending command against its own expected command identity,
+     checksum, operation scope, bucket/key or bucket-only scope, generation or
+     reservation identity, and side-effect boundary before proceeding. A
+     different contender's successful recovery is only a wakeup signal until
+     that revalidation succeeds.
+   - cap object-version reservation retries as part of the same retry budget.
+     A single client PUT attempt may not burn unbounded
+     `ReserveObjectVersion` commands for one bucket/key. Reuse the request's
+     durable identity where possible; otherwise bound allocator retries, record
+     `reservation_attempts`, `reservation_conflicts`, and
+     `commands_per_visible_commit`, and return `OperationAborted` or
+     `SlowDown` according to whether the bottleneck is metadata contention or
+     capacity.
+   - make overload adaptive but bounded. Start with conservative configured
+     min/max limits for each resource, then use observed completion rate,
+     p95/p99 wait time, timeout count, and queue depth to adjust admission
+     inside those limits. Increase slowly only while wait time is below target
+     and no overload is emitted; decrease immediately when waits exceed budget,
+     storage-node resource exhaustion appears, or operation-attempt timeout risk
+     is detected. This is admission control, not blind sleeps.
+   - emit `SlowDown` early enough for SDK retries to pace clients. The response
+     should include the existing `Retry-After` header, with a later follow-up
+     allowed to derive the value from overload debt instead of the current
+     constant. The first correctness target is that clients see bounded 503
+     `SlowDown`, not that the retry delay is perfectly tuned.
+   - keep measurement-first diagnostics, but use them to validate the control
+     loop rather than to justify larger timeouts. Preserve UAT time series for
+     every capacity resource: in-use, queue depth, wait histogram, acquire
+     timeout count, `SlowDown` count, EOF/timeout count, bytes in flight,
+     completed work units, and background-vs-foreground split.
    - ensure the UAT harness does not hide failures by retrying transport EOFs
-     or HTTP 500s; pacing must come from server-side admission/backpressure
-   - do not treat higher `S3_TEST_TIMEOUT_SECS` values as the fix for
-     multihost saturation; timeout increases may be used only as an explicit
-     diagnostic control after server-side queue/wait metrics identify the
-     bottleneck
-   - use deterministic local pressure injection where possible so faster
-     developer hosts can reproduce slow-disk/slow-CPU queueing without relying
-     on host-specific timing
-5. multihost UAT observability
+     or HTTP 500s; pacing must come from server-side admission/backpressure.
+     Higher `S3_TEST_TIMEOUT_SECS` values may be used only as a diagnostic
+     control after the server-side stage metrics identify the bottleneck.
+   - use deterministic local pressure injection for RPC acquire, shard IO,
+     metadata apply, pending-command recovery, EC work, and response streaming
+     so faster developer hosts can reproduce slow-disk/slow-CPU queueing
+     without relying on host-specific timing.
+5. backpressure implementation order
+   - first fix the lossiest overload surface: storage-node session/RPC
+     saturation must return typed `ResourceExhausted` instead of closing or
+     dropping accepted connections. Choose and implement either a
+     connection-level overload frame, a header-first continue/overload
+     handshake for large payload RPCs, or a tightly scoped close-and-retry
+     signal that the client maps to resource exhaustion before payload side
+     effects are possible. Add a low-limit test that proves the public S3
+     response is `SlowDown`, not a client write block, EOF, or operation-attempt
+     timeout.
+   - add the shared capacity lease type and instrumentation with fixed static
+     limits only. Wire it into storage-node RPC sessions, shard read/write
+     operations, and frontend request admission before adding adaptive behavior.
+   - add frontend client-side node admission from placement results so expensive
+     operations do not launch RPC fanout that the target nodes already cannot
+     accept. Keep storage-node typed overload as the authoritative fallback.
+   - add per-segment streaming write admission: acquire body buffer,
+     destination shard-write bytes, and target-node RPC capacity before reading
+     the next segment. If the wait budget is exhausted, stop reading and return
+     `SlowDown` through the normal abort/cleanup path.
+   - add explicit mutating-operation outcome gates for overload after staging:
+     no `SlowDown` may be returned until staging cleanup has completed and the
+     server has proven no visible publish occurred. If publish/commit outcome is
+     unknown, return the existing fail-closed internal/invariant path with full
+     diagnostics rather than a retryable overload response.
+   - add internal-copy pacing on the same per-segment capacity path, retiring
+     the separate medium-priority plan unless a copy-specific policy is still
+     useful after the shared byte budget exists.
+   - add per-PG metadata apply and pending-command recovery leases, then replace
+     drain/reissue loops with single-flight recovery, bounded waiter budgets,
+     and waiter-side command identity/checksum/scope revalidation.
+   - add foreground/background capacity classes and make lifecycle, reclaim,
+     delete finalization, scavenger, repair, and scrub use low-priority leases
+     with backoff.
+   - only after the static limits pass UAT under forced low budgets, add the
+     bounded adaptive controller. It must be feature/config gated at first and
+     tested against deterministic pressure injection before becoming the default.
+   - after every slice, run the focused pressure tests with low limits, then a
+     repeated UAT subset on the slow host before widening the tested surface.
+6. multihost UAT observability
    - make the UAT harness always preserve a concise metrics/log summary on
      failure: slowest operations, 409/503/500 counts, transport failures, RPC
      latency, queue wait histograms, and storage-node saturation events
@@ -6244,27 +6348,69 @@ Required tests:
    before request bodies time out
 6. storage-node RPC saturation returns a typed overload response and does not
    close the connection mid-request
-7. overload injection before write/RPC admission leaves no command installed, no
+7. storage-node active-session exhaustion returns a framed
+   `ResourceExhausted` RPC response or an explicit connection-level overload
+   frame, maps to S3 `SlowDown`, and produces no coordinator-visible or
+   public S3-client-visible EOF, raw `StorageRpc` error, or operation-attempt
+   timeout. A deliberate pre-side-effect close-and-retry signal may be observed
+   only inside the storage client and must be converted there to typed
+   `ResourceExhausted` before it crosses into storage-cluster/coordinator code.
+   Large-payload `ShardWrite` coverage must prove the client can observe
+   overload before uploading the full payload, or that the internal
+   close-and-retry signal maps to `SlowDown`; it must not block in
+   `write_storage_rpc_frame_to`, allocate or drain the full declared payload on
+   the server, or depend on the normal generic payload limit while the node is
+   saturated.
+8. client-side node admission prevents RPC fanout from exceeding configured
+   target-node capacity, while stale estimates still converge through
+   storage-node typed overload
+9. streamed PUT and `UploadPart` acquire per-segment capacity before body reads;
+   under forced low shard-write capacity, the client sees either TCP pacing or
+   S3 `SlowDown`, not a body idle timeout or dropped connection
+10. `CopyObject` and `UploadPartCopy` consume the same byte/RPC capacity budget
+    as client-body writes and cannot starve unrelated bounded PUT/GET traffic
+11. pending-command drain/reissue single-flight allows one recovery worker per
+    `(node, pg, epoch, pending slot/log index)` and prevents duplicate durable
+    command storms under concurrent contenders
+12. single-flight waiters revalidate the recovered command identity, checksum,
+    operation scope, object/bucket scope, generation or reservation identity,
+    and side-effect boundary before proceeding; divergent contenders must wake
+    and return the correct retryable contention error or fail closed rather than
+    treating another command's recovery as their own success
+13. object-version reservation retries are bounded per request attempt, expose
+    `reservation_attempts` and `commands_per_visible_commit`, and return
+    `OperationAborted` or `SlowDown` instead of looping until the SDK
+    operation-attempt timeout fires
+14. foreground capacity reservations keep bounded PUT/GET traffic making
+    progress while lifecycle, reclaim, delete-finalizer, scavenger, repair, or
+    scrub work is saturated
+15. overload injection before write/RPC admission leaves no command installed, no
    shard ack written, no leaked bucket-write reservation, no leaked object
    generation reservation, and no leaked read handle
-8. overload after idempotent command/session identity is established can be
+16. capacity failure after destination staging has started but before publish
+    aborts the staging session, completes cleanup, proves no visible object
+    mutation committed, and only then returns S3 `SlowDown`
+17. capacity failure or transport loss with unknown publish/commit outcome fails
+    closed with invariant/internal diagnostics and must not return retryable
+    `SlowDown` or `OperationAborted`
+18. overload after idempotent command/session identity is established can be
    retried safely and converges without duplicate mutation or leaked cleanup
    state
-9. background lifecycle/reclaim/scavenger load cannot starve a bounded foreground
+19. background lifecycle/reclaim/scavenger load cannot starve a bounded foreground
    S3 PUT/GET/MPU workload
-10. full-suite multihost large-object pressure, including multipart copy,
+20. full-suite multihost large-object pressure, including multipart copy,
     checksum/object-attributes MPU completion, and SSE-C multipart PUT/GET,
     either completes within the configured operation-attempt budget or returns
     bounded S3-shaped overload responses; it must not fail only as SDK
     operation-attempt timeouts
-11. every HTTP 500 in a focused failure-injection test emits a structured cause
+21. every HTTP 500 in a focused failure-injection test emits a structured cause
    label and enough request/RPC/PG context to debug without temporary tracing
-12. diagnostics and flight-recorder dumps redact secrets, payload context,
+22. diagnostics and flight-recorder dumps redact secrets, payload context,
     request headers, SSE-C material, and unbounded names; explicit dump access
     is disabled by default and local/admin-only
-13. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
+23. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
    deterministic diagnostics for the first failing iteration
-14. guardrails fail if a new coordinator request path maps expected
+24. guardrails fail if a new coordinator request path maps expected
     metadata-command contention directly to generic `Store`, `Metadata`, or
     internal errors
 
@@ -6417,6 +6563,14 @@ Status:
   S3 `SlowDown`. The local debug metrics endpoint exposes the new counters, and
   the UAT wrapper samples that endpoint once per second into the retained log
   directory so slow-host timeout runs preserve the pressure ramp.
+- Reworked the remaining Phase 10.9 backpressure direction after slow-host UAT
+  showed that adding more command-aborted/contention mappings does not make
+  clients slow down to sustainable work capacity. The plan now requires a
+  capacity-admission protocol with side-effect-aware leases, typed storage-node
+  overload instead of EOFs, client-side node admission, per-segment body/shard
+  pacing, single-flight pending-command recovery, bounded object-version
+  reservation retries, foreground/background budget separation, and only then a
+  bounded adaptive controller.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
