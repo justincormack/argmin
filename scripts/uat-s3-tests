@@ -258,6 +258,7 @@ storage_node_logs=()
 frontend_pid=""
 frontend_log=""
 metrics_sampler_pid=""
+slowdown_summary_printed=0
 
 print_command() {
     printf '+'
@@ -354,6 +355,11 @@ latest_metric_sample_value() {
 }
 
 print_slowdown_summary() {
+    if ((slowdown_summary_printed)); then
+        return 0
+    fi
+    slowdown_summary_printed=1
+
     local metrics_log="$logs_dir/frontend-metrics-samples.log"
     echo "== argmin-s3 UAT SlowDown summary ==" >&2
     if [[ -s "$metrics_log" ]]; then
@@ -377,9 +383,11 @@ print_slowdown_summary() {
     fi
     local slowdown_log_match_lines
     local slowdown_log_match_count=0
-    slowdown_log_match_lines="$(grep -hE "request_error .*status=503|SlowDown|slow_down" "${server_logs[@]}" 2>/dev/null || true)"
-    if [[ -n "$slowdown_log_match_lines" ]]; then
-        slowdown_log_match_count="$(printf '%s\n' "$slowdown_log_match_lines" | wc -l | tr -d ' ')"
+    if ((${#server_logs[@]})); then
+        slowdown_log_match_lines="$(grep -hE "request_error .*status=503|SlowDown|slow_down" "${server_logs[@]}" 2>/dev/null || true)"
+        if [[ -n "$slowdown_log_match_lines" ]]; then
+            slowdown_log_match_count="$(printf '%s\n' "$slowdown_log_match_lines" | wc -l | tr -d ' ')"
+        fi
     fi
     echo "log_matches status_503_or_slowdown=$slowdown_log_match_count" >&2
 }
@@ -592,7 +600,14 @@ run_nextest() {
         printf '+'
         printf ' %q' "${cmd[@]}"
         printf '\n'
+        set +e
         "${cmd[@]}"
+        local status=$?
+        set -e
+        if ((status != 0)); then
+            print_slowdown_summary
+            return "$status"
+        fi
     done
 }
 
