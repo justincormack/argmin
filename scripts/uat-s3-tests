@@ -347,6 +347,43 @@ kill_storage_node() {
     fi
 }
 
+latest_metric_sample_value() {
+    local metrics_log="$1"
+    local metric_name="$2"
+    awk -v metric="$metric_name" '$1 == metric { value = $2 } END { if (value != "") print value; else print "0" }' "$metrics_log"
+}
+
+print_slowdown_summary() {
+    local metrics_log="$logs_dir/frontend-metrics-samples.log"
+    echo "== argmin-s3 UAT SlowDown summary ==" >&2
+    if [[ -s "$metrics_log" ]]; then
+        local slow_down
+        local admission_timeout
+        local admission_wait
+        local admission_wait_us
+        local operation_aborted
+        local request_errors
+        local storage_rpc_errors
+        slow_down="$(latest_metric_sample_value "$metrics_log" slow_down_response_total)"
+        admission_timeout="$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)"
+        admission_wait="$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)"
+        admission_wait_us="$(latest_metric_sample_value "$metrics_log" request_admission_wait_us_total)"
+        operation_aborted="$(latest_metric_sample_value "$metrics_log" operation_aborted_response_total)"
+        request_errors="$(latest_metric_sample_value "$metrics_log" request_error_total)"
+        storage_rpc_errors="$(latest_metric_sample_value "$metrics_log" storage_rpc_error_total)"
+        echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors" >&2
+    else
+        echo "metrics unavailable" >&2
+    fi
+    local slowdown_log_match_lines
+    local slowdown_log_match_count=0
+    slowdown_log_match_lines="$(grep -hE "request_error .*status=503|SlowDown|slow_down" "${server_logs[@]}" 2>/dev/null || true)"
+    if [[ -n "$slowdown_log_match_lines" ]]; then
+        slowdown_log_match_count="$(printf '%s\n' "$slowdown_log_match_lines" | wc -l | tr -d ' ')"
+    fi
+    echo "log_matches status_503_or_slowdown=$slowdown_log_match_count" >&2
+}
+
 cleanup_server() {
     local status=$?
     if [[ -n "${metrics_sampler_pid:-}" ]] && kill -0 "$metrics_sampler_pid" 2>/dev/null; then
@@ -367,6 +404,7 @@ cleanup_server() {
     for pid in "${server_pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
+    print_slowdown_summary
     if ((status != 0)); then
         echo "== argmin-s3 UAT failure diagnostics ==" >&2
         local found_diagnostics=0

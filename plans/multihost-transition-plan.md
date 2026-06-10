@@ -6586,6 +6586,12 @@ Status:
   the Unix socket backlog instead of accepting and silently dropping them. A
   framed/handshaked overload protocol is still a later phase item, but this
   removes the immediate EOF/drop behavior from the main `serve_forever` path.
+- Added UAT SlowDown visibility and a first tuning knob for forced pressure
+  runs. The UAT wrapper now prints a concise SlowDown summary from the final
+  frontend metrics sample and matching logs, and frontend topology setup accepts
+  `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` so slow-host or stress runs can
+  deliberately set a low per-node Unix RPC admission limit and verify bounded
+  S3 `SlowDown` responses instead of opaque client timeouts.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

@@ -295,9 +295,10 @@ fn build_remote_frontend_storage_cluster(
     .map_err(|e| e.to_string())?;
     local_map
         .install_unix_storage_node_clients(config.storage_node_sockets.iter().map(|entry| {
-            LocalUnixStorageNodeClientConfig::new(
+            LocalUnixStorageNodeClientConfig::with_rpc_admission_limit(
                 NodeId::new(entry.node_id),
                 entry.socket_path.clone(),
+                config.storage_node_rpc_admission_limit,
             )
         }))
         .map_err(|e| e.to_string())?;
@@ -374,7 +375,7 @@ async fn run_frontend_server(
     };
 
     eprintln!(
-        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
+        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, storage RPC admission {}, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
         scheme,
         config.listen_addr,
         config.ec_k,
@@ -383,6 +384,7 @@ async fn run_frontend_server(
         config.workers,
         config.max_connections,
         config.max_inflight_requests,
+        config.storage_node_rpc_admission_limit,
         config.stream_read_chunk_size,
         config.panic_on_500,
         config.abort_on_500,
@@ -440,6 +442,8 @@ mod tests {
             storage_node_data_dir: Some("/tmp/argmin-test/node-0002".to_string()),
             storage_node_socket_path: Some("/tmp/argmin-test/node-0002.sock".to_string()),
             storage_node_sockets: Vec::new(),
+            storage_node_rpc_admission_limit:
+                LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT,
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
             ec_k: 4,

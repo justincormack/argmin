@@ -210,7 +210,7 @@ use crate::types::{
     UploadId, UploadState, VersionId, WriteAck,
 };
 
-const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT: usize = 1024;
+pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT: usize = 1024;
 
 fn merge_bucket_snapshot_pair_request(
     source: BucketSnapshotRequest,
@@ -2824,7 +2824,7 @@ impl UnixStorageNodeClient {
         }
     }
 
-    fn with_rpc_admission_limit(
+    pub(crate) fn with_rpc_admission_limit(
         node_id: NodeId,
         cluster_epoch: ClusterEpoch,
         socket_path: impl Into<PathBuf>,

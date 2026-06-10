@@ -18,7 +18,7 @@ use crate::node_client::{
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
     ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
-    UnixStorageNodeClient,
+    UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -62,6 +62,7 @@ pub struct LocalUnixShardNodeClientConfig {
 pub struct LocalUnixStorageNodeClientConfig {
     node_id: NodeId,
     socket_path: PathBuf,
+    rpc_admission_limit: usize,
 }
 
 impl LocalUnixShardNodeClientConfig {
@@ -82,10 +83,25 @@ impl LocalUnixShardNodeClientConfig {
 }
 
 impl LocalUnixStorageNodeClientConfig {
+    pub const DEFAULT_RPC_ADMISSION_LIMIT: usize = UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT;
+
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             node_id,
             socket_path: socket_path.into(),
+            rpc_admission_limit: Self::DEFAULT_RPC_ADMISSION_LIMIT,
+        }
+    }
+
+    pub fn with_rpc_admission_limit(
+        node_id: NodeId,
+        socket_path: impl Into<PathBuf>,
+        rpc_admission_limit: usize,
+    ) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+            rpc_admission_limit,
         }
     }
 
@@ -95,6 +111,10 @@ impl LocalUnixStorageNodeClientConfig {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub fn rpc_admission_limit(&self) -> usize {
+        self.rpc_admission_limit
     }
 }
 
@@ -1183,60 +1203,52 @@ impl LocalClusterMap {
         let configs: Vec<LocalUnixStorageNodeClientConfig> = configs.into_iter().collect();
         self.validate_unix_storage_node_client_configs(&configs)?;
 
-        self.install_unix_bucket_metadata_clients(configs.iter().map(|config| {
-            LocalUnixBucketMetadataNodeClientConfig::new(config.node_id, config.socket_path.clone())
-        }))?;
-        self.install_unix_bucket_write_reservation_clients(configs.iter().map(|config| {
-            LocalUnixBucketWriteReservationNodeClientConfig::new(
+        for config in configs {
+            let node = self
+                .nodes
+                .get_mut(&config.node_id)
+                .expect("validated remote storage-node client node must exist");
+            let client = Arc::new(UnixStorageNodeClient::with_rpc_admission_limit(
                 config.node_id,
+                self.epoch,
                 config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_metadata_command_clients(configs.iter().map(|config| {
-            LocalUnixMetadataCommandNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_object_generation_metadata_clients(configs.iter().map(|config| {
-            LocalUnixObjectGenerationMetadataNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_object_version_metadata_clients(configs.iter().map(|config| {
-            LocalUnixObjectVersionMetadataNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_direct_put_metadata_clients(configs.iter().map(|config| {
-            LocalUnixDirectPutMetadataNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_object_listing_metadata_clients(configs.iter().map(|config| {
-            LocalUnixObjectListingMetadataNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_object_mutation_metadata_clients(configs.iter().map(|config| {
-            LocalUnixObjectMutationMetadataNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_object_read_metadata_clients(configs.iter().map(|config| {
-            LocalUnixObjectReadMetadataNodeClientConfig::new(
-                config.node_id,
-                config.socket_path.clone(),
-            )
-        }))?;
-        self.install_unix_shard_clients(configs.into_iter().map(|config| {
-            LocalUnixShardNodeClientConfig::new(config.node_id, config.socket_path)
-        }))?;
+                config.rpc_admission_limit,
+            ));
+            let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
+            let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
+                client.clone();
+            let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = client.clone();
+            let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
+                client.clone();
+            let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> =
+                client.clone();
+            let direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient> = client.clone();
+            let object_listing_metadata_client: Arc<dyn ObjectListingMetadataNodeClient> =
+                client.clone();
+            let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> =
+                client.clone();
+            let object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient> = client.clone();
+            let shard_client: Arc<dyn PlacedShardNodeClient> = client.clone();
+            let shard_ack_client: Arc<dyn ShardAckNodeClient> = client.clone();
+            let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = client.clone();
+            let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client;
+
+            node.bucket_metadata_client = bucket_metadata_client;
+            node.bucket_metadata_unix_socket_path = Some(config.socket_path.clone());
+            node.bucket_write_reservation_client = bucket_write_reservation_client;
+            node.bucket_write_reservation_unix_socket_path = Some(config.socket_path);
+            node.metadata_command_client = metadata_command_client;
+            node.object_generation_metadata_client = object_generation_metadata_client;
+            node.object_version_metadata_client = object_version_metadata_client;
+            node.direct_put_metadata_client = direct_put_metadata_client;
+            node.object_listing_metadata_client = object_listing_metadata_client;
+            node.object_mutation_metadata_client = object_mutation_metadata_client;
+            node.object_read_metadata_client = object_read_metadata_client;
+            node.shard_client = shard_client;
+            node.shard_ack_client = shard_ack_client;
+            node.shard_read_handle_client = shard_read_handle_client;
+            node.shard_scavenger_client = shard_scavenger_client;
+        }
         Ok(())
     }
 
@@ -1262,6 +1274,13 @@ impl LocalClusterMap {
                 return Err(ClusterBuildError::RemoteStorageNodeClientNodeNotFound {
                     id: config.node_id.as_u32(),
                 });
+            }
+            if config.rpc_admission_limit == 0 {
+                return Err(
+                    ClusterBuildError::RemoteStorageNodeClientRpcAdmissionLimitZero {
+                        id: config.node_id.as_u32(),
+                    },
+                );
             }
         }
         Ok(())
