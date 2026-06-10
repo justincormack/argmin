@@ -1077,6 +1077,10 @@ fn local_debug_metrics_body() -> String {
             "request_admission_wait_us_total {}\n",
             "request_admission_timeout_total {}\n",
             "storage_rpc_error_total {}\n",
+            "storage_rpc_admission_total {}\n",
+            "storage_rpc_admission_wait_total {}\n",
+            "storage_rpc_admission_wait_us_total {}\n",
+            "storage_rpc_admission_timeout_total {}\n",
             "shard_scavenger_observation_total {}\n",
             "shard_scavenger_scan_incomplete_total {}\n",
             "metadata_command_conflict_total {}\n",
@@ -1105,6 +1109,10 @@ fn local_debug_metrics_body() -> String {
         snapshot.request_admission_wait_us_total,
         snapshot.request_admission_timeout_total,
         snapshot.storage_rpc_error_total,
+        snapshot.storage_rpc_admission_total,
+        snapshot.storage_rpc_admission_wait_total,
+        snapshot.storage_rpc_admission_wait_us_total,
+        snapshot.storage_rpc_admission_timeout_total,
         snapshot.shard_scavenger_observation_total,
         snapshot.shard_scavenger_scan_incomplete_total,
         snapshot.metadata_command_conflict_total,
@@ -4422,6 +4430,10 @@ mod tests {
             .contains("content-type: text/plain; charset=utf-8"));
         assert!(response.contains("metadata_command_conflict_total "));
         assert!(response.contains("storage_rpc_error_total "));
+        assert!(response.contains("storage_rpc_admission_total "));
+        assert!(response.contains("storage_rpc_admission_wait_total "));
+        assert!(response.contains("storage_rpc_admission_wait_us_total "));
+        assert!(response.contains("storage_rpc_admission_timeout_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));

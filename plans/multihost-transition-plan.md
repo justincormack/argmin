@@ -6592,6 +6592,46 @@ Status:
   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` so slow-host or stress runs can
   deliberately set a low per-node Unix RPC admission limit and verify bounded
   S3 `SlowDown` responses instead of opaque client timeouts.
+- Changed the local Unix storage-RPC admission gate from immediate fail-open
+  shedding to bounded waiting on actual in-flight RPC capacity. A full
+  per-node client gate now waits for release before mapping sustained overload
+  to storage `ResourceExhausted`/S3 `SlowDown`, reducing retry storms where a
+  short burst could previously exhaust the SDK retry budget even though the
+  node was draining work. The wait path now exports
+  `storage_rpc_admission_total`,
+  `storage_rpc_admission_wait_total`,
+  `storage_rpc_admission_wait_us_total`, and
+  `storage_rpc_admission_timeout_total`; the timeout counter is the signal that
+  the bounded wait was actually hit before shedding, while wait/total gives the
+  proportion of storage RPCs that encountered local backpressure. The bounded
+  wait default for bulk/list RPCs is intentionally short (`250ms`) and can be
+  tuned with `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS`; sustained bulk
+  overload should return `SlowDown` quickly enough that client retry/backoff,
+  not blocked server workers, provides the pacing. Control and mutation RPCs
+  use a separate bounded wait (`ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS`,
+  default `1000ms`) so bucket cleanup, metadata publication, and ordinary writes
+  are not prematurely surfaced as public `SlowDown` while bulk traffic is being
+  shed.
+- Split the local storage-RPC admission gate into bulk and control classes.
+  High-volume read/list RPCs (`ShardRead`, read-handle acquire, object and
+  bucket listing pages) are capped below the total per-node admission limit,
+  reserving a small amount of capacity for metadata publication, delete-bucket
+  drains, cleanup, and other control work. Forced-pressure UAT with
+  `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT=10` showed that a single undifferentiated
+  gate could make cleanup/control requests time out behind list pagination even
+  though the node was otherwise responding with typed `SlowDown`. One-row
+  listing probes used to prove bucket emptiness are classified as control work;
+  completed-multipart cleanup enumeration also uses control admission. Normal
+  client listing pages remain bulk and should feel backpressure first. The
+  mixed-class condition variable wakes all waiters on release because a freed
+  slot can be usable by control work while bulk waiters are still over their
+  class cap.
+- In remote-frontend mode, cap the effective HTTP in-flight request semaphore by
+  the per-node storage RPC admission limit. A frontend with a deliberately low
+  storage-RPC limit must not admit substantially more S3 handlers than the
+  storage layer can serve; otherwise pressure appears only after each handler
+  has already fanned out into storage RPCs, producing public `SlowDown` and long
+  cleanup tails instead of request-level pacing.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

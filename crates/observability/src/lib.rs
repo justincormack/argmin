@@ -96,6 +96,10 @@ static REQUEST_ADMISSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_ADMISSION_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_ADMISSION_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ADMISSION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ADMISSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ADMISSION_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -713,6 +717,14 @@ pub struct StorageRpcErrorSummary<'a> {
     pub message: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRpcAdmissionSummary<'a> {
+    pub node_id: u32,
+    pub rpc_kind: &'a str,
+    pub wait_us: u128,
+    pub timeout_us: Option<u128>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub request_start_total: u64,
@@ -727,6 +739,10 @@ pub struct MetricsSnapshot {
     pub request_admission_wait_us_total: u64,
     pub request_admission_timeout_total: u64,
     pub storage_rpc_error_total: u64,
+    pub storage_rpc_admission_total: u64,
+    pub storage_rpc_admission_wait_total: u64,
+    pub storage_rpc_admission_wait_us_total: u64,
+    pub storage_rpc_admission_timeout_total: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
@@ -798,6 +814,12 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         request_admission_wait_us_total: REQUEST_ADMISSION_WAIT_US_TOTAL.load(Ordering::Relaxed),
         request_admission_timeout_total: REQUEST_ADMISSION_TIMEOUT_TOTAL.load(Ordering::Relaxed),
         storage_rpc_error_total: STORAGE_RPC_ERROR_TOTAL.load(Ordering::Relaxed),
+        storage_rpc_admission_total: STORAGE_RPC_ADMISSION_TOTAL.load(Ordering::Relaxed),
+        storage_rpc_admission_wait_total: STORAGE_RPC_ADMISSION_WAIT_TOTAL.load(Ordering::Relaxed),
+        storage_rpc_admission_wait_us_total: STORAGE_RPC_ADMISSION_WAIT_US_TOTAL
+            .load(Ordering::Relaxed),
+        storage_rpc_admission_timeout_total: STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL
+            .load(Ordering::Relaxed),
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),
@@ -1386,6 +1408,74 @@ pub fn emit_storage_rpc_error(target: &'static str, summary: StorageRpcErrorSumm
     )
 }
 
+pub fn emit_storage_rpc_admission_attempt() {
+    STORAGE_RPC_ADMISSION_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn emit_storage_rpc_admission_wait(
+    target: &'static str,
+    summary: StorageRpcAdmissionSummary<'_>,
+) -> bool {
+    STORAGE_RPC_ADMISSION_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    STORAGE_RPC_ADMISSION_WAIT_US_TOTAL
+        .fetch_add(saturating_u128_to_u64(summary.wait_us), Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    record_flight_event(
+        &context,
+        target,
+        "storage_rpc_admission_wait",
+        format!(
+            "node_id={} rpc_kind={} wait_us={}",
+            summary.node_id, summary.rpc_kind, summary.wait_us
+        ),
+    );
+    event_in_context(
+        &context,
+        target,
+        "storage_rpc_admission_wait",
+        Some(format_args!(
+            "node_id={} rpc_kind={} wait_us={}",
+            summary.node_id, summary.rpc_kind, summary.wait_us
+        )),
+    )
+}
+
+pub fn emit_storage_rpc_admission_timeout(
+    target: &'static str,
+    summary: StorageRpcAdmissionSummary<'_>,
+) -> bool {
+    STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    record_flight_event(
+        &context,
+        target,
+        "storage_rpc_admission_timeout",
+        format!(
+            "node_id={} rpc_kind={} wait_us={} timeout_us={}",
+            summary.node_id,
+            summary.rpc_kind,
+            summary.wait_us,
+            summary.timeout_us.unwrap_or_default()
+        ),
+    );
+    event_in_context(
+        &context,
+        target,
+        "storage_rpc_admission_timeout",
+        Some(format_args!(
+            "node_id={} rpc_kind={} wait_us={} timeout_us={}",
+            summary.node_id,
+            summary.rpc_kind,
+            summary.wait_us,
+            summary.timeout_us.unwrap_or_default()
+        )),
+    )
+}
+
 pub fn emit_shard_scavenger_observation(
     target: &'static str,
     summary: ShardScavengerObservationSummary<'_>,
@@ -1820,6 +1910,25 @@ mod tests {
                 timeout_us: Some(5_000_000),
             },
         );
+        emit_storage_rpc_admission_attempt();
+        emit_storage_rpc_admission_wait(
+            "storage_node_client",
+            StorageRpcAdmissionSummary {
+                node_id: 7,
+                rpc_kind: "shard write",
+                wait_us: 456,
+                timeout_us: Some(5_000_000),
+            },
+        );
+        emit_storage_rpc_admission_timeout(
+            "storage_node_client",
+            StorageRpcAdmissionSummary {
+                node_id: 7,
+                rpc_kind: "shard write",
+                wait_us: 5_000_000,
+                timeout_us: Some(5_000_000),
+            },
+        );
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
         emit_metadata_command_conflict(
             "storage",
@@ -2031,6 +2140,22 @@ mod tests {
         assert_eq!(
             after.storage_rpc_error_total,
             before.storage_rpc_error_total + 1
+        );
+        assert_eq!(
+            after.storage_rpc_admission_total,
+            before.storage_rpc_admission_total + 1
+        );
+        assert_eq!(
+            after.storage_rpc_admission_wait_total,
+            before.storage_rpc_admission_wait_total + 1
+        );
+        assert_eq!(
+            after.storage_rpc_admission_wait_us_total,
+            before.storage_rpc_admission_wait_us_total + 456
+        );
+        assert_eq!(
+            after.storage_rpc_admission_timeout_total,
+            before.storage_rpc_admission_timeout_total + 1
         );
         assert_eq!(
             after.shard_scavenger_observation_total,

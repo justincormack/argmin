@@ -370,6 +370,11 @@ print_slowdown_summary() {
         local operation_aborted
         local request_errors
         local storage_rpc_errors
+        local storage_rpc_admission_total
+        local storage_rpc_admission_wait
+        local storage_rpc_admission_wait_us
+        local storage_rpc_admission_timeout
+        local storage_rpc_admission_wait_percent
         slow_down="$(latest_metric_sample_value "$metrics_log" slow_down_response_total)"
         admission_timeout="$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)"
         admission_wait="$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)"
@@ -377,7 +382,16 @@ print_slowdown_summary() {
         operation_aborted="$(latest_metric_sample_value "$metrics_log" operation_aborted_response_total)"
         request_errors="$(latest_metric_sample_value "$metrics_log" request_error_total)"
         storage_rpc_errors="$(latest_metric_sample_value "$metrics_log" storage_rpc_error_total)"
-        echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors" >&2
+        storage_rpc_admission_total="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_total)"
+        storage_rpc_admission_wait="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_total)"
+        storage_rpc_admission_wait_us="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_us_total)"
+        storage_rpc_admission_timeout="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_timeout_total)"
+        if ((storage_rpc_admission_total > 0)); then
+            storage_rpc_admission_wait_percent="$(awk -v waited="$storage_rpc_admission_wait" -v total="$storage_rpc_admission_total" 'BEGIN { printf "%.2f", (waited * 100.0) / total }')"
+        else
+            storage_rpc_admission_wait_percent="0.00"
+        fi
+        echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
     else
         echo "metrics unavailable" >&2
     fi

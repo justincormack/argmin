@@ -2,6 +2,7 @@ use ec::EcConfig;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use storage::LocalUnixStorageNodeClientConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,8 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_socket_path: Option<String>,
     pub(crate) storage_node_sockets: Vec<ConfiguredStorageNodeSocket>,
     pub(crate) storage_node_rpc_admission_limit: usize,
+    pub(crate) storage_node_rpc_admission_wait_timeout: Duration,
+    pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
     pub(crate) storage_cluster_epoch: u64,
     pub(crate) storage_pg_ids: Vec<u32>,
     pub(crate) ec_k: u8,
@@ -100,6 +103,8 @@ impl ServerConfig {
     ///   `ARGMIN_STORAGE_PG_IDS` (all PGs in `0..ARGMIN_PG_COUNT`)
     ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for frontend/combined)
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` (1024)
+    ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` (250)
+    ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
@@ -227,6 +232,30 @@ impl ServerConfig {
                 })
                 .parse()
                 .map_err(|e| format!("invalid ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT: {e}"))?;
+        let storage_node_rpc_admission_wait_ms: u64 =
+            get("ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS")
+                .unwrap_or_else(|| {
+                    LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT
+                        .as_millis()
+                        .to_string()
+                })
+                .parse()
+                .map_err(|e| format!("invalid ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS: {e}"))?;
+        let storage_node_rpc_admission_wait_timeout =
+            Duration::from_millis(storage_node_rpc_admission_wait_ms);
+        let storage_node_rpc_control_admission_wait_ms: u64 =
+            get("ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS")
+                .unwrap_or_else(|| {
+                    LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT
+                        .as_millis()
+                        .to_string()
+                })
+                .parse()
+                .map_err(|e| {
+                    format!("invalid ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS: {e}")
+                })?;
+        let storage_node_rpc_control_admission_wait_timeout =
+            Duration::from_millis(storage_node_rpc_control_admission_wait_ms);
         let stream_read_chunk_size: usize = get("ARGMIN_STREAM_READ_CHUNK_SIZE")
             .unwrap_or_else(|| server_core::coordinator::INTERNAL_SEGMENT_SIZE.to_string())
             .parse()
@@ -315,6 +344,14 @@ impl ServerConfig {
         if storage_node_rpc_admission_limit == 0 {
             return Err("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be > 0".to_string());
         }
+        if storage_node_rpc_admission_wait_timeout.is_zero() {
+            return Err("ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS must be > 0".to_string());
+        }
+        if storage_node_rpc_control_admission_wait_timeout.is_zero() {
+            return Err(
+                "ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS must be > 0".to_string(),
+            );
+        }
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
@@ -371,6 +408,8 @@ impl ServerConfig {
             storage_node_socket_path,
             storage_node_sockets,
             storage_node_rpc_admission_limit,
+            storage_node_rpc_admission_wait_timeout,
+            storage_node_rpc_control_admission_wait_timeout,
             storage_cluster_epoch,
             storage_pg_ids,
             ec_k,
@@ -768,6 +807,14 @@ mod tests {
             LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT
         );
         assert_eq!(
+            cfg.storage_node_rpc_admission_wait_timeout,
+            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT
+        );
+        assert_eq!(
+            cfg.storage_node_rpc_control_admission_wait_timeout,
+            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT
+        );
+        assert_eq!(
             cfg.stream_read_chunk_size,
             server_core::coordinator::INTERNAL_SEGMENT_SIZE
         );
@@ -822,6 +869,10 @@ mod tests {
         assert_eq!(
             cfg.storage_node_rpc_admission_limit,
             LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT
+        );
+        assert_eq!(
+            cfg.storage_node_rpc_admission_wait_timeout,
+            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT
         );
         assert_eq!(
             cfg.stream_read_chunk_size,
@@ -1396,6 +1447,32 @@ mod tests {
     }
 
     #[test]
+    fn custom_storage_node_rpc_admission_wait_timeout() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS",
+            "75",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.storage_node_rpc_admission_wait_timeout,
+            Duration::from_millis(75)
+        );
+    }
+
+    #[test]
+    fn custom_storage_node_rpc_control_admission_wait_timeout() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS",
+            "1500",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.storage_node_rpc_control_admission_wait_timeout,
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
     fn storage_node_rpc_admission_limit_zero() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
             "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT",
@@ -1406,6 +1483,26 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_rpc_admission_wait_timeout_zero() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS",
+            "0",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS must be > 0"));
+    }
+
+    #[test]
+    fn storage_node_rpc_control_admission_wait_timeout_zero() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS",
+            "0",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS must be > 0"));
+    }
+
+    #[test]
     fn invalid_storage_node_rpc_admission_limit() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
             "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT",
@@ -1413,6 +1510,26 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT"));
+    }
+
+    #[test]
+    fn invalid_storage_node_rpc_admission_wait_timeout() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS",
+            "not_a_number",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS"));
+    }
+
+    #[test]
+    fn invalid_storage_node_rpc_control_admission_wait_timeout() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS",
+            "not_a_number",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS"));
     }
 
     #[test]

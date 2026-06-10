@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use placement::NodeId;
 use s3_types::{AclGrants, BucketVersioningState};
@@ -211,6 +212,10 @@ use crate::types::{
 };
 
 pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT: usize = 1024;
+pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT: Duration =
+    Duration::from_millis(250);
+pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT: Duration =
+    Duration::from_secs(1);
 
 fn merge_bucket_snapshot_pair_request(
     source: BucketSnapshotRequest,
@@ -2696,11 +2701,38 @@ pub(crate) struct UnixStorageNodeClient {
 
 struct UnixStorageNodeRpcAdmission {
     limit: usize,
-    active: Mutex<usize>,
+    bulk_limit: usize,
+    wait_timeout: Duration,
+    control_wait_timeout: Duration,
+    active: Mutex<UnixStorageNodeRpcAdmissionActive>,
+    capacity_available: Condvar,
 }
 
 struct UnixStorageNodeRpcAdmissionPermit {
     admission: Arc<UnixStorageNodeRpcAdmission>,
+    class: UnixStorageNodeRpcAdmissionClass,
+}
+
+enum UnixStorageNodeRpcAdmissionAcquire {
+    Acquired {
+        permit: UnixStorageNodeRpcAdmissionPermit,
+        wait_us: u128,
+    },
+    TimedOut {
+        wait_us: u128,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixStorageNodeRpcAdmissionClass {
+    Control,
+    Bulk,
+}
+
+#[derive(Default)]
+struct UnixStorageNodeRpcAdmissionActive {
+    total: usize,
+    bulk: usize,
 }
 
 type UnixStorageNodeRpcAdmissionKey = (u32, PathBuf);
@@ -2708,26 +2740,111 @@ type UnixStorageNodeRpcAdmissionRegistry =
     Mutex<BTreeMap<UnixStorageNodeRpcAdmissionKey, Weak<UnixStorageNodeRpcAdmission>>>;
 
 impl UnixStorageNodeRpcAdmission {
+    #[cfg(test)]
     fn new(limit: usize) -> Self {
+        Self::new_with_wait_timeout(
+            limit,
+            UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+            UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+        )
+    }
+
+    fn new_with_wait_timeout(
+        limit: usize,
+        wait_timeout: Duration,
+        control_wait_timeout: Duration,
+    ) -> Self {
         assert!(
             limit > 0,
             "Unix storage-node RPC admission limit must be > 0"
         );
+        let reserved_control = (limit / 4).clamp(1, 4).min(limit);
+        let bulk_limit = limit.saturating_sub(reserved_control).max(1).min(limit);
         Self {
             limit,
-            active: Mutex::new(0),
+            bulk_limit,
+            wait_timeout,
+            control_wait_timeout,
+            active: Mutex::new(UnixStorageNodeRpcAdmissionActive::default()),
+            capacity_available: Condvar::new(),
         }
     }
 
-    fn try_acquire(self: &Arc<Self>) -> Option<UnixStorageNodeRpcAdmissionPermit> {
+    #[cfg(test)]
+    fn try_acquire_for_test(self: &Arc<Self>) -> Option<UnixStorageNodeRpcAdmissionPermit> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if *active >= self.limit {
+        if active.total >= self.limit {
             return None;
         }
-        *active += 1;
+        active.total += 1;
         Some(UnixStorageNodeRpcAdmissionPermit {
             admission: Arc::clone(self),
+            class: UnixStorageNodeRpcAdmissionClass::Control,
         })
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> UnixStorageNodeRpcAdmissionAcquire {
+        let started_at = Instant::now();
+        let wait_timeout = self.wait_timeout_for_class(class);
+        let deadline = started_at + wait_timeout;
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waited = false;
+        loop {
+            if self.can_admit(&active, class) {
+                active.total += 1;
+                if class == UnixStorageNodeRpcAdmissionClass::Bulk {
+                    active.bulk += 1;
+                }
+                return UnixStorageNodeRpcAdmissionAcquire::Acquired {
+                    permit: UnixStorageNodeRpcAdmissionPermit {
+                        admission: Arc::clone(self),
+                        class,
+                    },
+                    wait_us: if waited {
+                        started_at.elapsed().as_micros()
+                    } else {
+                        0
+                    },
+                };
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return UnixStorageNodeRpcAdmissionAcquire::TimedOut {
+                    wait_us: started_at.elapsed().as_micros(),
+                };
+            };
+            waited = true;
+            let (next_active, wait_result) = self
+                .capacity_available
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            active = next_active;
+            if wait_result.timed_out() && !self.can_admit(&active, class) {
+                return UnixStorageNodeRpcAdmissionAcquire::TimedOut {
+                    wait_us: started_at.elapsed().as_micros(),
+                };
+            }
+        }
+    }
+
+    fn can_admit(
+        &self,
+        active: &UnixStorageNodeRpcAdmissionActive,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> bool {
+        if active.total >= self.limit {
+            return false;
+        }
+        class == UnixStorageNodeRpcAdmissionClass::Control || active.bulk < self.bulk_limit
+    }
+
+    fn wait_timeout_for_class(&self, class: UnixStorageNodeRpcAdmissionClass) -> Duration {
+        match class {
+            UnixStorageNodeRpcAdmissionClass::Control => self.control_wait_timeout,
+            UnixStorageNodeRpcAdmissionClass::Bulk => self.wait_timeout,
+        }
     }
 }
 
@@ -2738,9 +2855,17 @@ impl Drop for UnixStorageNodeRpcAdmissionPermit {
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *active = active
+        active.total = active
+            .total
             .checked_sub(1)
             .expect("Unix storage-node RPC admission release without acquire");
+        if self.class == UnixStorageNodeRpcAdmissionClass::Bulk {
+            active.bulk = active
+                .bulk
+                .checked_sub(1)
+                .expect("Unix storage-node bulk RPC admission release without acquire");
+        }
+        self.admission.capacity_available.notify_all();
     }
 }
 
@@ -2748,6 +2873,22 @@ fn shared_unix_storage_node_rpc_admission(
     node_id: NodeId,
     socket_path: &std::path::Path,
     limit: usize,
+) -> Arc<UnixStorageNodeRpcAdmission> {
+    shared_unix_storage_node_rpc_admission_with_wait_timeout(
+        node_id,
+        socket_path,
+        limit,
+        UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+        UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+    )
+}
+
+fn shared_unix_storage_node_rpc_admission_with_wait_timeout(
+    node_id: NodeId,
+    socket_path: &std::path::Path,
+    limit: usize,
+    wait_timeout: Duration,
+    control_wait_timeout: Duration,
 ) -> Arc<UnixStorageNodeRpcAdmission> {
     static ADMISSIONS: OnceLock<UnixStorageNodeRpcAdmissionRegistry> = OnceLock::new();
 
@@ -2759,7 +2900,11 @@ fn shared_unix_storage_node_rpc_admission(
     if let Some(admission) = admissions.get(&key).and_then(Weak::upgrade) {
         return admission;
     }
-    let admission = Arc::new(UnixStorageNodeRpcAdmission::new(limit));
+    let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        limit,
+        wait_timeout,
+        control_wait_timeout,
+    ));
     admissions.insert(key, Arc::downgrade(&admission));
     admission
 }
@@ -2824,17 +2969,39 @@ impl UnixStorageNodeClient {
         }
     }
 
+    pub(crate) fn with_rpc_admission_settings(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        socket_path: impl Into<PathBuf>,
+        rpc_admission_limit: usize,
+        rpc_admission_wait_timeout: Duration,
+        rpc_control_admission_wait_timeout: Duration,
+    ) -> Self {
+        Self::with_rpc_admission(
+            node_id,
+            cluster_epoch,
+            socket_path.into(),
+            Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+                rpc_admission_limit,
+                rpc_admission_wait_timeout,
+                rpc_control_admission_wait_timeout,
+            )),
+        )
+    }
+
     pub(crate) fn with_rpc_admission_limit(
         node_id: NodeId,
         cluster_epoch: ClusterEpoch,
         socket_path: impl Into<PathBuf>,
         rpc_admission_limit: usize,
     ) -> Self {
-        Self::with_rpc_admission(
+        Self::with_rpc_admission_settings(
             node_id,
             cluster_epoch,
-            socket_path.into(),
-            Arc::new(UnixStorageNodeRpcAdmission::new(rpc_admission_limit)),
+            socket_path,
+            rpc_admission_limit,
+            UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+            UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
         )
     }
 
@@ -4065,7 +4232,16 @@ impl UnixStorageNodeClient {
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, StoreError> {
-        let rpc_permit = self.acquire_rpc_admission(kind)?;
+        self.rpc_request_with_admission_class(kind, payload, storage_rpc_admission_class(kind))
+    }
+
+    fn rpc_request_with_admission_class(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> Result<Vec<u8>, StoreError> {
+        let rpc_permit = self.acquire_rpc_admission_with_class(kind, class)?;
         self.rpc_request_with_permit(kind, payload, rpc_permit)
     }
 
@@ -4131,16 +4307,52 @@ impl UnixStorageNodeClient {
         &self,
         kind: StorageRpcMessageKind,
     ) -> Result<UnixStorageNodeRpcAdmissionPermit, StoreError> {
-        self.rpc_admission
-            .try_acquire()
-            .ok_or_else(|| StoreError::StorageRpcResourceExhausted {
-                node_id: self.node_id.as_u32(),
-                operation: kind.operation_name(),
-                message: format!(
-                    "storage-node client RPC admission limit {} is exhausted",
-                    self.rpc_admission.limit
+        self.acquire_rpc_admission_with_class(kind, storage_rpc_admission_class(kind))
+    }
+
+    fn acquire_rpc_admission_with_class(
+        &self,
+        kind: StorageRpcMessageKind,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> Result<UnixStorageNodeRpcAdmissionPermit, StoreError> {
+        observability::emit_storage_rpc_admission_attempt();
+        let wait_timeout = self.rpc_admission.wait_timeout_for_class(class);
+        match self.rpc_admission.acquire(class) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, wait_us } => {
+                if wait_us > 0 {
+                    let _ = observability::emit_storage_rpc_admission_wait(
+                        "storage_node_client",
+                        observability::StorageRpcAdmissionSummary {
+                            node_id: self.node_id.as_u32(),
+                            rpc_kind: kind.operation_name(),
+                            wait_us,
+                            timeout_us: Some(wait_timeout.as_micros()),
+                        },
+                    );
+                }
+                Ok(permit)
+            }
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { wait_us } => {
+                let _ = observability::emit_storage_rpc_admission_timeout(
+                    "storage_node_client",
+                    observability::StorageRpcAdmissionSummary {
+                        node_id: self.node_id.as_u32(),
+                        rpc_kind: kind.operation_name(),
+                        wait_us,
+                        timeout_us: Some(wait_timeout.as_micros()),
+                    },
+                );
+                Err(StoreError::StorageRpcResourceExhausted {
+                    node_id: self.node_id.as_u32(),
+                    operation: kind.operation_name(),
+                    message: format!(
+                    "storage-node client RPC admission limit {} is exhausted after waiting {} ms",
+                    self.rpc_admission.limit,
+                    wait_timeout.as_millis()
                 ),
-            })
+                })
+            }
+        }
     }
 
     fn shard_location(
@@ -4188,6 +4400,32 @@ impl UnixStorageNodeClient {
             operation,
             message,
         }
+    }
+}
+
+fn storage_rpc_admission_class(kind: StorageRpcMessageKind) -> UnixStorageNodeRpcAdmissionClass {
+    match kind {
+        StorageRpcMessageKind::ShardRead
+        | StorageRpcMessageKind::ShardReadRange
+        | StorageRpcMessageKind::ReadHandlesAcquire
+        | StorageRpcMessageKind::ObjectListPage
+        | StorageRpcMessageKind::ObjectVersionListPage
+        | StorageRpcMessageKind::ObjectMultipartUploadListPage
+        | StorageRpcMessageKind::BucketList
+        | StorageRpcMessageKind::ObjectMultipartPartsList
+        | StorageRpcMessageKind::ObjectStreamUploadsList
+        | StorageRpcMessageKind::ObjectStreamUploadsPgList => {
+            UnixStorageNodeRpcAdmissionClass::Bulk
+        }
+        _ => UnixStorageNodeRpcAdmissionClass::Control,
+    }
+}
+
+fn listing_probe_admission_class(limit: u32) -> UnixStorageNodeRpcAdmissionClass {
+    if limit <= 1 {
+        UnixStorageNodeRpcAdmissionClass::Control
+    } else {
+        UnixStorageNodeRpcAdmissionClass::Bulk
     }
 }
 
@@ -7585,7 +7823,11 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
             )
         })?;
         let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectListPage, payload)
+            .rpc_request_with_admission_class(
+                StorageRpcMessageKind::ObjectListPage,
+                payload,
+                listing_probe_admission_class(req.max_keys),
+            )
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = decode_list_objects_response(&response).map_err(|error| {
             BucketSnapshotLoadError::Store(
@@ -7620,7 +7862,11 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
             )
         })?;
         let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectVersionListPage, payload)
+            .rpc_request_with_admission_class(
+                StorageRpcMessageKind::ObjectVersionListPage,
+                payload,
+                listing_probe_admission_class(req.max_keys),
+            )
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = decode_list_object_versions_response(&response).map_err(|error| {
             BucketSnapshotLoadError::Store(
@@ -7654,9 +7900,10 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
             )
         })?;
         let response = self
-            .rpc_request(
+            .rpc_request_with_admission_class(
                 StorageRpcMessageKind::ObjectMultipartUploadListPage,
                 payload,
+                listing_probe_admission_class(req.max_uploads),
             )
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = decode_list_multipart_uploads_response(&response).map_err(|error| {
@@ -9488,7 +9735,11 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             )
         })?;
         let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadsList, payload)
+            .rpc_request_with_admission_class(
+                StorageRpcMessageKind::ObjectStreamUploadsList,
+                payload,
+                listing_probe_admission_class(limit),
+            )
             .map_err(ObjectPgActionError::Store)?;
         let response = decode_stream_uploads_list_response(&response).map_err(|error| {
             ObjectPgActionError::Store(
@@ -15644,9 +15895,26 @@ mod tests {
         )
     }
 
+    fn test_unix_storage_node_client_with_rpc_admission_timeout(
+        limit: usize,
+        wait_timeout: Duration,
+    ) -> UnixStorageNodeClient {
+        let tmp = test_util::tempdir();
+        UnixStorageNodeClient::with_rpc_admission(
+            NodeId::new(7),
+            ClusterEpoch::new(1).unwrap(),
+            tmp.path().join("unused.sock"),
+            Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+                limit,
+                wait_timeout,
+                wait_timeout,
+            )),
+        )
+    }
+
     fn test_rpc_admission_permit() -> UnixStorageNodeRpcAdmissionPermit {
         Arc::new(UnixStorageNodeRpcAdmission::new(1))
-            .try_acquire()
+            .try_acquire_for_test()
             .unwrap()
     }
 
@@ -21859,19 +22127,17 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_exhaustion_is_typed_before_connect() {
-        let client = UnixStorageNodeClient::with_rpc_admission_limit(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            "/tmp/unopened-storage-node.sock",
-            1,
-        );
+        let client =
+            test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
         let _held = client
             .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
             .unwrap();
+        let before = observability::metrics_snapshot();
 
         let err = client
             .rpc_request_result(StorageRpcMessageKind::ShardWrite, Vec::new())
             .unwrap_err();
+        let after = observability::metrics_snapshot();
         assert!(matches!(
             err,
             StoreError::StorageRpcResourceExhausted {
@@ -21880,26 +22146,164 @@ mod tests {
                 ref message,
             } if message.contains("admission limit 1")
         ));
+        assert!(after.storage_rpc_admission_total > before.storage_rpc_admission_total);
+        assert!(
+            after.storage_rpc_admission_timeout_total > before.storage_rpc_admission_timeout_total
+        );
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_waits_for_released_capacity() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let held = admission.try_acquire_for_test().unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let admission_for_thread = Arc::clone(&admission);
+
+        let join = thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            match admission_for_thread.acquire(UnixStorageNodeRpcAdmissionClass::Control) {
+                UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, wait_us } => {
+                    acquired_tx.send(wait_us > 0).unwrap();
+                    Some(permit)
+                }
+                UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                    acquired_tx.send(false).unwrap();
+                    None
+                }
+            }
+        });
+
+        attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(held);
+        assert!(acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        let acquired = join.join().unwrap();
+        assert!(acquired.is_some());
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_times_out_under_sustained_overload() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let _held = admission.try_acquire_for_test().unwrap();
+
+        assert!(matches!(
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::Control),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_reserves_capacity_for_control_work() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            2,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let held_bulk = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Bulk) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("first bulk admission unexpectedly timed out")
+            }
+        };
+
+        assert!(matches!(
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::Bulk),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+
+        let control = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Control) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("control admission should use reserved capacity")
+            }
+        };
+
+        drop(control);
+        drop(held_bulk);
+    }
+
+    #[test]
+    fn listing_probe_admission_class_reserves_single_row_emptiness_probes() {
+        assert_eq!(
+            listing_probe_admission_class(1),
+            UnixStorageNodeRpcAdmissionClass::Control
+        );
+        assert_eq!(
+            listing_probe_admission_class(2),
+            UnixStorageNodeRpcAdmissionClass::Bulk
+        );
+    }
+
+    #[test]
+    fn completed_multipart_cleanup_listing_uses_control_admission_class() {
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::ObjectCompletedMultipartUploadsList),
+            UnixStorageNodeRpcAdmissionClass::Control
+        );
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_wait_metric_records_released_capacity() {
+        let client = Arc::new(test_unix_storage_node_client_with_rpc_admission_timeout(
+            1,
+            Duration::from_secs(1),
+        ));
+        let held = client
+            .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+            .unwrap();
+        let before = observability::metrics_snapshot();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let client_for_thread = Arc::clone(&client);
+        let join = thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            client_for_thread.acquire_rpc_admission(StorageRpcMessageKind::ShardWrite)
+        });
+
+        attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        drop(held);
+        let permit = join.join().unwrap().unwrap();
+        drop(permit);
+        let after = observability::metrics_snapshot();
+
+        assert!(after.storage_rpc_admission_total > before.storage_rpc_admission_total);
+        assert!(after.storage_rpc_admission_wait_total > before.storage_rpc_admission_wait_total);
+        assert!(
+            after.storage_rpc_admission_wait_us_total > before.storage_rpc_admission_wait_us_total
+        );
     }
 
     #[test]
     fn unix_storage_node_rpc_admission_is_shared_by_node_and_socket() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("missing.sock");
-        let client_a = UnixStorageNodeClient::new(
+        let rpc_admission = shared_unix_storage_node_rpc_admission_with_wait_timeout(
+            NodeId::new(7),
+            &socket_path,
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let client_a = UnixStorageNodeClient::with_rpc_admission(
             NodeId::new(7),
             ClusterEpoch::new(1).unwrap(),
             socket_path.clone(),
+            Arc::clone(&rpc_admission),
         );
         let client_b =
             UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
-        let _held: Vec<_> = (0..UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT)
-            .map(|_| {
-                client_a
-                    .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
-                    .unwrap()
-            })
-            .collect();
+        let _held = client_a
+            .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+            .unwrap();
 
         let err = client_b
             .rpc_request_result(StorageRpcMessageKind::ShardWrite, Vec::new())
@@ -21916,12 +22320,8 @@ mod tests {
 
     #[test]
     fn unix_storage_node_shard_write_admission_exhausts_before_socket_write() {
-        let client = UnixStorageNodeClient::with_rpc_admission_limit(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            "/tmp/unopened-storage-node.sock",
-            1,
-        );
+        let client =
+            test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
         let _held = client
             .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
             .unwrap();
@@ -21942,12 +22342,8 @@ mod tests {
 
     #[test]
     fn unix_storage_node_read_handle_session_admission_exhausts_before_connect() {
-        let client = UnixStorageNodeClient::with_rpc_admission_limit(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            "/tmp/unopened-storage-node.sock",
-            1,
-        );
+        let client =
+            test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
         let _held = client
             .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
             .unwrap();
@@ -21968,12 +22364,8 @@ mod tests {
 
     #[test]
     fn unix_storage_node_metadata_session_admission_exhausts_before_connect() {
-        let client = UnixStorageNodeClient::with_rpc_admission_limit(
-            NodeId::new(7),
-            ClusterEpoch::new(1).unwrap(),
-            "/tmp/unopened-storage-node.sock",
-            1,
-        );
+        let client =
+            test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
         let _held = client
             .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
             .unwrap();

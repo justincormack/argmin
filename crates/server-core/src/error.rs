@@ -33,7 +33,7 @@ pub enum ServerError {
     DeleteMarkerHit { bucket: String, key: String },
 
     #[error("storage error: {0}")]
-    Store(#[from] StoreError),
+    Store(StoreError),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -121,7 +121,7 @@ pub enum ServerError {
     #[error("not modified")]
     NotModified { etag: String, last_modified: u64 },
 
-    #[error("please reduce your request rate")]
+    #[error("Please reduce your request rate.")]
     SlowDown,
 
     #[error("bad digest")]
@@ -298,6 +298,16 @@ pub enum ServerError {
         expected: u64,
         actual: u64,
     },
+}
+
+impl From<StoreError> for ServerError {
+    fn from(error: StoreError) -> Self {
+        if store_error_is_resource_exhausted(&error) {
+            Self::SlowDown
+        } else {
+            Self::Store(error)
+        }
+    }
 }
 
 impl ServerError {
@@ -542,6 +552,14 @@ impl ServerError {
     }
 }
 
+fn store_error_is_resource_exhausted(error: &StoreError) -> bool {
+    match error {
+        StoreError::StorageRpcResourceExhausted { .. } => true,
+        StoreError::ShardStore { source, .. } => store_error_is_resource_exhausted(source),
+        _ => false,
+    }
+}
+
 fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
     match error {
         StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
@@ -749,6 +767,17 @@ mod tests {
             shard_overload.diagnostic_cause_chain(),
             "server_error>store_error>shard_store>storage_rpc_resource_exhausted"
         );
+        let converted_overload = ServerError::from(StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            source: Box::new(StoreError::StorageRpcResourceExhausted {
+                node_id: 1,
+                operation: "ReadHandlesAcquire",
+                message: "limit exceeded".to_string(),
+            }),
+        });
+        assert!(matches!(converted_overload, ServerError::SlowDown));
 
         let stale_bucket = ServerError::Metadata(MetadataError::StaleBucketMetadataCommand {
             name: storage::BucketName::try_from("bucket".to_string()).unwrap(),

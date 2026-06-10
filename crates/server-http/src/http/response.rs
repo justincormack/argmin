@@ -263,7 +263,7 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::InvalidRange { .. } => "invalid range".to_string(),
         ServerError::PreconditionFailed => "precondition failed".to_string(),
         ServerError::NotModified { .. } => "not modified".to_string(),
-        ServerError::SlowDown => "please reduce your request rate".to_string(),
+        ServerError::SlowDown => "Please reduce your request rate.".to_string(),
         ServerError::BadDigest => "bad digest".to_string(),
         ServerError::ChecksumDigestMismatch { algorithm } => {
             format!("The {algorithm} you specified did not match the calculated checksum.")
@@ -3540,6 +3540,7 @@ mod tests {
         assert_eq!(find_header(&resp, "Content-Length"), None);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("SlowDown"));
+        assert!(body.contains("<Message>Please reduce your request rate.</Message>"));
     }
 
     #[test]

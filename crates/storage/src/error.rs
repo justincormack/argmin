@@ -449,6 +449,12 @@ pub enum ClusterBuildError {
     #[error("remote storage-node client node {id} RPC admission limit must be > 0")]
     RemoteStorageNodeClientRpcAdmissionLimitZero { id: u32 },
 
+    #[error("remote storage-node client node {id} RPC admission wait timeout must be > 0")]
+    RemoteStorageNodeClientRpcAdmissionWaitTimeoutZero { id: u32 },
+
+    #[error("remote storage-node client node {id} RPC control admission wait timeout must be > 0")]
+    RemoteStorageNodeClientRpcControlAdmissionWaitTimeoutZero { id: u32 },
+
     #[error("duplicate remote shard client node id {id}")]
     DuplicateRemoteShardClientNodeId { id: u32 },
 

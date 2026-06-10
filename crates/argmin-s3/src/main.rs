@@ -295,10 +295,12 @@ fn build_remote_frontend_storage_cluster(
     .map_err(|e| e.to_string())?;
     local_map
         .install_unix_storage_node_clients(config.storage_node_sockets.iter().map(|entry| {
-            LocalUnixStorageNodeClientConfig::with_rpc_admission_limit(
+            LocalUnixStorageNodeClientConfig::with_rpc_admission(
                 NodeId::new(entry.node_id),
                 entry.socket_path.clone(),
                 config.storage_node_rpc_admission_limit,
+                config.storage_node_rpc_admission_wait_timeout,
+                config.storage_node_rpc_control_admission_wait_timeout,
             )
         }))
         .map_err(|e| e.to_string())?;
@@ -373,9 +375,16 @@ async fn run_frontend_server(
     } else {
         "http"
     };
+    let effective_max_inflight_requests = if config.process_role.uses_remote_frontend_routing() {
+        let storage_rpc_limit =
+            u32::try_from(config.storage_node_rpc_admission_limit).unwrap_or(u32::MAX);
+        config.max_inflight_requests.min(storage_rpc_limit)
+    } else {
+        config.max_inflight_requests
+    };
 
     eprintln!(
-        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, storage RPC admission {}, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
+        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight effective {} in-flight, storage RPC admission {} bulk wait {} ms control wait {} ms, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
         scheme,
         config.listen_addr,
         config.ec_k,
@@ -384,7 +393,12 @@ async fn run_frontend_server(
         config.workers,
         config.max_connections,
         config.max_inflight_requests,
+        effective_max_inflight_requests,
         config.storage_node_rpc_admission_limit,
+        config.storage_node_rpc_admission_wait_timeout.as_millis(),
+        config
+            .storage_node_rpc_control_admission_wait_timeout
+            .as_millis(),
         config.stream_read_chunk_size,
         config.panic_on_500,
         config.abort_on_500,
@@ -407,7 +421,7 @@ async fn run_frontend_server(
                 tls_acceptor,
                 frontends,
                 config.max_connections,
-                config.max_inflight_requests,
+                effective_max_inflight_requests,
                 serve_config,
             )
             .await;
@@ -417,7 +431,7 @@ async fn run_frontend_server(
                 listener,
                 frontends,
                 config.max_connections,
-                config.max_inflight_requests,
+                effective_max_inflight_requests,
                 serve_config,
             )
             .await;
@@ -444,6 +458,10 @@ mod tests {
             storage_node_sockets: Vec::new(),
             storage_node_rpc_admission_limit:
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT,
+            storage_node_rpc_admission_wait_timeout:
+                LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+            storage_node_rpc_control_admission_wait_timeout:
+                LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
             ec_k: 4,

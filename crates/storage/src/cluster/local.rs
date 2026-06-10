@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
@@ -19,6 +20,7 @@ use crate::node_client::{
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
     ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
     UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -63,6 +65,8 @@ pub struct LocalUnixStorageNodeClientConfig {
     node_id: NodeId,
     socket_path: PathBuf,
     rpc_admission_limit: usize,
+    rpc_admission_wait_timeout: Duration,
+    rpc_control_admission_wait_timeout: Duration,
 }
 
 impl LocalUnixShardNodeClientConfig {
@@ -84,12 +88,18 @@ impl LocalUnixShardNodeClientConfig {
 
 impl LocalUnixStorageNodeClientConfig {
     pub const DEFAULT_RPC_ADMISSION_LIMIT: usize = UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT;
+    pub const DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT: Duration =
+        UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT;
+    pub const DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT: Duration =
+        crate::node_client::UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT;
 
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             node_id,
             socket_path: socket_path.into(),
             rpc_admission_limit: Self::DEFAULT_RPC_ADMISSION_LIMIT,
+            rpc_admission_wait_timeout: Self::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+            rpc_control_admission_wait_timeout: Self::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
         }
     }
 
@@ -102,6 +112,24 @@ impl LocalUnixStorageNodeClientConfig {
             node_id,
             socket_path: socket_path.into(),
             rpc_admission_limit,
+            rpc_admission_wait_timeout: Self::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+            rpc_control_admission_wait_timeout: Self::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+        }
+    }
+
+    pub fn with_rpc_admission(
+        node_id: NodeId,
+        socket_path: impl Into<PathBuf>,
+        rpc_admission_limit: usize,
+        rpc_admission_wait_timeout: Duration,
+        rpc_control_admission_wait_timeout: Duration,
+    ) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+            rpc_admission_limit,
+            rpc_admission_wait_timeout,
+            rpc_control_admission_wait_timeout,
         }
     }
 
@@ -115,6 +143,14 @@ impl LocalUnixStorageNodeClientConfig {
 
     pub fn rpc_admission_limit(&self) -> usize {
         self.rpc_admission_limit
+    }
+
+    pub fn rpc_admission_wait_timeout(&self) -> Duration {
+        self.rpc_admission_wait_timeout
+    }
+
+    pub fn rpc_control_admission_wait_timeout(&self) -> Duration {
+        self.rpc_control_admission_wait_timeout
     }
 }
 
@@ -1208,11 +1244,13 @@ impl LocalClusterMap {
                 .nodes
                 .get_mut(&config.node_id)
                 .expect("validated remote storage-node client node must exist");
-            let client = Arc::new(UnixStorageNodeClient::with_rpc_admission_limit(
+            let client = Arc::new(UnixStorageNodeClient::with_rpc_admission_settings(
                 config.node_id,
                 self.epoch,
                 config.socket_path.clone(),
                 config.rpc_admission_limit,
+                config.rpc_admission_wait_timeout,
+                config.rpc_control_admission_wait_timeout,
             ));
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
@@ -1278,6 +1316,20 @@ impl LocalClusterMap {
             if config.rpc_admission_limit == 0 {
                 return Err(
                     ClusterBuildError::RemoteStorageNodeClientRpcAdmissionLimitZero {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if config.rpc_admission_wait_timeout.is_zero() {
+                return Err(
+                    ClusterBuildError::RemoteStorageNodeClientRpcAdmissionWaitTimeoutZero {
+                        id: config.node_id.as_u32(),
+                    },
+                );
+            }
+            if config.rpc_control_admission_wait_timeout.is_zero() {
+                return Err(
+                    ClusterBuildError::RemoteStorageNodeClientRpcControlAdmissionWaitTimeoutZero {
                         id: config.node_id.as_u32(),
                     },
                 );
