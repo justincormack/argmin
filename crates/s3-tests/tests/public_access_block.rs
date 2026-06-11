@@ -3,7 +3,7 @@ use s3_tests::{content_md5_header, send_signed_request, unique_bucket, CTX};
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 #[test]

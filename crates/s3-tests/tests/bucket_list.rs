@@ -137,7 +137,7 @@ fn test_bucket_list_empty() {
         let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
         assert!(resp.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -208,12 +208,7 @@ fn test_bucket_list_distinct() {
             .unwrap();
         assert!(resp.contents().is_empty());
 
-        client
-            .delete_bucket()
-            .bucket(&bucket_b)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket_b).await;
         delete_all_and_bucket(client, &bucket_a, &keys_a).await;
     });
 }
@@ -1980,7 +1975,7 @@ fn test_bucket_list_without_encoding_type_keeps_control_characters_literal() {
         for &(_, encoded_key) in CONTROL_KEY_CASES {
             delete_raw_object(&bucket, encoded_key);
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2031,7 +2026,7 @@ fn test_bucket_list_encoding_type_url_encodes_control_characters() {
         for &(_, encoded_key) in CONTROL_KEY_CASES {
             delete_raw_object(&bucket, encoded_key);
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2069,7 +2064,7 @@ fn test_bucket_listv2_without_encoding_type_keeps_control_characters_literal() {
         for &(_, encoded_key) in CONTROL_KEY_CASES {
             delete_raw_object(&bucket, encoded_key);
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2095,7 +2090,7 @@ fn test_bucket_list_without_encoding_type_escapes_xml_special_characters() {
         );
 
         delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2126,7 +2121,7 @@ fn test_bucket_list_encoding_type_url_encodes_xml_special_characters() {
         );
 
         delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2152,7 +2147,7 @@ fn test_bucket_listv2_without_encoding_type_escapes_xml_special_characters() {
         );
 
         delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2183,7 +2178,7 @@ fn test_bucket_listv2_encoding_type_url_encodes_xml_special_characters() {
         );
 
         delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2234,7 +2229,7 @@ fn test_bucket_listv2_encoding_type_url_encodes_control_characters() {
         for &(_, encoded_key) in CONTROL_KEY_CASES {
             delete_raw_object(&bucket, encoded_key);
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2280,7 +2275,7 @@ fn test_bucket_listv2_echoed_fields_without_encoding_type_escape_special_charact
             response.body
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2331,7 +2326,7 @@ fn test_bucket_listv2_echoed_fields_with_encoding_type_url_encode_special_charac
             response.body
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2377,7 +2372,7 @@ fn test_bucket_listv1_echoed_fields_without_encoding_type_escape_special_charact
             response.body
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2428,7 +2423,7 @@ fn test_bucket_listv1_echoed_fields_with_encoding_type_url_encode_special_charac
             response.body
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2575,7 +2570,7 @@ fn test_bucket_list_objects_anonymous_fail() {
             status
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2597,7 +2592,7 @@ fn test_bucket_listv2_objects_anonymous_fail() {
             status
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2620,7 +2615,7 @@ fn test_bucket_list_long_name() {
         let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
         assert!(resp.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 

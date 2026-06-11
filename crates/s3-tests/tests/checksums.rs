@@ -42,7 +42,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {

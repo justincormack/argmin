@@ -43,7 +43,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 fn tag(key: &str, value: &str) -> Tag {
@@ -870,7 +870,7 @@ fn test_list_multipart_uploads_key_marker_only() {
                 .await
                 .unwrap();
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -893,7 +893,7 @@ fn test_put_tagging_nonexistent_key() {
             .await;
         assert_s3_err_code(&result, "NoSuchKey");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -914,7 +914,7 @@ fn test_delete_tagging_nonexistent_key() {
             .await;
         assert_s3_err_code(&result, "NoSuchKey");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 

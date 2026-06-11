@@ -20,7 +20,7 @@ async fn canonical_owner_id(client: &Client) -> String {
         .and_then(|owner| owner.id())
         .expect("expected owner ID in GetBucketAcl")
         .to_string();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     owner_id
 }
 
@@ -188,6 +188,6 @@ fn test_object_copy_not_owned_object_bucket() {
             .key("foo123bar")
             .send()
             .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

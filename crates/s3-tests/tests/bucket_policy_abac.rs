@@ -61,7 +61,7 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
         }
     }
 
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn cleanup(bucket: &str, keys: &[&str]) {

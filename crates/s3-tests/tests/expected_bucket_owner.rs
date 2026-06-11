@@ -209,7 +209,7 @@ async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn cleanup_multipart_bucket(bucket: &str, keys: &[&str]) {
@@ -248,7 +248,7 @@ async fn cleanup_multipart_bucket(bucket: &str, keys: &[&str]) {
         }
     }
 
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn cleanup_object_lock_bucket(bucket: &str) {
@@ -381,7 +381,7 @@ fn test_create_bucket_ignores_expected_bucket_owner() {
         match result {
             Ok(_) => {
                 client.head_bucket().bucket(&bucket).send().await.unwrap();
-                client.delete_bucket().bucket(&bucket).send().await.unwrap();
+                s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
             }
             Err(err) => {
                 let result = Err::<(), _>(err);

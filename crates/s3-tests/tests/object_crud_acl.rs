@@ -71,7 +71,7 @@ async fn canonical_owner_id(client: &Client) -> String {
         .and_then(|owner| owner.id())
         .expect("expected owner ID in GetBucketAcl")
         .to_string();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     owner_id
 }
 
@@ -277,7 +277,7 @@ async fn run_object_header_acl_grants_case(key: &str, body: Vec<u8>) {
         .send()
         .await
         .unwrap();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 }
 
 async fn alt_get_object_eventually(

@@ -102,7 +102,7 @@ fn test_bucket_create_delete() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         // Clean up
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -116,7 +116,7 @@ fn test_bucket_create_exists() {
         // Verify bucket exists via HEAD
         client.head_bucket().bucket(&bucket).send().await.unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -142,7 +142,7 @@ fn test_bucket_create_already_exists() {
             assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
         }
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -209,7 +209,7 @@ fn test_account_regional_bucket_create_succeeds_when_suffix_matches() {
             "unexpected response body: {}",
             response.body
         );
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -252,7 +252,7 @@ fn test_account_regional_bucket_recreate_returns_bucket_already_owned_by_you() {
         let second = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
         assert_raw_s3_error(&second, 409, "BucketAlreadyOwnedByYou");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -296,7 +296,7 @@ fn test_bucket_delete_nonempty() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -356,14 +356,14 @@ fn test_bucket_delete_then_recreate() {
         let bucket = unique_bucket();
 
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 
         // AWS documents that bucket removal can take time to finish, and
         // immediate same-name recreate may transiently return BucketAlreadyExists.
         s3_tests::create_bucket_retrying_reuse(client, &bucket)
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -378,7 +378,7 @@ fn test_bucket_head() {
 
         client.head_bucket().bucket(&bucket).send().await.unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -400,7 +400,7 @@ fn test_bucket_get_location() {
             expected_bucket_location_constraint_for_sdk(CTX.region())
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -427,7 +427,7 @@ fn test_bucket_head_expected_owner() {
             .await
             .unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -450,7 +450,7 @@ fn test_bucket_head_wrong_expected_owner() {
             .await;
         assert_eq!(err_status(&result), 403);
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -495,7 +495,7 @@ fn test_buckets_list_contains_created() {
         let owner_id = owner.id().expect("expected owner ID in ListBuckets");
         assert_canonical_owner_id(owner_id);
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -515,7 +515,7 @@ fn test_bucket_list_objects_empty() {
         assert_eq!(resp.key_count(), Some(0));
         assert!(resp.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -559,7 +559,7 @@ fn test_bucket_list_objects_with_objects() {
                 .await
                 .unwrap();
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -597,7 +597,7 @@ fn test_bucket_head_extended() {
         // HEAD should return without error and include standard headers
         client.head_bucket().bucket(&bucket).send().await.unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -640,7 +640,7 @@ fn test_bucket_create_special_key_names() {
                 .await
                 .unwrap();
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -662,7 +662,7 @@ fn test_buckets_list_ctime() {
             "bucket should have creation date"
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -681,6 +681,6 @@ fn test_bucket_create_exists_nonowner() {
         assert_eq!(err_status(&result), 409);
         assert_s3_err_code(&result, "BucketAlreadyExists");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

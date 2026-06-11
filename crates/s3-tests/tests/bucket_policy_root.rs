@@ -309,12 +309,7 @@ async fn cleanup_bucket(root_client: &aws_sdk_s3::Client, bucket: &str) {
         .bucket(bucket)
         .send()
         .await;
-    root_client
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(root_client, bucket).await;
 }
 
 #[test]

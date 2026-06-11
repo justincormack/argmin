@@ -136,7 +136,7 @@ async fn cleanup(bucket: &str, key: &str) {
         }
     }
 
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
@@ -151,7 +151,7 @@ async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
             .await
             .unwrap();
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn cleanup_multipart(bucket: &str, key: &str, upload_id: &str) {
@@ -1089,7 +1089,7 @@ fn test_sse_c_put_rejects_invalid_key_md5() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1125,7 +1125,7 @@ fn test_sse_c_put_invalid_key_md5_argument_name_matches_aws() {
             Some("x-amz-server-side-encryption")
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1153,7 +1153,7 @@ fn test_sse_c_put_requires_key_md5_header() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1178,7 +1178,7 @@ fn test_sse_c_put_requires_key_header() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1206,7 +1206,7 @@ fn test_sse_c_put_rejects_key_without_algorithm() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2296,7 +2296,7 @@ fn test_sse_c_copy_object_round_trip() {
             .key("dst")
             .send()
             .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2343,7 +2343,7 @@ fn test_sse_c_copy_object_requires_source_headers() {
             .key("src")
             .send()
             .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2523,7 +2523,7 @@ fn test_sse_c_upload_part_copy_round_trip() {
             .key("dst")
             .send()
             .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2601,7 +2601,7 @@ fn test_sse_c_upload_part_copy_requires_source_headers() {
             .key("dst")
             .send()
             .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2683,6 +2683,6 @@ fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
             .key("dst")
             .send()
             .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

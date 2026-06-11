@@ -55,7 +55,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 /// Cleanup helper for versioned buckets: delete each specific version then
@@ -71,7 +71,7 @@ async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
             .send()
             .await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 // ── test_get_object_attributes ──────────────────────────────────────
@@ -1131,7 +1131,7 @@ fn test_multipart_crc64nvme_composite_rejected() {
             .await;
         assert!(result.is_err(), "expected error for CRC64NVME + COMPOSITE");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 

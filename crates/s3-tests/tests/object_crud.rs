@@ -195,7 +195,7 @@ fn test_object_write_file() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -241,7 +241,7 @@ fn test_get_object_expected_bucket_owner() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -281,7 +281,7 @@ fn test_get_object_wrong_expected_bucket_owner() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -317,7 +317,7 @@ fn test_object_write_empty() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -362,7 +362,7 @@ fn test_object_write_overwrite() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -393,7 +393,7 @@ fn test_object_write_check_etag() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -413,7 +413,7 @@ fn test_object_read_not_exist() {
             .await;
         assert_eq!(err_status(&result), 404);
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -463,7 +463,7 @@ fn test_object_head_existing() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -481,7 +481,7 @@ fn test_object_head_nonexistent() {
             .await;
         assert!(result.is_err());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -519,7 +519,7 @@ fn test_object_delete_existing() {
             .await;
         assert!(result.is_err());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -538,7 +538,7 @@ fn test_object_delete_nonexistent() {
             .await
             .unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -576,7 +576,7 @@ fn test_object_content_type() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -615,7 +615,7 @@ fn test_object_default_content_type() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -657,7 +657,7 @@ fn test_object_metadata_round_trip() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -695,7 +695,7 @@ fn test_object_metadata_in_get() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -734,7 +734,7 @@ fn test_object_metadata_empty_value() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -798,7 +798,7 @@ fn test_object_metadata_overwrite_to_empty() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -853,7 +853,7 @@ fn test_object_metadata_replaced_on_put() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -899,7 +899,7 @@ fn test_object_metadata_unicode_accepted() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -921,7 +921,7 @@ fn test_object_metadata_too_large() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MetadataTooLarge");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -943,7 +943,7 @@ fn test_object_system_metadata_too_large() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MetadataTooLarge");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1020,7 +1020,7 @@ fn test_object_etag_matches_head_and_get() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1067,7 +1067,7 @@ fn test_object_same_content_same_etag() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1105,7 +1105,7 @@ fn test_object_key_with_slashes() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1141,7 +1141,7 @@ fn test_object_key_with_spaces() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1179,7 +1179,7 @@ fn test_object_write_cache_control() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1258,7 +1258,7 @@ fn test_object_content_disposition() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1296,7 +1296,7 @@ fn test_object_content_encoding() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1334,7 +1334,7 @@ fn test_object_content_language() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1372,7 +1372,7 @@ fn test_object_head_zero_bytes() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1411,7 +1411,7 @@ fn test_object_read_unreadable() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1450,7 +1450,7 @@ fn test_object_write_expires() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1517,7 +1517,7 @@ fn test_object_write_read_update_read_delete() {
         let result = client.get_object().bucket(&bucket).key("obj").send().await;
         assert!(result.is_err());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1632,6 +1632,6 @@ fn test_object_content_encoding_aws_chunked() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

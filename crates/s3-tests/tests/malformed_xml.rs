@@ -25,7 +25,7 @@ async fn setup_bucket() -> String {
 
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 fn assert_error_code(body: &str, code: &str) {

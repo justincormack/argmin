@@ -23,7 +23,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 fn assert_error_code(body: &str, code: &str) {
@@ -880,12 +880,7 @@ fn test_signed_chunked_put_with_gzip_content_encoding() {
             .key("signed-chunked-gzip")
             .send()
             .await;
-        ctx.client
-            .delete_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(&ctx.client, &bucket).await;
     });
 }
 
@@ -953,12 +948,7 @@ fn test_signed_chunked_put_strips_aws_chunked_content_encoding_variants() {
                 .send()
                 .await;
         }
-        ctx.client
-            .delete_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(&ctx.client, &bucket).await;
     });
 }
 

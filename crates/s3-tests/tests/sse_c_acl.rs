@@ -49,7 +49,7 @@ async fn create_acl_sse_c_bucket() -> String {
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 #[test]

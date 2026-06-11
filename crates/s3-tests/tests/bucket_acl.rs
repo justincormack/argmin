@@ -238,12 +238,7 @@ async fn alt_canonical_owner_id() -> String {
         .and_then(|owner| owner.id())
         .expect("expected owner ID in GetBucketAcl")
         .to_string();
-    alt_client
-        .delete_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(alt_client, &bucket).await;
     id
 }
 

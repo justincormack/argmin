@@ -87,12 +87,7 @@ async fn create_bucket_in_test_region(
 }
 
 async fn cleanup_bucket(bucket: &str) {
-    CTX.client()
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), bucket).await;
 }
 
 async fn cleanup_bucket_with_keys(bucket: &str, keys: &[&str]) {

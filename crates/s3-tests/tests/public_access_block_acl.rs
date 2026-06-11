@@ -90,7 +90,7 @@ async fn anonymous_get_status_eventually(url: &str, expected_status: u16, descri
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn setup_acl_enabled_bucket() -> String {

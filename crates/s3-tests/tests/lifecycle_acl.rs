@@ -7,7 +7,7 @@ use s3_tests::{assert_s3_err_code, create_acl_enabled_bucket, err_status, CTX};
 async fn cleanup_bucket(bucket: &str) {
     let client = CTX.client();
     let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn assert_lifecycle_deleted_eventually(bucket: &str) {

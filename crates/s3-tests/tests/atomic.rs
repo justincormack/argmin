@@ -432,7 +432,7 @@ fn test_atomic_write_bucket_gone() {
 
         // Create then immediately delete the bucket
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 
         // PUT to the gone bucket → 404
         let result = client

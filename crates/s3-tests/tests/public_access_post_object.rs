@@ -158,7 +158,7 @@ async fn assert_post_object_anonymous_public_write_bucket() {
         .send()
         .await
         .unwrap();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 }
 
 #[test]
@@ -220,7 +220,7 @@ async fn assert_post_object_anonymous_public_read_request() {
         .send()
         .await
         .unwrap();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 }
 
 #[test]
@@ -296,6 +296,6 @@ fn test_post_object_anonymous_bucket_owner_full_control_request() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

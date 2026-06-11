@@ -30,7 +30,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         }
     }
 
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn create_bucket_allowing_policy(client: &aws_sdk_s3::Client) -> String {

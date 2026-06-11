@@ -48,7 +48,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn get_object_eventually_after_copy(
@@ -858,18 +858,8 @@ fn test_object_copy_not_owned_bucket() {
             .send()
             .await
             .unwrap();
-        client
-            .delete_bucket()
-            .bucket(&bucket1)
-            .send()
-            .await
-            .unwrap();
-        alt_client
-            .delete_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket1).await;
+        s3_tests::delete_bucket_retrying_operation_aborted(alt_client, &bucket2).await;
     });
 }
 

@@ -76,7 +76,7 @@ async fn cleanup(bucket: &str, key: Option<&str>) {
     if let Some(key) = key {
         let _ = client.delete_object().bucket(bucket).key(key).send().await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn wait_for_sse_c_blocked(bucket: &str) {

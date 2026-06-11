@@ -97,7 +97,7 @@ fn test_multi_object_delete() {
         let list = client.list_objects().bucket(&bucket).send().await.unwrap();
         assert!(list.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -177,7 +177,7 @@ fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -349,7 +349,7 @@ fn test_multi_objectv2_delete() {
         assert_eq!(list.key_count(), Some(0));
         assert!(list.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -379,7 +379,7 @@ fn test_multi_object_delete_quiet() {
             .unwrap();
         assert!(list.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -407,7 +407,7 @@ fn test_multi_object_delete_large() {
             .unwrap();
         assert!(list.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -428,7 +428,7 @@ fn test_multi_object_delete_nonexistent_keys() {
         assert_eq!(resp.deleted().len(), 3);
         assert!(resp.errors().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -460,7 +460,7 @@ fn test_multi_object_delete_mixed() {
 
         // keys vec only has the originally created ones; bucket is already empty
         let _ = keys;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -489,7 +489,7 @@ fn test_multi_object_delete_special_keys() {
             .unwrap();
         assert!(list.contents().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -544,7 +544,7 @@ fn test_multi_object_delete_verify_response() {
         assert_eq!(deleted_keys, vec!["alpha", "beta", "gamma"]);
         assert!(resp.errors().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -620,7 +620,7 @@ fn test_multi_object_delete_key_limit() {
             .await;
         assert_eq!(err_status(&result), 400);
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -674,7 +674,7 @@ fn test_multi_objectv2_delete_key_limit() {
             .await;
         assert_eq!(err_status(&result), 400);
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -684,7 +684,7 @@ fn test_object_delete_key_bucket_gone() {
         let client = CTX.client();
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 
         // Try to delete an object from the now-deleted bucket
         let result = client
@@ -771,7 +771,7 @@ async fn cleanup_versioned_bucket(bucket: &str) {
             .await
             .unwrap();
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 // ── Versioning + multi-object delete ────────────────────────────────
@@ -850,7 +850,7 @@ fn test_versioning_multi_object_delete() {
         assert_eq!(resp2.deleted().len(), num_versions);
         assert!(resp2.errors().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -923,7 +923,7 @@ fn test_versioning_multi_object_delete_with_marker() {
         assert!(list.versions().is_empty());
         assert!(list.delete_markers().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 

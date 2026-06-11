@@ -19,7 +19,7 @@ fn agent() -> s3_tests::Agent {
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str) {
@@ -146,7 +146,7 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
         .and_then(|owner| owner.id())
         .expect("expected owner ID in GetBucketAcl")
         .to_string();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     owner_id
 }
 
@@ -502,7 +502,7 @@ async fn run_cross_account_object_tagging_matrix_case(ownership: ObjectOwnership
         .send()
         .await
         .unwrap();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
 }
 
 // ── test_create_bucket_no_ownership_controls ────────────────────────
@@ -591,7 +591,7 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 

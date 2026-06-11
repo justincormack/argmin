@@ -33,7 +33,7 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
         .id()
         .expect("expected owner ID in GetBucketAcl")
         .to_string();
-    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     owner_id
 }
 
@@ -73,7 +73,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         }
     }
 
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn eventually_ok<T, E, F, Fut>(description: &str, mut op: F) -> T
