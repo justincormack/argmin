@@ -1253,3 +1253,24 @@ pub fn is_sdk_stream_disconnect<E: std::fmt::Debug>(err: &aws_sdk_s3::error::Sdk
             || message.contains("Connection reset")
             || message.contains("IncompleteMessage"))
 }
+
+/// Return true for SDK errors caused by a streaming request being rejected
+/// while the client is still writing, accepting either a pure dispatch
+/// disconnect or a response whose status arrived before the error body failed.
+pub fn is_sdk_stream_disconnect_or_status<E: std::fmt::Debug>(
+    err: &aws_sdk_s3::error::SdkError<E>,
+    expected_status: u16,
+) -> bool {
+    if is_sdk_stream_disconnect(err) {
+        return true;
+    }
+    if err.raw_response().map(|r| r.status().as_u16()) != Some(expected_status) {
+        return false;
+    }
+    let message = format!("{err:?}");
+    message.contains("ResponseError")
+        && (message.contains("hyper::Error(Body")
+            || message.contains("connection error")
+            || message.contains("IncompleteMessage")
+            || message.contains("incomplete message"))
+}

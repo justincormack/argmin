@@ -18,9 +18,9 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
-    assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect, object_url,
-    send_signed_request, send_signed_request_with_credentials, unique_bucket, RawResponse,
-    SignedRequestCredentials, CTX,
+    assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect_or_status,
+    object_url, send_signed_request, send_signed_request_with_credentials, unique_bucket,
+    RawResponse, SignedRequestCredentials, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -459,7 +459,7 @@ fn test_abort_multipart_upload_racing_started_upload_part_returns_success_or_no_
         let uploaded_part = match &upload_part {
             Ok(output) => Some(output),
             Err(err) => {
-                if is_sdk_stream_disconnect(err) {
+                if is_sdk_stream_disconnect_or_status(err, 404) {
                     None
                 } else {
                     assert_eq!(
@@ -581,7 +581,7 @@ fn test_abort_multipart_upload_racing_started_second_part_returns_success_or_no_
         let uploaded_part = match &upload_part {
             Ok(output) => Some(output),
             Err(err) => {
-                if is_sdk_stream_disconnect(err) {
+                if is_sdk_stream_disconnect_or_status(err, 404) {
                     None
                 } else {
                     assert_eq!(

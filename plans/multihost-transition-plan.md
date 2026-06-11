@@ -6266,6 +6266,28 @@ Work items:
      and no overload is emitted; decrease immediately when waits exceed budget,
      storage-node resource exhaustion appears, or operation-attempt timeout risk
      is detected. This is admission control, not blind sleeps.
+   - bias admission toward completing already-admitted work when unfinished work
+     is accumulating, without starving new starts. Split mutating work into at
+     least `Completion`, `Progress`, and `StartWrite` classes. Completion work
+     includes pending-command apply/drain, stream segment append commit,
+     multipart complete/abort cleanup, reservation/session release, and other
+     paths that have already created durable side effects or hold durable
+     identity. `StartWrite` includes `CreateStreamUpload`, create-multipart,
+     and other first-side-effect admission for new writes. The controller must
+     keep a small nonzero floor for new starts, but as completion pressure rises
+     it should reduce the new-start share and reserve more capacity for closing
+     existing operations. `SlowDown` should be emitted primarily at `StartWrite`
+     and bulk/list admission boundaries; completion paths should either finish,
+     clean up and then return the operation-appropriate retryable response, or
+     fail closed if the outcome is ambiguous.
+   - split cheap read work from expensive list/scan work. `ShardRead`,
+     `ShardReadRange`, read-handle acquisition, and ordinary `GET`/`HEAD`
+     support should have a separate bounded `Read` class with a low-latency
+     reservation. Object listing, version listing, bucket listing, multipart
+     listing, stream-upload listing, and other page/scan style operations should
+     use a separate `List` class with a smaller cap and earlier overload
+     behavior. Internal cleanup enumeration must not accidentally share the
+     user-list class when it is needed to finish already-admitted work.
    - emit `SlowDown` early enough for SDK retries to pace clients. The response
      should include the existing `Retry-After` header, with a later follow-up
      allowed to derive the value from overload debt instead of the current
@@ -6318,6 +6340,16 @@ Work items:
    - add foreground/background capacity classes and make lifecycle, reclaim,
      delete finalization, scavenger, repair, and scrub use low-priority leases
      with backoff.
+   - split the coarse storage-RPC bulk class into separate `Read` and `List`
+     classes before tuning limits. Large listing/page work must feel overload
+     before ordinary cached reads, and metrics must report read/list admission
+     totals, waits, timeouts, and active counts independently.
+   - add adaptive completion pressure after the static class split is stable.
+     The first version may use stepped configured thresholds rather than a
+     continuous controller, but it must reserve a floor for new starts while
+     shifting additional capacity to completion/progress work as unfinished
+     stream sessions, pending appends, pending metadata commands, staged
+     payloads, and cleanup backlog grow.
    - only after the static limits pass UAT under forced low budgets, add the
      bounded adaptive controller. It must be feature/config gated at first and
      tested against deterministic pressure injection before becoming the default.
@@ -6403,14 +6435,21 @@ Required tests:
     either completes within the configured operation-attempt budget or returns
     bounded S3-shaped overload responses; it must not fail only as SDK
     operation-attempt timeouts
-21. every HTTP 500 in a focused failure-injection test emits a structured cause
+21. read/list class separation under forced list pressure keeps bounded
+    `GET`/`HEAD` and shard-read work making progress while large listing/page
+    operations either wait within budget or return S3 `SlowDown`
+22. adaptive completion pressure under many unfinished stream sessions/pending
+    appends shifts capacity toward append/finalize/cleanup work, reduces new
+    `CreateStreamUpload`/create-multipart admission, and still admits at least
+    the configured new-start floor
+23. every HTTP 500 in a focused failure-injection test emits a structured cause
    label and enough request/RPC/PG context to debug without temporary tracing
-22. diagnostics and flight-recorder dumps redact secrets, payload context,
+24. diagnostics and flight-recorder dumps redact secrets, payload context,
     request headers, SSE-C material, and unbounded names; explicit dump access
     is disabled by default and local/admin-only
-23. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
+25. repeated multihost UAT subsets run with abort-on-500 enabled and preserve
    deterministic diagnostics for the first failing iteration
-24. guardrails fail if a new coordinator request path maps expected
+26. guardrails fail if a new coordinator request path maps expected
     metadata-command contention directly to generic `Store`, `Metadata`, or
     internal errors
 
@@ -6632,6 +6671,13 @@ Status:
   storage layer can serve; otherwise pressure appears only after each handler
   has already fanned out into storage RPCs, producing public `SlowDown` and long
   cleanup tails instead of request-level pacing.
+- Added the next Phase 10.9 admission-shaping direction to the plan. The coarse
+  control/bulk split is not enough for soak stability: already-admitted work
+  such as stream append commit/finalize/cleanup should receive increasing
+  reserved capacity as unfinished work accumulates, while new write starts keep
+  a small floor and otherwise feel `SlowDown` first. The plan now also requires
+  splitting cheap `Read` work from expensive `List`/scan work so large listing
+  pressure does not suppress ordinary cached reads.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
