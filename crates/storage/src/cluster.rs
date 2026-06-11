@@ -60,6 +60,7 @@ mod local;
 mod request_ops;
 
 const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
+const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,7 +694,7 @@ enum SnapshotSensitiveCommandInstall {
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
-    LogConflict,
+    LogConflict { pending_visible: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1853,7 +1854,11 @@ impl StorageCluster {
         {
             Ok(command_id) => command_id,
             Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
-                return Ok(ObjectPgPendingCommandInstall::LogConflict);
+                return Ok(ObjectPgPendingCommandInstall::LogConflict {
+                    pending_visible: self
+                        .pending_metadata_command_for_bucket(pg_id, bucket)?
+                        .is_some(),
+                });
             }
             Err(error) => return Err(error),
         };
@@ -1869,10 +1874,39 @@ impl StorageCluster {
                 Ok(ObjectPgPendingCommandInstall::Pending(pending))
             }
             Err(StoreError::MetadataCommandLogConflict { .. }) => {
-                Ok(ObjectPgPendingCommandInstall::LogConflict)
+                Ok(ObjectPgPendingCommandInstall::LogConflict {
+                    pending_visible: self
+                        .pending_metadata_command_for_bucket(pg_id, bucket)?
+                        .is_some(),
+                })
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn drain_after_object_pg_log_conflict(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        pending_visible: bool,
+        empty_log_conflicts: &mut usize,
+        context: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        let drained = if pending_visible {
+            self.drain_one_pending_object_metadata_command(pg_id, bucket)?
+        } else {
+            false
+        };
+        if drained {
+            *empty_log_conflicts = 0;
+            return Ok(());
+        }
+
+        *empty_log_conflicts += 1;
+        if *empty_log_conflicts >= OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES {
+            return Err(conflicting_pending_object_metadata_command(context));
+        }
+        Ok(())
     }
 
     fn install_snapshot_sensitive_metadata_command_or_drain(
@@ -2646,6 +2680,7 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let mut empty_log_conflicts = 0;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
@@ -2717,8 +2752,14 @@ impl StorageCluster {
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
                     continue;
                 }
-                ObjectPgPendingCommandInstall::LogConflict => {
-                    self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
+                ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
+                    self.drain_after_object_pg_log_conflict(
+                        pg_id,
+                        bucket,
+                        pending_visible,
+                        &mut empty_log_conflicts,
+                        "object generation reservation log conflict without pending progress",
+                    )?;
                     continue;
                 }
             };
@@ -2872,6 +2913,7 @@ impl StorageCluster {
         key: &ObjectKey,
         completion_admission: bool,
     ) -> Result<VersionId, ObjectPgActionError> {
+        let mut empty_log_conflicts = 0;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
@@ -2956,8 +2998,14 @@ impl StorageCluster {
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
                     continue;
                 }
-                ObjectPgPendingCommandInstall::LogConflict => {
-                    self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
+                ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
+                    self.drain_after_object_pg_log_conflict(
+                        pg_id,
+                        bucket,
+                        pending_visible,
+                        &mut empty_log_conflicts,
+                        "object version reservation log conflict without pending progress",
+                    )?;
                     continue;
                 }
             };
@@ -3349,6 +3397,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
+        let mut empty_log_conflicts = 0;
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
@@ -3396,8 +3445,14 @@ impl StorageCluster {
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
                     continue;
                 }
-                ObjectPgPendingCommandInstall::LogConflict => {
-                    self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
+                ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
+                    self.drain_after_object_pg_log_conflict(
+                        pg_id,
+                        bucket,
+                        pending_visible,
+                        &mut empty_log_conflicts,
+                        "object generation release log conflict without pending progress",
+                    )?;
                     continue;
                 }
             };
@@ -4003,6 +4058,7 @@ impl StorageCluster {
             };
 
         let mut stale_commit_snapshot_retries = 0;
+        let mut empty_log_conflicts = 0;
         let (command, new_pending_command) = loop {
             let (command, new_pending_command, payload_acks_registered) = loop {
                 let Some(command) =
@@ -4077,9 +4133,17 @@ impl StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            let cleanup =
-                                self.drain_one_pending_object_metadata_command(pg_id, &req.bucket);
-                            if let Err(error) = cleanup {
+                            let pending_visible = self
+                                .pending_metadata_command_for_bucket(pg_id, &req.bucket)?
+                                .is_some();
+                            let drain_result = self.drain_after_object_pg_log_conflict(
+                                pg_id,
+                                &req.bucket,
+                                pending_visible,
+                                &mut empty_log_conflicts,
+                                "direct put commit command log conflict without pending progress",
+                            );
+                            if let Err(error) = drain_result {
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
@@ -4923,6 +4987,7 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
+        let mut empty_log_conflicts = 0;
         loop {
             if let Err(error) =
                 self.drain_pending_object_metadata_commands_for_exact_bucket(pg_id, bucket)
@@ -5053,10 +5118,14 @@ impl StorageCluster {
                     }
                     continue;
                 }
-                Ok(ObjectPgPendingCommandInstall::LogConflict) => {
-                    if let Err(error) =
-                        self.drain_one_pending_object_metadata_command(pg_id, bucket)
-                    {
+                Ok(ObjectPgPendingCommandInstall::LogConflict { pending_visible }) => {
+                    if let Err(error) = self.drain_after_object_pg_log_conflict(
+                        pg_id,
+                        bucket,
+                        pending_visible,
+                        &mut empty_log_conflicts,
+                        "stream append command log conflict without pending progress",
+                    ) {
                         self.delete_payload_shard_keys_best_effort(
                             segment_record.data_pg_id,
                             EcShape {
