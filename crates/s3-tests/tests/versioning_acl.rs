@@ -1,9 +1,17 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     AccessControlPolicy, BucketVersioningStatus, Grant, Grantee, ObjectOwnership, Owner,
     OwnershipControls, OwnershipControlsRule, Permission, Type, VersioningConfiguration,
 };
 use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, unique_bucket, CTX};
+use tokio::time::{sleep, Duration};
+
+const VERSIONING_ACL_SETUP_ATTEMPTS: usize = 20;
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -18,6 +26,62 @@ fn assert_canonical_owner_id(id: &str) {
     );
 }
 
+async fn put_bucket_ownership_controls_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    controls: OwnershipControls,
+) {
+    for attempt in 0..VERSIONING_ACL_SETUP_ATTEMPTS {
+        match client
+            .put_bucket_ownership_controls()
+            .bucket(bucket)
+            .ownership_controls(controls.clone())
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err) && attempt + 1 < VERSIONING_ACL_SETUP_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => {
+                panic!("put bucket ownership controls during versioning ACL setup: {err:?}")
+            }
+        }
+    }
+    panic!("put bucket ownership controls during versioning ACL setup did not complete");
+}
+
+async fn put_bucket_versioning_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) {
+    for attempt in 0..VERSIONING_ACL_SETUP_ATTEMPTS {
+        match client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(status.clone())
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err) && attempt + 1 < VERSIONING_ACL_SETUP_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put bucket versioning during versioning ACL setup: {err:?}"),
+        }
+    }
+    panic!("put bucket versioning during versioning ACL setup did not complete");
+}
+
 async fn setup_versioned_acl_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
@@ -30,24 +94,13 @@ async fn setup_versioned_acl_bucket() -> String {
         .rules(ownership_rule)
         .build()
         .unwrap();
-    client
-        .put_bucket_ownership_controls()
-        .bucket(&bucket)
-        .ownership_controls(controls)
-        .send()
-        .await
-        .unwrap();
-    client
-        .put_bucket_versioning()
-        .bucket(&bucket)
-        .versioning_configuration(
-            VersioningConfiguration::builder()
-                .status(BucketVersioningStatus::Enabled)
-                .build(),
-        )
-        .send()
-        .await
-        .unwrap();
+    put_bucket_ownership_controls_retrying_operation_aborted(client, &bucket, controls).await;
+    put_bucket_versioning_retrying_operation_aborted(
+        client,
+        &bucket,
+        BucketVersioningStatus::Enabled,
+    )
+    .await;
     bucket
 }
 

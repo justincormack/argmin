@@ -56,6 +56,38 @@ async fn put_object_retrying_operation_aborted(
     panic!("put object during versioning setup did not complete");
 }
 
+async fn upload_part_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("upload part during versioning setup: {err:?}"),
+        }
+    }
+    panic!("upload part during versioning setup did not complete");
+}
+
 async fn delete_object_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -2245,16 +2277,9 @@ fn test_versioning_obj_create_overwrite_multipart() {
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
-        let part_resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_data))
-            .send()
-            .await
-            .unwrap();
+        let part_resp =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, part_data)
+                .await;
         let complete = complete_multipart_upload_retrying_operation_aborted(
             client,
             &bucket,
