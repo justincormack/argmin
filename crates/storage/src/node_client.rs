@@ -1152,6 +1152,32 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_completion_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.acquire_durable_bucket_write_reservation(
+            pg_id,
+            bucket,
+            reservation_id,
+            owner_token,
+            cluster_epoch,
+            operation_kind,
+            created_at,
+            lease_deadline,
+            target_context,
+        )
+    }
+
     fn validate_bucket_write_reservation_proof(
         &self,
         pg_id: PgId,
@@ -1313,6 +1339,15 @@ pub(crate) trait ObjectVersionMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError>;
+
+    fn next_completion_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        self.next_object_version_id(pg_id, bucket, key)
+    }
 }
 
 pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
@@ -1934,6 +1969,15 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
         min_log_index: MetadataCommandLogIndex,
     ) -> Result<MetadataCommandId, StoreError>;
+
+    fn next_completion_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        self.next_metadata_command_id_at_least(pg_id, cluster_epoch, min_log_index)
+    }
 
     fn pending_metadata_command_envelope(
         &self,
@@ -2701,7 +2745,11 @@ pub(crate) struct UnixStorageNodeClient {
 
 struct UnixStorageNodeRpcAdmission {
     limit: usize,
-    bulk_limit: usize,
+    non_reserved_limit: usize,
+    read_limit: usize,
+    list_limit: usize,
+    start_write_limit: usize,
+    start_write_floor: usize,
     wait_timeout: Duration,
     control_wait_timeout: Duration,
     active: Mutex<UnixStorageNodeRpcAdmissionActive>,
@@ -2726,13 +2774,92 @@ enum UnixStorageNodeRpcAdmissionAcquire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnixStorageNodeRpcAdmissionClass {
     Control,
-    Bulk,
+    Completion,
+    Progress,
+    StartWrite,
+    Read,
+    List,
+}
+
+impl UnixStorageNodeRpcAdmissionClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Completion => "completion",
+            Self::Progress => "progress",
+            Self::StartWrite => "start_write",
+            Self::Read => "read",
+            Self::List => "list",
+        }
+    }
 }
 
 #[derive(Default)]
 struct UnixStorageNodeRpcAdmissionActive {
     total: usize,
-    bulk: usize,
+    completion: usize,
+    progress: usize,
+    start_write: usize,
+    read: usize,
+    list: usize,
+}
+
+impl UnixStorageNodeRpcAdmissionActive {
+    fn non_reserved(&self) -> usize {
+        self.progress + self.start_write + self.read + self.list
+    }
+
+    fn acquire(&mut self, class: UnixStorageNodeRpcAdmissionClass) {
+        self.total += 1;
+        match class {
+            UnixStorageNodeRpcAdmissionClass::Control => {}
+            UnixStorageNodeRpcAdmissionClass::Completion => self.completion += 1,
+            UnixStorageNodeRpcAdmissionClass::Progress => self.progress += 1,
+            UnixStorageNodeRpcAdmissionClass::StartWrite => self.start_write += 1,
+            UnixStorageNodeRpcAdmissionClass::Read => self.read += 1,
+            UnixStorageNodeRpcAdmissionClass::List => self.list += 1,
+        }
+    }
+
+    fn release(&mut self, class: UnixStorageNodeRpcAdmissionClass) {
+        self.total = self
+            .total
+            .checked_sub(1)
+            .expect("Unix storage-node RPC admission release without acquire");
+        match class {
+            UnixStorageNodeRpcAdmissionClass::Control => {}
+            UnixStorageNodeRpcAdmissionClass::Completion => {
+                self.completion = self
+                    .completion
+                    .checked_sub(1)
+                    .expect("Unix storage-node completion RPC admission release without acquire");
+            }
+            UnixStorageNodeRpcAdmissionClass::Progress => {
+                self.progress = self
+                    .progress
+                    .checked_sub(1)
+                    .expect("Unix storage-node progress RPC admission release without acquire");
+            }
+            UnixStorageNodeRpcAdmissionClass::StartWrite => {
+                self.start_write = self
+                    .start_write
+                    .checked_sub(1)
+                    .expect("Unix storage-node start-write RPC admission release without acquire");
+            }
+            UnixStorageNodeRpcAdmissionClass::Read => {
+                self.read = self
+                    .read
+                    .checked_sub(1)
+                    .expect("Unix storage-node read RPC admission release without acquire");
+            }
+            UnixStorageNodeRpcAdmissionClass::List => {
+                self.list = self
+                    .list
+                    .checked_sub(1)
+                    .expect("Unix storage-node list RPC admission release without acquire");
+            }
+        }
+    }
 }
 
 type UnixStorageNodeRpcAdmissionKey = (u32, PathBuf);
@@ -2759,10 +2886,16 @@ impl UnixStorageNodeRpcAdmission {
             "Unix storage-node RPC admission limit must be > 0"
         );
         let reserved_control = (limit / 4).clamp(1, 4).min(limit);
-        let bulk_limit = limit.saturating_sub(reserved_control).max(1).min(limit);
+        let shared_limit = limit.saturating_sub(reserved_control).max(1).min(limit);
+        let list_limit = (shared_limit / 2).max(1).min(shared_limit);
+        let start_write_floor = (limit / 8).clamp(1, 4).min(shared_limit);
         Self {
             limit,
-            bulk_limit,
+            non_reserved_limit: shared_limit,
+            read_limit: shared_limit,
+            list_limit,
+            start_write_limit: shared_limit,
+            start_write_floor,
             wait_timeout,
             control_wait_timeout,
             active: Mutex::new(UnixStorageNodeRpcAdmissionActive::default()),
@@ -2776,7 +2909,7 @@ impl UnixStorageNodeRpcAdmission {
         if active.total >= self.limit {
             return None;
         }
-        active.total += 1;
+        active.acquire(UnixStorageNodeRpcAdmissionClass::Control);
         Some(UnixStorageNodeRpcAdmissionPermit {
             admission: Arc::clone(self),
             class: UnixStorageNodeRpcAdmissionClass::Control,
@@ -2794,10 +2927,7 @@ impl UnixStorageNodeRpcAdmission {
         let mut waited = false;
         loop {
             if self.can_admit(&active, class) {
-                active.total += 1;
-                if class == UnixStorageNodeRpcAdmissionClass::Bulk {
-                    active.bulk += 1;
-                }
+                active.acquire(class);
                 return UnixStorageNodeRpcAdmissionAcquire::Acquired {
                     permit: UnixStorageNodeRpcAdmissionPermit {
                         admission: Arc::clone(self),
@@ -2837,13 +2967,41 @@ impl UnixStorageNodeRpcAdmission {
         if active.total >= self.limit {
             return false;
         }
-        class == UnixStorageNodeRpcAdmissionClass::Control || active.bulk < self.bulk_limit
+        match class {
+            UnixStorageNodeRpcAdmissionClass::Control
+            | UnixStorageNodeRpcAdmissionClass::Completion => true,
+            UnixStorageNodeRpcAdmissionClass::Progress => {
+                active.non_reserved() < self.non_reserved_limit
+            }
+            UnixStorageNodeRpcAdmissionClass::StartWrite => {
+                active.non_reserved() < self.non_reserved_limit
+                    && active.start_write < self.current_start_write_limit(active)
+            }
+            UnixStorageNodeRpcAdmissionClass::Read => {
+                active.non_reserved() < self.non_reserved_limit && active.read < self.read_limit
+            }
+            UnixStorageNodeRpcAdmissionClass::List => {
+                active.non_reserved() < self.non_reserved_limit && active.list < self.list_limit
+            }
+        }
+    }
+
+    fn current_start_write_limit(&self, active: &UnixStorageNodeRpcAdmissionActive) -> usize {
+        let completion_pressure = active.completion + active.progress;
+        self.start_write_limit
+            .saturating_sub(completion_pressure)
+            .max(self.start_write_floor)
+            .min(self.start_write_limit)
     }
 
     fn wait_timeout_for_class(&self, class: UnixStorageNodeRpcAdmissionClass) -> Duration {
         match class {
-            UnixStorageNodeRpcAdmissionClass::Control => self.control_wait_timeout,
-            UnixStorageNodeRpcAdmissionClass::Bulk => self.wait_timeout,
+            UnixStorageNodeRpcAdmissionClass::Control
+            | UnixStorageNodeRpcAdmissionClass::Completion
+            | UnixStorageNodeRpcAdmissionClass::Progress => self.control_wait_timeout,
+            UnixStorageNodeRpcAdmissionClass::StartWrite
+            | UnixStorageNodeRpcAdmissionClass::Read
+            | UnixStorageNodeRpcAdmissionClass::List => self.wait_timeout,
         }
     }
 }
@@ -2855,16 +3013,7 @@ impl Drop for UnixStorageNodeRpcAdmissionPermit {
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        active.total = active
-            .total
-            .checked_sub(1)
-            .expect("Unix storage-node RPC admission release without acquire");
-        if self.class == UnixStorageNodeRpcAdmissionClass::Bulk {
-            active.bulk = active
-                .bulk
-                .checked_sub(1)
-                .expect("Unix storage-node bulk RPC admission release without acquire");
-        }
+        active.release(self.class);
         self.admission.capacity_available.notify_all();
     }
 }
@@ -3402,6 +3551,31 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         min_log_index: MetadataCommandLogIndex,
     ) -> Result<MetadataCommandId, StoreError> {
+        self.next_metadata_command_id_at_least_with_admission_class(
+            pg_id,
+            min_log_index,
+            storage_rpc_admission_class(StorageRpcMessageKind::MetadataCommandNextId),
+        )
+    }
+
+    pub(crate) fn next_completion_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        self.next_metadata_command_id_at_least_with_admission_class(
+            pg_id,
+            min_log_index,
+            UnixStorageNodeRpcAdmissionClass::Completion,
+        )
+    }
+
+    fn next_metadata_command_id_at_least_with_admission_class(
+        &self,
+        pg_id: PgId,
+        min_log_index: MetadataCommandLogIndex,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> Result<MetadataCommandId, StoreError> {
         let request = StorageRpcMetadataCommandNextIdRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -3409,7 +3583,11 @@ impl UnixStorageNodeClient {
             min_log_index: min_log_index.get(),
         };
         let payload = encode_metadata_command_next_id_request(&request);
-        let response = self.rpc_request(StorageRpcMessageKind::MetadataCommandNextId, payload)?;
+        let response = self.rpc_request_with_admission_class(
+            StorageRpcMessageKind::MetadataCommandNextId,
+            payload,
+            class,
+        )?;
         let decoded = decode_metadata_command_next_id_response(&response).map_err(|error| {
             self.rpc_payload_error(
                 "decode metadata command next id response",
@@ -4325,6 +4503,7 @@ impl UnixStorageNodeClient {
                         observability::StorageRpcAdmissionSummary {
                             node_id: self.node_id.as_u32(),
                             rpc_kind: kind.operation_name(),
+                            admission_class: class.as_str(),
                             wait_us,
                             timeout_us: Some(wait_timeout.as_micros()),
                         },
@@ -4338,6 +4517,7 @@ impl UnixStorageNodeClient {
                     observability::StorageRpcAdmissionSummary {
                         node_id: self.node_id.as_u32(),
                         rpc_kind: kind.operation_name(),
+                        admission_class: class.as_str(),
                         wait_us,
                         timeout_us: Some(wait_timeout.as_micros()),
                     },
@@ -4405,27 +4585,153 @@ impl UnixStorageNodeClient {
 
 fn storage_rpc_admission_class(kind: StorageRpcMessageKind) -> UnixStorageNodeRpcAdmissionClass {
     match kind {
+        StorageRpcMessageKind::Health => UnixStorageNodeRpcAdmissionClass::Control,
+
         StorageRpcMessageKind::ShardRead
         | StorageRpcMessageKind::ShardReadRange
         | StorageRpcMessageKind::ReadHandlesAcquire
+        | StorageRpcMessageKind::BucketHeadRaw
+        | StorageRpcMessageKind::BucketHeadInfo
+        | StorageRpcMessageKind::BucketSnapshotLoad
+        | StorageRpcMessageKind::BucketSnapshotPairLoad
+        | StorageRpcMessageKind::BucketExecutionGenerations
+        | StorageRpcMessageKind::BucketFastPathIdentities
+        | StorageRpcMessageKind::BucketSubresourceGet
+        | StorageRpcMessageKind::ObjectReadAuthSubjectLoad
+        | StorageRpcMessageKind::ObjectReadSnapshotLoad
+        | StorageRpcMessageKind::ObjectTagsForSubjectLoad => UnixStorageNodeRpcAdmissionClass::Read,
+
+        StorageRpcMessageKind::ShardScavengerListFiles
+        | StorageRpcMessageKind::BucketWriteReservationsList
+        | StorageRpcMessageKind::LifecycleSweepBucketsList
+        | StorageRpcMessageKind::ObjectLifecycleVersionListLoad
         | StorageRpcMessageKind::ObjectListPage
         | StorageRpcMessageKind::ObjectVersionListPage
         | StorageRpcMessageKind::ObjectMultipartUploadListPage
         | StorageRpcMessageKind::BucketList
         | StorageRpcMessageKind::ObjectMultipartPartsList
+        | StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad
         | StorageRpcMessageKind::ObjectStreamUploadsList
-        | StorageRpcMessageKind::ObjectStreamUploadsPgList => {
-            UnixStorageNodeRpcAdmissionClass::Bulk
+        | StorageRpcMessageKind::ObjectStreamUploadsPgList
+        | StorageRpcMessageKind::ShardScavengerShardRows
+        | StorageRpcMessageKind::ShardScavengerPayloadReferences
+        | StorageRpcMessageKind::ShardScavengerObservations => {
+            UnixStorageNodeRpcAdmissionClass::List
         }
-        _ => UnixStorageNodeRpcAdmissionClass::Control,
+
+        StorageRpcMessageKind::BucketCreateCommandBuild
+        | StorageRpcMessageKind::ObjectGenerationNext
+        | StorageRpcMessageKind::ObjectGenerationReservation
+        | StorageRpcMessageKind::ObjectVersionNext
+        | StorageRpcMessageKind::BucketWriteReservationAcquire
+        | StorageRpcMessageKind::MetadataCommandNextId
+        | StorageRpcMessageKind::ObjectMetadataPutCommandBuild
+        | StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild
+        | StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild
+        | StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild
+        | StorageRpcMessageKind::ObjectStreamUploadCommandBuild
+        | StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
+            UnixStorageNodeRpcAdmissionClass::StartWrite
+        }
+
+        StorageRpcMessageKind::ShardWrite
+        | StorageRpcMessageKind::ShardAckRecord
+        | StorageRpcMessageKind::ShardAckValidate
+        | StorageRpcMessageKind::ShardAckLoad
+        | StorageRpcMessageKind::BucketWriteReservationValidate
+        | StorageRpcMessageKind::BucketWriteReservationHeartbeat
+        | StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad
+        | StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad
+        | StorageRpcMessageKind::ObjectDeleteSpecificSnapshotLoad
+        | StorageRpcMessageKind::ObjectStreamUploadMatch
+        | StorageRpcMessageKind::ObjectMultipartUploadMatch
+        | StorageRpcMessageKind::ObjectStreamUploadSessionLoad
+        | StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad
+        | StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare
+        | StorageRpcMessageKind::ObjectMultipartUploadLoad
+        | StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad
+        | StorageRpcMessageKind::ObjectMultipartManagementLookup
+        | StorageRpcMessageKind::BucketMetadataControlPendingMatch
+        | StorageRpcMessageKind::LifecycleSweepRoots
+        | StorageRpcMessageKind::LifecycleSweepClaimAcquire
+        | StorageRpcMessageKind::LifecycleSweepClaimHeartbeat
+        | StorageRpcMessageKind::ObjectPayloadReclaimExists
+        | StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot
+        | StorageRpcMessageKind::ObjectPayloadReclaimRoot
+        | StorageRpcMessageKind::ObjectPayloadReclaimLoad
+        | StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire
+        | StorageRpcMessageKind::ShardScavengerObservationRecord
+        | StorageRpcMessageKind::ShardScavengerObservationResolve => {
+            UnixStorageNodeRpcAdmissionClass::Progress
+        }
+
+        StorageRpcMessageKind::MetadataCommand
+        | StorageRpcMessageKind::MetadataCommandReplicaState
+        | StorageRpcMessageKind::MetadataCommandAcceptance
+        | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
+        | StorageRpcMessageKind::MetadataCommandPendingSlotInsert
+        | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
+        | StorageRpcMessageKind::MetadataCommandMaxLogIndex
+        | StorageRpcMessageKind::MetadataCommandPendingEnvelope
+        | StorageRpcMessageKind::MetadataCommandValidateReplayState
+        | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
+        | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
+        | StorageRpcMessageKind::MetadataCommandMatchingAppliedLog
+        | StorageRpcMessageKind::MetadataCommandAbandoned
+        | StorageRpcMessageKind::MetadataCommandRecordAbandoned
+        | StorageRpcMessageKind::MetadataCommandPendingSlotReplace
+        | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
+        | StorageRpcMessageKind::MetadataCommandApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandPgLockAcquire
+        | StorageRpcMessageKind::MetadataCommandPgLockRelease
+        | StorageRpcMessageKind::ReadHandlesRelease
+        | StorageRpcMessageKind::ClaimHeartbeat
+        | StorageRpcMessageKind::ClaimRelease
+        | StorageRpcMessageKind::ProofRelease
+        | StorageRpcMessageKind::ShardDelete
+        | StorageRpcMessageKind::ShardAckDelete
+        | StorageRpcMessageKind::BucketWriteReservationRelease
+        | StorageRpcMessageKind::DirectPutCommitSnapshotLoad
+        | StorageRpcMessageKind::DirectPutCommitCommandBuild
+        | StorageRpcMessageKind::CompletedMultipartOrderCommandBuild
+        | StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad
+        | StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild
+        | StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad
+        | StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild
+        | StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild
+        | StorageRpcMessageKind::ObjectMultipartAbortCommandBuild
+        | StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild
+        | StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad
+        | StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad
+        | StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad
+        | StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad
+        | StorageRpcMessageKind::ObjectCompletedMultipartUploadsList
+        | StorageRpcMessageKind::BucketWriteDrainBegin
+        | StorageRpcMessageKind::BucketWriteDrainClear
+        | StorageRpcMessageKind::BucketWriteDrainClearExpired
+        | StorageRpcMessageKind::BucketDeleteFinalized
+        | StorageRpcMessageKind::BucketDeleteFinalizeRoots
+        | StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire
+        | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
+        | StorageRpcMessageKind::BucketMarkDeletingCommandBuild
+        | StorageRpcMessageKind::BucketWriteDrainExists
+        | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
+        | StorageRpcMessageKind::LifecycleSweepClaimError
+        | StorageRpcMessageKind::LifecycleSweepClaimRelease => {
+            UnixStorageNodeRpcAdmissionClass::Completion
+        }
+
+        StorageRpcMessageKind::BucketMetadataControlCommandBuild => {
+            UnixStorageNodeRpcAdmissionClass::StartWrite
+        }
     }
 }
 
 fn listing_probe_admission_class(limit: u32) -> UnixStorageNodeRpcAdmissionClass {
     if limit <= 1 {
-        UnixStorageNodeRpcAdmissionClass::Control
+        UnixStorageNodeRpcAdmissionClass::Completion
     } else {
-        UnixStorageNodeRpcAdmissionClass::Bulk
+        UnixStorageNodeRpcAdmissionClass::List
     }
 }
 
@@ -5036,6 +5342,26 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
             });
         }
         UnixStorageNodeClient::next_metadata_command_id_at_least(self, pg_id, min_log_index)
+    }
+
+    fn next_completion_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        UnixStorageNodeClient::next_completion_metadata_command_id_at_least(
+            self,
+            pg_id,
+            min_log_index,
+        )
     }
 
     fn pending_metadata_command_envelope(
@@ -8054,6 +8380,89 @@ fn validate_list_multipart_uploads_response(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
+    client: &UnixStorageNodeClient,
+    pg_id: PgId,
+    bucket: &BucketName,
+    reservation_id: &str,
+    owner_token: &str,
+    cluster_epoch: ClusterEpoch,
+    operation_kind: &str,
+    created_at: u64,
+    lease_deadline: Option<u64>,
+    target_context: Option<&str>,
+    class: UnixStorageNodeRpcAdmissionClass,
+) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+    let request = StorageRpcBucketWriteReservationAcquireRequest {
+        node_id: client.node_id,
+        cluster_epoch,
+        pg_id,
+        bucket: bucket.clone(),
+        reservation_id: reservation_id.to_string(),
+        owner_token: owner_token.to_string(),
+        operation_kind: operation_kind.to_string(),
+        created_at,
+        lease_deadline,
+        target_context: target_context.map(str::to_string),
+    };
+    let payload = encode_bucket_write_reservation_acquire_request(&request).map_err(|error| {
+        BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            "encode bucket write reservation acquire request",
+            error.to_string(),
+        ))
+    })?;
+    let response = client
+        .rpc_request_with_admission_class(
+            StorageRpcMessageKind::BucketWriteReservationAcquire,
+            payload,
+            class,
+        )
+        .map_err(BucketSnapshotLoadError::Store)?;
+    let response = decode_bucket_write_reservation_record_response(&response).map_err(|error| {
+        BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            "decode bucket write reservation acquire response",
+            error.to_string(),
+        ))
+    })?;
+    let record = match response.outcome {
+        StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) => record,
+        StorageRpcBucketWriteReservationAcquireOutcome::Draining => {
+            return Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteDraining,
+            ));
+        }
+        StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { name }
+            if name == *bucket =>
+        {
+            return Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ));
+        }
+        StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { .. } => {
+            return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+                "validate bucket write reservation acquire response",
+                "bucket not found response identity does not match request".to_string(),
+            )));
+        }
+    };
+    if record.bucket != *bucket
+        || record.reservation_id != reservation_id
+        || record.owner_token != owner_token
+        || record.cluster_epoch != cluster_epoch
+        || record.operation_kind != operation_kind
+        || record.created_at != created_at
+        || record.lease_deadline != lease_deadline
+        || record.target_context.as_deref() != target_context
+    {
+        return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            "validate bucket write reservation acquire response",
+            "reservation response identity does not match request".to_string(),
+        )));
+    }
+    Ok(record)
+}
+
 impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     fn durable_bucket_write_drain_exists(
         &self,
@@ -8091,76 +8500,47 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         lease_deadline: Option<u64>,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
-        let request = StorageRpcBucketWriteReservationAcquireRequest {
-            node_id: self.node_id,
-            cluster_epoch,
+        unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
+            self,
             pg_id,
-            bucket: bucket.clone(),
-            reservation_id: reservation_id.to_string(),
-            owner_token: owner_token.to_string(),
-            operation_kind: operation_kind.to_string(),
+            bucket,
+            reservation_id,
+            owner_token,
+            cluster_epoch,
+            operation_kind,
             created_at,
             lease_deadline,
-            target_context: target_context.map(str::to_string),
-        };
-        let payload =
-            encode_bucket_write_reservation_acquire_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode bucket write reservation acquire request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::BucketWriteReservationAcquire,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response =
-            decode_bucket_write_reservation_record_response(&response).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode bucket write reservation acquire response",
-                    error.to_string(),
-                ))
-            })?;
-        let record = match response.outcome {
-            StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) => record,
-            StorageRpcBucketWriteReservationAcquireOutcome::Draining => {
-                return Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::BucketWriteDraining,
-                ));
-            }
-            StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { name }
-                if name == *bucket =>
-            {
-                return Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::BucketNotFound { name },
-                ));
-            }
-            StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { .. } => {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate bucket write reservation acquire response",
-                    "bucket not found response identity does not match request".to_string(),
-                )));
-            }
-        };
-        if record.bucket != *bucket
-            || record.reservation_id != reservation_id
-            || record.owner_token != owner_token
-            || record.cluster_epoch != cluster_epoch
-            || record.operation_kind != operation_kind
-            || record.created_at != created_at
-            || record.lease_deadline != lease_deadline
-            || record.target_context.as_deref() != target_context
-        {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate bucket write reservation acquire response",
-                "reservation response identity does not match request".to_string(),
-            )));
-        }
-        Ok(record)
+            target_context,
+            storage_rpc_admission_class(StorageRpcMessageKind::BucketWriteReservationAcquire),
+        )
     }
 
+    fn acquire_completion_durable_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        reservation_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        operation_kind: &str,
+        created_at: u64,
+        lease_deadline: Option<u64>,
+        target_context: Option<&str>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
+            self,
+            pg_id,
+            bucket,
+            reservation_id,
+            owner_token,
+            cluster_epoch,
+            operation_kind,
+            created_at,
+            lease_deadline,
+            target_context,
+            UnixStorageNodeRpcAdmissionClass::Completion,
+        )
+    }
     fn validate_bucket_write_reservation_proof(
         &self,
         pg_id: PgId,
@@ -8949,6 +9329,37 @@ impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
+        self.next_object_version_id_with_admission_class(
+            pg_id,
+            bucket,
+            key,
+            storage_rpc_admission_class(StorageRpcMessageKind::ObjectVersionNext),
+        )
+    }
+
+    fn next_completion_object_version_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        self.next_object_version_id_with_admission_class(
+            pg_id,
+            bucket,
+            key,
+            UnixStorageNodeRpcAdmissionClass::Completion,
+        )
+    }
+}
+
+impl UnixStorageNodeClient {
+    fn next_object_version_id_with_admission_class(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> Result<VersionId, ObjectPgActionError> {
         let request = StorageRpcObjectRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -8958,7 +9369,11 @@ impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
         };
         let payload = encode_object_request(&request);
         let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectVersionNext, payload)
+            .rpc_request_with_admission_class(
+                StorageRpcMessageKind::ObjectVersionNext,
+                payload,
+                class,
+            )
             .map_err(ObjectPgActionError::Store)?;
         decode_object_version_response(&response)
             .map(|response| response.version_id)
@@ -22202,52 +22617,267 @@ mod tests {
     }
 
     #[test]
-    fn unix_storage_node_rpc_admission_reserves_capacity_for_control_work() {
+    fn unix_storage_node_rpc_admission_splits_read_from_list_work() {
         let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
-            2,
+            4,
             Duration::from_millis(10),
             Duration::from_millis(10),
         ));
-        let held_bulk = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Bulk) {
+        let held_list = match admission.acquire(UnixStorageNodeRpcAdmissionClass::List) {
             UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
             UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
-                panic!("first bulk admission unexpectedly timed out")
+                panic!("first list admission unexpectedly timed out")
             }
         };
 
         assert!(matches!(
-            admission.acquire(UnixStorageNodeRpcAdmissionClass::Bulk),
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::List),
             UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
         ));
 
-        let control = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Control) {
+        let read = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Read) {
             UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
             UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
-                panic!("control admission should use reserved capacity")
+                panic!("read admission should not wait behind list cap")
             }
         };
 
-        drop(control);
-        drop(held_bulk);
+        drop(read);
+        drop(held_list);
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_biases_completion_over_new_starts() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            4,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let held_progress_a = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("first progress admission unexpectedly timed out")
+            }
+        };
+        let held_progress_b = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("second progress admission unexpectedly timed out")
+            }
+        };
+        let held_start = match admission.acquire(UnixStorageNodeRpcAdmissionClass::StartWrite) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("start-write floor admission unexpectedly timed out")
+            }
+        };
+
+        assert!(matches!(
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::StartWrite),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+
+        let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("completion admission should use remaining capacity")
+            }
+        };
+
+        drop(completion);
+        drop(held_start);
+        drop(held_progress_b);
+        drop(held_progress_a);
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_completion_progresses_when_start_write_is_saturated() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            4,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let held_progress_a = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("first progress admission unexpectedly timed out")
+            }
+        };
+        let held_progress_b = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("second progress admission unexpectedly timed out")
+            }
+        };
+        let held_start = match admission.acquire(UnixStorageNodeRpcAdmissionClass::StartWrite) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("start-write floor admission unexpectedly timed out")
+            }
+        };
+
+        assert!(matches!(
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::StartWrite),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+
+        let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("completion helper admission should not wait behind start-write saturation")
+            }
+        };
+
+        drop(completion);
+        drop(held_start);
+        drop(held_progress_b);
+        drop(held_progress_a);
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_progress_cannot_consume_completion_reserve() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            4,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let held_progress_a = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("first progress admission unexpectedly timed out")
+            }
+        };
+        let held_progress_b = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("second progress admission unexpectedly timed out")
+            }
+        };
+        let held_progress_c = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("third progress admission unexpectedly timed out")
+            }
+        };
+
+        assert!(matches!(
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+
+        let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("completion admission should use reserved capacity")
+            }
+        };
+
+        drop(completion);
+        drop(held_progress_c);
+        drop(held_progress_b);
+        drop(held_progress_a);
+    }
+
+    #[test]
+    fn shard_write_uses_progress_admission_class() {
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::ShardWrite),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
     }
 
     #[test]
     fn listing_probe_admission_class_reserves_single_row_emptiness_probes() {
         assert_eq!(
             listing_probe_admission_class(1),
-            UnixStorageNodeRpcAdmissionClass::Control
+            UnixStorageNodeRpcAdmissionClass::Completion
         );
         assert_eq!(
             listing_probe_admission_class(2),
-            UnixStorageNodeRpcAdmissionClass::Bulk
+            UnixStorageNodeRpcAdmissionClass::List
         );
     }
 
     #[test]
-    fn completed_multipart_cleanup_listing_uses_control_admission_class() {
+    fn completed_multipart_cleanup_listing_uses_completion_admission_class() {
         assert_eq!(
             storage_rpc_admission_class(StorageRpcMessageKind::ObjectCompletedMultipartUploadsList),
-            UnixStorageNodeRpcAdmissionClass::Control
+            UnixStorageNodeRpcAdmissionClass::Completion
+        );
+    }
+
+    #[test]
+    fn metadata_command_critical_section_uses_completion_admission_class() {
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::MetadataCommandPgLockAcquire),
+            UnixStorageNodeRpcAdmissionClass::Completion
+        );
+    }
+
+    #[test]
+    fn direct_put_commit_rpcs_use_completion_admission_class() {
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::DirectPutCommitSnapshotLoad),
+            UnixStorageNodeRpcAdmissionClass::Completion
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::DirectPutCommitCommandBuild),
+            UnixStorageNodeRpcAdmissionClass::Completion
+        );
+    }
+
+    #[test]
+    fn ordinary_object_mutation_command_builds_do_not_use_control_reserve() {
+        for kind in [
+            StorageRpcMessageKind::ObjectMetadataPutCommandBuild,
+            StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild,
+            StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild,
+            StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild,
+        ] {
+            assert_eq!(
+                storage_rpc_admission_class(kind),
+                UnixStorageNodeRpcAdmissionClass::StartWrite
+            );
+        }
+    }
+
+    #[test]
+    fn context_sensitive_helper_rpcs_default_to_start_write_admission_class() {
+        for kind in [
+            StorageRpcMessageKind::ObjectVersionNext,
+            StorageRpcMessageKind::BucketWriteReservationAcquire,
+            StorageRpcMessageKind::MetadataCommandNextId,
+        ] {
+            assert_eq!(
+                storage_rpc_admission_class(kind),
+                UnixStorageNodeRpcAdmissionClass::StartWrite
+            );
+        }
+    }
+
+    #[test]
+    fn read_support_rpcs_use_read_admission_class() {
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::ObjectReadAuthSubjectLoad),
+            UnixStorageNodeRpcAdmissionClass::Read
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::ObjectReadSnapshotLoad),
+            UnixStorageNodeRpcAdmissionClass::Read
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::ObjectTagsForSubjectLoad),
+            UnixStorageNodeRpcAdmissionClass::Read
+        );
+    }
+
+    #[test]
+    fn multipart_listing_support_uses_list_admission_class() {
+        assert_eq!(
+            storage_rpc_admission_class(
+                StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad
+            ),
+            UnixStorageNodeRpcAdmissionClass::List
         );
     }
 

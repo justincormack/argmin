@@ -721,6 +721,7 @@ pub struct StorageRpcErrorSummary<'a> {
 pub struct StorageRpcAdmissionSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
+    pub admission_class: &'a str,
     pub wait_us: u128,
     pub timeout_us: Option<u128>,
 }
@@ -1427,8 +1428,8 @@ pub fn emit_storage_rpc_admission_wait(
         target,
         "storage_rpc_admission_wait",
         format!(
-            "node_id={} rpc_kind={} wait_us={}",
-            summary.node_id, summary.rpc_kind, summary.wait_us
+            "node_id={} rpc_kind={} admission_class={} wait_us={}",
+            summary.node_id, summary.rpc_kind, summary.admission_class, summary.wait_us
         ),
     );
     event_in_context(
@@ -1436,8 +1437,8 @@ pub fn emit_storage_rpc_admission_wait(
         target,
         "storage_rpc_admission_wait",
         Some(format_args!(
-            "node_id={} rpc_kind={} wait_us={}",
-            summary.node_id, summary.rpc_kind, summary.wait_us
+            "node_id={} rpc_kind={} admission_class={} wait_us={}",
+            summary.node_id, summary.rpc_kind, summary.admission_class, summary.wait_us
         )),
     )
 }
@@ -1455,9 +1456,10 @@ pub fn emit_storage_rpc_admission_timeout(
         target,
         "storage_rpc_admission_timeout",
         format!(
-            "node_id={} rpc_kind={} wait_us={} timeout_us={}",
+            "node_id={} rpc_kind={} admission_class={} wait_us={} timeout_us={}",
             summary.node_id,
             summary.rpc_kind,
+            summary.admission_class,
             summary.wait_us,
             summary.timeout_us.unwrap_or_default()
         ),
@@ -1467,9 +1469,10 @@ pub fn emit_storage_rpc_admission_timeout(
         target,
         "storage_rpc_admission_timeout",
         Some(format_args!(
-            "node_id={} rpc_kind={} wait_us={} timeout_us={}",
+            "node_id={} rpc_kind={} admission_class={} wait_us={} timeout_us={}",
             summary.node_id,
             summary.rpc_kind,
+            summary.admission_class,
             summary.wait_us,
             summary.timeout_us.unwrap_or_default()
         )),
@@ -1916,6 +1919,7 @@ mod tests {
             StorageRpcAdmissionSummary {
                 node_id: 7,
                 rpc_kind: "shard write",
+                admission_class: "progress",
                 wait_us: 456,
                 timeout_us: Some(5_000_000),
             },
@@ -1925,6 +1929,7 @@ mod tests {
             StorageRpcAdmissionSummary {
                 node_id: 7,
                 rpc_kind: "shard write",
+                admission_class: "progress",
                 wait_us: 5_000_000,
                 timeout_us: Some(5_000_000),
             },

@@ -1377,7 +1377,31 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
-        match self.next_bucket_metadata_command_id(pg_id) {
+        self.next_bucket_metadata_command_id_or_drain_with_completion_admission(
+            pg_id, bucket, false,
+        )
+    }
+
+    fn next_completion_bucket_metadata_command_id_or_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
+        self.next_bucket_metadata_command_id_or_drain_with_completion_admission(pg_id, bucket, true)
+    }
+
+    fn next_bucket_metadata_command_id_or_drain_with_completion_admission(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        completion_admission: bool,
+    ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
+        let command_id_result = if completion_admission {
+            self.next_completion_bucket_metadata_command_id(pg_id)
+        } else {
+            self.next_bucket_metadata_command_id(pg_id)
+        };
+        match command_id_result {
             Ok(command_id) => Ok(Some(command_id)),
             Err(BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
                 ..
@@ -1752,6 +1776,38 @@ impl super::StorageCluster {
         let record = node
             .bucket_write_reservation_client()
             .acquire_durable_bucket_write_reservation(
+                PgId::new(pg_id),
+                bucket,
+                &reservation_id,
+                &owner_token,
+                self.operation_epoch(),
+                operation_kind,
+                crate::clock::current_time_millis(),
+                None,
+                target_context,
+            )?;
+        Ok(super::DurableBucketWriteReservation {
+            node: Arc::clone(node.bucket_metadata_client()),
+            pg_id,
+            record,
+        })
+    }
+
+    pub(super) fn acquire_completion_durable_bucket_write_reservation(
+        &self,
+        bucket: &BucketName,
+        operation_kind: &'static str,
+        target_context: Option<&str>,
+    ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
+        let pg_id = self.bucket_metadata_pg_id(bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        let reservation_id = self.next_bucket_write_reservation_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let record = node
+            .bucket_write_reservation_client()
+            .acquire_completion_durable_bucket_write_reservation(
                 PgId::new(pg_id),
                 bucket,
                 &reservation_id,
@@ -6985,7 +7041,7 @@ impl super::StorageCluster {
                 Some(command) => (command, false),
                 None => {
                     let version_id = if prepared.versioning == BucketVersioningState::Enabled {
-                        match self.reserve_next_object_version(pg_id, bucket, key) {
+                        match self.reserve_next_object_version_for_completion(pg_id, bucket, key) {
                             Ok(version_id) => version_id,
                             Err(error) => {
                                 release_caller_bucket_write_proof_if_unowned!()?;
@@ -7686,7 +7742,7 @@ impl super::StorageCluster {
                 self.metadata_command_apply_test_hook_scope_id(),
             );
             let Some(command_id) = self
-                .next_bucket_metadata_command_id_or_drain(pg_id, bucket)
+                .next_completion_bucket_metadata_command_id_or_drain(pg_id, bucket)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
             else {
                 continue;
@@ -7797,7 +7853,7 @@ impl super::StorageCluster {
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
 
         'retry_after_pending_conflict: loop {
-            let reservation = match self.acquire_durable_bucket_write_reservation(
+            let reservation = match self.acquire_completion_durable_bucket_write_reservation(
                 &bucket,
                 "complete-multipart-upload",
                 Some(key.as_str()),
@@ -7871,7 +7927,7 @@ impl super::StorageCluster {
             }
 
             let version_id = if req.versioning == BucketVersioningState::Enabled {
-                match self.reserve_next_object_version(pg_id, &bucket, &key) {
+                match self.reserve_next_object_version_for_completion(pg_id, &bucket, &key) {
                     Ok(version_id) => version_id,
                     Err(error) => {
                         release_bucket_write_proof!()?;

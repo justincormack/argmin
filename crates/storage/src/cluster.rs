@@ -1793,6 +1793,16 @@ impl StorageCluster {
         )
     }
 
+    fn next_completion_metadata_command_id(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandId, StoreError> {
+        self.next_completion_metadata_command_id_at_least(
+            pg_id,
+            MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
+        )
+    }
+
     fn next_metadata_command_id_at_least(
         &self,
         pg_id: PgId,
@@ -1804,6 +1814,23 @@ impl StorageCluster {
         primary
             .metadata_command_client()
             .next_metadata_command_id_at_least(pg_id, self.operation_epoch(), min_log_index)
+    }
+
+    fn next_completion_metadata_command_id_at_least(
+        &self,
+        pg_id: PgId,
+        min_log_index: MetadataCommandLogIndex,
+    ) -> Result<MetadataCommandId, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        primary
+            .metadata_command_client()
+            .next_completion_metadata_command_id_at_least(
+                pg_id,
+                self.operation_epoch(),
+                min_log_index,
+            )
     }
 
     #[cfg(test)]
@@ -2626,6 +2653,25 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
+        self.reserve_next_object_version_with_completion_admission(pg_id, bucket, key, false)
+    }
+
+    fn reserve_next_object_version_for_completion(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        self.reserve_next_object_version_with_completion_admission(pg_id, bucket, key, true)
+    }
+
+    fn reserve_next_object_version_with_completion_admission(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        completion_admission: bool,
+    ) -> Result<VersionId, ObjectPgActionError> {
         loop {
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
@@ -2678,8 +2724,18 @@ impl StorageCluster {
                 continue;
             }
 
-            let version_id = self.max_next_object_version_id_on_acting_set(pg_id, bucket, key)?;
-            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
+            let version_id = self.max_next_object_version_id_on_acting_set(
+                pg_id,
+                bucket,
+                key,
+                completion_admission,
+            )?;
+            let Some(command_id) = self
+                .next_object_metadata_command_id_or_drain_with_completion_admission(
+                    pg_id,
+                    bucket,
+                    completion_admission,
+                )?
             else {
                 continue;
             };
@@ -2712,15 +2768,19 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         key: &ObjectKey,
+        completion_admission: bool,
     ) -> Result<VersionId, ObjectPgActionError> {
         let mut version_id = VersionId::from_u64(1);
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            let candidate = node
-                .object_version_metadata_client()
-                .next_object_version_id(pg_id, bucket, key)?;
+            let object_version_client = node.object_version_metadata_client();
+            let candidate = if completion_admission {
+                object_version_client.next_completion_object_version_id(pg_id, bucket, key)?
+            } else {
+                object_version_client.next_object_version_id(pg_id, bucket, key)?
+            };
             if candidate.to_u64() > version_id.to_u64() {
                 version_id = candidate;
             }
@@ -3168,6 +3228,19 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
     ) -> Result<MetadataCommandId, ObjectPgActionError> {
+        self.next_object_metadata_command_id_with_completion_admission(pg_id, false)
+    }
+
+    fn next_object_metadata_command_id_with_completion_admission(
+        &self,
+        pg_id: PgId,
+        completion_admission: bool,
+    ) -> Result<MetadataCommandId, ObjectPgActionError> {
+        if completion_admission {
+            return self
+                .next_completion_metadata_command_id(pg_id)
+                .map_err(ObjectPgActionError::from);
+        }
         self.next_metadata_command_id(pg_id)
             .map_err(ObjectPgActionError::from)
     }
@@ -3177,7 +3250,20 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<MetadataCommandId>, ObjectPgActionError> {
-        match self.next_object_metadata_command_id(pg_id) {
+        self.next_object_metadata_command_id_or_drain_with_completion_admission(
+            pg_id, bucket, false,
+        )
+    }
+
+    fn next_object_metadata_command_id_or_drain_with_completion_admission(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        completion_admission: bool,
+    ) -> Result<Option<MetadataCommandId>, ObjectPgActionError> {
+        match self
+            .next_object_metadata_command_id_with_completion_admission(pg_id, completion_admission)
+        {
             Ok(command_id) => Ok(Some(command_id)),
             Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
                 self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
@@ -3202,6 +3288,14 @@ impl StorageCluster {
         pg_id: PgId,
     ) -> Result<MetadataCommandId, BucketSnapshotLoadError> {
         self.next_metadata_command_id(pg_id)
+            .map_err(BucketSnapshotLoadError::from)
+    }
+
+    fn next_completion_bucket_metadata_command_id(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandId, BucketSnapshotLoadError> {
+        self.next_completion_metadata_command_id(pg_id)
             .map_err(BucketSnapshotLoadError::from)
     }
 
@@ -3554,7 +3648,11 @@ impl StorageCluster {
                     }
 
                     let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
-                        match self.reserve_next_object_version(pg_id, &req.bucket, &req.key) {
+                        match self.reserve_next_object_version_for_completion(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                        ) {
                             Ok(version_id) => version_id,
                             Err(error) => {
                                 cleanup_direct_put_attempt_before_command_ownership!();

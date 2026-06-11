@@ -6678,6 +6678,37 @@ Status:
   a small floor and otherwise feel `SlowDown` first. The plan now also requires
   splitting cheap `Read` work from expensive `List`/scan work so large listing
   pressure does not suppress ordinary cached reads.
+- Started implementing that direction in the local Unix storage-RPC admission
+  gate. The old control/bulk split is now explicit `Control`, `Completion`,
+  `Progress`, `StartWrite`, `Read`, and `List` classes. `List` has a smaller
+  cap than `Read`; single-row cleanup/listing probes and completed-multipart
+  cleanup enumeration use completion admission. `StartWrite` keeps a nonzero
+  floor but its cap shrinks as active completion/progress RPCs rise, so stream
+  append/finalize/cleanup work can use reserved capacity while new
+  `CreateStreamUpload`/create-multipart command builds feel pressure first.
+  Storage-RPC admission wait/timeout diagnostics now include the admission
+  class. This is still a deterministic stepped policy, not the later full
+  adaptive controller.
+- Tightened the first admission-class implementation after review. Non-reserved
+  work (`Progress`, `StartWrite`, `Read`, and `List`) now shares a cap below the
+  total per-node RPC limit so `Progress` shard writes cannot consume the
+  completion/control reserve. Long-lived metadata-command critical sections are
+  classified as `Completion` for their held session permit. GET/HEAD metadata
+  support RPCs are classified as `Read`, and MPU listing support loads are
+  classified as `List`, so they no longer bypass the read/list caps by falling
+  through to `Control`.
+- Removed the storage-RPC admission classifier fallback. Every
+  `StorageRpcMessageKind` must now be explicitly classified, so new or
+  overlooked high-volume user mutations cannot silently consume the protected
+  control/completion reserve. Direct PUT commit RPCs are `Completion`; ordinary
+  object put/delete command-build RPCs are `StartWrite`.
+- Added explicit call-site overrides for context-sensitive helper RPCs. Shared
+  helpers such as object-version allocation, bucket-write reservation acquire,
+  and metadata-command id allocation default to `StartWrite`, but direct PUT
+  commit, stream PUT finalize, completed-MPU sequence-order reservation, and
+  multipart completion use completion-specific helper methods once durable work
+  already exists. This prevents completion paths from being throttled by the
+  shrinking new-start cap without giving all callers privileged admission.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
