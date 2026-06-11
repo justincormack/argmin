@@ -6709,6 +6709,13 @@ Status:
   multipart completion use completion-specific helper methods once durable work
   already exists. This prevents completion paths from being throttled by the
   shrinking new-start cap without giving all callers privileged admission.
+- Tightened the public storage-RPC admission configuration floor to reject
+  pathological test-only values. The admission math needs at least two
+  non-reserved read slots for a remote object read to hold a read-handle
+  session while issuing the shard read, plus reserved control/completion
+  capacity and room for list/progress/start-write work. The environment knob
+  now requires a minimum of 8; lower values remain available only to direct
+  low-level unit tests that are deliberately exercising exhaustion behavior.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

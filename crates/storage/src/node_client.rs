@@ -212,6 +212,7 @@ use crate::types::{
 };
 
 pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT: usize = 1024;
+pub(crate) const UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT: usize = 8;
 pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT: Duration =
     Duration::from_millis(250);
 pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT: Duration =
@@ -22644,6 +22645,65 @@ mod tests {
 
         drop(read);
         drop(held_list);
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_minimum_supports_nested_read_and_mixed_work() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let held_read_handle = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Read) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should allow a held read-handle session")
+            }
+        };
+        let shard_read = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Read) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should allow shard read while handle is held")
+            }
+        };
+        let list = match admission.acquire(UnixStorageNodeRpcAdmissionClass::List) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should leave room for list work")
+            }
+        };
+        let progress = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Progress) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should leave room for progress work")
+            }
+        };
+        let start_write = match admission.acquire(UnixStorageNodeRpcAdmissionClass::StartWrite) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should leave a start-write floor")
+            }
+        };
+        let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should preserve completion capacity")
+            }
+        };
+        let control = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Control) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("minimum admission limit should preserve control capacity")
+            }
+        };
+
+        drop(control);
+        drop(completion);
+        drop(start_write);
+        drop(progress);
+        drop(list);
+        drop(shard_read);
+        drop(held_read_handle);
     }
 
     #[test]

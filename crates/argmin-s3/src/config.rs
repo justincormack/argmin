@@ -341,8 +341,13 @@ impl ServerConfig {
         if max_inflight_requests == 0 {
             return Err("ARGMIN_MAX_INFLIGHT_REQUESTS must be > 0".to_string());
         }
-        if storage_node_rpc_admission_limit == 0 {
-            return Err("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be > 0".to_string());
+        if storage_node_rpc_admission_limit
+            < LocalUnixStorageNodeClientConfig::MIN_RPC_ADMISSION_LIMIT
+        {
+            return Err(format!(
+                "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be >= {}",
+                LocalUnixStorageNodeClientConfig::MIN_RPC_ADMISSION_LIMIT
+            ));
         }
         if storage_node_rpc_admission_wait_timeout.is_zero() {
             return Err("ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS must be > 0".to_string());
@@ -1440,10 +1445,10 @@ mod tests {
     fn custom_storage_node_rpc_admission_limit() {
         let cfg = ServerConfig::from_lookup(make_required_env(&[(
             "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT",
-            "7",
+            "8",
         )]))
         .unwrap();
-        assert_eq!(cfg.storage_node_rpc_admission_limit, 7);
+        assert_eq!(cfg.storage_node_rpc_admission_limit, 8);
     }
 
     #[test]
@@ -1479,7 +1484,23 @@ mod tests {
             "0",
         )]))
         .unwrap_err();
-        assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be > 0"));
+        assert!(
+            err.contains("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be >= 8"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn storage_node_rpc_admission_limit_below_minimum() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT",
+            "7",
+        )]))
+        .unwrap_err();
+        assert!(
+            err.contains("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be >= 8"),
+            "{err}"
+        );
     }
 
     #[test]

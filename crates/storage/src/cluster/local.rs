@@ -21,6 +21,7 @@ use crate::node_client::{
     ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
     UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+    UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
 use crate::pg_topology::PgTopology;
 use crate::{
@@ -88,6 +89,7 @@ impl LocalUnixShardNodeClientConfig {
 
 impl LocalUnixStorageNodeClientConfig {
     pub const DEFAULT_RPC_ADMISSION_LIMIT: usize = UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT;
+    pub const MIN_RPC_ADMISSION_LIMIT: usize = UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT;
     pub const DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT: Duration =
         UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT;
     pub const DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT: Duration =
