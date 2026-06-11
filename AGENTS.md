@@ -39,7 +39,8 @@ this is largely complete now.
 Use `./scripts/coverage` to measure integration test coverage, which is the main measure we want to improve,
 not unit test coverage.
 
-Always run the full test suite before comitting in case something unexpected breaks.
+Always run the full test suite before comitting in case something unexpected breaks. Use `cargo nextest run`
+fir running tests as it is faster than `cargo test`.
 
 We have tried to fix convergence issues on AWS, where some control plane (not data plane) operations take time
 to converge. There may be a few cases left. Locally most operations are immediate, although DeleteBucket does
