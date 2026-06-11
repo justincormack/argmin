@@ -29,6 +29,15 @@ commands.
 This rule is simple and correct, but it can wait for admitted writers whose
 future outcome could be classified without waiting.
 
+The conservative wait must still be bounded at the HTTP operation level. A
+durable reservation that cannot be resolved by draining pending commands must
+not make `DeleteBucket` hang until the client SDK attempt timeout. The current
+fallback is to return `BucketNotEmpty` after a short reservation-drain grace
+period, log the stuck reservation context, and let the client/test cleanup retry.
+This preserves the Phase 9.4 rule because the reservation is not discarded and
+the owning writer still has to converge or fail against the durable delete
+drain.
+
 ## Optimization Model
 
 The key distinction is the writer stage:
@@ -130,6 +139,9 @@ the reservation row alone.
   UploadPartCopy whose source read later fails.
 - Command-owned reservations are still converged through pending metadata
   command replay before emptiness is trusted.
+- An orphaned or otherwise unresolved durable reservation does not create an
+  unbounded `DeleteBucket` request; it returns a retryable not-empty outcome and
+  preserves the reservation for the owning operation.
 - Reopen/retry cases preserve the classification decision and never allow a
   writer to publish after terminal `MarkBucketDeleting`.
 

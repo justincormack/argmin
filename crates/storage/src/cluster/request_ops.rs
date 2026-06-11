@@ -37,6 +37,7 @@ use crate::*;
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
+const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
 const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = 60_000;
@@ -2037,6 +2038,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
+        let started = std::time::Instant::now();
         loop {
             let pg_id = self.bucket_metadata_pg_id(bucket);
             let node = self
@@ -2048,6 +2050,27 @@ impl super::StorageCluster {
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if reservations.is_empty() {
                 return Ok(());
+            }
+            if started.elapsed()
+                >= std::time::Duration::from_millis(BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS)
+            {
+                let first = reservations
+                    .first()
+                    .expect("non-empty reservations should have a first record");
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_reservation_wait_timeout",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} reservations={} first_reservation_id={} first_operation_kind={} first_target_context={:?}",
+                        bucket,
+                        pg_id,
+                        reservations.len(),
+                        first.reservation_id,
+                        first.operation_kind,
+                        first.target_context
+                    )),
+                );
+                return Err(MetadataError::BucketNotEmpty.into());
             }
             self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
             crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);

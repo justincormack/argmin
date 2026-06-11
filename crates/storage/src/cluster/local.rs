@@ -39685,6 +39685,74 @@ mod tests {
     }
 
     #[test]
+    fn begin_bucket_delete_bounds_orphaned_durable_reservation_wait() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-orphan-reservation-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let reservation = cluster
+            .acquire_durable_bucket_write_reservation(
+                &bucket,
+                "test-orphaned-write",
+                Some("orphaned-key"),
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "DeleteBucket should not wait indefinitely for an orphaned durable reservation"
+        );
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "orphaned durable reservation should make DeleteBucket retryable, got {err:?}"
+        );
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+                .unwrap()
+                .is_none(),
+            "failed DeleteBucket should clear its temporary durable drain"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                .unwrap()
+                .len(),
+            1,
+            "DeleteBucket must not silently drop another operation's durable reservation"
+        );
+        drop(bucket_pg);
+
+        cluster
+            .release_durable_bucket_write_reservation(reservation)
+            .unwrap();
+        cluster.begin_bucket_delete(&bucket).unwrap();
+    }
+
+    #[test]
     fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
