@@ -1,19 +1,44 @@
 use std::time::Duration;
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Grant, ObjectCannedAcl, ObjectOwnership,
     OwnershipControls, OwnershipControlsRule, Permission,
 };
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, create_acl_enabled_bucket,
-    disable_bucket_public_access_block, err_status, send_signed_request, unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, create_acl_enabled_bucket, err_status,
+    send_signed_request, CTX,
 };
 use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
+use std::future::Future;
 
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+const SETUP_OPERATION_ATTEMPTS: usize = 20;
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+async fn retrying_operation_aborted<T, E, F, Fut>(description: &str, mut op: F) -> T
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    for attempt in 0..SETUP_OPERATION_ATTEMPTS {
+        match op().await {
+            Ok(output) => return output,
+            Err(err) if is_operation_aborted(&err) && attempt + 1 < SETUP_OPERATION_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("{description}: {err:?}"),
+        }
+    }
+    unreachable!("{description} retry loop must return on final attempt");
+}
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
@@ -260,13 +285,17 @@ async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
         .build()
         .unwrap();
     let controls = OwnershipControls::builder().rules(rule).build().unwrap();
-    CTX.client()
-        .put_bucket_ownership_controls()
-        .bucket(bucket)
-        .ownership_controls(controls)
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted(
+        "put bucket ownership controls during public ACL setup",
+        || {
+            CTX.client()
+                .put_bucket_ownership_controls()
+                .bucket(bucket)
+                .ownership_controls(controls.clone())
+                .send()
+        },
+    )
+    .await;
 }
 
 fn has_grant(
@@ -315,7 +344,10 @@ async fn setup_public_write_bucket() -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        retrying_operation_aborted("delete object during public ACL cleanup", || {
+            client.delete_object().bucket(bucket).key(*key).send()
+        })
+        .await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -459,23 +491,18 @@ fn test_anonymous_public_write_put_bucket_owner_full_control_makes_bucket_owner_
 fn test_bucket_owner_enforced_disables_legacy_public_read_object_acl() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket_request(client, &bucket)
-            .object_ownership(ObjectOwnership::ObjectWriter)
-            .send()
-            .await
-            .unwrap();
-        disable_bucket_public_access_block(client, &bucket).await;
+        let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("pre-boe-public")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"public"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put public-read object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("pre-boe-public")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"public"))
+                .send()
+        })
+        .await;
 
         let object_url = format!("{}/{}/pre-boe-public", CTX.endpoint(), bucket);
 
@@ -507,13 +534,14 @@ fn test_public_read_bucket_acl_blocks_bucket_owner_enforced_transition() {
             put.body
         );
 
-        client
-            .put_bucket_acl()
-            .bucket(&bucket)
-            .acl(aws_sdk_s3::types::BucketCannedAcl::Private)
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put private bucket ACL during public ACL setup", || {
+            client
+                .put_bucket_acl()
+                .bucket(&bucket)
+                .acl(aws_sdk_s3::types::BucketCannedAcl::Private)
+                .send()
+        })
+        .await;
         set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
 
         cleanup(&bucket, &[]).await;
@@ -526,15 +554,16 @@ fn test_anon_get_object_public_bucket() {
         let client = CTX.client();
         let bucket = setup_public_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"public data"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put public object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"public data"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let body = anon_get_status_eventually(&url, 200, "anon GET on public bucket").await;
@@ -550,15 +579,16 @@ fn test_anon_head_object_public_bucket() {
         let client = CTX.client();
         let bucket = setup_public_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"head me"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put public object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"head me"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         anon_head_status_eventually(&url, 200, "anon HEAD on public bucket").await;
@@ -612,14 +642,15 @@ fn test_anon_delete_object_public_bucket_fail() {
         let client = CTX.client();
         let bucket = setup_public_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from_static(b"data"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let mut resp = agent().delete(&url).call().expect("transport error");
@@ -655,14 +686,15 @@ fn test_anon_list_objects_v1_public_bucket() {
         let client = CTX.client();
         let bucket = setup_public_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj1")
-            .body(ByteStream::from_static(b"a"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj1")
+                .body(ByteStream::from_static(b"a"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
         let body = anon_get_status_eventually(&url, 200, "anon list v1 on public bucket").await;
@@ -682,14 +714,15 @@ fn test_anon_list_objects_v2_public_bucket() {
         let client = CTX.client();
         let bucket = setup_public_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj1")
-            .body(ByteStream::from_static(b"a"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj1")
+                .body(ByteStream::from_static(b"a"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
         let body = anon_get_status_eventually(&url, 200, "anon list v2 on public bucket").await;
@@ -717,13 +750,14 @@ fn test_object_anon_put_write_access() {
         )
         .await;
 
-        CTX.client()
-            .delete_object()
-            .bucket(&bucket)
-            .key("anon-upload")
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("delete object during public ACL cleanup", || {
+            CTX.client()
+                .delete_object()
+                .bucket(&bucket)
+                .key("anon-upload")
+                .send()
+        })
+        .await;
 
         cleanup(&bucket, &[]).await;
     });
@@ -787,16 +821,17 @@ fn test_public_read_object_does_not_make_get_object_tagging_public() {
         let client = CTX.client();
         let bucket = setup_public_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .tagging("env=public")
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put tagged public object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .tagging("env=public")
+                .body(ByteStream::from_static(b"hello"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}/obj?tagging", CTX.endpoint(), bucket);
         let mut resp = agent().get(&url).call().expect("transport error");
@@ -907,15 +942,16 @@ fn test_object_acl_canned_during_create() {
         let client = CTX.client();
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put public-read object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("foo")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"bar"))
+                .send()
+        })
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -948,23 +984,25 @@ fn test_put_object_acl_canned_public_read_write_round_trip() {
         let client = CTX.client();
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("foo")
+                .body(ByteStream::from_static(b"bar"))
+                .send()
+        })
+        .await;
 
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::PublicReadWrite)
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put public-read-write object ACL", || {
+            client
+                .put_object_acl()
+                .bucket(&bucket)
+                .key("foo")
+                .acl(ObjectCannedAcl::PublicReadWrite)
+                .send()
+        })
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -1005,23 +1043,25 @@ fn test_put_object_acl_canned_authenticated_read_round_trip() {
         let client = CTX.client();
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("foo")
+                .body(ByteStream::from_static(b"bar"))
+                .send()
+        })
+        .await;
 
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::AuthenticatedRead)
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put authenticated-read object ACL", || {
+            client
+                .put_object_acl()
+                .bucket(&bucket)
+                .key("foo")
+                .acl(ObjectCannedAcl::AuthenticatedRead)
+                .send()
+        })
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -1058,27 +1098,29 @@ fn test_put_object_acl_without_content_length_header() {
         let client = CTX.client();
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("foo")
+                .body(ByteStream::from_static(b"bar"))
+                .send()
+        })
+        .await;
 
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key("foo")
-            .acl(ObjectCannedAcl::PublicRead)
-            .customize()
-            .mutate_request(|req| {
-                req.headers_mut().remove("content-length");
-            })
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object ACL without content-length", || {
+            client
+                .put_object_acl()
+                .bucket(&bucket)
+                .key("foo")
+                .acl(ObjectCannedAcl::PublicRead)
+                .customize()
+                .mutate_request(|req| {
+                    req.headers_mut().remove("content-length");
+                })
+                .send()
+        })
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -1112,21 +1154,22 @@ fn test_object_header_acl_grants_authenticated_users_read() {
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
         let key = "auth-users-header-grant";
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"authenticated-read"))
-            .customize()
-            .mutate_request(move |req| {
-                req.headers_mut().insert(
-                    "x-amz-grant-read",
-                    format!("uri=\"{}\"", AUTHENTICATED_USERS_GROUP_URI),
-                );
-            })
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object with authenticated-read grant", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"authenticated-read"))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut().insert(
+                        "x-amz-grant-read",
+                        format!("uri=\"{}\"", AUTHENTICATED_USERS_GROUP_URI),
+                    );
+                })
+                .send()
+        })
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -1168,45 +1211,49 @@ fn test_multipart_upload_public_read_acl_allows_anonymous_get() {
         let key = "multipart-public-read";
         let body = vec![b'x'; 1024];
 
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .acl(ObjectCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let create =
+            retrying_operation_aborted("create multipart upload during public ACL setup", || {
+                client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .acl(ObjectCannedAcl::PublicRead)
+                    .send()
+            })
+            .await;
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body.clone()))
-            .send()
-            .await
-            .unwrap();
+        let part = retrying_operation_aborted("upload part during public ACL setup", || {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(body.clone()))
+                .send()
+        })
+        .await;
 
-        client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(
-                        CompletedPart::builder()
-                            .e_tag(part.e_tag().unwrap())
-                            .part_number(1)
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("complete multipart upload during public ACL setup", || {
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .parts(
+                            CompletedPart::builder()
+                                .e_tag(part.e_tag().unwrap())
+                                .part_number(1)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .send()
+        })
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -1247,24 +1294,26 @@ fn test_copy_object_public_read_acl_allows_cross_account_get() {
         let alt_client = CTX.alt_client();
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .body(ByteStream::from_static(b"foo"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("foo123bar")
+                .body(ByteStream::from_static(b"foo"))
+                .send()
+        })
+        .await;
 
-        client
-            .copy_object()
-            .bucket(&bucket)
-            .key("bar321foo")
-            .copy_source(format!("{}/foo123bar", bucket))
-            .acl(ObjectCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("copy object during public ACL setup", || {
+            client
+                .copy_object()
+                .bucket(&bucket)
+                .key("bar321foo")
+                .copy_source(format!("{}/foo123bar", bucket))
+                .acl(ObjectCannedAcl::PublicRead)
+                .send()
+        })
+        .await;
 
         let copied = alt_client
             .get_object()
@@ -1294,17 +1343,18 @@ fn test_copy_object_public_read_acl_allows_cross_account_get() {
             copied_acl.grants()
         );
 
-        client
-            .copy_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .copy_source(format!("{}/bar321foo", bucket))
-            .acl(ObjectCannedAcl::PublicRead)
-            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-            .metadata("abc", "def")
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("replace copy object during public ACL setup", || {
+            client
+                .copy_object()
+                .bucket(&bucket)
+                .key("foo123bar")
+                .copy_source(format!("{}/bar321foo", bucket))
+                .acl(ObjectCannedAcl::PublicRead)
+                .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+                .metadata("abc", "def")
+                .send()
+        })
+        .await;
 
         let overwritten = alt_client
             .get_object()
@@ -1366,14 +1416,15 @@ fn test_signed_create_multipart_upload_public_write_bucket_rejects_existing_owne
         let bucket = setup_public_write_bucket().await;
         let key = "multipart-existing-owner-key";
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"owner-body"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put owner object during public ACL setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"owner-body"))
+                .send()
+        })
+        .await;
 
         let create = alt_client
             .create_multipart_upload()
@@ -1397,54 +1448,63 @@ fn test_complete_multipart_upload_allows_owner_key_created_after_public_write_in
         let bucket = setup_public_write_bucket().await;
         let key = "multipart-public-write-race";
 
-        let create = alt_client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
+        let create =
+            retrying_operation_aborted("create multipart upload during public write setup", || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            })
+            .await;
         let upload_id = create.upload_id().unwrap().to_string();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"owner-body"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put owner object during public write setup", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"owner-body"))
+                .send()
+        })
+        .await;
 
         let data = vec![b'x'; 1024];
-        let upload_part = alt_client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(data.clone()))
-            .send()
-            .await
-            .unwrap();
+        let upload_part =
+            retrying_operation_aborted("upload part during public write setup", || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(data.clone()))
+                    .send()
+            })
+            .await;
 
-        let complete = alt_client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(
-                        CompletedPart::builder()
-                            .e_tag(upload_part.e_tag().unwrap())
-                            .part_number(1)
+        let complete = retrying_operation_aborted(
+            "complete multipart upload during public write setup",
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(
+                                CompletedPart::builder()
+                                    .e_tag(upload_part.e_tag().unwrap())
+                                    .part_number(1)
+                                    .build(),
+                            )
                             .build(),
                     )
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+                    .send()
+            },
+        )
+        .await;
         assert!(
             complete.e_tag().is_some(),
             "expected CompleteMultipartUpload to return an ETag"

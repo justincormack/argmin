@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::thread;
@@ -179,6 +180,29 @@ fn is_bucket_not_empty<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkErro
 
 fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<&str> {
     err.as_service_error().and_then(ProvideErrorMetadata::code)
+}
+
+async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+
+    loop {
+        match op().await {
+            Ok(output) => return output,
+            Err(err)
+                if s3_error_code(&err) == Some("OperationAborted")
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => panic!("{context}: {err:?}"),
+        }
+    }
 }
 
 async fn verify_bucket_exists_after_create_conflict(client: &Client, bucket: &str, context: &str) {
@@ -420,13 +444,14 @@ pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String
 pub async fn create_public_bucket(client: &Client) -> String {
     let bucket = create_acl_enabled_bucket(client, ObjectOwnership::BucketOwnerPreferred).await;
 
-    client
-        .put_bucket_acl()
-        .bucket(&bucket)
-        .acl(BucketCannedAcl::PublicRead)
-        .send()
-        .await
-        .expect("set public-read ACL");
+    retrying_operation_aborted("set public-read ACL", || {
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .send()
+    })
+    .await;
 
     bucket
 }
@@ -438,13 +463,14 @@ pub async fn create_public_bucket(client: &Client) -> String {
 pub async fn create_public_write_bucket(client: &Client) -> String {
     let bucket = create_acl_enabled_bucket(client, ObjectOwnership::BucketOwnerPreferred).await;
 
-    client
-        .put_bucket_acl()
-        .bucket(&bucket)
-        .acl(BucketCannedAcl::PublicReadWrite)
-        .send()
-        .await
-        .expect("set public-read-write ACL");
+    retrying_operation_aborted("set public-read-write ACL", || {
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicReadWrite)
+            .send()
+    })
+    .await;
 
     // Issue one read-back pass after the control-plane writes. This is not a
     // convergence loop; it just gives AWS a moment to settle before tests make
