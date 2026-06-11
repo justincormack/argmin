@@ -88,6 +88,32 @@ async fn upload_part_retrying_operation_aborted(
     panic!("upload part during versioning setup did not complete");
 }
 
+async fn create_multipart_upload_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("create multipart upload during versioning setup: {err:?}"),
+        }
+    }
+    panic!("create multipart upload during versioning setup did not complete");
+}
+
 async fn delete_object_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -2269,13 +2295,7 @@ fn test_versioning_obj_create_overwrite_multipart() {
 
         // Overwrite with a multipart upload
         let part_data = vec![b'Z'; 5 * 1024 * 1024];
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
+        let create = create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
         let upload_id = create.upload_id().unwrap();
         let part_resp =
             upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, part_data)
@@ -2388,24 +2408,11 @@ fn test_versioning_bucket_multipart_upload_return_version_id() {
 
         // Multipart upload on versioned bucket should return version_id
         let part_data = vec![b'V'; 5 * 1024 * 1024];
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
+        let create = create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
         let upload_id = create.upload_id().unwrap();
-        let part_resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_data))
-            .send()
-            .await
-            .unwrap();
+        let part_resp =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, part_data)
+                .await;
         let complete = complete_multipart_upload_retrying_operation_aborted(
             client,
             &bucket,
