@@ -8,7 +8,7 @@ use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -1480,6 +1480,11 @@ fn copy_object_destination_create_stream_maps_command_log_conflict_to_operation_
         "expected CopyObject destination stream create conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
+    let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
+    assert!(
+        leaked_sessions.is_empty(),
+        "failed CopyObject destination stream create must not leave stream uploads: {leaked_sessions:?}"
+    );
 }
 
 #[test]
@@ -1547,6 +1552,132 @@ fn copy_object_destination_finalize_maps_command_log_conflict_to_operation_abort
         "expected CopyObject destination finalize conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
+}
+
+#[test]
+fn copy_object_failure_retries_destination_stream_abort_cleanup() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"copy-source",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("dst");
+    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
+    let primary_node = storage_cluster
+        .local_pg_route(PgId::new(object_pg))
+        .unwrap()
+        .primary_node_id();
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let append_failures = Arc::new(AtomicUsize::new(1));
+    let abort_failures = Arc::new(AtomicUsize::new(2));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_append_failures = Arc::clone(&append_failures);
+    let hook_abort_failures = Arc::clone(&abort_failures);
+    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
+        Arc::new(move |context| {
+            if context.bucket.as_ref() != Some(&hook_bucket)
+                || context.key.as_ref() != Some(&hook_key)
+                || context.node_id != primary_node
+            {
+                return Ok(());
+            }
+            if context.kind == MetadataCommandApplyTestKind::AppendStreamSegment
+                && hook_append_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(storage::StoreError::MetadataCommandLogConflict {
+                    node_id: primary_node.as_u32(),
+                    pg_id: object_pg,
+                    cluster_epoch: storage::ClusterEpoch::INITIAL,
+                    log_index: 1,
+                });
+            }
+            if context.kind == MetadataCommandApplyTestKind::AbortStreamUpload
+                && hook_abort_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(storage::StoreError::MetadataCommandLogConflict {
+                    node_id: primary_node.as_u32(),
+                    pg_id: object_pg,
+                    cluster_epoch: storage::ClusterEpoch::INITIAL,
+                    log_index: 1,
+                });
+            }
+            Ok(())
+        }),
+    );
+
+    let err = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected CopyObject append conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+    assert_eq!(
+        append_failures.load(Ordering::SeqCst),
+        0,
+        "test must inject one CopyObject append conflict"
+    );
+    assert_eq!(
+        abort_failures.load(Ordering::SeqCst),
+        0,
+        "CopyObject cleanup should retry transient abort conflicts"
+    );
+    let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
+    assert!(
+        leaked_sessions.is_empty(),
+        "failed CopyObject must not leave stream uploads after retrying abort cleanup: {leaked_sessions:?}"
+    );
 }
 
 #[test]

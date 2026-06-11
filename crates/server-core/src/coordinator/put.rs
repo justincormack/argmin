@@ -48,7 +48,7 @@ impl Coordinator {
                 &prepared.session_id,
             );
             if result.is_err() {
-                let _ = self.abort_stream_put_for(
+                let _ = self.abort_stream_put_for_cleanup(
                     prepared.authorized_write.bucket_typed(),
                     prepared.authorized_write.key_typed(),
                     &prepared.session_id,
@@ -100,7 +100,7 @@ impl Coordinator {
                 &session_id,
             );
             if result.is_err() {
-                let _ = self.abort_stream_put_for(
+                let _ = self.abort_stream_put_for_cleanup(
                     authorized.bucket_typed(),
                     authorized.key_typed(),
                     &session_id,

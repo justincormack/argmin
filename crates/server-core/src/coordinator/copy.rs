@@ -376,7 +376,7 @@ impl Coordinator {
             })
         })();
         if copy_result.is_err() {
-            let _ = self.abort_stream_put_for(
+            let _ = self.abort_stream_put_for_cleanup(
                 req.destination.bucket.name_typed(),
                 req.destination.key_typed(),
                 &session_id,
@@ -568,7 +568,7 @@ impl Coordinator {
             })
         })();
         if result.is_err() {
-            let _ = self.abort_stream_put_for(&bucket, &key, session_id);
+            let _ = self.abort_stream_put_for_cleanup(&bucket, &key, session_id);
         }
         let inner = result?;
         Ok(UploadPartCopyResult {

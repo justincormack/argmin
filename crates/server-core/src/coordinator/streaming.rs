@@ -1,3 +1,4 @@
+use std::time::{Duration, Instant};
 use storage::{
     stream_segment_key_hash, BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
     PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
@@ -517,6 +518,26 @@ impl Coordinator {
         self.storage_node
             .abort_stream_upload_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)
+    }
+
+    pub(super) fn abort_stream_put_for_cleanup(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.abort_stream_put_for(bucket, key, session_id) {
+                Ok(()) => return Ok(()),
+                Err(ServerError::OperationAborted | ServerError::SlowDown)
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(super) fn heartbeat_stream_put_for(
