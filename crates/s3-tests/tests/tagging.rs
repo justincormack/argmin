@@ -5,11 +5,13 @@ use aws_sdk_s3::types::{
     MetadataDirective as CopyMetadataDirective, Tag, Tagging, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, err_status,
-    send_signed_request, unique_bucket, CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
+    delete_bucket_retrying_operation_aborted, err_status, send_signed_request, unique_bucket, CTX,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -21,13 +23,111 @@ fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkErr
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
 }
 
+type RetrySendFuture<T, E> =
+    Pin<Box<dyn Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>>>;
+
+trait SendRetryingOperationAborted: Clone {
+    type Output;
+    type Error: ProvideErrorMetadata;
+
+    fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error>;
+
+    async fn send_retrying_operation_aborted(
+        self,
+        description: &str,
+    ) -> Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>> {
+        for attempt in 0..CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
+            match self.clone().send_once().await {
+                Ok(output) => return Ok(output),
+                Err(err)
+                    if is_operation_aborted(&err)
+                        && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("{description} retry loop must return on final attempt");
+    }
+}
+
+macro_rules! impl_send_retrying_operation_aborted {
+    ($builder:path, $output:path, $error:path) => {
+        impl SendRetryingOperationAborted for $builder {
+            type Output = $output;
+            type Error = $error;
+
+            fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
+                Box::pin(async move { self.send().await })
+            }
+        }
+    };
+}
+
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
+    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
+    aws_sdk_s3::operation::delete_object::DeleteObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_object_tagging::builders::PutObjectTaggingFluentBuilder,
+    aws_sdk_s3::operation::put_object_tagging::PutObjectTaggingOutput,
+    aws_sdk_s3::operation::put_object_tagging::PutObjectTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_object_tagging::builders::DeleteObjectTaggingFluentBuilder,
+    aws_sdk_s3::operation::delete_object_tagging::DeleteObjectTaggingOutput,
+    aws_sdk_s3::operation::delete_object_tagging::DeleteObjectTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_versioning::builders::PutBucketVersioningFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningOutput,
+    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_tagging::builders::PutBucketTaggingFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_tagging::PutBucketTaggingOutput,
+    aws_sdk_s3::operation::put_bucket_tagging::PutBucketTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_tagging::builders::DeleteBucketTaggingFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_tagging::DeleteBucketTaggingOutput,
+    aws_sdk_s3::operation::delete_bucket_tagging::DeleteBucketTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_policy::builders::PutBucketPolicyFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_policy::PutBucketPolicyOutput,
+    aws_sdk_s3::operation::put_bucket_policy::PutBucketPolicyError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket::builders::DeleteBucketFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket::DeleteBucketOutput,
+    aws_sdk_s3::operation::delete_bucket::DeleteBucketError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
+    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
+    aws_sdk_s3::operation::copy_object::CopyObjectOutput,
+    aws_sdk_s3::operation::copy_object::CopyObjectError
+);
+
 /// Cleanup helper.
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = client
+            .delete_object()
+            .bucket(bucket)
+            .key(*key)
+            .send_retrying_operation_aborted("delete object during tagging cleanup")
+            .await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 fn tag(key: &str, value: &str) -> Tag {
@@ -154,9 +254,31 @@ fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
+fn raw_response_is_operation_aborted(response: &s3_tests::RawResponse) -> bool {
+    response.status == 409 && response.body.contains("<Code>OperationAborted</Code>")
+}
+
+fn send_raw_retrying_operation_aborted<F>(description: &str, mut send: F) -> s3_tests::RawResponse
+where
+    F: FnMut() -> s3_tests::RawResponse,
+{
+    for attempt in 0..CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
+        let response = send();
+        if !raw_response_is_operation_aborted(&response) {
+            return response;
+        }
+        if attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+        }
+    }
+    panic!("{description} did not complete without OperationAborted");
+}
+
 fn put_bucket_tagging_raw(bucket: &str, body: &[u8]) -> s3_tests::RawResponse {
     let url = format!("{}/{bucket}?tagging", CTX.endpoint());
-    send_signed_request("PUT", &url, body, [content_md5_header(body)])
+    send_raw_retrying_operation_aborted("put raw bucket tagging", || {
+        send_signed_request("PUT", &url, body, [content_md5_header(body)])
+    })
 }
 
 fn alt_policy_principal() -> serde_json::Value {
@@ -193,7 +315,9 @@ fn test_bucket_tagging_raw_get_returns_canonical_xml() {
         assert_eq!(put.status, 204, "unexpected body: {}", put.body);
 
         let url = format!("{}/{}?tagging", CTX.endpoint(), bucket);
-        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+        let get = send_raw_retrying_operation_aborted("get raw bucket tagging", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>())
+        });
 
         cleanup(&bucket, &[]).await;
 
@@ -239,7 +363,7 @@ fn test_put_get_delete_bucket_tagging() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tags)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -264,7 +388,7 @@ fn test_put_get_delete_bucket_tagging() {
         client
             .delete_bucket_tagging()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -302,7 +426,7 @@ fn test_delete_bucket_tagging_not_set() {
         client
             .delete_bucket_tagging()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -325,7 +449,7 @@ fn test_put_bucket_tagging_max_tags() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging(tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -356,7 +480,7 @@ fn test_put_bucket_tagging_too_many() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging(tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
 
@@ -388,7 +512,7 @@ fn test_put_get_delete_object_tagging() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tags)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -415,7 +539,7 @@ fn test_put_get_delete_object_tagging() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -482,7 +606,7 @@ fn test_delete_object_tagging_not_set() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -514,7 +638,7 @@ fn test_put_object_tagging_max_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -555,7 +679,7 @@ fn test_put_object_tagging_too_many() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
 
@@ -584,7 +708,7 @@ fn test_put_object_tagging_overwrite() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(vec![tag("old", "value")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -594,7 +718,7 @@ fn test_put_object_tagging_overwrite() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(vec![tag("new", "value2")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -746,7 +870,7 @@ fn test_copy_object_with_tagging() {
             .copy_source(format!("{}/src", bucket))
             .tagging("copied=true&env=test")
             .tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -791,7 +915,7 @@ fn test_set_bucket_tagging() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging(vec![tag("Hello", "World")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -811,7 +935,7 @@ fn test_set_bucket_tagging() {
         client
             .delete_bucket_tagging()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -845,7 +969,7 @@ fn test_get_obj_tagging() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(input_tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -887,7 +1011,7 @@ fn test_get_obj_head_tagging() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(input_tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -928,7 +1052,7 @@ fn test_put_max_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(input_tags.clone()))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -974,7 +1098,7 @@ fn test_put_excess_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(input_tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
 
@@ -1014,7 +1138,7 @@ fn test_put_modify_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(vec![tag("key", "val"), tag("key2", "val2")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1040,7 +1164,7 @@ fn test_put_modify_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(vec![tag("key3", "val3")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1082,7 +1206,7 @@ fn test_put_delete_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(input_tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1099,7 +1223,7 @@ fn test_put_delete_tags() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1200,7 +1324,7 @@ fn test_put_max_kvsize_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(tags.clone()))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1239,7 +1363,7 @@ fn test_put_excess_key_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
 
@@ -1279,7 +1403,7 @@ fn test_put_excess_val_tags() {
             .bucket(&bucket)
             .key("obj")
             .tagging(tagging(tags))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
 
@@ -1356,7 +1480,7 @@ fn test_copy_object_default_copies_tags() {
             .bucket(&bucket)
             .key("dst")
             .copy_source(format!("{}/src", bucket))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1408,7 +1532,7 @@ fn test_copy_object_replace_clears_tags() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1444,7 +1568,7 @@ async fn create_delete_marker() -> (String, String, String) {
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("S3 mutation during tagging test")
         .await
         .unwrap();
 
@@ -1465,7 +1589,7 @@ async fn create_delete_marker() -> (String, String, String) {
         .delete_object()
         .bucket(&bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("S3 mutation during tagging test")
         .await
         .unwrap();
 
@@ -1488,7 +1612,7 @@ fn test_put_tagging_on_delete_marker() {
             .key(&key)
             .version_id(&dm_version_id)
             .tagging(tagging(vec![tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
 
         assert!(result.is_err());
@@ -1534,7 +1658,7 @@ fn test_delete_tagging_on_delete_marker() {
             .bucket(&bucket)
             .key(&key)
             .version_id(&dm_version_id)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
 
         assert!(result.is_err());
@@ -1561,7 +1685,7 @@ fn test_tagging_on_deleted_object_without_version_id() {
             .bucket(&bucket)
             .key(&key)
             .tagging(tagging(vec![tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
         assert_eq!(err_status(&result), 405);
@@ -1583,7 +1707,7 @@ fn test_tagging_on_deleted_object_without_version_id() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key(&key)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert!(result.is_err());
         assert_eq!(err_status(&result), 405);
@@ -1611,7 +1735,7 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1644,7 +1768,7 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
             .delete_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         assert!(delete_resp.delete_marker().unwrap_or(false));
@@ -1688,7 +1812,7 @@ fn test_set_multipart_tagging() {
             .bucket(&bucket)
             .key(key)
             .tagging("foo=bar&bar")
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -1732,7 +1856,7 @@ fn test_set_multipart_tagging() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1782,7 +1906,7 @@ fn test_bucket_policy_get_object_tagging_alt_account() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1796,7 +1920,7 @@ fn test_bucket_policy_get_object_tagging_alt_account() {
             .bucket(&bucket)
             .key(key)
             .tagging(input_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1844,7 +1968,7 @@ fn test_bucket_policy_put_object_tagging_alt_account() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1858,7 +1982,7 @@ fn test_bucket_policy_put_object_tagging_alt_account() {
             .bucket(&bucket)
             .key(key)
             .tagging(input_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1906,7 +2030,7 @@ fn test_bucket_policy_delete_object_tagging_alt_account() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1919,7 +2043,7 @@ fn test_bucket_policy_delete_object_tagging_alt_account() {
                     .map(|i| tag(&format!("{i}"), &format!("{i}")))
                     .collect(),
             ))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1927,7 +2051,7 @@ fn test_bucket_policy_delete_object_tagging_alt_account() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1983,7 +2107,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -1992,7 +2116,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key(allow_key)
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2000,7 +2124,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key(deny_key)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2008,7 +2132,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key(allow_key)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2016,7 +2140,7 @@ fn test_bucket_policy_delete_obj_tagging_existing_tag() {
             .delete_object_tagging()
             .bucket(&bucket)
             .key(deny_key)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
@@ -2083,7 +2207,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2092,7 +2216,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2100,7 +2224,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             .bucket(&bucket)
             .key("denytag")
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2108,7 +2232,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
             .bucket(&bucket)
             .key("invalidtag")
             .tagging(tagging(vec![tag("security1", "allow")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2174,7 +2298,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2183,7 +2307,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2191,7 +2315,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("denytag")
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2199,7 +2323,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("invalidtag")
             .tagging(tagging(vec![tag("security1", "allow")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2276,7 +2400,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2285,7 +2409,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2293,7 +2417,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("denytag")
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2303,7 +2427,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2312,7 +2436,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("denytag")
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&deny_result), 403);
         assert_s3_err_code(&deny_result, "AccessDenied");
@@ -2323,7 +2447,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(deny_tags)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2332,7 +2456,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(allow_tags)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&second_result), 403);
         assert_s3_err_code(&second_result, "AccessDenied");
@@ -2363,7 +2487,7 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2404,7 +2528,7 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2414,7 +2538,7 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
             .key(allow_key)
             .version_id(&allow_version)
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2423,7 +2547,7 @@ fn test_bucket_policy_get_obj_version_tagging_existing_tag() {
             .key(deny_key)
             .version_id(&deny_version)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2476,7 +2600,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2517,7 +2641,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2527,7 +2651,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .key(allow_key)
             .version_id(&allow_version)
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2536,7 +2660,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .key(deny_key)
             .version_id(&deny_version)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2547,7 +2671,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .key(allow_key)
             .version_id(&allow_version)
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2557,7 +2681,7 @@ fn test_bucket_policy_put_obj_version_tagging_existing_tag() {
             .key(deny_key)
             .version_id(&deny_version)
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
@@ -2602,7 +2726,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2612,7 +2736,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .bucket(&bucket)
             .key(key)
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2621,7 +2745,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .bucket(&bucket)
             .key(key)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
@@ -2660,7 +2784,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2690,7 +2814,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2701,7 +2825,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .key(key)
             .version_id(&version_id)
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2711,7 +2835,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .key(key)
             .version_id(&version_id)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
@@ -2752,7 +2876,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2793,7 +2917,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2803,7 +2927,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .key(allow_key)
             .version_id(&allow_version)
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -2812,7 +2936,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .key(deny_key)
             .version_id(&deny_version)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2821,7 +2945,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .bucket(&bucket)
             .key(allow_key)
             .version_id(&allow_version)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2830,7 +2954,7 @@ fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
             .bucket(&bucket)
             .key(deny_key)
             .version_id(&deny_version)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
@@ -2890,7 +3014,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
             .bucket(&bucket)
             .key(key)
             .tagging(bootstrap_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2908,7 +3032,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2917,7 +3041,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
             .bucket(&bucket)
             .key(key)
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2973,7 +3097,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2983,7 +3107,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             .bucket(&bucket)
             .key(key)
             .tagging(allow_tags.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -2992,7 +3116,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
             .bucket(&bucket)
             .key(key)
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
@@ -3045,7 +3169,7 @@ fn test_bucket_policy_put_obj_copy_source() {
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(src_policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3063,7 +3187,7 @@ fn test_bucket_policy_put_obj_copy_source() {
             .put_bucket_policy()
             .bucket(&dst_bucket)
             .policy(dst_policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3072,7 +3196,7 @@ fn test_bucket_policy_put_obj_copy_source() {
             .bucket(&dst_bucket)
             .key("new_foo")
             .copy_source(format!("{src_bucket}/public/foo"))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3091,7 +3215,7 @@ fn test_bucket_policy_put_obj_copy_source() {
             .bucket(&dst_bucket)
             .key("new_foo2")
             .copy_source(format!("{src_bucket}/public/bar"))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3110,7 +3234,7 @@ fn test_bucket_policy_put_obj_copy_source() {
             .bucket(&dst_bucket)
             .key("new_foo3")
             .copy_source(format!("{src_bucket}/private/foo"))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await;
         assert_eq!(err_status(&result), 403);
         assert_s3_err_code(&result, "AccessDenied");
@@ -3155,7 +3279,7 @@ fn test_bucket_policy_put_obj_copy_source_meta() {
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(src_policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3173,7 +3297,7 @@ fn test_bucket_policy_put_obj_copy_source_meta() {
             .put_bucket_policy()
             .bucket(&dst_bucket)
             .policy(dst_policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3183,7 +3307,7 @@ fn test_bucket_policy_put_obj_copy_source_meta() {
             .key("new_foo")
             .copy_source(format!("{src_bucket}/public/foo"))
             .metadata_directive(CopyMetadataDirective::Copy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3254,7 +3378,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
@@ -3263,7 +3387,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             .bucket(&bucket)
             .key("allowtag")
             .tagging(tagging(vec![tag("security", "allow"), tag("foo", "bar")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -3271,7 +3395,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             .bucket(&bucket)
             .key("denytag")
             .tagging(tagging(vec![tag("security", "deny")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
         client
@@ -3279,7 +3403,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
             .bucket(&bucket)
             .key("invalidtag")
             .tagging(tagging(vec![tag("security1", "allow")]))
-            .send()
+            .send_retrying_operation_aborted("S3 mutation during tagging test")
             .await
             .unwrap();
 
