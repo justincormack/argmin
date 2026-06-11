@@ -4,6 +4,7 @@
 //! follows AWS: `public-read-write` allows a different signed account to create
 //! a brand-new key, but not to overwrite an existing object.
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketCannedAcl, ObjectCannedAcl, ObjectOwnership, OwnershipControls, OwnershipControlsRule,
@@ -12,11 +13,35 @@ use s3_tests::{
     assert_s3_err_code, delete_all_and_bucket, disable_bucket_public_access_block, err_status,
     unique_bucket, CTX,
 };
+use std::future::Future;
 use std::time::Duration;
 
 const ACL_KEY: &str = "foo";
 const DEFAULT_KEY: &str = "bar";
 const NEW_KEY: &str = "new";
+const SETUP_OPERATION_ATTEMPTS: usize = 20;
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+async fn retrying_operation_aborted<T, E, F, Fut>(description: &str, mut op: F) -> T
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    for attempt in 0..SETUP_OPERATION_ATTEMPTS {
+        match op().await {
+            Ok(output) => return output,
+            Err(err) if is_operation_aborted(&err) && attempt + 1 < SETUP_OPERATION_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("{description}: {err:?}"),
+        }
+    }
+    unreachable!("{description} retry loop must return on final attempt");
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BucketAclCase {
@@ -77,13 +102,17 @@ async fn set_bucket_owner_preferred(bucket: &str) {
         .unwrap();
     let controls = OwnershipControls::builder().rules(rule).build().unwrap();
 
-    CTX.client()
-        .put_bucket_ownership_controls()
-        .bucket(bucket)
-        .ownership_controls(controls)
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted(
+        "put bucket ownership controls during ACL matrix setup",
+        || {
+            CTX.client()
+                .put_bucket_ownership_controls()
+                .bucket(bucket)
+                .ownership_controls(controls.clone())
+                .send()
+        },
+    )
+    .await;
 }
 
 async fn setup_access_matrix(
@@ -97,39 +126,43 @@ async fn setup_access_matrix(
     disable_bucket_public_access_block(client, &bucket).await;
     set_bucket_owner_preferred(&bucket).await;
 
-    client
-        .put_bucket_acl()
-        .bucket(&bucket)
-        .acl(bucket_acl.canned_acl())
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted("put bucket ACL during ACL matrix setup", || {
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(bucket_acl.canned_acl())
+            .send()
+    })
+    .await;
 
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(ACL_KEY)
-        .body(ByteStream::from_static(b"foocontent"))
-        .send()
-        .await
-        .unwrap();
-    client
-        .put_object_acl()
-        .bucket(&bucket)
-        .key(ACL_KEY)
-        .acl(object_acl.canned_acl())
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted("put object during ACL matrix setup", || {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(ACL_KEY)
+            .body(ByteStream::from_static(b"foocontent"))
+            .send()
+    })
+    .await;
+    retrying_operation_aborted("put object ACL during ACL matrix setup", || {
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key(ACL_KEY)
+            .acl(object_acl.canned_acl())
+            .send()
+    })
+    .await;
 
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(DEFAULT_KEY)
-        .body(ByteStream::from_static(b"barcontent"))
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted("put default object during ACL matrix setup", || {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(DEFAULT_KEY)
+            .body(ByteStream::from_static(b"barcontent"))
+            .send()
+    })
+    .await;
 
     client
         .get_bucket_acl()
