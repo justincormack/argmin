@@ -85,19 +85,32 @@ pub fn unique_bucket() -> String {
 pub async fn disable_bucket_public_access_block(client: &Client, bucket: &str) {
     use aws_sdk_s3::types::PublicAccessBlockConfiguration;
 
-    let pab = PublicAccessBlockConfiguration::builder()
-        .block_public_acls(false)
-        .ignore_public_acls(false)
-        .block_public_policy(false)
-        .restrict_public_buckets(false)
-        .build();
-    client
-        .put_public_access_block()
-        .bucket(bucket)
-        .public_access_block_configuration(pab)
-        .send()
-        .await
-        .expect("disable bucket public access block");
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+    loop {
+        let pab = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(false)
+            .ignore_public_acls(false)
+            .block_public_policy(false)
+            .restrict_public_buckets(false)
+            .build();
+        match client
+            .put_public_access_block()
+            .bucket(bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+        {
+            Ok(_) => break,
+            Err(err)
+                if s3_error_code(&err) == Some("OperationAborted")
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => panic!("disable bucket public access block: {err:?}"),
+        }
+    }
     wait_for_bucket_public_access_block_disabled(client, bucket).await;
 }
 
