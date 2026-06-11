@@ -31,7 +31,7 @@ async fn put_object_retrying_operation_aborted(
     bucket: &str,
     key: &str,
     body: Vec<u8>,
-) {
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
     for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
         match client
             .put_object()
@@ -41,16 +41,17 @@ async fn put_object_retrying_operation_aborted(
             .send()
             .await
         {
-            Ok(_) => return,
+            Ok(output) => return output,
             Err(err)
                 if is_operation_aborted(&err)
                     && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
             {
                 sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
             }
-            Err(err) => panic!("put object during concurrent version race: {err:?}"),
+            Err(err) => panic!("put object during versioning setup: {err:?}"),
         }
     }
+    panic!("put object during versioning setup did not complete");
 }
 
 async fn delete_object_retrying_operation_aborted(
@@ -257,14 +258,9 @@ async fn create_multiple_versions(
     let mut contents = Vec::new();
     for i in 0..num {
         let body = format!("content-{}", i);
-        let resp = client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(body.clone().into_bytes()))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            put_object_retrying_operation_aborted(client, bucket, key, body.clone().into_bytes())
+                .await;
         version_ids.push(resp.version_id().unwrap().to_string());
         contents.push(body);
     }
@@ -739,14 +735,7 @@ fn test_versioning_obj_plain_null_version_removal() {
 
         // Put object before versioning is enabled (null version)
         let key = "testobjfoo";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"fooz"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"fooz".to_vec()).await;
 
         // Enable versioning
         client
@@ -797,14 +786,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
 
         let key = "testobjfoo";
         // Put before versioning
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"fooz"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"fooz".to_vec()).await;
 
         // Enable versioning
         client
@@ -820,14 +802,8 @@ fn test_versioning_obj_plain_null_version_overwrite() {
             .unwrap();
 
         // Put new version (gets a real version ID)
-        let resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"zzz"))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"zzz".to_vec()).await;
         let version_id = resp.version_id().unwrap().to_string();
 
         // GET returns new version
@@ -912,14 +888,8 @@ fn test_versioning_obj_suspend_versions() {
             .unwrap();
 
         // Puts while suspended overwrite the null version
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"suspended content"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"suspended content".to_vec())
+            .await;
 
         // Re-enable versioning
         client
@@ -967,14 +937,8 @@ fn test_versioning_list_object_versions_suspended_null_is_latest() {
         let bucket = setup_versioned_bucket().await;
         let key = "testobj";
 
-        let older = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"older"))
-            .send()
-            .await
-            .unwrap();
+        let older =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"older".to_vec()).await;
         let older_version_id = older.version_id().unwrap().to_string();
 
         client
@@ -989,14 +953,7 @@ fn test_versioning_list_object_versions_suspended_null_is_latest() {
             .await
             .unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"current"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"current".to_vec()).await;
 
         let resp = client
             .list_object_versions()
@@ -1029,14 +986,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
 
         let key = "testobjbar";
         // Put before versioning
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"foooz"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"foooz".to_vec()).await;
 
         // Enable then suspend
         client
@@ -1063,14 +1013,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
             .unwrap();
 
         // Put while suspended overwrites null
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"zzz"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"zzz".to_vec()).await;
 
         let resp = client
             .get_object()
@@ -1133,14 +1076,8 @@ fn test_versioning_obj_suspended_copy() {
             .unwrap();
 
         // Overwrite with null version
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key1)
-            .body(ByteStream::from_static(b"null content"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key1, b"null content".to_vec())
+            .await;
 
         // Copy to another key in same bucket
         let key2 = "testobj2";
@@ -1290,14 +1227,9 @@ fn test_versioning_list_object_versions_pagination_and_markers() {
         let other_key = "beta<versions";
 
         let (mut key_versions, _) = create_multiple_versions(&bucket, key, 2).await;
-        let other_resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key(other_key)
-            .body(ByteStream::from_static(b"other"))
-            .send()
-            .await
-            .unwrap();
+        let other_resp =
+            put_object_retrying_operation_aborted(client, &bucket, other_key, b"other".to_vec())
+                .await;
         let other_vid = other_resp.version_id().unwrap().to_string();
 
         let delete_resp = client
@@ -1374,33 +1306,14 @@ fn test_versioning_list_object_versions_rejects_version_id_marker_without_key_ma
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
 
-        let alpha_v1 = client
-            .put_object()
-            .bucket(&bucket)
-            .key("alpha")
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap()
-            .version_id()
-            .expect("alpha v1 version id")
-            .to_string();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("alpha")
-            .body(ByteStream::from_static(b"v2"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("beta")
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        let alpha_v1 =
+            put_object_retrying_operation_aborted(client, &bucket, "alpha", b"v1".to_vec())
+                .await
+                .version_id()
+                .expect("alpha v1 version id")
+                .to_string();
+        put_object_retrying_operation_aborted(client, &bucket, "alpha", b"v2".to_vec()).await;
+        put_object_retrying_operation_aborted(client, &bucket, "beta", b"v1".to_vec()).await;
 
         let result = client
             .list_object_versions()
@@ -1423,14 +1336,13 @@ fn test_versioning_list_object_versions_oversized_max_keys_echoed_by_aws() {
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("oversized-max-keys.txt")
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "oversized-max-keys.txt",
+            b"v1".to_vec(),
+        )
+        .await;
 
         let resp = client
             .list_object_versions()
@@ -1457,14 +1369,13 @@ fn test_versioning_list_object_versions_raw_xml_echoes_oversized_max_keys_on_aws
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("oversized-max-keys-raw.txt")
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "oversized-max-keys-raw.txt",
+            b"v1".to_vec(),
+        )
+        .await;
 
         let url = format!("{}/{bucket}?versions=&max-keys=5000", CTX.endpoint());
         let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
@@ -1493,14 +1404,7 @@ fn test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_
         let key = "oversized-max-keys-many-versions.txt";
 
         for _ in 0..1001 {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(key)
-                .body(ByteStream::from_static(b""))
-                .send()
-                .await
-                .unwrap();
+            put_object_retrying_operation_aborted(client, &bucket, key, Vec::new()).await;
         }
 
         let resp = client
@@ -1568,14 +1472,7 @@ fn test_versioning_list_object_versions_encoding_type_url() {
         let bucket = setup_versioned_bucket().await;
         let key = "dir/hello world&plus+";
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"v1".to_vec()).await;
 
         let resp = client
             .list_object_versions()
@@ -2023,14 +1920,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
 
         // Versioning-enabled: should return a version ID
         let bucket = setup_versioned_bucket().await;
-        let resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key("bar")
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await
-            .unwrap();
+        let resp = put_object_retrying_operation_aborted(client, &bucket, "bar", Vec::new()).await;
         let version_id = resp.version_id().unwrap().to_string();
 
         let resp = client
@@ -2050,14 +1940,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
         // Default (no versioning): should not return a version ID
         let bucket2 = unique_bucket();
         s3_tests::create_bucket(client, &bucket2).await.unwrap();
-        let resp = client
-            .put_object()
-            .bucket(&bucket2)
-            .key("baz")
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await
-            .unwrap();
+        let resp = put_object_retrying_operation_aborted(client, &bucket2, "baz", Vec::new()).await;
         assert!(
             resp.version_id().is_none(),
             "expected no version ID for non-versioned bucket"
@@ -2090,14 +1973,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             .send()
             .await
             .unwrap();
-        let resp = client
-            .put_object()
-            .bucket(&bucket3)
-            .key("baz")
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await
-            .unwrap();
+        let resp = put_object_retrying_operation_aborted(client, &bucket3, "baz", Vec::new()).await;
         assert!(
             resp.version_id().is_none(),
             "expected no version ID for suspended bucket"
@@ -2204,14 +2080,7 @@ fn test_versioning_concurrent_multi_object_delete() {
         // Create num_versions versions of each key
         for _ in 0..num_versions {
             for key in &key_names {
-                client
-                    .put_object()
-                    .bucket(&bucket)
-                    .key(key)
-                    .body(ByteStream::from_static(b"data"))
-                    .send()
-                    .await
-                    .unwrap();
+                put_object_retrying_operation_aborted(client, &bucket, key, b"data".to_vec()).await;
             }
         }
 
@@ -2272,14 +2141,7 @@ fn test_delete_marker_nonversioned() {
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "frodo.txt";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"body"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"body".to_vec()).await;
 
         let resp = client
             .delete_object()
@@ -2302,14 +2164,8 @@ fn test_delete_marker_versioned() {
         let bucket = setup_versioned_bucket().await;
 
         let key = "bilbo.txt";
-        let put_resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"body"))
-            .send()
-            .await
-            .unwrap();
+        let put_resp =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"body".to_vec()).await;
         let vid = put_resp.version_id().unwrap().to_string();
 
         let del_resp = client
@@ -2459,14 +2315,8 @@ fn test_versioning_obj_create_overwrite_multipart() {
         let key = "mp-overwrite";
 
         // Put a plain object first
-        let put = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"original"))
-            .send()
-            .await
-            .unwrap();
+        let put =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"original".to_vec()).await;
         let v1 = put.version_id().unwrap().to_string();
 
         // Overwrite with a multipart upload
@@ -2542,14 +2392,7 @@ fn test_list_object_versions_includes_owner() {
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("owned")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, "owned", b"data".to_vec()).await;
 
         let resp = client
             .list_object_versions()
@@ -2577,14 +2420,7 @@ fn test_list_object_versions_delete_marker_includes_owner() {
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("owned")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, "owned", b"data".to_vec()).await;
 
         let del_resp = client
             .delete_object()
