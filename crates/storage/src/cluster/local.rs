@@ -3507,7 +3507,7 @@ fn prepare_local_node_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::PendingMetadataCommandOutcome;
+    use crate::cluster::{MetadataCommandRecoveryWaiterOutcome, PendingMetadataCommandOutcome};
     use crate::metadata_command::{
         metadata_command_log_hash, AbortMultipartUploadCommand, AbortStreamUploadCommand,
         AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
@@ -16716,14 +16716,108 @@ mod tests {
         let outcome = cluster
             .pending_command_recovery_waiter_outcome(pg_id, &command)
             .unwrap();
-        assert_eq!(outcome, Some(PendingMetadataCommandOutcome::Applied));
+        assert_eq!(
+            outcome.pending_outcome(),
+            Some(PendingMetadataCommandOutcome::Applied)
+        );
         assert!(
             crate::StorageCluster::metadata_command_recovery_applied_collectable_object_command(
                 &command,
-                outcome.unwrap()
+                outcome.pending_outcome().unwrap()
             ),
             "collect drains must preserve exact applied object commands for idempotent recovery"
         );
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn recovery_waiter_distinguishes_missing_and_replaced_unapplied_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "collect-waiter-missing-");
+        let key = key_for_object_pg(topology, &bucket, 1, "stream-key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let missing_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                crate::VersionId::from_u64(1),
+            )),
+        );
+
+        let missing_outcome = cluster
+            .pending_command_recovery_waiter_outcome(pg_id, &missing_command)
+            .unwrap();
+        assert_eq!(
+            missing_outcome,
+            MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+        );
+        assert_eq!(
+            missing_outcome.pending_outcome(),
+            Some(PendingMetadataCommandOutcome::RetryPartialExactConflict)
+        );
+
+        let replacement_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key,
+                crate::VersionId::from_u64(2),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &replacement_command);
+
+        let replaced_outcome = cluster
+            .pending_command_recovery_waiter_outcome(pg_id, &missing_command)
+            .unwrap();
+        assert_eq!(
+            replaced_outcome,
+            MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied
+        );
+        assert_eq!(
+            replaced_outcome.pending_outcome(),
+            Some(PendingMetadataCommandOutcome::RetryPartialExactConflict)
+        );
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            pg.record_metadata_command_applied(node_id.as_u32(), &replacement_command)
+                .unwrap();
+        }
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(pg_id.get()).unwrap();
+            assert!(
+                pg.remove_pending_metadata_command_slot(
+                    NodeId::new(1).as_u32(),
+                    &replacement_command,
+                )
+                .unwrap()
+            );
+        }
         assert_clean_metadata_command_stream(&map, &[1]);
     }
 

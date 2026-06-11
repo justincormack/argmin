@@ -133,6 +133,35 @@ impl PendingMetadataCommandOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataCommandRecoveryWaiterOutcome {
+    StillPending,
+    Applied,
+    MissingNotApplied,
+    ReplacedNotApplied,
+}
+
+impl MetadataCommandRecoveryWaiterOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::StillPending => "waiter_still_pending",
+            Self::Applied => "waiter_applied",
+            Self::MissingNotApplied => "waiter_missing_not_applied",
+            Self::ReplacedNotApplied => "waiter_replaced_not_applied",
+        }
+    }
+
+    fn pending_outcome(self) -> Option<PendingMetadataCommandOutcome> {
+        match self {
+            Self::StillPending => None,
+            Self::Applied => Some(PendingMetadataCommandOutcome::Applied),
+            Self::MissingNotApplied | Self::ReplacedNotApplied => {
+                Some(PendingMetadataCommandOutcome::RetryPartialExactConflict)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ExactPendingObjectMetadataCommand<'a> {
     command: &'a MetadataCommandEnvelope,
@@ -2966,19 +2995,16 @@ impl StorageCluster {
                         pg_id, command, "waited", wait_us,
                     );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_wait");
-                    match self.pending_command_recovery_waiter_outcome(pg_id, command)? {
-                        Some(outcome) => {
-                            self.emit_metadata_command_recovery_outcome_for_command(
-                                pg_id,
-                                command,
-                                outcome.metric_label(),
-                            );
-                            return Ok(outcome);
-                        }
+                    let waiter_outcome =
+                        self.pending_command_recovery_waiter_outcome(pg_id, command)?;
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id,
+                        command,
+                        waiter_outcome.metric_label(),
+                    );
+                    match waiter_outcome.pending_outcome() {
+                        Some(outcome) => return Ok(outcome),
                         None => {
-                            self.emit_metadata_command_recovery_outcome_for_command(
-                                pg_id, command, "pending",
-                            );
                             continue;
                         }
                     }
@@ -3015,20 +3041,22 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-    ) -> Result<Option<PendingMetadataCommandOutcome>, ObjectPgActionError> {
+    ) -> Result<MetadataCommandRecoveryWaiterOutcome, ObjectPgActionError> {
         let pending = self.pending_metadata_command_for_bucket(pg_id, command.bucket_name())?;
         if pending.as_ref() == Some(command) {
-            return Ok(None);
+            return Ok(MetadataCommandRecoveryWaiterOutcome::StillPending);
         }
         if self
             .metadata_command_is_applied_on_all_acting_nodes(pg_id, command)
             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
         {
-            return Ok(Some(PendingMetadataCommandOutcome::Applied));
+            return Ok(MetadataCommandRecoveryWaiterOutcome::Applied);
         }
-        Ok(Some(
-            PendingMetadataCommandOutcome::RetryPartialExactConflict,
-        ))
+        if pending.is_some() {
+            Ok(MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied)
+        } else {
+            Ok(MetadataCommandRecoveryWaiterOutcome::MissingNotApplied)
+        }
     }
 
     fn finish_pending_metadata_command_recovery(
@@ -4081,43 +4109,31 @@ impl StorageCluster {
                         pg_id, &command, "waited", wait_us,
                     );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_wait");
-                    match self.pending_command_recovery_waiter_outcome(pg_id, &command)? {
-                        Some(PendingMetadataCommandOutcome::Applied) => {
+                    let waiter_outcome =
+                        self.pending_command_recovery_waiter_outcome(pg_id, &command)?;
+                    match waiter_outcome {
+                        MetadataCommandRecoveryWaiterOutcome::Applied => {
                             self.emit_metadata_command_recovery_outcome_for_command(
-                                pg_id, &command, "applied",
+                                pg_id,
+                                &command,
+                                waiter_outcome.metric_label(),
                             );
                             break command;
                         }
-                        Some(PendingMetadataCommandOutcome::Abandoned) => {
+                        MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                        | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                            let outcome = match (new_pending_command, waiter_outcome) {
+                                (true, MetadataCommandRecoveryWaiterOutcome::MissingNotApplied) => {
+                                    "cleanup_suppressed_waiter_missing_not_applied"
+                                }
+                                (
+                                    true,
+                                    MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied,
+                                ) => "cleanup_suppressed_waiter_replaced_not_applied",
+                                _ => waiter_outcome.metric_label(),
+                            };
                             self.emit_metadata_command_recovery_outcome_for_command(
-                                pg_id,
-                                &command,
-                                "abandoned",
-                            );
-                            if new_pending_command {
-                                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                                    pg_id,
-                                    &req.bucket,
-                                    &req.key,
-                                    &req.generation_reservation_id,
-                                );
-                                self.delete_direct_put_segment_payload_shards(
-                                    req.data_pg_id,
-                                    req.ec,
-                                    &req.segment_okh,
-                                    req.segment_vid,
-                                    written_shards,
-                                );
-                            }
-                            return Err(conflicting_pending_object_metadata_command(
-                                "abandoned pending command for direct put commit",
-                            ));
-                        }
-                        Some(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
-                            self.emit_metadata_command_recovery_outcome_for_command(
-                                pg_id,
-                                &command,
-                                "retry_partial_exact_conflict",
+                                pg_id, &command, outcome,
                             );
                             // The recovery leader may have reissued and applied a matching
                             // command, so the owner cannot safely tear down payload state here.
@@ -4125,9 +4141,11 @@ impl StorageCluster {
                                 "retryable partial pending command for direct put commit",
                             ));
                         }
-                        None => {
+                        MetadataCommandRecoveryWaiterOutcome::StillPending => {
                             self.emit_metadata_command_recovery_outcome_for_command(
-                                pg_id, &command, "pending",
+                                pg_id,
+                                &command,
+                                waiter_outcome.metric_label(),
                             );
                             continue;
                         }
