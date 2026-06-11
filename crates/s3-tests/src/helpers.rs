@@ -1221,22 +1221,16 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
         let mut objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = Vec::new();
 
         for v in resp.versions() {
-            objects.push(
-                aws_sdk_s3::types::ObjectIdentifier::builder()
-                    .key(v.key().unwrap_or_default())
-                    .version_id(v.version_id().unwrap_or_default())
-                    .build()
-                    .unwrap(),
-            );
+            objects.push(object_identifier_for_listed_version(
+                v.key().unwrap_or_default(),
+                v.version_id(),
+            ));
         }
         for m in resp.delete_markers() {
-            objects.push(
-                aws_sdk_s3::types::ObjectIdentifier::builder()
-                    .key(m.key().unwrap_or_default())
-                    .version_id(m.version_id().unwrap_or_default())
-                    .build()
-                    .unwrap(),
-            );
+            objects.push(object_identifier_for_listed_version(
+                m.key().unwrap_or_default(),
+                m.version_id(),
+            ));
         }
 
         if objects.is_empty() {
@@ -1244,32 +1238,33 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
         }
 
         for chunk in objects.chunks(25) {
-            let mut last_error = None;
-            for _ in 0..5 {
-                let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(chunk.to_vec()))
-                    .quiet(true)
-                    .build()
-                    .unwrap();
-                match delete_objects_with_md5(client, bucket, delete).send().await {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
-                    Err(err) if is_bucket_already_absent(&err) => return,
-                    Err(err) => {
-                        last_error = Some(err);
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-            if let Some(err) = last_error {
-                panic!("delete objects: {err:?}");
-            }
+            let delete = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(chunk.to_vec()))
+                .quiet(true)
+                .build()
+                .unwrap();
+            let resp = delete_objects_retrying_operation_aborted(client, bucket, delete).await;
+            assert!(
+                resp.errors().is_empty(),
+                "delete objects returned embedded errors: {:?}",
+                resp.errors()
+            );
         }
     }
 
     delete_bucket_retrying_operation_aborted(client, bucket).await;
+}
+
+fn object_identifier_for_listed_version(key: &str, version_id: Option<&str>) -> ObjectIdentifier {
+    ObjectIdentifier::builder()
+        .key(key)
+        .set_version_id(
+            version_id
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string),
+        )
+        .build()
+        .unwrap()
 }
 
 pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &str) {
