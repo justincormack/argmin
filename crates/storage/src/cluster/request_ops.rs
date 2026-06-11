@@ -933,8 +933,12 @@ impl super::StorageCluster {
                 )?;
             match outcome {
                 FinishPendingMetadataCommandResult::Applied => {}
-                FinishPendingMetadataCommandResult::Abandoned
-                | FinishPendingMetadataCommandResult::RetryPartialExactConflict => continue,
+                FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+                    return Err(conflicting_pending_metadata_command(
+                        "retryable partial pending create bucket command",
+                    ));
+                }
+                FinishPendingMetadataCommandResult::Abandoned => continue,
             }
 
             let info = primary_store
@@ -2266,6 +2270,34 @@ impl super::StorageCluster {
                 .head_bucket_raw(pg_id, bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if current.state == BucketState::Deleting {
+                if let Some(command) = self
+                    .pending_metadata_command_for_bucket(pg_id, bucket)
+                    .map_err(BucketWriteDrainError::from)?
+                {
+                    if matches!(
+                        command.payload(),
+                        MetadataCommandPayload::MarkBucketDeleting(mark)
+                            if mark.bucket_name() == bucket
+                    ) {
+                        let outcome = self
+                            .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                                pg_id,
+                                &command,
+                                false,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        if matches!(
+                            outcome,
+                            FinishPendingMetadataCommandResult::RetryPartialExactConflict
+                        ) {
+                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                                conflicting_pending_metadata_command(
+                                    "retryable partial pending mark bucket deleting command",
+                                ),
+                            ));
+                        }
+                    }
+                }
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
@@ -2426,8 +2458,14 @@ impl super::StorageCluster {
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             match outcome {
                 FinishPendingMetadataCommandResult::Applied => {}
-                FinishPendingMetadataCommandResult::Abandoned
-                | FinishPendingMetadataCommandResult::RetryPartialExactConflict => continue,
+                FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+                    return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                        conflicting_pending_metadata_command(
+                            "retryable partial pending mark bucket deleting command",
+                        ),
+                    ));
+                }
+                FinishPendingMetadataCommandResult::Abandoned => continue,
             }
 
             return Ok(());
@@ -4772,6 +4810,36 @@ impl super::StorageCluster {
                         applied_nodes,
                         source,
                     } = error;
+                    match self
+                        .retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                            pg_id,
+                            &command,
+                            applied_nodes,
+                            &source,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    {
+                        Some(true) => {
+                            self.release_applied_metadata_command_bucket_write_reservations(
+                                &command,
+                            )
+                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id,
+                                command.bucket_name(),
+                                &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
+                            self.after_object_metadata_command_applied(&command);
+                            return Ok(());
+                        }
+                        Some(false) => {
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "retryable partial object metadata command conflict",
+                            ));
+                        }
+                        None => {}
+                    }
                     if applied_nodes == 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
@@ -4786,19 +4854,6 @@ impl super::StorageCluster {
                             ));
                         };
                         command = reissued;
-                        continue;
-                    }
-                    if super::StorageCluster::metadata_command_log_conflict_matches(
-                        &command, &source,
-                    ) && self
-                        .partial_exact_metadata_command_conflict_is_retryable(
-                            pg_id,
-                            &command,
-                            applied_nodes,
-                            &source,
-                        )
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
-                    {
                         continue;
                     }
                     if applied_nodes == 0
@@ -6272,8 +6327,12 @@ impl super::StorageCluster {
                         );
                         return Ok(true);
                     }
-                    super::PendingMetadataCommandOutcome::Abandoned
-                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
+                    super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                        return Err(super::conflicting_pending_object_metadata_command(
+                            "retryable partial pending payload reclaim command",
+                        ));
+                    }
+                    super::PendingMetadataCommandOutcome::Abandoned => continue,
                 }
             }
             self.emit_pending_slot_action_for_command(pg_id, &command, "reclaim_defer");
@@ -6414,10 +6473,12 @@ impl super::StorageCluster {
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )? {
                             super::PendingMetadataCommandOutcome::Applied => return Ok(true),
-                            super::PendingMetadataCommandOutcome::Abandoned
-                            | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                                continue;
+                            super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                return Err(super::conflicting_pending_object_metadata_command(
+                                    "retryable partial pending payload reclaim command",
+                                ));
                             }
+                            super::PendingMetadataCommandOutcome::Abandoned => continue,
                         }
                     }
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
@@ -7712,18 +7773,24 @@ impl super::StorageCluster {
                         super::PendingMetadataCommandOutcome::Applied => {
                             return Ok(completion_order);
                         }
-                        super::PendingMetadataCommandOutcome::Abandoned
-                        | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                            continue;
+                        super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "retryable partial pending completed multipart order command",
+                            ));
                         }
+                        super::PendingMetadataCommandOutcome::Abandoned => continue,
                     }
                 }
                 match self
                     .finish_pending_command_for_completed_multipart_order(pg_id, bucket, &command)?
                 {
                     super::PendingMetadataCommandOutcome::Applied => continue,
-                    super::PendingMetadataCommandOutcome::Abandoned
-                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
+                    super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                        return Err(super::conflicting_pending_object_metadata_command(
+                            "retryable partial pending completed multipart dependency command",
+                        ));
+                    }
+                    super::PendingMetadataCommandOutcome::Abandoned => continue,
                 }
             }
 
@@ -7790,19 +7857,39 @@ impl super::StorageCluster {
                     return Ok(());
                 }
                 Err(error)
-                    if super::StorageCluster::metadata_command_log_conflict_matches(
-                        &command,
-                        &error.source,
-                    ) && self
-                        .partial_exact_metadata_command_conflict_is_retryable(
+                    if matches!(
+                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
                             pg_id,
                             &command,
                             error.applied_nodes,
                             &error.source,
                         )
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)? =>
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
+                        Some(true)
+                    ) =>
                 {
-                    continue;
+                    self.release_metadata_command_bucket_write_reservation(&command)
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                    self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                        .map_err(ObjectPgActionError::from)?;
+                    self.after_object_metadata_command_applied(&command);
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                            pg_id,
+                            &command,
+                            error.applied_nodes,
+                            &error.source,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
+                        Some(false)
+                    ) =>
+                {
+                    return Err(super::conflicting_pending_object_metadata_command(
+                        "retryable partial multipart completion command conflict",
+                    ));
                 }
                 Err(error)
                     if error.applied_nodes == 0

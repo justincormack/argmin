@@ -37842,6 +37842,14 @@ mod tests {
             },
         ));
 
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+            ),
+            "partial exact mark deleting conflict should ask the caller to retry, got {err:?}"
+        );
         cluster.begin_bucket_delete(&bucket).unwrap();
 
         assert!(

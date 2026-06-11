@@ -1114,6 +1114,27 @@ impl StorageCluster {
         Ok(expected_hashes.is_some())
     }
 
+    fn retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        applied_nodes: usize,
+        source: &BucketSnapshotLoadError,
+    ) -> Result<Option<bool>, BucketSnapshotLoadError> {
+        if !Self::metadata_command_log_conflict_matches(command, source)
+            || !self.partial_exact_metadata_command_conflict_is_retryable(
+                pg_id,
+                command,
+                applied_nodes,
+                source,
+            )?
+        {
+            return Ok(None);
+        }
+        self.metadata_command_is_applied_on_all_acting_nodes(pg_id, command)
+            .map(Some)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn matching_reissued_pending_command_if_safe(
         &self,
@@ -2636,10 +2657,12 @@ impl StorageCluster {
                             ExactPendingObjectMetadataCommand::for_checked_request(&command);
                         match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(generation_id),
-                            PendingMetadataCommandOutcome::Abandoned
-                            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                                continue;
+                            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable partial pending generation reservation command",
+                                ));
                             }
+                            PendingMetadataCommandOutcome::Abandoned => continue,
                         }
                     }
                     _ => {}
@@ -2717,17 +2740,45 @@ impl StorageCluster {
                         }
                     }
                     Err(error)
-                        if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                            && self
-                                .partial_exact_metadata_command_conflict_is_retryable(
-                                    pg_id,
-                                    &command,
-                                    error.applied_nodes,
-                                    &error.source,
-                                )
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(true)
+                        ) =>
                     {
-                        continue;
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
+                        match command.payload() {
+                            MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
+                                return Ok(reservation.generation_id);
+                            }
+                            _ => {
+                                unreachable!(
+                                    "reserve object generation pending command kind changed"
+                                )
+                            }
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(false)
+                        ) =>
+                    {
+                        return Err(conflicting_pending_object_metadata_command(
+                            "retryable partial reserve object generation command conflict",
+                        ));
                     }
                     Err(error)
                         if error.applied_nodes == 0
@@ -2855,9 +2906,13 @@ impl StorageCluster {
                         PendingMetadataCommandOutcome::Applied if matches_request => {
                             return Ok(reserved_version_id);
                         }
+                        PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                            return Err(conflicting_pending_object_metadata_command(
+                                "retryable partial pending version reservation command",
+                            ));
+                        }
                         PendingMetadataCommandOutcome::Applied
-                        | PendingMetadataCommandOutcome::Abandoned
-                        | PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
+                        | PendingMetadataCommandOutcome::Abandoned => continue,
                     }
                 }
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
@@ -2948,15 +3003,17 @@ impl StorageCluster {
         pg_id: PgId,
         command: ExactPendingObjectMetadataCommand<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        loop {
-            match self.finish_exact_pending_object_metadata_command(pg_id, command)? {
-                PendingMetadataCommandOutcome::Applied => return Ok(()),
-                PendingMetadataCommandOutcome::RetryPartialExactConflict => continue,
-                PendingMetadataCommandOutcome::Abandoned => {
-                    return Err(conflicting_pending_object_metadata_command(
-                        "abandoned pending object metadata command",
-                    ));
-                }
+        match self.finish_exact_pending_object_metadata_command(pg_id, command)? {
+            PendingMetadataCommandOutcome::Applied => Ok(()),
+            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                Err(conflicting_pending_object_metadata_command(
+                    "retryable partial pending object metadata command",
+                ))
+            }
+            PendingMetadataCommandOutcome::Abandoned => {
+                Err(conflicting_pending_object_metadata_command(
+                    "abandoned pending object metadata command",
+                ))
             }
         }
     }
@@ -3282,10 +3339,12 @@ impl StorageCluster {
                             ExactPendingObjectMetadataCommand::for_checked_request(&command);
                         match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
-                            PendingMetadataCommandOutcome::Abandoned
-                            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                                continue;
+                            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable partial pending generation release command",
+                                ));
                             }
+                            PendingMetadataCommandOutcome::Abandoned => continue,
                         }
                     }
                     _ => {
@@ -3331,17 +3390,36 @@ impl StorageCluster {
                         return Ok(());
                     }
                     Err(error)
-                        if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                            && self
-                                .partial_exact_metadata_command_conflict_is_retryable(
-                                    pg_id,
-                                    &command,
-                                    error.applied_nodes,
-                                    &error.source,
-                                )
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(true)
+                        ) =>
                     {
-                        continue;
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
+                        return Ok(());
+                    }
+                    Err(error)
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(false)
+                        ) =>
+                    {
+                        return Err(conflicting_pending_object_metadata_command(
+                            "retryable partial release object generation command conflict",
+                        ));
                     }
                     Err(error)
                         if error.applied_nodes == 0
@@ -3551,17 +3629,40 @@ impl StorageCluster {
                     return Ok(StreamAppendCommandApplyOutcome::Applied);
                 }
                 Err(error)
-                    if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                        && self
-                            .partial_exact_metadata_command_conflict_is_retryable(
-                                pg_id,
-                                &command,
-                                error.applied_nodes,
-                                &error.source,
-                            )
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                    if matches!(
+                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                            pg_id,
+                            &command,
+                            error.applied_nodes,
+                            &error.source,
+                        )
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                        Some(true)
+                    ) =>
                 {
-                    continue;
+                    self.remove_pending_metadata_command_for_bucket(
+                        pg_id,
+                        command.bucket_name(),
+                        &command,
+                    )
+                    .map_err(ObjectPgActionError::from)?;
+                    return Ok(StreamAppendCommandApplyOutcome::Applied);
+                }
+                Err(error)
+                    if matches!(
+                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                            pg_id,
+                            &command,
+                            error.applied_nodes,
+                            &error.source,
+                        )
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                        Some(false)
+                    ) =>
+                {
+                    return Err(conflicting_pending_object_metadata_command(
+                        "retryable partial stream append command conflict",
+                    ));
                 }
                 Err(error)
                     if error.applied_nodes == 0
@@ -3708,10 +3809,12 @@ impl StorageCluster {
                             ExactPendingObjectMetadataCommand::for_checked_request(&command);
                         match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
-                            PendingMetadataCommandOutcome::Abandoned
-                            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                                continue;
+                            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable partial pending generation release command",
+                                ));
                             }
+                            PendingMetadataCommandOutcome::Abandoned => continue,
                         }
                     }
                     _ => {
@@ -3746,17 +3849,36 @@ impl StorageCluster {
                         return Ok(());
                     }
                     Err(error)
-                        if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                            && self
-                                .partial_exact_metadata_command_conflict_is_retryable(
-                                    pg_id,
-                                    &command,
-                                    error.applied_nodes,
-                                    &error.source,
-                                )
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(true)
+                        ) =>
                     {
-                        continue;
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
+                        return Ok(());
+                    }
+                    Err(error)
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(false)
+                        ) =>
+                    {
+                        return Err(conflicting_pending_object_metadata_command(
+                            "retryable partial release object generation command conflict",
+                        ));
                     }
                     Err(error)
                         if error.applied_nodes == 0
@@ -4175,17 +4297,34 @@ impl StorageCluster {
                 match self.apply_metadata_command_to_acting_set(&command) {
                     Ok(()) => break,
                     Err(error)
-                        if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                            && self
-                                .partial_exact_metadata_command_conflict_is_retryable(
-                                    pg_id,
-                                    &command,
-                                    error.applied_nodes,
-                                    &error.source,
-                                )
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(true)
+                        ) =>
                     {
-                        continue;
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
+                                pg_id,
+                                &command,
+                                error.applied_nodes,
+                                &error.source,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                            Some(false)
+                        ) =>
+                    {
+                        return Err(conflicting_pending_object_metadata_command(
+                            "retryable partial direct PUT command conflict",
+                        ));
                     }
                     Err(error)
                         if error.applied_nodes == 0
