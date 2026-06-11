@@ -5,12 +5,33 @@ use aws_sdk_s3::types::{
     OwnershipControls, OwnershipControlsRule, Permission, Type, VersioningConfiguration,
 };
 use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, unique_bucket, CTX};
+use std::future::Future;
 use tokio::time::{sleep, Duration};
 
 const VERSIONING_ACL_SETUP_ATTEMPTS: usize = 20;
 
 fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+async fn retrying_operation_aborted<T, E, F, Fut>(description: &str, mut op: F) -> T
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    for attempt in 0..VERSIONING_ACL_SETUP_ATTEMPTS {
+        match op().await {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err) && attempt + 1 < VERSIONING_ACL_SETUP_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("{description}: {err:?}"),
+        }
+    }
+    panic!("{description} did not complete");
 }
 
 fn assert_canonical_owner_id(id: &str) {
@@ -31,26 +52,17 @@ async fn put_bucket_ownership_controls_retrying_operation_aborted(
     bucket: &str,
     controls: OwnershipControls,
 ) {
-    for attempt in 0..VERSIONING_ACL_SETUP_ATTEMPTS {
-        match client
-            .put_bucket_ownership_controls()
-            .bucket(bucket)
-            .ownership_controls(controls.clone())
-            .send()
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err) && attempt + 1 < VERSIONING_ACL_SETUP_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => {
-                panic!("put bucket ownership controls during versioning ACL setup: {err:?}")
-            }
-        }
-    }
-    panic!("put bucket ownership controls during versioning ACL setup did not complete");
+    retrying_operation_aborted(
+        "put bucket ownership controls during versioning ACL setup",
+        || {
+            client
+                .put_bucket_ownership_controls()
+                .bucket(bucket)
+                .ownership_controls(controls.clone())
+                .send()
+        },
+    )
+    .await;
 }
 
 async fn put_bucket_versioning_retrying_operation_aborted(
@@ -58,8 +70,8 @@ async fn put_bucket_versioning_retrying_operation_aborted(
     bucket: &str,
     status: BucketVersioningStatus,
 ) {
-    for attempt in 0..VERSIONING_ACL_SETUP_ATTEMPTS {
-        match client
+    retrying_operation_aborted("put bucket versioning during versioning ACL setup", || {
+        client
             .put_bucket_versioning()
             .bucket(bucket)
             .versioning_configuration(
@@ -68,18 +80,8 @@ async fn put_bucket_versioning_retrying_operation_aborted(
                     .build(),
             )
             .send()
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err) && attempt + 1 < VERSIONING_ACL_SETUP_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("put bucket versioning during versioning ACL setup: {err:?}"),
-        }
-    }
-    panic!("put bucket versioning during versioning ACL setup did not complete");
+    })
+    .await;
 }
 
 async fn setup_versioned_acl_bucket() -> String {
@@ -151,14 +153,16 @@ async fn create_multiple_versions(
     let mut contents = Vec::new();
     for i in 0..num {
         let body = format!("content-{}", i);
-        let resp = client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(body.clone().into_bytes()))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            retrying_operation_aborted("put object during versioned object ACL setup", || {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body.clone().into_bytes()))
+                    .send()
+            })
+            .await;
         version_ids.push(resp.version_id().unwrap().to_string());
         contents.push(body);
     }
@@ -193,21 +197,22 @@ fn test_versioned_object_acl() {
         let alt_owner_id = canonical_owner_id(alt_client).await;
         assert_canonical_owner_id(&alt_owner_id);
 
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&target_version_id)
-            .access_control_policy(access_control_policy(
-                &owner_id,
-                vec![
-                    canonical_user_grant(&owner_id, Permission::FullControl),
-                    canonical_user_grant(&alt_owner_id, Permission::Read),
-                ],
-            ))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put object ACL on versioned target", || {
+            client
+                .put_object_acl()
+                .bucket(&bucket)
+                .key(key)
+                .version_id(&target_version_id)
+                .access_control_policy(access_control_policy(
+                    &owner_id,
+                    vec![
+                        canonical_user_grant(&owner_id, Permission::FullControl),
+                        canonical_user_grant(&alt_owner_id, Permission::Read),
+                    ],
+                ))
+                .send()
+        })
+        .await;
 
         let target = alt_client
             .get_object()
@@ -279,20 +284,21 @@ fn test_versioned_object_acl_no_version_specified() {
             .to_string();
         let alt_owner_id = canonical_owner_id(alt_client).await;
 
-        client
-            .put_object_acl()
-            .bucket(&bucket)
-            .key(key)
-            .access_control_policy(access_control_policy(
-                &owner_id,
-                vec![
-                    canonical_user_grant(&owner_id, Permission::FullControl),
-                    canonical_user_grant(&alt_owner_id, Permission::Read),
-                ],
-            ))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put current object ACL on versioned object", || {
+            client
+                .put_object_acl()
+                .bucket(&bucket)
+                .key(key)
+                .access_control_policy(access_control_policy(
+                    &owner_id,
+                    vec![
+                        canonical_user_grant(&owner_id, Permission::FullControl),
+                        canonical_user_grant(&alt_owner_id, Permission::Read),
+                    ],
+                ))
+                .send()
+        })
+        .await;
 
         let current = alt_client
             .get_object()
