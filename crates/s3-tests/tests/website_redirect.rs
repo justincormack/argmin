@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, MetadataDirective,
@@ -7,9 +8,152 @@ use s3_tests::{
     assert_s3_err_code, object_url, post_object_raw_to_test_endpoint_with_headers,
     sigv4_post_fields_for_credentials, unique_bucket, CTX,
 };
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 const WEBSITE_REDIRECT_HEADER_NAME: &str = "x-amz-website-redirect-location";
+const WEBSITE_REDIRECT_OPERATION_ATTEMPTS: usize = 20;
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+type RetrySendFuture<T, E> =
+    Pin<Box<dyn Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>>>;
+
+trait SendRetryingOperationAborted: Clone {
+    type Output;
+    type Error: ProvideErrorMetadata;
+
+    fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error>;
+
+    async fn send_retrying_operation_aborted(
+        self,
+        description: &str,
+    ) -> Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>> {
+        for attempt in 0..WEBSITE_REDIRECT_OPERATION_ATTEMPTS {
+            match self.clone().send_once().await {
+                Ok(output) => return Ok(output),
+                Err(err)
+                    if is_operation_aborted(&err)
+                        && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("{description} retry loop must return on final attempt");
+    }
+}
+
+macro_rules! impl_send_retrying_operation_aborted {
+    ($builder:path, $output:path, $error:path) => {
+        impl SendRetryingOperationAborted for $builder {
+            type Output = $output;
+            type Error = $error;
+
+            fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
+                Box::pin(async move { self.send().await })
+            }
+        }
+    };
+}
+
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
+    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
+    aws_sdk_s3::operation::copy_object::CopyObjectOutput,
+    aws_sdk_s3::operation::copy_object::CopyObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
+    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket::builders::DeleteBucketFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket::DeleteBucketOutput,
+    aws_sdk_s3::operation::delete_bucket::DeleteBucketError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
+    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
+    aws_sdk_s3::operation::delete_object::DeleteObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_versioning::builders::PutBucketVersioningFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningOutput,
+    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningError
+);
+
+async fn put_object_retrying_operation_aborted(
+    bucket: &str,
+    key: &str,
+    redirect: Option<&str>,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    for attempt in 0..WEBSITE_REDIRECT_OPERATION_ATTEMPTS {
+        let mut put = CTX
+            .client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()));
+        if let Some(redirect) = redirect {
+            put = put.website_redirect_location(redirect);
+        }
+        match put.send().await {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put object during website redirect test: {err:?}"),
+        }
+    }
+    unreachable!("put object retry loop must return on final attempt");
+}
+
+async fn upload_part_retrying_operation_aborted(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
+    for attempt in 0..WEBSITE_REDIRECT_OPERATION_ATTEMPTS {
+        match CTX
+            .client()
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("upload part during website redirect test: {err:?}"),
+        }
+    }
+    unreachable!("upload part retry loop must return on final attempt");
+}
 
 async fn setup_bucket() -> String {
     let bucket = unique_bucket();
@@ -29,14 +173,19 @@ async fn setup_versioned_bucket() -> String {
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("put bucket versioning during website redirect setup")
         .await
         .unwrap();
     bucket
 }
 
 async fn cleanup_bucket(bucket: &str) {
-    let _ = CTX.client().delete_bucket().bucket(bucket).send().await;
+    let _ = CTX
+        .client()
+        .delete_bucket()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("delete bucket during website redirect cleanup")
+        .await;
 }
 
 async fn cleanup_object_and_bucket(bucket: &str, key: &str) {
@@ -45,7 +194,7 @@ async fn cleanup_object_and_bucket(bucket: &str, key: &str) {
         .delete_object()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("delete object during website redirect cleanup")
         .await;
     cleanup_bucket(bucket).await;
 }
@@ -64,20 +213,14 @@ async fn complete_single_part_multipart_upload_with_redirect(
     if let Some(redirect) = redirect {
         create = create.website_redirect_location(redirect);
     }
-    let upload = create.send().await.unwrap();
-    let upload_id = upload.upload_id().unwrap().to_string();
-
-    let part = CTX
-        .client()
-        .upload_part()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(&upload_id)
-        .part_number(1)
-        .body(ByteStream::from(body.to_vec()))
-        .send()
+    let upload = create
+        .send_retrying_operation_aborted("create multipart upload during website redirect setup")
         .await
         .unwrap();
+    let upload_id = upload.upload_id().unwrap().to_string();
+
+    let part =
+        upload_part_retrying_operation_aborted(bucket, key, &upload_id, 1, body.to_vec()).await;
 
     CTX.client()
         .complete_multipart_upload()
@@ -94,7 +237,7 @@ async fn complete_single_part_multipart_upload_with_redirect(
                 )
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete multipart upload during website redirect setup")
         .await
         .unwrap();
 }
@@ -158,15 +301,13 @@ fn test_put_object_website_redirect_round_trips_on_head_and_get() {
         let key = "put-redirect";
         let redirect = "/docs/landing.html";
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .website_redirect_location(redirect)
-            .body(ByteStream::from_static(b"redirect-body"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            &bucket,
+            key,
+            Some(redirect),
+            b"redirect-body".to_vec(),
+        )
+        .await;
 
         let head = CTX
             .client()
@@ -368,15 +509,13 @@ fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
         let dst_key = "copy-dst";
         let redirect = "/docs/source.html";
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .website_redirect_location(redirect)
-            .body(ByteStream::from_static(b"copy-body"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            &bucket,
+            src_key,
+            Some(redirect),
+            b"copy-body".to_vec(),
+        )
+        .await;
 
         CTX.client()
             .copy_object()
@@ -384,7 +523,7 @@ fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
             .key(dst_key)
             .copy_source(format!("{bucket}/{src_key}"))
             .metadata_directive(MetadataDirective::Copy)
-            .send()
+            .send_retrying_operation_aborted("copy object during website redirect test")
             .await
             .unwrap();
 
@@ -413,7 +552,7 @@ fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
             .delete_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("delete copied object during website redirect cleanup")
             .await;
         cleanup_object_and_bucket(&bucket, src_key).await;
     });
@@ -426,14 +565,13 @@ fn test_copy_object_explicit_redirect_persists_on_destination() {
         let src_key = "copy-src-explicit";
         let dst_key = "copy-dst-explicit";
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"copy-explicit-body"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            &bucket,
+            src_key,
+            None,
+            b"copy-explicit-body".to_vec(),
+        )
+        .await;
 
         CTX.client()
             .copy_object()
@@ -441,7 +579,7 @@ fn test_copy_object_explicit_redirect_persists_on_destination() {
             .key(dst_key)
             .copy_source(format!("{bucket}/{src_key}"))
             .website_redirect_location("/docs/destination.html")
-            .send()
+            .send_retrying_operation_aborted("copy object during website redirect test")
             .await
             .unwrap();
 
@@ -463,7 +601,7 @@ fn test_copy_object_explicit_redirect_persists_on_destination() {
             .delete_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("delete copied object during website redirect cleanup")
             .await;
         cleanup_object_and_bucket(&bucket, src_key).await;
     });
@@ -475,14 +613,7 @@ fn test_copy_object_same_key_redirect_only_change_is_allowed() {
         let bucket = setup_bucket().await;
         let key = "copy-same-key-redirect";
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"same-key-body"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(&bucket, key, None, b"same-key-body".to_vec()).await;
 
         CTX.client()
             .copy_object()
@@ -490,7 +621,7 @@ fn test_copy_object_same_key_redirect_only_change_is_allowed() {
             .key(key)
             .copy_source(format!("{bucket}/{key}"))
             .website_redirect_location("/docs/changed-by-copy.html")
-            .send()
+            .send_retrying_operation_aborted("copy object during website redirect test")
             .await
             .unwrap();
 
@@ -518,15 +649,13 @@ fn test_copy_object_same_key_with_explicit_same_redirect_is_allowed() {
         let key = "copy-same-key-no-change";
         let redirect = "/docs/original.html";
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .website_redirect_location(redirect)
-            .body(ByteStream::from_static(b"same-key-no-change-body"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            &bucket,
+            key,
+            Some(redirect),
+            b"same-key-no-change-body".to_vec(),
+        )
+        .await;
 
         // AWS accepts the request when the redirect header is explicitly
         // present, even if the value matches the stored redirect exactly.
@@ -536,7 +665,7 @@ fn test_copy_object_same_key_with_explicit_same_redirect_is_allowed() {
             .key(key)
             .copy_source(format!("{bucket}/{key}"))
             .website_redirect_location(redirect)
-            .send()
+            .send_retrying_operation_aborted("copy object during website redirect test")
             .await
             .unwrap();
 
@@ -761,28 +890,22 @@ fn test_versioned_objects_surface_redirect_metadata_per_version() {
         let bucket = setup_versioned_bucket().await;
         let key = "versioned-redirect";
 
-        let put_v1 = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .website_redirect_location("/docs/v1.html")
-            .body(ByteStream::from_static(b"version-one"))
-            .send()
-            .await
-            .unwrap();
+        let put_v1 = put_object_retrying_operation_aborted(
+            &bucket,
+            key,
+            Some("/docs/v1.html"),
+            b"version-one".to_vec(),
+        )
+        .await;
         let v1 = put_v1.version_id().unwrap().to_string();
 
-        let put_v2 = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .website_redirect_location("/docs/v2.html")
-            .body(ByteStream::from_static(b"version-two"))
-            .send()
-            .await
-            .unwrap();
+        let put_v2 = put_object_retrying_operation_aborted(
+            &bucket,
+            key,
+            Some("/docs/v2.html"),
+            b"version-two".to_vec(),
+        )
+        .await;
         let v2 = put_v2.version_id().unwrap().to_string();
 
         let current_head = CTX
