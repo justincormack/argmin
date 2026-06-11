@@ -106,9 +106,21 @@ static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_SESSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_RECOVERY_LEADER_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_RECOVERY_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_RECOVERY_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_RECOVERY_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_RECOVERY_OUTCOME_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
     OnceLock::new();
 static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
+    Mutex<Vec<MetadataCommandDimensionCounter>>,
+> = OnceLock::new();
+static METADATA_COMMAND_RECOVERY_ADMISSION_DIMENSIONS: OnceLock<
+    Mutex<Vec<MetadataCommandDimensionCounter>>,
+> = OnceLock::new();
+static METADATA_COMMAND_RECOVERY_OUTCOME_DIMENSIONS: OnceLock<
     Mutex<Vec<MetadataCommandDimensionCounter>>,
 > = OnceLock::new();
 static STREAM_UPLOAD_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
@@ -261,6 +273,26 @@ fn metadata_command_pending_slot_action_dimensions(
     METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn metadata_command_recovery_admission_dimensions(
+) -> &'static Mutex<Vec<MetadataCommandDimensionCounter>> {
+    METADATA_COMMAND_RECOVERY_ADMISSION_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn metadata_command_recovery_outcome_dimensions(
+) -> &'static Mutex<Vec<MetadataCommandDimensionCounter>> {
+    METADATA_COMMAND_RECOVERY_OUTCOME_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn fetch_max_atomic(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn increment_metadata_command_dimension(
     counters: &Mutex<Vec<MetadataCommandDimensionCounter>>,
     pg_id: u32,
@@ -311,6 +343,18 @@ pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDime
 pub fn metadata_command_pending_slot_action_dimension_snapshot(
 ) -> Vec<MetadataCommandDimensionSample> {
     metadata_command_dimension_snapshot(metadata_command_pending_slot_action_dimensions())
+}
+
+#[must_use]
+pub fn metadata_command_recovery_admission_dimension_snapshot(
+) -> Vec<MetadataCommandDimensionSample> {
+    metadata_command_dimension_snapshot(metadata_command_recovery_admission_dimensions())
+}
+
+#[must_use]
+pub fn metadata_command_recovery_outcome_dimension_snapshot() -> Vec<MetadataCommandDimensionSample>
+{
+    metadata_command_dimension_snapshot(metadata_command_recovery_outcome_dimensions())
 }
 
 fn truncate_detail(mut detail: String) -> String {
@@ -710,6 +754,27 @@ pub struct MetadataCommandSessionWaitSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandRecoveryAdmissionSummary {
+    pub node_id: Option<u32>,
+    pub pg_id: u32,
+    pub cluster_epoch: u64,
+    pub log_index: Option<u64>,
+    pub admission: &'static str,
+    pub command_kind: Option<&'static str>,
+    pub wait_us: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandRecoveryOutcomeSummary {
+    pub node_id: Option<u32>,
+    pub pg_id: u32,
+    pub cluster_epoch: u64,
+    pub log_index: Option<u64>,
+    pub outcome: &'static str,
+    pub command_kind: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageRpcErrorSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
@@ -750,6 +815,12 @@ pub struct MetricsSnapshot {
     pub metadata_command_conflict_total: u64,
     pub metadata_command_pending_slot_action_total: u64,
     pub metadata_command_session_wait_total: u64,
+    pub metadata_command_recovery_leader_total: u64,
+    pub metadata_command_recovery_wait_total: u64,
+    pub metadata_command_recovery_wait_us_total: u64,
+    pub metadata_command_recovery_wait_us_max: u64,
+    pub metadata_command_recovery_timeout_total: u64,
+    pub metadata_command_recovery_outcome_total: u64,
     pub stream_upload_active_sessions: u64,
     pub stream_upload_session_created_total: u64,
     pub stream_upload_session_aborted_total: u64,
@@ -830,6 +901,18 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         metadata_command_pending_slot_action_total: METADATA_COMMAND_PENDING_SLOT_ACTION_TOTAL
             .load(Ordering::Relaxed),
         metadata_command_session_wait_total: METADATA_COMMAND_SESSION_WAIT_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_recovery_leader_total: METADATA_COMMAND_RECOVERY_LEADER_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_recovery_wait_total: METADATA_COMMAND_RECOVERY_WAIT_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_recovery_wait_us_total: METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_recovery_wait_us_max: METADATA_COMMAND_RECOVERY_WAIT_US_MAX
+            .load(Ordering::Relaxed),
+        metadata_command_recovery_timeout_total: METADATA_COMMAND_RECOVERY_TIMEOUT_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_recovery_outcome_total: METADATA_COMMAND_RECOVERY_OUTCOME_TOTAL
             .load(Ordering::Relaxed),
         stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
@@ -1375,6 +1458,124 @@ pub fn emit_metadata_command_session_wait(
         Some(format_args!(
             "node_id={} pg_id={} wait_us={}",
             summary.node_id, summary.pg_id, summary.wait_us
+        )),
+    )
+}
+
+pub fn emit_metadata_command_recovery_admission(
+    target: &'static str,
+    summary: MetadataCommandRecoveryAdmissionSummary,
+) -> bool {
+    match summary.admission {
+        "leader" => {
+            METADATA_COMMAND_RECOVERY_LEADER_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "waited" => {
+            METADATA_COMMAND_RECOVERY_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let wait_us = saturating_u128_to_u64(summary.wait_us);
+            METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL.fetch_add(wait_us, Ordering::Relaxed);
+            fetch_max_atomic(&METADATA_COMMAND_RECOVERY_WAIT_US_MAX, wait_us);
+        }
+        "timed_out" => {
+            METADATA_COMMAND_RECOVERY_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            METADATA_COMMAND_RECOVERY_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let wait_us = saturating_u128_to_u64(summary.wait_us);
+            METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL.fetch_add(wait_us, Ordering::Relaxed);
+            fetch_max_atomic(&METADATA_COMMAND_RECOVERY_WAIT_US_MAX, wait_us);
+        }
+        _ => {}
+    }
+    increment_metadata_command_dimension(
+        metadata_command_recovery_admission_dimensions(),
+        summary.pg_id,
+        summary.admission,
+        summary.command_kind.unwrap_or("unknown"),
+    );
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let node_id = summary
+        .node_id
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let log_index = summary
+        .log_index
+        .map(|log_index| log_index.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_kind = summary.command_kind.unwrap_or("unknown");
+    let detail = format!(
+        "node_id={} pg_id={} cluster_epoch={} log_index={} admission={} command_kind={} wait_us={}",
+        node_id,
+        summary.pg_id,
+        summary.cluster_epoch,
+        log_index,
+        summary.admission,
+        command_kind,
+        summary.wait_us
+    );
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_recovery_admission",
+        detail,
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_recovery_admission",
+        Some(format_args!(
+            "node_id={} pg_id={} cluster_epoch={} log_index={} admission={} command_kind={} wait_us={}",
+            node_id,
+            summary.pg_id,
+            summary.cluster_epoch,
+            log_index,
+            summary.admission,
+            command_kind,
+            summary.wait_us
+        )),
+    )
+}
+
+pub fn emit_metadata_command_recovery_outcome(
+    target: &'static str,
+    summary: MetadataCommandRecoveryOutcomeSummary,
+) -> bool {
+    METADATA_COMMAND_RECOVERY_OUTCOME_TOTAL.fetch_add(1, Ordering::Relaxed);
+    increment_metadata_command_dimension(
+        metadata_command_recovery_outcome_dimensions(),
+        summary.pg_id,
+        summary.outcome,
+        summary.command_kind.unwrap_or("unknown"),
+    );
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let node_id = summary
+        .node_id
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let log_index = summary
+        .log_index
+        .map(|log_index| log_index.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_kind = summary.command_kind.unwrap_or("unknown");
+    let detail = format!(
+        "node_id={} pg_id={} cluster_epoch={} log_index={} outcome={} command_kind={}",
+        node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.outcome, command_kind
+    );
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_recovery_outcome",
+        detail,
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_recovery_outcome",
+        Some(format_args!(
+            "node_id={} pg_id={} cluster_epoch={} log_index={} outcome={} command_kind={}",
+            node_id, summary.pg_id, summary.cluster_epoch, log_index, summary.outcome, command_kind
         )),
     )
 }
@@ -1965,6 +2166,53 @@ mod tests {
                 wait_us: 55,
             },
         );
+        emit_metadata_command_recovery_admission(
+            "storage",
+            MetadataCommandRecoveryAdmissionSummary {
+                node_id: Some(7),
+                pg_id: 11,
+                cluster_epoch: 1,
+                log_index: Some(15),
+                admission: "leader",
+                command_kind: Some("ReserveObjectVersion"),
+                wait_us: 0,
+            },
+        );
+        emit_metadata_command_recovery_admission(
+            "storage",
+            MetadataCommandRecoveryAdmissionSummary {
+                node_id: Some(7),
+                pg_id: 11,
+                cluster_epoch: 1,
+                log_index: Some(15),
+                admission: "waited",
+                command_kind: Some("ReserveObjectVersion"),
+                wait_us: 99,
+            },
+        );
+        emit_metadata_command_recovery_admission(
+            "storage",
+            MetadataCommandRecoveryAdmissionSummary {
+                node_id: Some(7),
+                pg_id: 11,
+                cluster_epoch: 1,
+                log_index: Some(15),
+                admission: "timed_out",
+                command_kind: Some("ReserveObjectVersion"),
+                wait_us: 101,
+            },
+        );
+        emit_metadata_command_recovery_outcome(
+            "storage",
+            MetadataCommandRecoveryOutcomeSummary {
+                node_id: Some(7),
+                pg_id: 11,
+                cluster_epoch: 1,
+                log_index: Some(15),
+                outcome: "retry_partial_exact_conflict",
+                command_kind: Some("ReserveObjectVersion"),
+            },
+        );
         emit_storage_rpc_error(
             "storage",
             StorageRpcErrorSummary {
@@ -2141,6 +2389,27 @@ mod tests {
         assert_eq!(
             after.metadata_command_session_wait_total,
             before.metadata_command_session_wait_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_recovery_leader_total,
+            before.metadata_command_recovery_leader_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_recovery_wait_total,
+            before.metadata_command_recovery_wait_total + 2
+        );
+        assert_eq!(
+            after.metadata_command_recovery_wait_us_total,
+            before.metadata_command_recovery_wait_us_total + 200
+        );
+        assert!(after.metadata_command_recovery_wait_us_max >= 101);
+        assert_eq!(
+            after.metadata_command_recovery_timeout_total,
+            before.metadata_command_recovery_timeout_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_recovery_outcome_total,
+            before.metadata_command_recovery_outcome_total + 1
         );
         assert_eq!(
             after.storage_rpc_error_total,
@@ -2428,6 +2697,29 @@ mod tests {
                 wait_us: 1234,
             },
         );
+        emit_metadata_command_recovery_admission(
+            "storage",
+            MetadataCommandRecoveryAdmissionSummary {
+                node_id: Some(7),
+                pg_id: 3,
+                cluster_epoch: 1,
+                log_index: Some(11),
+                admission: "waited",
+                command_kind: Some("ReserveObjectVersion"),
+                wait_us: 4321,
+            },
+        );
+        emit_metadata_command_recovery_outcome(
+            "storage",
+            MetadataCommandRecoveryOutcomeSummary {
+                node_id: Some(7),
+                pg_id: 3,
+                cluster_epoch: 1,
+                log_index: Some(11),
+                outcome: "applied",
+                command_kind: Some("ReserveObjectVersion"),
+            },
+        );
 
         let after = metrics_snapshot();
         assert_eq!(
@@ -2441,6 +2733,19 @@ mod tests {
         assert_eq!(
             after.metadata_command_session_wait_total,
             before.metadata_command_session_wait_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_recovery_wait_total,
+            before.metadata_command_recovery_wait_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_recovery_wait_us_total,
+            before.metadata_command_recovery_wait_us_total + 4321
+        );
+        assert!(after.metadata_command_recovery_wait_us_max >= 4321);
+        assert_eq!(
+            after.metadata_command_recovery_outcome_total,
+            before.metadata_command_recovery_outcome_total + 1
         );
 
         let records = flight_recorder_snapshot();
@@ -2485,6 +2790,39 @@ mod tests {
         assert!(wait.detail.contains("node_id=7"));
         assert!(wait.detail.contains("pg_id=3"));
         assert!(wait.detail.contains("wait_us=1234"));
+
+        let recovery_admission = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-metadata-command"
+                    && record.event == "metadata_command_recovery_admission"
+            })
+            .expect("metadata command recovery admission should be recorded");
+        assert!(recovery_admission.detail.contains("node_id=7"));
+        assert!(recovery_admission.detail.contains("pg_id=3"));
+        assert!(recovery_admission.detail.contains("log_index=11"));
+        assert!(recovery_admission.detail.contains("admission=waited"));
+        assert!(recovery_admission
+            .detail
+            .contains("command_kind=ReserveObjectVersion"));
+        assert!(recovery_admission.detail.contains("wait_us=4321"));
+
+        let recovery_outcome = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "request-metadata-command"
+                    && record.event == "metadata_command_recovery_outcome"
+            })
+            .expect("metadata command recovery outcome should be recorded");
+        assert!(recovery_outcome.detail.contains("node_id=7"));
+        assert!(recovery_outcome.detail.contains("pg_id=3"));
+        assert!(recovery_outcome.detail.contains("log_index=11"));
+        assert!(recovery_outcome.detail.contains("outcome=applied"));
+        assert!(recovery_outcome
+            .detail
+            .contains("command_kind=ReserveObjectVersion"));
     }
 
     #[test]

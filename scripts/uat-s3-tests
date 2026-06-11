@@ -354,6 +354,20 @@ latest_metric_sample_value() {
     awk -v metric="$metric_name" '$1 == metric { value = $2 } END { if (value != "") print value; else print "0" }' "$metrics_log"
 }
 
+latest_metric_family_top() {
+    local metrics_log="$1"
+    local metric_name="$2"
+    local limit="$3"
+    awk -v metric="$metric_name" '
+        index($1, metric "{") == 1 { values[$1] = $2 }
+        END {
+            for (sample in values) {
+                print values[sample], sample
+            }
+        }
+    ' "$metrics_log" | sort -nr | head -n "$limit"
+}
+
 print_slowdown_summary() {
     if ((slowdown_summary_printed)); then
         return 0
@@ -375,6 +389,12 @@ print_slowdown_summary() {
         local storage_rpc_admission_wait_us
         local storage_rpc_admission_timeout
         local storage_rpc_admission_wait_percent
+        local metadata_recovery_leader
+        local metadata_recovery_wait
+        local metadata_recovery_wait_us
+        local metadata_recovery_wait_us_max
+        local metadata_recovery_timeout
+        local metadata_recovery_outcome
         slow_down="$(latest_metric_sample_value "$metrics_log" slow_down_response_total)"
         admission_timeout="$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)"
         admission_wait="$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)"
@@ -386,12 +406,25 @@ print_slowdown_summary() {
         storage_rpc_admission_wait="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_total)"
         storage_rpc_admission_wait_us="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_us_total)"
         storage_rpc_admission_timeout="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_timeout_total)"
+        metadata_recovery_leader="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_leader_total)"
+        metadata_recovery_wait="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_wait_total)"
+        metadata_recovery_wait_us="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_wait_us_total)"
+        metadata_recovery_wait_us_max="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_wait_us_max)"
+        metadata_recovery_timeout="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_timeout_total)"
+        metadata_recovery_outcome="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_outcome_total)"
         if ((storage_rpc_admission_total > 0)); then
             storage_rpc_admission_wait_percent="$(awk -v waited="$storage_rpc_admission_wait" -v total="$storage_rpc_admission_total" 'BEGIN { printf "%.2f", (waited * 100.0) / total }')"
         else
             storage_rpc_admission_wait_percent="0.00"
         fi
         echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
+        echo "metadata_recovery leader_total=$metadata_recovery_leader wait_total=$metadata_recovery_wait wait_us_total=$metadata_recovery_wait_us wait_us_max=$metadata_recovery_wait_us_max timeout_total=$metadata_recovery_timeout outcome_total=$metadata_recovery_outcome" >&2
+        echo "metadata_recovery_top admission" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_recovery_admission_by_pg_command_total 10 >&2 || true
+        echo "metadata_recovery_top outcome" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_recovery_outcome_by_pg_command_total 10 >&2 || true
+        echo "metadata_pending_slot_top action" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_pending_slot_action_by_pg_command_total 10 >&2 || true
     else
         echo "metrics unavailable" >&2
     fi

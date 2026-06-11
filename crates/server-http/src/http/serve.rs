@@ -1086,6 +1086,12 @@ fn local_debug_metrics_body() -> String {
             "metadata_command_conflict_total {}\n",
             "metadata_command_pending_slot_action_total {}\n",
             "metadata_command_session_wait_total {}\n",
+            "metadata_command_recovery_leader_total {}\n",
+            "metadata_command_recovery_wait_total {}\n",
+            "metadata_command_recovery_wait_us_total {}\n",
+            "metadata_command_recovery_wait_us_max {}\n",
+            "metadata_command_recovery_timeout_total {}\n",
+            "metadata_command_recovery_outcome_total {}\n",
             "stream_upload_active_sessions {}\n",
             "stream_upload_session_created_total {}\n",
             "stream_upload_session_aborted_total {}\n",
@@ -1118,6 +1124,12 @@ fn local_debug_metrics_body() -> String {
         snapshot.metadata_command_conflict_total,
         snapshot.metadata_command_pending_slot_action_total,
         snapshot.metadata_command_session_wait_total,
+        snapshot.metadata_command_recovery_leader_total,
+        snapshot.metadata_command_recovery_wait_total,
+        snapshot.metadata_command_recovery_wait_us_total,
+        snapshot.metadata_command_recovery_wait_us_max,
+        snapshot.metadata_command_recovery_timeout_total,
+        snapshot.metadata_command_recovery_outcome_total,
         snapshot.stream_upload_active_sessions,
         snapshot.stream_upload_session_created_total,
         snapshot.stream_upload_session_aborted_total,
@@ -1140,6 +1152,20 @@ fn local_debug_metrics_body() -> String {
         let _ = writeln!(
             body,
             "metadata_command_pending_slot_action_by_pg_command_total{{pg_id=\"{}\",action=\"{}\",command_kind=\"{}\"}} {}",
+            sample.pg_id, sample.classifier, sample.command_kind, sample.count
+        );
+    }
+    for sample in observability::metadata_command_recovery_admission_dimension_snapshot() {
+        let _ = writeln!(
+            body,
+            "metadata_command_recovery_admission_by_pg_command_total{{pg_id=\"{}\",admission=\"{}\",command_kind=\"{}\"}} {}",
+            sample.pg_id, sample.classifier, sample.command_kind, sample.count
+        );
+    }
+    for sample in observability::metadata_command_recovery_outcome_dimension_snapshot() {
+        let _ = writeln!(
+            body,
+            "metadata_command_recovery_outcome_by_pg_command_total{{pg_id=\"{}\",outcome=\"{}\",command_kind=\"{}\"}} {}",
             sample.pg_id, sample.classifier, sample.command_kind, sample.count
         );
     }

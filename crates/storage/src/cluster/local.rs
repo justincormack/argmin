@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
@@ -819,8 +819,8 @@ struct MetadataCommandRecoveryFlight {
 #[derive(Debug)]
 pub(crate) enum MetadataCommandRecoveryAdmission {
     Leader(MetadataCommandRecoveryGuard),
-    Waited,
-    TimedOut,
+    Waited { wait_us: u128 },
+    TimedOut { wait_us: u128 },
 }
 
 #[derive(Debug)]
@@ -916,6 +916,7 @@ impl LocalClusterRuntimeState {
             });
         }
 
+        let wait_started = Instant::now();
         let (guard, wait_result) = flight
             .done
             .wait_timeout_while(
@@ -924,11 +925,12 @@ impl LocalClusterRuntimeState {
                 |in_progress| *in_progress,
             )
             .unwrap_or_else(|e| e.into_inner());
+        let wait_us = wait_started.elapsed().as_micros();
         if *guard {
             debug_assert!(wait_result.timed_out());
-            MetadataCommandRecoveryAdmission::TimedOut
+            MetadataCommandRecoveryAdmission::TimedOut { wait_us }
         } else {
-            MetadataCommandRecoveryAdmission::Waited
+            MetadataCommandRecoveryAdmission::Waited { wait_us }
         }
     }
 
@@ -3573,7 +3575,7 @@ mod tests {
             let admission = waiter_state.join_metadata_command_recovery(pg_id, &waiter_command);
             tx.send(matches!(
                 admission,
-                MetadataCommandRecoveryAdmission::Waited
+                MetadataCommandRecoveryAdmission::Waited { .. }
             ))
             .unwrap();
         });
@@ -3603,7 +3605,7 @@ mod tests {
 
         let timed_out = runtime_state.join_metadata_command_recovery(pg_id, &command);
         assert!(
-            matches!(timed_out, MetadataCommandRecoveryAdmission::TimedOut),
+            matches!(timed_out, MetadataCommandRecoveryAdmission::TimedOut { .. }),
             "waiter should return a bounded timeout while the leader remains active"
         );
     }

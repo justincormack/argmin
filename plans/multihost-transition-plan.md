@@ -6752,6 +6752,12 @@ Status:
   partial exact conflict now fail retryably without deleting segment shards or
   releasing the generation reservation, because the recovery leader may have
   reissued and applied a matching command that owns those side effects.
+- Added metadata-command recovery counters to the debug metrics and UAT summary:
+  leader/wait/timeout/outcome totals, total and max waiter time, top recovery
+  admission and outcome PG/command pairs, and top pending-slot actions. This
+  makes the next slow-host timeout distinguish between one legitimate recovery
+  leader with bounded waiters, repeated reissue storms, and waiters timing out
+  behind a stuck recovery leader.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

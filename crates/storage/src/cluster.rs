@@ -123,6 +123,16 @@ pub(super) enum PendingMetadataCommandOutcome {
     RetryPartialExactConflict,
 }
 
+impl PendingMetadataCommandOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Abandoned => "abandoned",
+            Self::RetryPartialExactConflict => "retry_partial_exact_conflict",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ExactPendingObjectMetadataCommand<'a> {
     command: &'a MetadataCommandEnvelope,
@@ -812,6 +822,50 @@ impl StorageCluster {
             Some(command.id().log_index().get()),
             action,
             Some(command.payload().kind_name()),
+        );
+    }
+
+    fn emit_metadata_command_recovery_admission_for_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        admission: &'static str,
+        wait_us: u128,
+    ) {
+        let _ = observability::emit_metadata_command_recovery_admission(
+            TRACE_TARGET,
+            observability::MetadataCommandRecoveryAdmissionSummary {
+                node_id: self
+                    .pending_slot_primary_node_id(pg_id)
+                    .map(|node_id| node_id.as_u32()),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch().get(),
+                log_index: Some(command.id().log_index().get()),
+                admission,
+                command_kind: Some(command.payload().kind_name()),
+                wait_us,
+            },
+        );
+    }
+
+    fn emit_metadata_command_recovery_outcome_for_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        outcome: &'static str,
+    ) {
+        let _ = observability::emit_metadata_command_recovery_outcome(
+            TRACE_TARGET,
+            observability::MetadataCommandRecoveryOutcomeSummary {
+                node_id: self
+                    .pending_slot_primary_node_id(pg_id)
+                    .map(|node_id| node_id.as_u32()),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch().get(),
+                log_index: Some(command.id().log_index().get()),
+                outcome,
+                command_kind: Some(command.payload().kind_name()),
+            },
         );
     }
 
@@ -2901,22 +2955,59 @@ impl StorageCluster {
                 .runtime_state()
                 .join_metadata_command_recovery(pg_id, command);
             let _recovery_guard = match recovery {
-                MetadataCommandRecoveryAdmission::Leader(guard) => guard,
-                MetadataCommandRecoveryAdmission::Waited => {
+                MetadataCommandRecoveryAdmission::Leader(guard) => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id, command, "leader", 0,
+                    );
+                    guard
+                }
+                MetadataCommandRecoveryAdmission::Waited { wait_us } => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id, command, "waited", wait_us,
+                    );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_wait");
                     match self.pending_command_recovery_waiter_outcome(pg_id, command)? {
-                        Some(outcome) => return Ok(outcome),
-                        None => continue,
+                        Some(outcome) => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id,
+                                command,
+                                outcome.metric_label(),
+                            );
+                            return Ok(outcome);
+                        }
+                        None => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id, command, "pending",
+                            );
+                            continue;
+                        }
                     }
                 }
-                MetadataCommandRecoveryAdmission::TimedOut => {
+                MetadataCommandRecoveryAdmission::TimedOut { wait_us } => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        command,
+                        "timed_out",
+                        wait_us,
+                    );
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id,
+                        command,
+                        "timed_out",
+                    );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_timeout");
                     return Err(conflicting_pending_object_metadata_command(
                         "pending command recovery timed out",
                     ));
                 }
             };
-            return self.finish_pending_metadata_command_recovery(pg_id, command);
+            let outcome = self.finish_pending_metadata_command_recovery(pg_id, command)?;
+            self.emit_metadata_command_recovery_outcome_for_command(
+                pg_id,
+                command,
+                outcome.metric_label(),
+            );
+            return Ok(outcome);
         }
     }
 
@@ -3979,12 +4070,30 @@ impl StorageCluster {
                 .runtime_state()
                 .join_metadata_command_recovery(pg_id, &command);
             let _recovery_guard = match recovery {
-                MetadataCommandRecoveryAdmission::Leader(guard) => guard,
-                MetadataCommandRecoveryAdmission::Waited => {
+                MetadataCommandRecoveryAdmission::Leader(guard) => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id, &command, "leader", 0,
+                    );
+                    guard
+                }
+                MetadataCommandRecoveryAdmission::Waited { wait_us } => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id, &command, "waited", wait_us,
+                    );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_wait");
                     match self.pending_command_recovery_waiter_outcome(pg_id, &command)? {
-                        Some(PendingMetadataCommandOutcome::Applied) => break command,
+                        Some(PendingMetadataCommandOutcome::Applied) => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id, &command, "applied",
+                            );
+                            break command;
+                        }
                         Some(PendingMetadataCommandOutcome::Abandoned) => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id,
+                                &command,
+                                "abandoned",
+                            );
                             if new_pending_command {
                                 self.release_object_generation_reservation_after_pending_drain_best_effort(
                                     pg_id,
@@ -4005,16 +4114,37 @@ impl StorageCluster {
                             ));
                         }
                         Some(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id,
+                                &command,
+                                "retry_partial_exact_conflict",
+                            );
                             // The recovery leader may have reissued and applied a matching
                             // command, so the owner cannot safely tear down payload state here.
                             return Err(conflicting_pending_object_metadata_command(
                                 "retryable partial pending command for direct put commit",
                             ));
                         }
-                        None => continue,
+                        None => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id, &command, "pending",
+                            );
+                            continue;
+                        }
                     }
                 }
-                MetadataCommandRecoveryAdmission::TimedOut => {
+                MetadataCommandRecoveryAdmission::TimedOut { wait_us } => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        &command,
+                        "timed_out",
+                        wait_us,
+                    );
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id,
+                        &command,
+                        "timed_out",
+                    );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_timeout");
                     return Err(conflicting_pending_object_metadata_command(
                         "pending direct PUT command recovery timed out",
@@ -4112,6 +4242,7 @@ impl StorageCluster {
                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
             self.remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name(), &command)
                 .map_err(ObjectPgActionError::from)?;
+            self.emit_metadata_command_recovery_outcome_for_command(pg_id, &command, "applied");
             break command;
         };
 
