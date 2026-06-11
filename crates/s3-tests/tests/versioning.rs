@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_with_md5, err_status,
-    send_signed_request, unique_bucket, CTX,
+    send_signed_request, unique_bucket, RawResponse, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -218,6 +218,26 @@ fn expected_raw_list_key(decoded_key: &str) -> String {
     format!("<Key>{escaped}</Key>")
 }
 
+fn raw_response_is_operation_aborted(response: &RawResponse) -> bool {
+    response.status == 409 && response.body.contains("<Code>OperationAborted</Code>")
+}
+
+fn send_raw_retrying_operation_aborted<F>(description: &str, mut send: F) -> RawResponse
+where
+    F: FnMut() -> RawResponse,
+{
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        let response = send();
+        if !raw_response_is_operation_aborted(&response) {
+            return response;
+        }
+        if attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+        }
+    }
+    panic!("{description} did not complete without OperationAborted");
+}
+
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
         id.len(),
@@ -262,10 +282,14 @@ fn test_bucket_versioning_raw_get_returns_canonical_xml() {
         let expected = server_http::http::xml::get_bucket_versioning_xml(parsed);
 
         let url = format!("{}/{}?versioning", CTX.endpoint(), bucket);
-        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        let put = send_raw_retrying_operation_aborted("put raw bucket versioning", || {
+            send_signed_request("PUT", &url, body, [content_md5_header(body)])
+        });
         assert_eq!(put.status, 200, "unexpected body: {}", put.body);
 
-        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+        let get = send_raw_retrying_operation_aborted("get raw bucket versioning", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>())
+        });
         delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
 
         assert_eq!(get.status, 200, "unexpected body: {}", get.body);
@@ -275,7 +299,9 @@ fn test_bucket_versioning_raw_get_returns_canonical_xml() {
 
 fn put_raw_object(bucket: &str, encoded_key: &str) {
     let url = format!("{}/{bucket}/{encoded_key}", CTX.endpoint());
-    let response = send_signed_request("PUT", &url, b"v1", std::iter::empty::<(&str, &str)>());
+    let response = send_raw_retrying_operation_aborted("put raw object", || {
+        send_signed_request("PUT", &url, b"v1", std::iter::empty::<(&str, &str)>())
+    });
     assert_eq!(response.status, 200, "unexpected body: {}", response.body);
 }
 
@@ -299,8 +325,9 @@ async fn cleanup_versioned_bucket_with_encoding(client: &aws_sdk_s3::Client, buc
                 "{}/{bucket}/{encoded_key}?versionId={encoded_version_id}",
                 CTX.endpoint()
             );
-            let response =
-                send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>());
+            let response = send_raw_retrying_operation_aborted("delete raw object version", || {
+                send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>())
+            });
             assert_eq!(response.status, 204, "unexpected body: {}", response.body);
             deleted_any = true;
         }
@@ -314,7 +341,9 @@ async fn cleanup_versioned_bucket_with_encoding(client: &aws_sdk_s3::Client, buc
                 CTX.endpoint()
             );
             let response =
-                send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>());
+                send_raw_retrying_operation_aborted("delete raw object delete marker", || {
+                    send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>())
+                });
             assert_eq!(response.status, 204, "unexpected body: {}", response.body);
             deleted_any = true;
         }
@@ -1308,7 +1337,9 @@ fn test_versioning_list_object_versions_raw_xml_echoes_oversized_max_keys_on_aws
         .await;
 
         let url = format!("{}/{bucket}?versions=&max-keys=5000", CTX.endpoint());
-        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        let response = send_raw_retrying_operation_aborted("get raw list object versions", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>())
+        });
 
         assert_eq!(response.status, 200, "unexpected body: {}", response.body);
         assert!(
@@ -1414,7 +1445,9 @@ fn test_versioning_list_object_versions_encoding_type_url() {
         assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
 
         let url = format!("{}/{bucket}?versions=&encoding-type=url", CTX.endpoint());
-        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        let response = send_raw_retrying_operation_aborted("get raw list object versions", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>())
+        });
         assert_eq!(response.status, 200, "unexpected body: {}", response.body);
         assert!(
             response.body.contains("<EncodingType>url</EncodingType>"),
@@ -1444,7 +1477,9 @@ fn test_versioning_list_object_versions_without_encoding_type_keeps_control_char
         }
 
         let url = format!("{}/{bucket}?versions=", CTX.endpoint());
-        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        let response = send_raw_retrying_operation_aborted("get raw list object versions", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>())
+        });
         assert_eq!(response.status, 200, "unexpected body: {}", response.body);
         assert!(
             !response.body.contains("<EncodingType>url</EncodingType>"),
@@ -1496,7 +1531,9 @@ fn test_versioning_list_object_versions_encoding_type_url_encodes_control_charac
         assert_eq!(keys, expected);
 
         let url = format!("{}/{bucket}?versions=&encoding-type=url", CTX.endpoint());
-        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        let response = send_raw_retrying_operation_aborted("get raw list object versions", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>())
+        });
         assert_eq!(response.status, 200, "unexpected body: {}", response.body);
         assert!(
             response.body.contains("<EncodingType>url</EncodingType>"),
@@ -1524,7 +1561,9 @@ fn test_versioning_list_object_versions_without_encoding_type_escapes_xml_specia
         put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
 
         let url = format!("{}/{bucket}?versions=", CTX.endpoint());
-        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        let response = send_raw_retrying_operation_aborted("get raw list object versions", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>())
+        });
         assert_eq!(response.status, 200, "unexpected body: {}", response.body);
         assert!(
             response
@@ -1547,7 +1586,9 @@ fn test_versioning_list_object_versions_encoding_type_url_encodes_xml_special_ch
         put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
 
         let url = format!("{}/{bucket}?versions=&encoding-type=url", CTX.endpoint());
-        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        let response = send_raw_retrying_operation_aborted("get raw list object versions", || {
+            send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>())
+        });
         assert_eq!(response.status, 200, "unexpected body: {}", response.body);
         assert!(
             response.body.contains("<EncodingType>url</EncodingType>"),
