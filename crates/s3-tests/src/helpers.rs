@@ -15,9 +15,9 @@ use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::{
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration,
-    BucketLocationConstraint, CreateBucketConfiguration, Delete, EncryptionType, ObjectOwnership,
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule,
+    BucketLocationConstraint, CreateBucketConfiguration, Delete, DeletedObject, EncryptionType,
+    Error as DeleteObjectError, ObjectIdentifier, ObjectOwnership, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use aws_sdk_s3::Client;
 use base64::Engine;
@@ -489,6 +489,90 @@ pub fn delete_objects_with_md5(
             let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
             req.headers_mut().insert("content-md5", content_md5);
         })
+}
+
+pub async fn delete_objects_retrying_operation_aborted(
+    client: &Client,
+    bucket: &str,
+    delete: Delete,
+) -> DeleteObjectsOutput {
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+    let quiet = delete.quiet();
+    let all_objects = delete.objects().to_vec();
+    let mut pending = all_objects.clone();
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    loop {
+        let request_delete = Delete::builder()
+            .set_objects(Some(pending.clone()))
+            .set_quiet(quiet)
+            .build()
+            .unwrap();
+
+        let resp = match delete_objects_with_md5(client, bucket, request_delete)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err)
+                if s3_error_code(&err) == Some("OperationAborted")
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Err(err) => panic!("delete objects: {err:?}"),
+        };
+
+        deleted.extend(resp.deleted().iter().cloned());
+
+        let mut retry = Vec::new();
+        for error in resp.errors() {
+            if error.code() == Some("OperationAborted") && std::time::Instant::now() < deadline {
+                retry.push(matching_delete_object(&all_objects, error));
+            } else {
+                errors.push(error.clone());
+            }
+        }
+
+        if retry.is_empty() {
+            return build_delete_objects_output(deleted, errors);
+        }
+
+        pending = retry;
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+}
+
+fn matching_delete_object(
+    objects: &[ObjectIdentifier],
+    error: &DeleteObjectError,
+) -> ObjectIdentifier {
+    let key = error.key().unwrap_or_default();
+    let version_id = error.version_id();
+    objects
+        .iter()
+        .find(|object| object.key() == key && object.version_id() == version_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            ObjectIdentifier::builder()
+                .key(key)
+                .set_version_id(version_id.map(ToString::to_string))
+                .build()
+                .unwrap()
+        })
+}
+
+fn build_delete_objects_output(
+    deleted: Vec<DeletedObject>,
+    errors: Vec<DeleteObjectError>,
+) -> DeleteObjectsOutput {
+    DeleteObjectsOutput::builder()
+        .set_deleted((!deleted.is_empty()).then_some(deleted))
+        .set_errors((!errors.is_empty()).then_some(errors))
+        .build()
 }
 
 /// Minimal response data for raw signed HTTP test requests.

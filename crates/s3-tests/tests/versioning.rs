@@ -6,8 +6,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
-    delete_bucket_retrying_operation_aborted, delete_objects_with_md5, err_status,
-    send_signed_request, unique_bucket, RawResponse, CTX,
+    delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
+    err_status, send_signed_request, unique_bucket, RawResponse, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -1716,7 +1716,7 @@ fn test_versioning_multi_object_delete() {
                     .unwrap()
             })
             .collect();
-        delete_objects_with_md5(
+        let resp = delete_objects_retrying_operation_aborted(
             client,
             &bucket,
             Delete::builder()
@@ -1724,9 +1724,12 @@ fn test_versioning_multi_object_delete() {
                 .build()
                 .unwrap(),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "unexpected errors: {:?}",
+            resp.errors()
+        );
 
         let resp = client
             .list_object_versions()
@@ -1737,7 +1740,7 @@ fn test_versioning_multi_object_delete() {
         assert!(resp.versions().is_empty());
 
         // Deleting again should succeed (idempotent)
-        delete_objects_with_md5(
+        let resp = delete_objects_retrying_operation_aborted(
             client,
             &bucket,
             Delete::builder()
@@ -1745,9 +1748,12 @@ fn test_versioning_multi_object_delete() {
                 .build()
                 .unwrap(),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "unexpected errors: {:?}",
+            resp.errors()
+        );
 
         delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -1779,7 +1785,7 @@ fn test_versioning_multi_object_delete_with_marker() {
                     .unwrap()
             })
             .collect();
-        delete_objects_with_md5(
+        let resp = delete_objects_retrying_operation_aborted(
             client,
             &bucket,
             Delete::builder()
@@ -1787,9 +1793,12 @@ fn test_versioning_multi_object_delete_with_marker() {
                 .build()
                 .unwrap(),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "unexpected errors: {:?}",
+            resp.errors()
+        );
 
         let resp = client
             .list_object_versions()
@@ -1801,7 +1810,7 @@ fn test_versioning_multi_object_delete_with_marker() {
         assert!(resp.delete_markers().is_empty());
 
         // Idempotent re-delete
-        delete_objects_with_md5(
+        let resp = delete_objects_retrying_operation_aborted(
             client,
             &bucket,
             Delete::builder()
@@ -1809,9 +1818,12 @@ fn test_versioning_multi_object_delete_with_marker() {
                 .build()
                 .unwrap(),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "unexpected errors: {:?}",
+            resp.errors()
+        );
 
         delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -1826,7 +1838,7 @@ fn test_versioning_multi_object_delete_with_marker_create() {
 
         // Use delete_objects to create a delete marker on a nonexistent key
         let objects = vec![ObjectIdentifier::builder().key(key).build().unwrap()];
-        let resp = delete_objects_with_md5(
+        let resp = delete_objects_retrying_operation_aborted(
             client,
             &bucket,
             Delete::builder()
@@ -1834,10 +1846,13 @@ fn test_versioning_multi_object_delete_with_marker_create() {
                 .build()
                 .unwrap(),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
+        assert!(
+            resp.errors().is_empty(),
+            "unexpected errors: {:?}",
+            resp.errors()
+        );
         assert_eq!(resp.deleted().len(), 1);
         assert!(resp.deleted()[0].delete_marker().unwrap_or(false));
         let dm_vid = resp.deleted()[0]
@@ -2048,7 +2063,7 @@ fn test_versioning_concurrent_multi_object_delete() {
             })
             .collect();
 
-        let resp = delete_objects_with_md5(
+        let resp = delete_objects_retrying_operation_aborted(
             client,
             &bucket,
             Delete::builder()
@@ -2056,9 +2071,12 @@ fn test_versioning_concurrent_multi_object_delete() {
                 .build()
                 .unwrap(),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "unexpected errors: {:?}",
+            resp.errors()
+        );
         assert_eq!(resp.deleted().len(), num_objects * num_versions);
 
         wait_for_version_listing_counts(
