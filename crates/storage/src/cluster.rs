@@ -651,6 +651,12 @@ enum SnapshotSensitiveCommandInstall {
     ContenderDrained,
 }
 
+enum ObjectPgPendingCommandInstall {
+    Installed(MetadataCommandEnvelope),
+    Pending(MetadataCommandEnvelope),
+    LogConflict,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketWriteReservationDisposition {
     TransferredToCommand,
@@ -1692,6 +1698,15 @@ impl StorageCluster {
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
         let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.try_set_pending_metadata_command_for_bucket_locked(pg_id, bucket, command)
+    }
+
+    fn try_set_pending_metadata_command_for_bucket_locked(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<()>, StoreError> {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
@@ -1711,6 +1726,48 @@ impl StorageCluster {
                 Ok(None)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn try_install_object_pg_pending_command_with_fresh_id(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        completion_admission: bool,
+        build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
+    ) -> Result<ObjectPgPendingCommandInstall, ObjectPgActionError> {
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            return Ok(ObjectPgPendingCommandInstall::Pending(command));
+        }
+        let command_id = match self
+            .next_object_metadata_command_id_with_completion_admission(pg_id, completion_admission)
+        {
+            Ok(command_id) => command_id,
+            Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
+                return Ok(ObjectPgPendingCommandInstall::LogConflict);
+            }
+            Err(error) => return Err(error),
+        };
+        let command = build_command(command_id);
+        match self.try_set_pending_metadata_command_for_bucket_locked(pg_id, bucket, &command) {
+            Ok(Some(())) => Ok(ObjectPgPendingCommandInstall::Installed(command)),
+            Ok(None) => {
+                let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+                    return Err(conflicting_pending_object_metadata_command(
+                        "pending slot conflicted without visible command",
+                    ));
+                };
+                Ok(ObjectPgPendingCommandInstall::Pending(pending))
+            }
+            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                Ok(ObjectPgPendingCommandInstall::LogConflict)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -2522,16 +2579,6 @@ impl StorageCluster {
                 .object_generation_metadata_primary_client(bucket, key)?
                 .next_object_generation_id(pg_id, bucket, key)?;
             self.maybe_run_before_object_generation_command_id_hook();
-            // Drain any unresolved slot before the allocator recheck, then take
-            // the final command id immediately before publish. A contender that
-            // reserves this generation in between is handled by the typed apply
-            // conflict below.
-            if self
-                .next_object_metadata_command_id_or_drain(pg_id, bucket)?
-                .is_none()
-            {
-                continue;
-            }
             if self
                 .object_generation_metadata_primary_client(bucket, key)?
                 .next_object_generation_id(pg_id, bucket, key)?
@@ -2540,25 +2587,35 @@ impl StorageCluster {
                 continue;
             }
             self.maybe_run_before_metadata_command_pending_install_hook();
-            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
-            else {
-                continue;
+            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+                pg_id,
+                bucket,
+                false,
+                |command_id| {
+                    MetadataCommandEnvelope::new(
+                        command_id,
+                        MetadataCommandPayload::ReserveObjectGeneration(
+                            ReserveObjectGenerationCommand::new(
+                                bucket.clone(),
+                                key.clone(),
+                                reservation_id.clone(),
+                                generation_id,
+                                crate::clock::current_time_millis(),
+                            ),
+                        ),
+                    )
+                },
+            )? {
+                ObjectPgPendingCommandInstall::Installed(command) => command,
+                ObjectPgPendingCommandInstall::Pending(command) => {
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    continue;
+                }
+                ObjectPgPendingCommandInstall::LogConflict => {
+                    self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
+                    continue;
+                }
             };
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::ReserveObjectGeneration(
-                    ReserveObjectGenerationCommand::new(
-                        bucket.clone(),
-                        key.clone(),
-                        reservation_id.clone(),
-                        generation_id,
-                        crate::clock::current_time_millis(),
-                    ),
-                ),
-            );
-            if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
-                continue;
-            }
             let mut command = command;
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
@@ -2730,26 +2787,33 @@ impl StorageCluster {
                 key,
                 completion_admission,
             )?;
-            let Some(command_id) = self
-                .next_object_metadata_command_id_or_drain_with_completion_admission(
-                    pg_id,
-                    bucket,
-                    completion_admission,
-                )?
-            else {
-                continue;
+            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+                pg_id,
+                bucket,
+                completion_admission,
+                |command_id| {
+                    MetadataCommandEnvelope::new(
+                        command_id,
+                        MetadataCommandPayload::ReserveObjectVersion(
+                            ReserveObjectVersionCommand::new(
+                                bucket.clone(),
+                                key.clone(),
+                                version_id,
+                            ),
+                        ),
+                    )
+                },
+            )? {
+                ObjectPgPendingCommandInstall::Installed(command) => command,
+                ObjectPgPendingCommandInstall::Pending(command) => {
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    continue;
+                }
+                ObjectPgPendingCommandInstall::LogConflict => {
+                    self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
+                    continue;
+                }
             };
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
-                    bucket.clone(),
-                    key.clone(),
-                    version_id,
-                )),
-            );
-            if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
-                continue;
-            }
             match self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command) {
                 Ok(()) => {}
                 Err(ObjectPgActionError::Metadata(
@@ -3028,23 +3092,33 @@ impl StorageCluster {
                 }
             }
 
-            let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
-            else {
-                continue;
+            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+                pg_id,
+                bucket,
+                false,
+                |command_id| {
+                    MetadataCommandEnvelope::new(
+                        command_id,
+                        MetadataCommandPayload::ReleaseObjectGeneration(
+                            ReleaseObjectGenerationCommand::new(
+                                bucket.clone(),
+                                key.clone(),
+                                reservation_id.clone(),
+                            ),
+                        ),
+                    )
+                },
+            )? {
+                ObjectPgPendingCommandInstall::Installed(command) => command,
+                ObjectPgPendingCommandInstall::Pending(command) => {
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    continue;
+                }
+                ObjectPgPendingCommandInstall::LogConflict => {
+                    self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
+                    continue;
+                }
             };
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::ReleaseObjectGeneration(
-                    ReleaseObjectGenerationCommand::new(
-                        bucket.clone(),
-                        key.clone(),
-                        reservation_id.clone(),
-                    ),
-                ),
-            );
-            if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
-                continue;
-            }
             let mut command = command;
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
@@ -4480,24 +4554,6 @@ impl StorageCluster {
             }
 
             self.maybe_run_before_stream_append_command_id_hook();
-            let command_id = match self.next_object_metadata_command_id_or_drain(pg_id, bucket) {
-                Ok(Some(command_id)) => command_id,
-                Ok(None) => continue,
-                Err(error) => {
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
-                    return Err(error);
-                }
-            };
-
             if let Err(error) =
                 self.register_payload_shard_acks(segment_record.data_pg_id, shard_batch)
             {
@@ -4536,17 +4592,60 @@ impl StorageCluster {
                 return Err(error);
             }
 
-            let command = MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    segment: segment_record.clone(),
-                })),
-            );
-            match self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command) {
-                Ok(true) => {}
-                Ok(false) => continue,
+            self.maybe_run_before_metadata_command_pending_install_hook();
+            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+                pg_id,
+                bucket,
+                false,
+                |command_id| {
+                    MetadataCommandEnvelope::new(
+                        command_id,
+                        MetadataCommandPayload::AppendStreamSegment(Box::new(
+                            AppendStreamSegmentCommand {
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                                segment: segment_record.clone(),
+                            },
+                        )),
+                    )
+                },
+            ) {
+                Ok(ObjectPgPendingCommandInstall::Installed(command)) => command,
+                Ok(ObjectPgPendingCommandInstall::Pending(command)) => {
+                    if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
+                    {
+                        self.delete_payload_shard_keys_best_effort(
+                            segment_record.data_pg_id,
+                            EcShape {
+                                k: segment_record.ec_k,
+                                m: segment_record.ec_m,
+                            },
+                            &segment_record.segment_okh,
+                            segment_record.segment_vid,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        );
+                        return Err(error);
+                    }
+                    continue;
+                }
+                Ok(ObjectPgPendingCommandInstall::LogConflict) => {
+                    if let Err(error) =
+                        self.drain_one_pending_object_metadata_command(pg_id, bucket)
+                    {
+                        self.delete_payload_shard_keys_best_effort(
+                            segment_record.data_pg_id,
+                            EcShape {
+                                k: segment_record.ec_k,
+                                m: segment_record.ec_m,
+                            },
+                            &segment_record.segment_okh,
+                            segment_record.segment_vid,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        );
+                        return Err(error);
+                    }
+                    continue;
+                }
                 Err(error) => {
                     self.delete_payload_shard_keys_best_effort(
                         segment_record.data_pg_id,
@@ -4560,7 +4659,7 @@ impl StorageCluster {
                     );
                     return Err(error);
                 }
-            }
+            };
             match self.apply_new_stream_append_command(
                 pg_id,
                 bucket,

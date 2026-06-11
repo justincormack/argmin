@@ -6686,6 +6686,14 @@ Status:
   floor but its cap shrinks as active completion/progress RPCs rise, so stream
   append/finalize/cleanup work can use reserved capacity while new
   `CreateStreamUpload`/create-multipart command builds feel pressure first.
+- Tightened object-PG pending-slot fairness for cheap command publishers seen
+  in slow-host UAT traces. Object generation reservation/release, object
+  version reservation, and stream segment append now allocate a fresh metadata
+  command id and install the durable pending command while holding the local
+  per-PG metadata-command lock. Expensive snapshot reads and shard validation
+  remain outside the lock, but once a local frontend observes an empty pending
+  slot, unrelated version/delete/reclaim work cannot refill the slot before the
+  current progress/completion command is published.
   Storage-RPC admission wait/timeout diagnostics now include the admission
   class. This is still a deterministic stepped policy, not the later full
   adaptive controller.
