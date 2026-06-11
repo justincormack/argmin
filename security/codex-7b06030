@@ -1,0 +1,241 @@
+RPC bulk reservation can self-throttle object reads
+Link: https://chatgpt.com/codex/cloud/security/findings/2f903dbb63188191bb4643c6cc90c06a?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit: 6c0e8481dad3757eaa3a3e5d1befb01a2c406093
+Commit link: https://github.com/justincormack/argmin/commit/6c0e8481dad3757eaa3a3e5d1befb01a2c406093
+
+The original report is stale in class names after the storage RPC admission
+split, but the underlying low-limit self-throttle was still valid: a remote
+object read can hold a read-handle session permit while issuing a shard read.
+With an admission limit of 2, the newer `Read` class had only one shared read
+slot, so the held read-handle permit could block the following `ShardRead` or
+`ShardReadRange` even though total admission capacity was not exhausted.
+
+The fix rejects unsafe public configuration values instead of trying to support
+pathological test-only limits. `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` now
+has a minimum of 8, exposed as
+`LocalUnixStorageNodeClientConfig::MIN_RPC_ADMISSION_LIMIT`. That floor gives
+room for a held read-handle session plus the nested shard read, while preserving
+reserved control/completion capacity and leaving headroom for list, progress,
+and start-write classes. Low-level unit tests may still construct smaller
+admission gates directly when intentionally testing exhaustion behavior.
+
+Regression coverage added:
+- `storage_node_rpc_admission_limit_below_minimum` verifies env config rejects
+  values below 8.
+- `unix_storage_node_rpc_admission_minimum_supports_nested_read_and_mixed_work`
+  verifies the configured minimum admits the representative nested read plus
+  list, progress, start-write, completion, and control work.
+
+Verification run before the fix commit:
+- `cargo fmt`
+- `cargo nextest run -p argmin-s3 storage_node_rpc_admission`
+- `cargo nextest run -p storage unix_storage_node_rpc_admission`
+- `cargo nextest run -p argmin-s3`
+- `cargo nextest run -p storage`
+- `git diff --check`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7b06030
+Author: justin@specialbusservice.com
+Created: 10/06/2026, 22:53:50
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced availability bug: the new bulk/control admission reservation makes a valid remote storage RPC admission limit of 2 insufficient for normal object reads, because the read flow needs two concurrent bulk permits on the same storage-node client.
+This commit introduces a per-node bulk_limit by reserving at least one RPC slot for control work. For ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT=2, bulk_limit becomes 1. Remote read paths first acquire a ReadHandlesAcquire RPC permit, which is classified as Bulk, and keep that permit in the read-handle session. They then issue ShardRead or ShardReadRange, also classified as Bulk. Because active.bulk is already equal to bulk_limit, the second bulk permit is denied even though total active RPCs is still below the configured limit. The request waits until the new admission timeout and returns SlowDown. The configuration accepts any positive limit, so a limit of 2 is valid and previously would have allowed the handle and read RPC to run concurrently.
+
+# Validation
+## Rubric
+- [x] Confirm configuration accepts the low limit: ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT=2 is valid because only zero is rejected.
+- [x] Confirm limit=2 computes bulk_limit=1 and preserves a separate control slot.
+- [x] Confirm ReadHandlesAcquire and ShardReadRange are both Bulk admissions on the same UnixStorageNodeClient.
+- [x] Confirm the read flow holds a read-handle session permit while issuing the subsequent shard read/range read.
+- [x] Dynamically reproduce the second Bulk admission timing out/resource-exhausting while active.total=1 < limit=2, and capture debugger evidence of that state.
+## Report
+Validated the finding with a targeted Rust unit-test PoC and an LLDB trace. The code accepts ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT=2 because config validation only rejects zero at crates/argmin-s3/src/config.rs:344-346. In crates/storage/src/node_client.rs:2761-2762, limit=2 yields reserved_control=1 and bulk_limit=1. Bulk admission is denied when active.bulk >= bulk_limit even if active.total < limit at node_client.rs:2832-2841. Both ReadHandlesAcquire and ShardReadRange are classified Bulk at node_client.rs:4406-4421. open_read_handle_session acquires and stores a ReadHandlesAcquire permit for the session lifetime at node_client.rs:3012-3024, and read_placed_shard_range later performs a ShardReadRange RPC at node_client.rs:3100-3119. The normal object-read flow holds read handles while reading shards at crates/storage/src/cluster.rs:5020-5056; remote clients are installed as both shard_client and shard_read_handle_client on the same UnixStorageNodeClient at crates/storage/src/cluster/local.rs:1247-1272, and local.rs:2501-2555 shows handle acquisition followed by read_payload_shard_into_without_handle.
+
+Dynamic PoC: I patched in a focused unit test, poc_limit_two_read_handle_permit_blocks_following_shard_read_range, which creates a real UnixStorageNodeClient with admission limit 2, opens an actual read-handle session over a Unix socket so the ReadHandlesAcquire Bulk permit is held, verifies a control/non-bulk permit can still use the reserved slot, then calls the real read_placed_shard_range path. The test output confirms self-throttling before shard I/O: `observed admission error: storage RPC shard read range on node 7 exhausted resources: storage-node client RPC admission limit 2 is exhausted after waiting 10 ms`.
+
+Debugger evidence: LLDB breakpoint at node_client.rs:2840 showed the initial open_read_handle_session path acquiring ReadHandlesAcquire as Bulk with limit=2/bulk_limit=1. A later breakpoint on the ShardReadRange path showed `*active = (total = 1, bulk = 1)`, `class = Bulk`, `limit = 2`, `bulk_limit = 1`; the backtrace was `read_placed_shard_range -> rpc_request -> rpc_request_with_admission_class -> acquire_rpc_admission_with_class -> UnixStorageNodeRpcAdmission::acquire -> can_admit`. Therefore total active RPCs was still below the configured limit, but the second Bulk read RPC was denied because the read-handle session consumed the only bulk slot.
+
+Direct crash was not expected for this availability bug; the PoC reproduces a typed resource-exhaustion/SlowDown-equivalent error rather than a process crash. Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`).
+
+# Evidence
+crates/argmin-s3/src/config.rs (L344 to 346)
+  Note: The configuration only rejects an admission limit of zero, so low values such as 2 are accepted.
+```
+        if storage_node_rpc_admission_limit == 0 {
+            return Err("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT must be > 0".to_string());
+        }
+```
+
+crates/storage/src/cluster.rs (L5020 to 5047)
+  Note: The object read path holds read handles while it proceeds to read shard data.
+```
+        let mut read_handles = match self
+            .local_map
+            .acquire_payload_shard_read_handles(self.operation_epoch(), &handle_entries)
+        {
+            Ok(read_handles) => read_handles,
+            Err(error) => {
+                placed_segment_recoverable_shard_error(error)?;
+                return Ok(false);
+            }
+        };
+
+        for (shard_index, (location, shard_key, ack)) in direct_shards.iter().enumerate() {
+            let start = shard_index * shard_size;
+            let end = start + shard_size;
+            if let Err(error) =
+                self.maybe_run_before_placed_payload_shard_read_hook(*location, shard_key)
+            {
+                read_handles.release().map_err(shard_io_error_to_store)?;
+                placed_segment_recoverable_shard_error(error)?;
+                return Ok(false);
+            }
+            match self.local_map.read_payload_shard_into_without_handle(
+                self.operation_epoch(),
+                *location,
+                shard_key,
+                *ack,
+                &mut dst[start..end],
+            ) {
+```
+
+crates/storage/src/node_client.rs (L2761 to 2762)
+  Note: The new reservation logic sets bulk_limit to 1 when the configured limit is 2.
+```
+        let reserved_control = (limit / 4).clamp(1, 4).min(limit);
+        let bulk_limit = limit.saturating_sub(reserved_control).max(1).min(limit);
+```
+
+crates/storage/src/node_client.rs (L2832 to 2841)
+  Note: Bulk RPCs are denied when active.bulk reaches bulk_limit even if total active RPCs is still below the configured limit.
+```
+    fn can_admit(
+        &self,
+        active: &UnixStorageNodeRpcAdmissionActive,
+        class: UnixStorageNodeRpcAdmissionClass,
+    ) -> bool {
+        if active.total >= self.limit {
+            return false;
+        }
+        class == UnixStorageNodeRpcAdmissionClass::Control || active.bulk < self.bulk_limit
+    }
+```
+
+crates/storage/src/node_client.rs (L3012 to 3024)
+  Note: Opening a remote read-handle session acquires and stores an RPC admission permit for the lifetime of the session.
+```
+    pub(crate) fn open_read_handle_session(
+        &self,
+    ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+        let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ReadHandlesAcquire)?;
+        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
+            context: "connect storage-node read-handle RPC socket",
+            source,
+        })?;
+        Ok(UnixStorageNodeReadHandleSession {
+            node_id: self.node_id,
+            stream,
+            next_request_id: 1,
+            _rpc_permit: rpc_permit,
+```
+
+crates/storage/src/node_client.rs (L3100 to 3119)
+  Note: The subsequent shard range read performs another RPC that is also classified as Bulk, causing self-throttling when bulk_limit is already consumed by the read handle.
+```
+    pub(crate) fn read_placed_shard_range(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        let request = StorageRpcShardReadRangeRequest {
+            location: self.shard_location(data_pg_id, key),
+            shard_key: key.clone(),
+            expected_ack,
+            offset,
+            length,
+        };
+        let payload = encode_shard_read_range_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode shard read range request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardReadRange, payload)?;
+        decode_shard_read_range_response(&response, length as usize).map_err(|error| {
+```
+
+crates/storage/src/node_client.rs (L4406 to 4421)
+  Note: Both ReadHandlesAcquire and ShardRead/ShardReadRange are classified as Bulk, so a read-handle permit consumes the same reserved bulk capacity needed by the subsequent shard read.
+```
+fn storage_rpc_admission_class(kind: StorageRpcMessageKind) -> UnixStorageNodeRpcAdmissionClass {
+    match kind {
+        StorageRpcMessageKind::ShardRead
+        | StorageRpcMessageKind::ShardReadRange
+        | StorageRpcMessageKind::ReadHandlesAcquire
+        | StorageRpcMessageKind::ObjectListPage
+        | StorageRpcMessageKind::ObjectVersionListPage
+        | StorageRpcMessageKind::ObjectMultipartUploadListPage
+        | StorageRpcMessageKind::BucketList
+        | StorageRpcMessageKind::ObjectMultipartPartsList
+        | StorageRpcMessageKind::ObjectStreamUploadsList
+        | StorageRpcMessageKind::ObjectStreamUploadsPgList => {
+            UnixStorageNodeRpcAdmissionClass::Bulk
+        }
+        _ => UnixStorageNodeRpcAdmissionClass::Control,
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. Static evidence plus the prior executable PoC support that the bug is real and reachable through normal S3 object read requests in production code. The limiting factors are significant: it requires a low non-default ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT, only affects remote storage-node routing, and produces availability-only 503 SlowDown responses without data exposure or integrity compromise. Those constraints rule out high/critical severity, but denial of object-read availability for affected deployments is still security-relevant enough to remain medium rather than ignore.
+## Likelihood
+high - The request path is easy to exercise with a single authorized or public-read GET once the deployment has the vulnerable low admission limit. However, the vulnerable condition requires a non-default tuning value and remote frontend/combined routing; default limit 1024 is not affected. | Remote network vector
+## Impact
+medium - Affected low-limit remote-storage deployments can consistently return 503 SlowDown for normal object reads, denying availability of readable objects. The impact is limited to availability; no confidentiality, integrity, identity, or execution impact was found.
+## Assumptions
+- The affected deployment uses the product's frontend/combined remote-storage routing path, not the legacy-local path.
+- The operator has configured ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT to a low but accepted value such as 1 or 2.
+- The attacker can issue S3 GET, ranged GET, or part GET requests for an object they are authorized to read, or for an object exposed through public-read ACL/policy.
+- ARGMIN_PROCESS_ROLE=frontend or combined, so object reads use UnixStorageNodeClient remote storage-node routing
+- ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT is set to 1 or 2; these values pass config validation
+- Readable object exists on the affected storage node
+- Requester is authenticated for the object, or the bucket/object permits anonymous public read
+## Path
+Client GET -> HTTP route GetObject -> Coordinator read -> ReadHandlesAcquire(Bulk, held) -> ShardReadRange(Bulk) -> bulk_limit=1 denial -> 503 SlowDown
+## Path evidence
+- `crates/argmin-s3/src/config.rs:344-346` - Configuration validation only rejects a zero RPC admission limit, so low positive values such as 1 or 2 are accepted.
+- `crates/storage/src/node_client.rs:2761-2762` - The admission constructor reserves at least one control slot; with limit=2 this computes bulk_limit=1.
+- `crates/storage/src/node_client.rs:2832-2841` - Bulk RPC admission is denied when active.bulk reaches bulk_limit, independently of total capacity still being below limit.
+- `crates/storage/src/node_client.rs:4406-4421` - ReadHandlesAcquire, ShardRead, and ShardReadRange are all classified as Bulk RPCs.
+- `crates/storage/src/node_client.rs:3012-3024` - Opening a read-handle session acquires a ReadHandlesAcquire RPC permit and stores it in the session, keeping it held.
+- `crates/storage/src/node_client.rs:3100-3119` - The subsequent shard range read performs another RPC using ShardReadRange, also classified as Bulk.
+- `crates/storage/src/cluster.rs:5020-5047` - The normal object read flow holds read handles while proceeding to read shard data.
+- `crates/storage/src/cluster/local.rs:1247-1272` - Remote storage-node clients are installed as both shard_client and shard_read_handle_client on the same UnixStorageNodeClient, so both permit acquisitions share the same admission counters.
+- `crates/server-http/src/http/mod.rs:1630-1761` - HTTP S3 GetObject and ranged GetObject requests dispatch to coordinator object read methods, making the bug reachable through normal S3 reads.
+- `crates/server-core/src/coordinator.rs:75-87` - StorageRpcResourceExhausted is mapped to ServerError::SlowDown.
+- `crates/server-core/src/error.rs:545-549` - ServerError::SlowDown is returned as HTTP 503.
+- `crates/argmin-s3/src/main.rs:358-365` - The production frontend binds a TCP listener using ARGMIN_LISTEN_ADDR, making S3 requests network-reachable according to deployment configuration.
+## Narrative
+This is a real runtime availability bug in the product path, but its exploitability depends on a low non-default storage RPC admission limit. The config accepts any positive ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT, so 1 and 2 are valid. For limit=2, the new reservation logic computes bulk_limit=1. Normal remote object reads acquire a ReadHandlesAcquire RPC permit and keep it for the read-handle session, then issue ShardRead or ShardReadRange while the handle is still held. Because ReadHandlesAcquire and shard reads are all classified as Bulk, the second bulk RPC is denied even though total active RPCs remains below the configured limit. The resulting StorageRpcResourceExhausted error is mapped to SlowDown/HTTP 503. The earlier validation PoC exercised the real UnixStorageNodeClient path and observed the admission exhaustion before shard I/O. Impact is availability-only for affected deployments; there is no evidence of data disclosure, integrity loss, privilege escalation, or code execution.
+## Controls
+- SigV4 authentication for private objects
+- Anonymous access only for explicitly public-readable objects
+- Bucket/object ACL and public-access-block authorization checks
+- HTTP request semaphore and timeouts
+- Default ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT is 1024, which avoids this specific low-limit condition
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000 unless operator config exposes it
+## Blindspots
+- No deployment manifests, Kubernetes services, Terraform, or load balancer configuration were present in the checkout, so actual internet exposure could not be confirmed.
+- Static review cannot determine how often operators set ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT to 1 or 2 in real deployments.
+- The supplied dynamic validation PoC was from an earlier stage; this stage did not rerun tests or modify the read-only repository.
+- The exact set of object layouts and read operations affected may vary, but the cited GetObject/range and storage read-handle paths are sufficient to prove reachability.
