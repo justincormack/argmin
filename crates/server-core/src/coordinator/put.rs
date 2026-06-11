@@ -1,6 +1,6 @@
 use storage::{
-    segment_key_hash, BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq, ObjectKey,
-    SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
+    direct_put_segment_key_hash, BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq,
+    ObjectKey, SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
@@ -149,12 +149,7 @@ impl Coordinator {
                         &transient_segment_id,
                     )
                     .map_err(Coordinator::map_object_pg_action_error)?;
-                let segment_okh = segment_key_hash(
-                    authorized.bucket(),
-                    authorized.key(),
-                    generation_id,
-                    segment_index,
-                );
+                let segment_okh = direct_put_segment_key_hash(&transient_segment_id, segment_index);
                 let segment_vid = generation_id;
 
                 let written_segment =

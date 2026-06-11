@@ -880,9 +880,10 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         .expect("buffered put should create a live object")
         .clone();
     let topology = PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
-    assert_eq!(
+    assert_ne!(
         segments[0].segment_okh,
-        segment_key_hash("bucket", "key", live.generation_id, 0)
+        segment_key_hash("bucket", "key", live.generation_id, 0),
+        "direct PUT shards should use transient staging keys, not generation-derived stream keys"
     );
     assert_eq!(segments[0].segment_vid, live.generation_id);
     assert_eq!(

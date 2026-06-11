@@ -18835,7 +18835,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_put_commit_retries_after_unrelated_partial_exact_pending_conflict() {
+    fn direct_put_commit_returns_contention_after_unrelated_partial_exact_pending_conflict() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
@@ -18975,25 +18975,23 @@ mod tests {
             },
         ));
 
-        let outcome = cluster
+        let err = cluster
             .commit_direct_put_object_from_payload_shards(
                 &commit_req,
                 &written.written_shards,
                 |_| Ok::<_, ()>(()),
             )
-            .unwrap()
-            .unwrap();
+            .unwrap_err();
         drop(hook_guard);
-        assert_eq!(outcome.live_size, payload.len() as u64);
-        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
-        assert_direct_put_metadata_on_acting_nodes(
-            &map,
-            &node_ids,
-            object_pg,
-            &commit_req,
-            &outcome,
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                    context: "retryable partial pending object metadata drain",
+                })
+            ),
+            "expected retryable drain contention, got {err:?}"
         );
-
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -19003,7 +19001,14 @@ mod tests {
                 .unwrap();
             let stored =
                 crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
-            assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
+            assert!(stored.as_live().is_some());
+            assert!(
+                matches!(
+                    crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                    Err(crate::MetadataError::ObjectNotFound)
+                ),
+                "direct PUT must not publish while unrelated pending work remains partial"
+            );
         }
     }
 
@@ -21081,6 +21086,120 @@ mod tests {
                 second_generation
             );
         }
+    }
+
+    #[test]
+    fn object_generation_exact_pending_reissue_conflict_returns_contention() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, other_bucket, other_key, object_pg) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            let bucket = bucket_for_pg(topology, 1, "pending-gen-reissue-main-");
+            let other_bucket = bucket_for_pg(topology, 1, "pending-gen-reissue-other-");
+            let object_pg = 2;
+            let key = key_for_object_pg(topology, &bucket, object_pg, "key-");
+            let other_key = key_for_object_pg(topology, &other_bucket, object_pg, "key-");
+            (bucket, key, other_bucket, other_key, object_pg)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        create_test_bucket(&cluster, &other_bucket);
+
+        let pg_id = PgId::new(object_pg);
+        let reservation_id = crate::SessionId::try_from("67".repeat(16)).unwrap();
+        let other_reservation_id = crate::SessionId::try_from("68".repeat(16)).unwrap();
+        let later_reservation_id = crate::SessionId::try_from("69".repeat(16)).unwrap();
+        let pending = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                reservation_id.clone(),
+                crate::GenerationId::MIN,
+                123,
+            )),
+        );
+        let other_first = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                other_bucket.clone(),
+                other_key.clone(),
+                other_reservation_id,
+                crate::GenerationId::MIN,
+                123,
+            )),
+        );
+        let other_second = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                other_bucket.clone(),
+                other_key.clone(),
+                later_reservation_id.clone(),
+                crate::GenerationId::new(2).unwrap(),
+                124,
+            )),
+        );
+
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(object_pg).unwrap();
+            pg.apply_metadata_command_and_record(node_id.as_u32(), &other_first)
+                .unwrap();
+            if node_id == NodeId::new(0) {
+                pg.apply_metadata_command_and_record(node_id.as_u32(), &other_second)
+                    .unwrap();
+            }
+        }
+        force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+
+        let err = cluster
+            .reserve_put_object_generation(&other_bucket, &other_key, &later_reservation_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                    context: "retryable partial pending object metadata drain",
+                })
+            ),
+            "expected retryable drain contention, got {err:?}"
+        );
+
+        let err = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                    context: "retryable partial pending generation reservation command",
+                })
+            ),
+            "expected retryable generation reservation contention, got {err:?}"
+        );
     }
 
     #[test]

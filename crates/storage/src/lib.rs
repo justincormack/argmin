@@ -70,8 +70,8 @@ pub use pg_topology::PgTopology;
 pub use placement::NodeId;
 pub use s3_types::lifecycle::*;
 pub use shard_key_hash::{
-    multipart_part_segment_key_hash, object_key_hash, part_key_hash, segment_key_hash,
-    stream_segment_key_hash,
+    direct_put_segment_key_hash, multipart_part_segment_key_hash, object_key_hash, part_key_hash,
+    segment_key_hash, stream_segment_key_hash,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

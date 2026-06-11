@@ -2810,11 +2810,20 @@ impl StorageCluster {
                                 &error.source,
                             ) =>
                     {
-                        let Some(reissued) = self
-                            .reissue_pending_metadata_command(pg_id, &command)
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-                        else {
-                            break;
+                        let reissued = match self.reissue_pending_metadata_command(pg_id, &command)
+                        {
+                            Ok(Some(reissued)) => reissued,
+                            Ok(None) => break,
+                            Err(BucketSnapshotLoadError::Store(
+                                StoreError::MetadataCommandLogConflict { .. },
+                            )) => {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable generation reservation reissue conflict",
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(bucket_snapshot_error_to_object_pg_action_error(error));
+                            }
                         };
                         command = reissued;
                     }
@@ -3024,9 +3033,14 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
         match self.drain_pending_metadata_command_with_recovery_gate(pg_id, command)? {
-            PendingMetadataCommandOutcome::Applied
-            | PendingMetadataCommandOutcome::Abandoned
-            | PendingMetadataCommandOutcome::RetryPartialExactConflict => Ok(()),
+            PendingMetadataCommandOutcome::Applied | PendingMetadataCommandOutcome::Abandoned => {
+                Ok(())
+            }
+            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                Err(conflicting_pending_object_metadata_command(
+                    "retryable partial pending object metadata drain",
+                ))
+            }
         }
     }
 
@@ -3228,11 +3242,17 @@ impl StorageCluster {
                     if error.applied_nodes == 0
                         && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
                 {
-                    let Some(reissued) = self
-                        .reissue_pending_metadata_command(pg_id, &command)
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-                    else {
-                        return Ok(PendingMetadataCommandOutcome::Abandoned);
+                    let reissued = match self.reissue_pending_metadata_command(pg_id, &command) {
+                        Ok(Some(reissued)) => reissued,
+                        Ok(None) => return Ok(PendingMetadataCommandOutcome::Abandoned),
+                        Err(BucketSnapshotLoadError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
+                        }
+                        Err(error) => {
+                            return Err(bucket_snapshot_error_to_object_pg_action_error(error));
+                        }
                     };
                     command = reissued;
                 }
@@ -3475,9 +3495,12 @@ impl StorageCluster {
             return Ok(false);
         };
         match self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)? {
-            PendingMetadataCommandOutcome::Applied
-            | PendingMetadataCommandOutcome::Abandoned
-            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
+            PendingMetadataCommandOutcome::Applied | PendingMetadataCommandOutcome::Abandoned => {}
+            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                return Err(conflicting_pending_object_metadata_command(
+                    "retryable partial pending object metadata drain",
+                ));
+            }
         }
         Ok(true)
     }
@@ -3491,6 +3514,14 @@ impl StorageCluster {
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let outcome =
                 self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+            if matches!(
+                outcome,
+                PendingMetadataCommandOutcome::RetryPartialExactConflict
+            ) {
+                return Err(conflicting_pending_object_metadata_command(
+                    "retryable partial pending object metadata drain",
+                ));
+            }
             if Self::metadata_command_recovery_applied_collectable_object_command(&command, outcome)
             {
                 applied.push(command);
@@ -3512,8 +3543,12 @@ impl StorageCluster {
                 self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
             match outcome {
                 PendingMetadataCommandOutcome::Applied
-                | PendingMetadataCommandOutcome::Abandoned
-                | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
+                | PendingMetadataCommandOutcome::Abandoned => {}
+                PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                    return Err(conflicting_pending_object_metadata_command(
+                        "retryable partial pending object metadata drain",
+                    ));
+                }
             }
         }
         Ok(())
@@ -4333,10 +4368,20 @@ impl StorageCluster {
                                 &error.source,
                             ) =>
                     {
-                        let Some(reissued) = self
-                            .reissue_pending_metadata_command(pg_id, &command)
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-                        else {
+                        let reissue_result = self.reissue_pending_metadata_command(pg_id, &command);
+                        let Some(reissued) = (match reissue_result {
+                            Ok(reissued) => reissued,
+                            Err(BucketSnapshotLoadError::Store(
+                                StoreError::MetadataCommandLogConflict { .. },
+                            )) => {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable direct PUT commit reissue conflict",
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(bucket_snapshot_error_to_object_pg_action_error(error));
+                            }
+                        }) else {
                             if new_pending_command {
                                 self.release_metadata_command_bucket_write_reservation(&command)
                                     .map_err(bucket_snapshot_error_to_object_pg_action_error)?;

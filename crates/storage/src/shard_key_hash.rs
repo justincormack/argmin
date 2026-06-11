@@ -23,6 +23,15 @@ pub fn stream_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u
     sha256_truncated_16(format!("segment/{}/{segment_index}", session_id.as_str()).as_bytes())
 }
 
+/// Compute the 16-byte segment key hash for direct PUT staging shard keys.
+///
+/// `segment_okh = SHA-256("direct-put-segment/" + session_id + "/" + segment_index)[:16]`
+pub fn direct_put_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
+    sha256_truncated_16(
+        format!("direct-put-segment/{}/{segment_index}", session_id.as_str()).as_bytes(),
+    )
+}
+
 /// Compute the 16-byte segment key hash for committed object segment shard keys.
 ///
 /// `segment_okh = SHA-256("segment/" + bucket + "/" + key + "/" + generation_id + "/" +
@@ -106,6 +115,30 @@ mod tests {
     fn stream_segment_key_hash_length() {
         let hash = stream_segment_key_hash(&session_id("0123456789abcdef0123456789abcdef"), 42);
         assert_eq!(hash.len(), 16);
+    }
+
+    #[test]
+    fn direct_put_segment_key_hash_deterministic() {
+        let session = session_id("0123456789abcdef0123456789abcdef");
+        let a = direct_put_segment_key_hash(&session, 0);
+        let b = direct_put_segment_key_hash(&session, 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn direct_put_segment_key_hash_different_sessions() {
+        let a = direct_put_segment_key_hash(&session_id("0123456789abcdef0123456789abcdef"), 0);
+        let b = direct_put_segment_key_hash(&session_id("fedcba9876543210fedcba9876543210"), 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn direct_put_segment_key_hash_is_separate_from_stream_hash() {
+        let session = session_id("0123456789abcdef0123456789abcdef");
+        assert_ne!(
+            direct_put_segment_key_hash(&session, 0),
+            stream_segment_key_hash(&session, 0)
+        );
     }
 
     #[test]

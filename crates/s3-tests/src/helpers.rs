@@ -160,6 +160,10 @@ fn is_bucket_already_absent<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::Sd
     s3_error_code(err) == Some("NoSuchBucket")
 }
 
+fn is_bucket_not_empty<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    s3_error_code(err) == Some("BucketNotEmpty")
+}
+
 fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<&str> {
     err.as_service_error().and_then(ProvideErrorMetadata::code)
 }
@@ -1276,8 +1280,8 @@ pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &
             Ok(_) => return,
             Err(err) if is_bucket_already_absent(&err) => return,
             Err(err)
-                if err.as_service_error().and_then(ProvideErrorMetadata::code)
-                    == Some("OperationAborted")
+                if (s3_error_code(&err) == Some("OperationAborted")
+                    || is_bucket_not_empty(&err))
                     && std::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(RETRY_DELAY).await;
