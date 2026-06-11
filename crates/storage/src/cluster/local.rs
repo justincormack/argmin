@@ -31,6 +31,7 @@ use crate::{
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
+const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalNodeStoreConfig {
@@ -788,6 +789,66 @@ impl LocalPgRoute {
 pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<Mutex<()>>>>,
+    metadata_command_recovery_flights:
+        Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MetadataCommandRecoveryKey {
+    pg_id: PgId,
+    log_index: u64,
+    checksum_crc64: u64,
+}
+
+impl MetadataCommandRecoveryKey {
+    fn new(pg_id: PgId, command: &MetadataCommandEnvelope) -> Self {
+        Self {
+            pg_id,
+            log_index: command.id().log_index().get(),
+            checksum_crc64: command.checksum_crc64(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MetadataCommandRecoveryFlight {
+    in_progress: Mutex<bool>,
+    done: Condvar,
+}
+
+#[derive(Debug)]
+pub(crate) enum MetadataCommandRecoveryAdmission {
+    Leader(MetadataCommandRecoveryGuard),
+    Waited,
+    TimedOut,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataCommandRecoveryGuard {
+    key: MetadataCommandRecoveryKey,
+    flight: Arc<MetadataCommandRecoveryFlight>,
+    flights: Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
+}
+
+impl Drop for MetadataCommandRecoveryGuard {
+    fn drop(&mut self) {
+        {
+            let mut in_progress = self
+                .flight
+                .in_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *in_progress = false;
+            self.flight.done.notify_all();
+        }
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        if flights
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            flights.remove(&self.key);
+        }
+    }
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
@@ -811,6 +872,7 @@ impl LocalClusterRuntimeState {
                 Condvar::new(),
             ),
             metadata_command_pg_locks: Mutex::new(HashMap::new()),
+            metadata_command_recovery_flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -824,6 +886,50 @@ impl LocalClusterRuntimeState {
                 .entry(pg_id)
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
+    }
+
+    pub(crate) fn join_metadata_command_recovery(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> MetadataCommandRecoveryAdmission {
+        let key = MetadataCommandRecoveryKey::new(pg_id, command);
+        let flights = Arc::clone(&self.metadata_command_recovery_flights);
+        let (flight, is_leader) = {
+            let mut flights_guard = flights.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(flight) = flights_guard.get(&key) {
+                (Arc::clone(flight), false)
+            } else {
+                let flight = Arc::new(MetadataCommandRecoveryFlight {
+                    in_progress: Mutex::new(true),
+                    done: Condvar::new(),
+                });
+                flights_guard.insert(key, Arc::clone(&flight));
+                (flight, true)
+            }
+        };
+        if is_leader {
+            return MetadataCommandRecoveryAdmission::Leader(MetadataCommandRecoveryGuard {
+                key,
+                flight,
+                flights,
+            });
+        }
+
+        let (guard, wait_result) = flight
+            .done
+            .wait_timeout_while(
+                flight.in_progress.lock().unwrap_or_else(|e| e.into_inner()),
+                METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT,
+                |in_progress| *in_progress,
+            )
+            .unwrap_or_else(|e| e.into_inner());
+        if *guard {
+            debug_assert!(wait_result.timed_out());
+            MetadataCommandRecoveryAdmission::TimedOut
+        } else {
+            MetadataCommandRecoveryAdmission::Waited
+        }
     }
 
     pub(crate) fn enqueue_object_payload_reclaim(
@@ -3447,6 +3553,59 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn metadata_command_recovery_single_flight_waits_for_matching_command() {
+        let runtime_state = Arc::new(LocalClusterRuntimeState::new());
+        let pg_id = PgId::new(1);
+        let bucket = BucketName::new("single-flight-pending-command").unwrap();
+        let command = create_bucket_metadata_command(pg_id, 1, bucket);
+        let recovery = runtime_state.join_metadata_command_recovery(pg_id, &command);
+        let MetadataCommandRecoveryAdmission::Leader(leader_guard) = recovery else {
+            panic!("first recovery caller should lead the single-flight");
+        };
+
+        let waiter_state = Arc::clone(&runtime_state);
+        let waiter_command = command.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let admission = waiter_state.join_metadata_command_recovery(pg_id, &waiter_command);
+            tx.send(matches!(
+                admission,
+                MetadataCommandRecoveryAdmission::Waited
+            ))
+            .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "second recovery caller should wait while the leader is active"
+        );
+        drop(leader_guard);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "second recovery caller should return as a waiter after the leader finishes"
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn metadata_command_recovery_single_flight_wait_is_bounded() {
+        let runtime_state = Arc::new(LocalClusterRuntimeState::new());
+        let pg_id = PgId::new(1);
+        let bucket = BucketName::new("single-flight-timeout-pending-command").unwrap();
+        let command = create_bucket_metadata_command(pg_id, 1, bucket);
+        let recovery = runtime_state.join_metadata_command_recovery(pg_id, &command);
+        let MetadataCommandRecoveryAdmission::Leader(_leader_guard) = recovery else {
+            panic!("first recovery caller should lead the single-flight");
+        };
+
+        let timed_out = runtime_state.join_metadata_command_recovery(pg_id, &command);
+        assert!(
+            matches!(timed_out, MetadataCommandRecoveryAdmission::TimedOut),
+            "waiter should return a bounded timeout while the leader remains active"
+        );
     }
 
     fn acquire_test_bucket_write_proof(
@@ -16497,6 +16656,72 @@ mod tests {
         assert!(record.detail.contains("action=drain_attempt"));
         assert!(record.detail.contains("command_kind=CreateBucket"));
         assert!(!record.detail.contains(bucket.as_str()));
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
+    fn recovery_waiter_preserves_exact_applied_object_command() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "collect-waiter-stream-create-");
+        let key = key_for_object_pg(topology, &bucket, 1, "stream-key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key,
+                crate::VersionId::from_u64(1),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap();
+            pg.record_metadata_command_applied(node_id.as_u32(), &command)
+                .unwrap();
+        }
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert!(primary_pg
+            .remove_pending_metadata_command_slot(NodeId::new(1).as_u32(), &command)
+            .unwrap());
+        drop(primary_pg);
+
+        let outcome = cluster
+            .pending_command_recovery_waiter_outcome(pg_id, &command)
+            .unwrap();
+        assert_eq!(outcome, Some(PendingMetadataCommandOutcome::Applied));
+        assert!(
+            crate::StorageCluster::metadata_command_recovery_applied_collectable_object_command(
+                &command,
+                outcome.unwrap()
+            ),
+            "collect drains must preserve exact applied object commands for idempotent recovery"
+        );
         assert_clean_metadata_command_stream(&map, &[1]);
     }
 

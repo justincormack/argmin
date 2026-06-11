@@ -7,7 +7,6 @@ use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
 use ring::rand::SecureRandom;
 
-use local::LocalClusterRuntimeState;
 pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
@@ -15,6 +14,7 @@ pub use local::{
     LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
+use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
@@ -2883,12 +2883,96 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
-        self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
-        match self.finish_object_pg_pending_slot_inner(pg_id, command, true)? {
+        match self.drain_pending_metadata_command_with_recovery_gate(pg_id, command)? {
             PendingMetadataCommandOutcome::Applied
             | PendingMetadataCommandOutcome::Abandoned
             | PendingMetadataCommandOutcome::RetryPartialExactConflict => Ok(()),
         }
+    }
+
+    fn drain_pending_metadata_command_with_recovery_gate(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        loop {
+            let recovery = self
+                .local_map
+                .runtime_state()
+                .join_metadata_command_recovery(pg_id, command);
+            let _recovery_guard = match recovery {
+                MetadataCommandRecoveryAdmission::Leader(guard) => guard,
+                MetadataCommandRecoveryAdmission::Waited => {
+                    self.emit_pending_slot_action_for_command(pg_id, command, "drain_wait");
+                    match self.pending_command_recovery_waiter_outcome(pg_id, command)? {
+                        Some(outcome) => return Ok(outcome),
+                        None => continue,
+                    }
+                }
+                MetadataCommandRecoveryAdmission::TimedOut => {
+                    self.emit_pending_slot_action_for_command(pg_id, command, "drain_timeout");
+                    return Err(conflicting_pending_object_metadata_command(
+                        "pending command recovery timed out",
+                    ));
+                }
+            };
+            return self.finish_pending_metadata_command_recovery(pg_id, command);
+        }
+    }
+
+    fn pending_command_recovery_waiter_outcome(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<PendingMetadataCommandOutcome>, ObjectPgActionError> {
+        let pending = self.pending_metadata_command_for_bucket(pg_id, command.bucket_name())?;
+        if pending.as_ref() == Some(command) {
+            return Ok(None);
+        }
+        if self
+            .metadata_command_is_applied_on_all_acting_nodes(pg_id, command)
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+        {
+            return Ok(Some(PendingMetadataCommandOutcome::Applied));
+        }
+        Ok(Some(
+            PendingMetadataCommandOutcome::RetryPartialExactConflict,
+        ))
+    }
+
+    fn finish_pending_metadata_command_recovery(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
+        if Self::metadata_command_is_bucket_pg_command(command) {
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                    pg_id, command, false,
+                )
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            return Ok(match outcome {
+                request_ops::FinishPendingMetadataCommandResult::Applied => {
+                    PendingMetadataCommandOutcome::Applied
+                }
+                request_ops::FinishPendingMetadataCommandResult::Abandoned => {
+                    PendingMetadataCommandOutcome::Abandoned
+                }
+                request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+                    PendingMetadataCommandOutcome::RetryPartialExactConflict
+                }
+            });
+        }
+        self.finish_object_pg_pending_slot_inner(pg_id, command, true)
+    }
+
+    fn metadata_command_recovery_applied_collectable_object_command(
+        command: &MetadataCommandEnvelope,
+        outcome: PendingMetadataCommandOutcome,
+    ) -> bool {
+        matches!(outcome, PendingMetadataCommandOutcome::Applied)
+            && !Self::metadata_command_is_bucket_pg_command(command)
     }
 
     fn finish_object_pg_pending_slot(
@@ -3193,21 +3277,7 @@ impl StorageCluster {
         let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
             return Ok(false);
         };
-        self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
-        if Self::metadata_command_is_bucket_pg_command(&command) {
-            let outcome = self
-                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-                    pg_id, &command, false,
-                )
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-            match outcome {
-                request_ops::FinishPendingMetadataCommandResult::Applied
-                | request_ops::FinishPendingMetadataCommandResult::Abandoned
-                | request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict => {}
-            }
-            return Ok(true);
-        }
-        match self.finish_object_pg_pending_slot(pg_id, &command)? {
+        match self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)? {
             PendingMetadataCommandOutcome::Applied
             | PendingMetadataCommandOutcome::Abandoned
             | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
@@ -3222,28 +3292,11 @@ impl StorageCluster {
     ) -> Result<Vec<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mut applied = Vec::new();
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-            self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
-            if Self::metadata_command_is_bucket_pg_command(&command) {
-                let outcome = self
-                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-                        pg_id,
-                        &command,
-                        false,
-                    )
-                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                match outcome {
-                    request_ops::FinishPendingMetadataCommandResult::Applied
-                    | request_ops::FinishPendingMetadataCommandResult::Abandoned
-                    | request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
-                    }
-                }
-                continue;
-            }
-            let outcome = self.finish_object_pg_pending_slot(pg_id, &command)?;
-            match outcome {
-                PendingMetadataCommandOutcome::Applied => applied.push(command),
-                PendingMetadataCommandOutcome::Abandoned
-                | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
+            let outcome =
+                self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+            if Self::metadata_command_recovery_applied_collectable_object_command(&command, outcome)
+            {
+                applied.push(command);
             }
         }
         Ok(applied)
@@ -3258,23 +3311,8 @@ impl StorageCluster {
             if command.bucket_name() != bucket {
                 return Ok(());
             }
-            self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
-            if Self::metadata_command_is_bucket_pg_command(&command) {
-                let outcome = self
-                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-                        pg_id,
-                        &command,
-                        false,
-                    )
-                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                if let request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict =
-                    outcome
-                {
-                    continue;
-                }
-                continue;
-            }
-            let outcome = self.finish_object_pg_pending_slot(pg_id, &command)?;
+            let outcome =
+                self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
             match outcome {
                 PendingMetadataCommandOutcome::Applied
                 | PendingMetadataCommandOutcome::Abandoned
@@ -3935,34 +3973,120 @@ impl StorageCluster {
             break (command, new_pending_command);
         };
 
-        let mut command = command;
-        loop {
-            match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => break,
-                Err(error)
-                    if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                        && self
-                            .partial_exact_metadata_command_conflict_is_retryable(
-                                pg_id,
-                                &command,
-                                error.applied_nodes,
-                                &error.source,
-                            )
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
-                {
-                    continue;
+        let command = loop {
+            let recovery = self
+                .local_map
+                .runtime_state()
+                .join_metadata_command_recovery(pg_id, &command);
+            let _recovery_guard = match recovery {
+                MetadataCommandRecoveryAdmission::Leader(guard) => guard,
+                MetadataCommandRecoveryAdmission::Waited => {
+                    self.emit_pending_slot_action_for_command(pg_id, &command, "drain_wait");
+                    match self.pending_command_recovery_waiter_outcome(pg_id, &command)? {
+                        Some(PendingMetadataCommandOutcome::Applied) => break command,
+                        Some(PendingMetadataCommandOutcome::Abandoned) => {
+                            if new_pending_command {
+                                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                    pg_id,
+                                    &req.bucket,
+                                    &req.key,
+                                    &req.generation_reservation_id,
+                                );
+                                self.delete_direct_put_segment_payload_shards(
+                                    req.data_pg_id,
+                                    req.ec,
+                                    &req.segment_okh,
+                                    req.segment_vid,
+                                    written_shards,
+                                );
+                            }
+                            return Err(conflicting_pending_object_metadata_command(
+                                "abandoned pending command for direct put commit",
+                            ));
+                        }
+                        Some(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                            // The recovery leader may have reissued and applied a matching
+                            // command, so the owner cannot safely tear down payload state here.
+                            return Err(conflicting_pending_object_metadata_command(
+                                "retryable partial pending command for direct put commit",
+                            ));
+                        }
+                        None => continue,
+                    }
                 }
-                Err(error)
-                    if error.applied_nodes == 0
-                        && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
-                {
-                    let Some(reissued) = self
-                        .reissue_pending_metadata_command(pg_id, &command)
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-                    else {
-                        if new_pending_command {
+                MetadataCommandRecoveryAdmission::TimedOut => {
+                    self.emit_pending_slot_action_for_command(pg_id, &command, "drain_timeout");
+                    return Err(conflicting_pending_object_metadata_command(
+                        "pending direct PUT command recovery timed out",
+                    ));
+                }
+            };
+
+            let mut command = command;
+            loop {
+                match self.apply_metadata_command_to_acting_set(&command) {
+                    Ok(()) => break,
+                    Err(error)
+                        if Self::metadata_command_log_conflict_matches(&command, &error.source)
+                            && self
+                                .partial_exact_metadata_command_conflict_is_retryable(
+                                    pg_id,
+                                    &command,
+                                    error.applied_nodes,
+                                    &error.source,
+                                )
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                    {
+                        continue;
+                    }
+                    Err(error)
+                        if error.applied_nodes == 0
+                            && Self::metadata_command_log_conflict_matches(
+                                &command,
+                                &error.source,
+                            ) =>
+                    {
+                        let Some(reissued) = self
+                            .reissue_pending_metadata_command(pg_id, &command)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                        else {
+                            if new_pending_command {
+                                self.release_metadata_command_bucket_write_reservation(&command)
+                                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                                    pg_id,
+                                    &req.bucket,
+                                    &req.key,
+                                    &req.generation_reservation_id,
+                                );
+                                self.delete_direct_put_segment_payload_shards(
+                                    req.data_pg_id,
+                                    req.ec,
+                                    &req.segment_okh,
+                                    req.segment_vid,
+                                    written_shards,
+                                );
+                            }
+                            return Err(conflicting_pending_object_metadata_command(
+                                "pending direct PUT command was displaced during reissue",
+                            ));
+                        };
+                        command = reissued;
+                    }
+                    Err(error) => {
+                        if new_pending_command && error.applied_nodes == 0 {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
                             self.release_metadata_command_bucket_write_reservation(&command)
                                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id,
+                                &req.bucket,
+                                &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
                             self.release_object_generation_reservation_after_pending_drain_best_effort(
                                 pg_id,
                                 &req.bucket,
@@ -3977,51 +4101,19 @@ impl StorageCluster {
                                 written_shards,
                             );
                         }
-                        return Err(conflicting_pending_object_metadata_command(
-                            "pending direct PUT command was displaced during reissue",
+                        return Err(bucket_snapshot_error_to_object_pg_action_error(
+                            error.source,
                         ));
-                    };
-                    command = reissued;
-                }
-                Err(error) => {
-                    if new_pending_command && error.applied_nodes == 0 {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
-                        self.release_metadata_command_bucket_write_reservation(&command)
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                        self.remove_pending_metadata_command_for_bucket(
-                            pg_id,
-                            &req.bucket,
-                            &command,
-                        )
-                        .map_err(ObjectPgActionError::from)?;
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
                     }
-                    return Err(bucket_snapshot_error_to_object_pg_action_error(
-                        error.source,
-                    ));
                 }
             }
-        }
 
-        self.release_metadata_command_bucket_write_reservation(&command)
-            .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-        self.remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name(), &command)
-            .map_err(ObjectPgActionError::from)?;
+            self.release_metadata_command_bucket_write_reservation(&command)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            self.remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name(), &command)
+                .map_err(ObjectPgActionError::from)?;
+            break command;
+        };
 
         #[cfg(any(test, feature = "test-hooks"))]
         crate::node::maybe_run_after_direct_put_metadata_publish_hook(

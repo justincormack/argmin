@@ -6336,7 +6336,10 @@ Work items:
      useful after the shared byte budget exists.
    - add per-PG metadata apply and pending-command recovery leases, then replace
      drain/reissue loops with single-flight recovery, bounded waiter budgets,
-     and waiter-side command identity/checksum/scope revalidation.
+     and waiter-side command identity/checksum/scope revalidation. Waiters that
+     cannot prove the exact command was applied must return typed retryable
+     contention without performing owner-side payload/generation cleanup, because
+     a recovery leader may have reissued and applied a matching command.
    - add foreground/background capacity classes and make lifecycle, reclaim,
      delete finalization, scavenger, repair, and scrub use low-priority leases
      with backoff.
@@ -6408,7 +6411,9 @@ Required tests:
     operation scope, object/bucket scope, generation or reservation identity,
     and side-effect boundary before proceeding; divergent contenders must wake
     and return the correct retryable contention error or fail closed rather than
-    treating another command's recovery as their own success
+    treating another command's recovery as their own success. Direct PUT waiter
+    ambiguity must not delete payload shards or release generation reservations
+    that could now be referenced by a reissued applied command.
 13. object-version reservation retries are bounded per request attempt, expose
     `reservation_attempts` and `commands_per_visible_commit`, and return
     `OperationAborted` or `SlowDown` instead of looping until the SDK
@@ -6732,6 +6737,21 @@ Status:
   capacity and room for list/progress/start-write work. The environment knob
   now requires a minimum of 8; lower values remain available only to direct
   low-level unit tests that are deliberately exercising exhaustion behavior.
+- Started the pending-command recovery single-flight slice after slow-host UAT
+  showed versioned direct PUTs stuck behind repeated `ReserveObjectVersion`
+  drain/reissue work on one object PG. Generic object/bucket PG pending-slot
+  drains now coalesce by exact PG, command log index, and command checksum: one
+  worker performs the drain while contenders wait, emit `drain_wait`, and then
+  re-read the pending slot before deciding what to do next. Waiters have a
+  bounded recovery budget and return typed metadata-command contention on
+  timeout. Exact owner apply paths remain unchanged.
+- Tightened the single-flight waiter result handling for direct PUT and stale
+  reservations. Generic drain recovery now abandons zero-apply stale
+  generation/version reservations instead of surfacing reservation conflicts
+  from unrelated pending slots. Direct PUT waiters that observe an ambiguous
+  partial exact conflict now fail retryably without deleting segment shards or
+  releasing the generation reservation, because the recovery leader may have
+  reissued and applied a matching command that owns those side effects.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

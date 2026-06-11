@@ -1346,19 +1346,9 @@ impl super::StorageCluster {
         _pending_bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
-        if Self::metadata_command_is_bucket_pg_command(command) {
-            self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
-            let outcome = self
-                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-                    pg_id, command, false,
-                )?;
-            if let FinishPendingMetadataCommandResult::RetryPartialExactConflict = outcome {
-                return Ok(());
-            }
-        } else {
-            self.drain_pending_object_metadata_command(pg_id, command)
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-        }
+        let _ = self
+            .drain_pending_metadata_command_with_recovery_gate(pg_id, command)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         Ok(())
     }
 
