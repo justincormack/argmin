@@ -3690,7 +3690,7 @@ impl StorageCluster {
 
         let mut stale_commit_snapshot_retries = 0;
         let (command, new_pending_command) = loop {
-            let (command, new_pending_command) = loop {
+            let (command, new_pending_command, payload_acks_registered) = loop {
                 let Some(command) =
                     (match self.pending_metadata_command_for_bucket(pg_id, &req.bucket) {
                         Ok(command) => command,
@@ -3737,6 +3737,12 @@ impl StorageCluster {
                         VersionId::Null
                     };
                     self.maybe_run_before_direct_put_command_id_hook();
+                    if let Err(error) =
+                        self.register_payload_shard_acks(req.data_pg_id, &shard_batch)
+                    {
+                        cleanup_direct_put_attempt_before_command_ownership!();
+                        return Err(error);
+                    }
                     let command = match direct_put_metadata_client.build_direct_put_commit_command(
                         BuildDirectPutCommitCommandReq {
                             pg_id,
@@ -3757,10 +3763,8 @@ impl StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            let cleanup = self.drain_pending_object_metadata_commands_for_bucket(
-                                pg_id,
-                                &req.bucket,
-                            );
+                            let cleanup =
+                                self.drain_one_pending_object_metadata_command(pg_id, &req.bucket);
                             if let Err(error) = cleanup {
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
@@ -3772,7 +3776,7 @@ impl StorageCluster {
                             return Err(error);
                         }
                     };
-                    break (command, true);
+                    break (command, true, true);
                 };
 
                 let is_matching_direct_put = matches!(
@@ -3839,7 +3843,7 @@ impl StorageCluster {
                     continue;
                 }
                 if is_matching_direct_put {
-                    break (command, false);
+                    break (command, false, false);
                 }
                 if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
                     cleanup_direct_put_attempt_before_command_ownership!();
@@ -3847,26 +3851,28 @@ impl StorageCluster {
                 }
             };
 
-            if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
-                if new_pending_command {
-                    let release_result =
-                        self.release_metadata_command_bucket_write_reservation(&command);
-                    self.release_object_generation_reservation_after_pending_drain_best_effort(
-                        pg_id,
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                    release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            if !payload_acks_registered {
+                if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
+                    if new_pending_command {
+                        let release_result =
+                            self.release_metadata_command_bucket_write_reservation(&command);
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
             if let Err(error) = self.validate_payload_shard_acks(
                 req.data_pg_id,
@@ -3923,12 +3929,6 @@ impl StorageCluster {
                     }
                 };
                 if !installed {
-                    let cleanup =
-                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, &req.bucket);
-                    if let Err(error) = cleanup {
-                        cleanup_direct_put_attempt_before_command_ownership!();
-                        return Err(error);
-                    }
                     continue;
                 }
             }

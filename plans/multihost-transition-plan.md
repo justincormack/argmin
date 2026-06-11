@@ -6697,6 +6697,14 @@ Status:
   Storage-RPC admission wait/timeout diagnostics now include the admission
   class. This is still a deterministic stepped policy, not the later full
   adaptive controller.
+- Tightened the direct PUT completion retry loop after another slow-host UAT
+  run showed many versioning tests stalling without storage-RPC admission
+  pressure. Direct PUT now registers the acknowledged shard set before
+  building a new metadata command and validates it before publishing,
+  preserving the fail-closed pre-publish validation hook while shortening the
+  command-build-to-pending-install window. On command-id or pending-slot
+  contention it drains at most one competing pending command per retry instead
+  of turning a single install conflict into a full object-PG backlog drain.
 - Tightened the first admission-class implementation after review. Non-reserved
   work (`Progress`, `StartWrite`, `Read`, and `List`) now shares a cap below the
   total per-node RPC limit so `Progress` shard writes cannot consume the
