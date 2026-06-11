@@ -1740,7 +1740,7 @@ impl StorageCluster {
         match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command) {
             Ok(Some(())) => Ok(true),
             Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
                 Ok(false)
             }
             Err(error) => Err(error.into()),
@@ -3051,6 +3051,36 @@ impl StorageCluster {
             .map(|_| ())
     }
 
+    fn drain_one_pending_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, ObjectPgActionError> {
+        let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+            return Ok(false);
+        };
+        self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
+        if Self::metadata_command_is_bucket_pg_command(&command) {
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                    pg_id, &command, false,
+                )
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            match outcome {
+                request_ops::FinishPendingMetadataCommandResult::Applied
+                | request_ops::FinishPendingMetadataCommandResult::Abandoned
+                | request_ops::FinishPendingMetadataCommandResult::RetryPartialExactConflict => {}
+            }
+            return Ok(true);
+        }
+        match self.finish_object_pg_pending_slot(pg_id, &command)? {
+            PendingMetadataCommandOutcome::Applied
+            | PendingMetadataCommandOutcome::Abandoned
+            | PendingMetadataCommandOutcome::RetryPartialExactConflict => {}
+        }
+        Ok(true)
+    }
+
     fn drain_pending_object_metadata_commands_for_bucket_collect(
         &self,
         pg_id: PgId,
@@ -3150,7 +3180,7 @@ impl StorageCluster {
         match self.next_object_metadata_command_id(pg_id) {
             Ok(command_id) => Ok(Some(command_id)),
             Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -4298,7 +4328,7 @@ impl StorageCluster {
         };
         loop {
             if let Err(error) =
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                self.drain_pending_object_metadata_commands_for_exact_bucket(pg_id, bucket)
             {
                 self.delete_payload_shard_keys_best_effort(
                     segment_record.data_pg_id,
