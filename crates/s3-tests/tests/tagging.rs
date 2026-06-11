@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
@@ -13,6 +14,12 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 static BUCKET_POLICY_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+const CONCURRENT_TAGGING_OPERATION_ATTEMPTS: usize = 20;
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
 
 /// Cleanup helper.
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -57,6 +64,39 @@ async fn wait_for_tag_count(bucket: &str, key: &str, expected_count: usize, desc
     panic!(
         "{description} did not converge for {bucket}/{key}: expected {expected_count} tags, last saw {last_seen}"
     );
+}
+
+async fn complete_multipart_upload_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    etag: &str,
+) {
+    for attempt in 0..CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
+        match client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("complete multipart upload during tagging setup: {err:?}"),
+        }
+    }
 }
 
 async fn wait_for_current_delete_marker_tagging_method_not_allowed(
@@ -1665,24 +1705,14 @@ fn test_set_multipart_tagging() {
             .await
             .unwrap();
 
-        client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(
-                        CompletedPart::builder()
-                            .e_tag(upload.e_tag().unwrap())
-                            .part_number(1)
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        complete_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            upload.e_tag().unwrap(),
+        )
+        .await;
 
         let result = client
             .get_object_tagging()

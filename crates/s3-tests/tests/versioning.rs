@@ -1,7 +1,8 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, Delete, EncodingType, ObjectIdentifier, VersioningConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, EncodingType,
+    ObjectIdentifier, VersioningConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
@@ -62,6 +63,7 @@ async fn delete_object_retrying_operation_aborted(
     for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
         match client.delete_object().bucket(bucket).key(key).send().await {
             Ok(output) => {
+                assert!(output.delete_marker().unwrap_or(false));
                 return output
                     .version_id()
                     .expect("delete marker version id")
@@ -104,6 +106,40 @@ async fn delete_object_version_retrying_operation_aborted(
             Err(err) => panic!("delete object version during concurrent version race: {err:?}"),
         }
     }
+}
+
+async fn complete_multipart_upload_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    etag: &str,
+) -> aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("complete multipart upload during versioning setup: {err:?}"),
+        }
+    }
+    panic!("complete multipart upload during versioning setup did not complete");
 }
 
 fn expected_raw_list_key(decoded_key: &str) -> String {
@@ -291,14 +327,7 @@ async fn check_obj_content(bucket: &str, key: &str, version_id: &str, expected: 
 async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
     let client = CTX.client();
     for vid in version_ids {
-        client
-            .delete_object()
-            .bucket(bucket)
-            .key(key)
-            .version_id(vid)
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, bucket, key, vid).await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
@@ -496,14 +525,7 @@ fn test_versioning_obj_create_read_remove() {
 
         // Remove each version by versionId
         for vid in &version_ids {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key)
-                .version_id(vid)
-                .send()
-                .await
-                .unwrap();
+            delete_object_version_retrying_operation_aborted(client, &bucket, key, vid).await;
         }
 
         // Bucket should have no versions left
@@ -535,14 +557,7 @@ fn test_versioning_obj_create_read_remove_head() {
         // Remove the latest (head) version
         let removed_vid = version_ids.pop().unwrap();
         contents.pop();
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&removed_vid)
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, &removed_vid).await;
 
         // GET should now return the previous version
         let resp = client
@@ -559,15 +574,7 @@ fn test_versioning_obj_create_read_remove_head() {
         );
 
         // Add a delete marker
-        let del_resp = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        assert!(del_resp.delete_marker().unwrap_or(false));
-        let dm_vid = del_resp.version_id().unwrap().to_string();
+        let dm_vid = delete_object_retrying_operation_aborted(client, &bucket, key).await;
         version_ids.push(dm_vid.clone());
 
         // list_object_versions should show versions + 1 delete marker
@@ -601,14 +608,8 @@ fn test_versioning_obj_create_versions_remove_all() {
         // Remove each version, verifying content before removal
         for i in 0..num {
             check_obj_content(&bucket, key, &version_ids[i], &contents[i]).await;
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key)
-                .version_id(&version_ids[i])
-                .send()
-                .await
-                .unwrap();
+            delete_object_version_retrying_operation_aborted(client, &bucket, key, &version_ids[i])
+                .await;
         }
 
         let resp = client
@@ -636,14 +637,13 @@ fn test_versioning_obj_create_versions_remove_special_names() {
 
             for i in 0..num {
                 check_obj_content(&bucket, key, &version_ids[i], &contents[i]).await;
-                client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(*key)
-                    .version_id(&version_ids[i])
-                    .send()
-                    .await
-                    .unwrap();
+                delete_object_version_retrying_operation_aborted(
+                    client,
+                    &bucket,
+                    key,
+                    &version_ids[i],
+                )
+                .await;
                 deleted_versions.push(((*key).to_string(), version_ids[i].clone()));
             }
         }
@@ -701,14 +701,7 @@ fn test_versioning_stack_delete_merkers() {
 
         // Create 3 delete markers by deleting without versionId
         for _ in 0..3 {
-            let resp = client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key)
-                .send()
-                .await
-                .unwrap();
-            all_vids.push(resp.version_id().unwrap().to_string());
+            all_vids.push(delete_object_retrying_operation_aborted(client, &bucket, key).await);
         }
 
         let resp = client
@@ -751,14 +744,7 @@ fn test_versioning_obj_plain_null_version_removal() {
             .unwrap();
 
         // Delete the null version
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id("null")
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
         // GET should now 404
         let result = client.get_object().bucket(&bucket).key(key).send().await;
@@ -818,14 +804,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
         assert_eq!(&body[..], b"zzz");
 
         // Delete the new version → old null version becomes current
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&version_id)
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, &version_id).await;
 
         let resp = client
             .get_object()
@@ -838,14 +817,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
         assert_eq!(&body[..], b"fooz");
 
         // Delete the null version
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id("null")
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
         let result = client.get_object().bucket(&bucket).key(key).send().await;
         assert_eq!(err_status(&result), 404);
@@ -908,23 +880,10 @@ fn test_versioning_obj_suspend_versions() {
 
         // Clean up: delete all versioned + null
         for vid in version_ids.iter().chain(extra_vids.iter()) {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key)
-                .version_id(vid)
-                .send()
-                .await
-                .unwrap();
+            delete_object_version_retrying_operation_aborted(client, &bucket, key, vid).await;
         }
         // Delete null version from suspended period
-        let _ = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id("null")
-            .send()
-            .await;
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1035,14 +994,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
         assert_eq!(resp.versions().len(), 1);
 
         // Delete null version
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id("null")
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
         let result = client.get_object().bucket(&bucket).key(key).send().await;
         assert_eq!(err_status(&result), 404);
@@ -1195,24 +1147,10 @@ fn test_versioning_obj_list_marker() {
         // Clean up both keys' versions, then delete bucket
         let client = CTX.client();
         for vid in &version_ids {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key)
-                .version_id(vid)
-                .send()
-                .await
-                .unwrap();
+            delete_object_version_retrying_operation_aborted(client, &bucket, key, vid).await;
         }
         for vid in &version_ids2 {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key2)
-                .version_id(vid)
-                .send()
-                .await
-                .unwrap();
+            delete_object_version_retrying_operation_aborted(client, &bucket, key2, vid).await;
         }
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1232,14 +1170,8 @@ fn test_versioning_list_object_versions_pagination_and_markers() {
                 .await;
         let other_vid = other_resp.version_id().unwrap().to_string();
 
-        let delete_resp = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let delete_marker_vid = delete_resp.version_id().unwrap().to_string();
+        let delete_marker_vid =
+            delete_object_retrying_operation_aborted(client, &bucket, key).await;
         key_versions.push(delete_marker_vid.clone());
 
         let mut key_marker: Option<String> = None;
@@ -1288,14 +1220,8 @@ fn test_versioning_list_object_versions_pagination_and_markers() {
             .iter()
             .all(|vid| key_versions.contains(vid)));
 
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(other_key)
-            .version_id(other_vid)
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, other_key, &other_vid)
+            .await;
         cleanup_versioned(&bucket, key, &key_versions).await;
     });
 }
@@ -1795,15 +1721,7 @@ fn test_versioning_multi_object_delete_with_marker() {
         let (version_ids, _) = create_multiple_versions(&bucket, key, 2).await;
 
         // Create a delete marker
-        let del_resp = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        assert!(del_resp.delete_marker().unwrap_or(false));
-        let dm_vid = del_resp.version_id().unwrap().to_string();
+        let dm_vid = delete_object_retrying_operation_aborted(client, &bucket, key).await;
 
         // Delete all versions + delete marker
         let mut all_ids = version_ids.clone();
@@ -1899,14 +1817,7 @@ fn test_versioning_multi_object_delete_with_marker_create() {
         assert_eq!(resp.delete_markers()[0].key().unwrap(), key);
 
         // Cleanup
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&dm_vid)
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, &dm_vid).await;
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -2168,34 +2079,11 @@ fn test_delete_marker_versioned() {
             put_object_retrying_operation_aborted(client, &bucket, key, b"body".to_vec()).await;
         let vid = put_resp.version_id().unwrap().to_string();
 
-        let del_resp = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        // Versioned delete should produce a delete marker
-        assert!(del_resp.delete_marker().unwrap_or(false));
-        let dm_vid = del_resp.version_id().unwrap().to_string();
+        let dm_vid = delete_object_retrying_operation_aborted(client, &bucket, key).await;
 
         // Cleanup
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&dm_vid)
-            .send()
-            .await
-            .unwrap();
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&vid)
-            .send()
-            .await
-            .unwrap();
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, &dm_vid).await;
+        delete_object_version_retrying_operation_aborted(client, &bucket, key, &vid).await;
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -2308,8 +2196,6 @@ fn test_versioning_bucket_create_suspend() {
 #[test]
 fn test_versioning_obj_create_overwrite_multipart() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
         let key = "mp-overwrite";
@@ -2339,24 +2225,14 @@ fn test_versioning_obj_create_overwrite_multipart() {
             .send()
             .await
             .unwrap();
-        let complete = client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(
-                        CompletedPart::builder()
-                            .e_tag(part_resp.e_tag().unwrap())
-                            .part_number(1)
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        let complete = complete_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            part_resp.e_tag().unwrap(),
+        )
+        .await;
         let v2 = complete.version_id().unwrap().to_string();
         assert_ne!(v1, v2, "multipart should create a new version");
 
@@ -2422,14 +2298,7 @@ fn test_list_object_versions_delete_marker_includes_owner() {
 
         put_object_retrying_operation_aborted(client, &bucket, "owned", b"data".to_vec()).await;
 
-        let del_resp = client
-            .delete_object()
-            .bucket(&bucket)
-            .key("owned")
-            .send()
-            .await
-            .unwrap();
-        assert!(del_resp.delete_marker().unwrap_or(false));
+        delete_object_retrying_operation_aborted(client, &bucket, "owned").await;
 
         let resp = client
             .list_object_versions()
@@ -2458,8 +2327,6 @@ fn test_list_object_versions_delete_marker_includes_owner() {
 #[test]
 fn test_versioning_bucket_multipart_upload_return_version_id() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
         let key = "mp-vid";
@@ -2484,24 +2351,14 @@ fn test_versioning_bucket_multipart_upload_return_version_id() {
             .send()
             .await
             .unwrap();
-        let complete = client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(
-                        CompletedPart::builder()
-                            .e_tag(part_resp.e_tag().unwrap())
-                            .part_number(1)
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        let complete = complete_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            part_resp.e_tag().unwrap(),
+        )
+        .await;
 
         let version_id = complete
             .version_id()
