@@ -1000,6 +1000,31 @@ impl StorageCluster {
         Ok(expected_hashes.is_some())
     }
 
+    fn metadata_command_is_applied_on_all_acting_nodes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let mut expected_hashes = None;
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?
+        {
+            let Some(hashes) = node
+                .metadata_command_client()
+                .applied_metadata_command_log_entry_hashes(pg_id, command)?
+            else {
+                return Ok(false);
+            };
+            match expected_hashes {
+                None => expected_hashes = Some(hashes),
+                Some(expected) if hashes == expected => {}
+                Some(_) => return Ok(false),
+            }
+        }
+        Ok(expected_hashes.is_some())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn matching_reissued_pending_command_if_safe(
         &self,
@@ -2798,6 +2823,21 @@ impl StorageCluster {
                             )
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
                 {
+                    if self
+                        .metadata_command_is_applied_on_all_acting_nodes(pg_id, &command)
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                    {
+                        self.release_applied_metadata_command_bucket_write_reservations(&command)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                        self.remove_pending_metadata_command_for_bucket(
+                            pg_id,
+                            command_bucket,
+                            &command,
+                        )
+                        .map_err(ObjectPgActionError::from)?;
+                        self.after_object_metadata_command_applied(&command);
+                        return Ok(PendingMetadataCommandOutcome::Applied);
+                    }
                     return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
                 }
                 Err(error)

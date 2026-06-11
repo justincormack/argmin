@@ -18947,6 +18947,58 @@ mod tests {
     }
 
     #[test]
+    fn reserve_object_version_clears_fully_applied_pending_reservation() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let pg_id = PgId::new(object_pg);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+                bucket.clone(),
+                key.clone(),
+                crate::VersionId::from_u64(1),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+            .unwrap();
+
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+            "test setup must leave the fully applied command pending"
+        );
+        let version = cluster
+            .reserve_next_object_version(pg_id, &bucket, &key)
+            .unwrap();
+        assert_eq!(version, crate::VersionId::from_u64(1));
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+        assert_clean_metadata_command_stream(&map, &[object_pg]);
+    }
+
+    #[test]
     fn reserve_object_version_partial_apply_after_reopen_converges() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
