@@ -538,11 +538,19 @@ async fn create_external_setup_probe_bucket(
 }
 
 async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label: &str) {
-    match client.delete_bucket().bucket(bucket).send().await {
-        Ok(_) => {}
-        Err(err) if err.code() == Some("NoSuchBucket") => {}
-        Err(err) => {
-            panic!("delete {label} probe bucket during external s3-tests setup: {err:?}");
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + configured_test_timeout();
+
+    loop {
+        match client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => return,
+            Err(err) if err.code() == Some("NoSuchBucket") => return,
+            Err(err) if is_delete_bucket_operation_aborted(&err) && Instant::now() < deadline => {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => {
+                panic!("delete {label} probe bucket during external s3-tests setup: {err:?}");
+            }
         }
     }
 }
@@ -664,6 +672,12 @@ fn is_create_bucket_lost_success_retry(
 
 fn is_create_bucket_operation_aborted(
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
+) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+fn is_delete_bucket_operation_aborted(
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::delete_bucket::DeleteBucketError>,
 ) -> bool {
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
 }

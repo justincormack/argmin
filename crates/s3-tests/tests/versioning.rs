@@ -142,6 +142,34 @@ async fn complete_multipart_upload_retrying_operation_aborted(
     panic!("complete multipart upload during versioning setup did not complete");
 }
 
+async fn copy_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    copy_source: String,
+) -> aws_sdk_s3::operation::copy_object::CopyObjectOutput {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .copy_object()
+            .bucket(bucket)
+            .key(key)
+            .copy_source(copy_source.clone())
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("copy object during versioning setup: {err:?}"),
+        }
+    }
+    panic!("copy object during versioning setup did not complete");
+}
+
 fn expected_raw_list_key(decoded_key: &str) -> String {
     let mut escaped = String::with_capacity(decoded_key.len());
     for ch in decoded_key.chars() {
@@ -1578,14 +1606,13 @@ fn test_versioning_copy_obj_version() {
         let mut copy_keys = Vec::new();
         for i in 0..num {
             let new_key = format!("key_{}", i);
-            client
-                .copy_object()
-                .bucket(&bucket)
-                .key(&new_key)
-                .copy_source(copy_source_with_version(&bucket, key, &version_ids[i]))
-                .send()
-                .await
-                .unwrap();
+            copy_object_retrying_operation_aborted(
+                client,
+                &bucket,
+                &new_key,
+                copy_source_with_version(&bucket, key, &version_ids[i]),
+            )
+            .await;
 
             let resp = client
                 .get_object()
@@ -1605,14 +1632,13 @@ fn test_versioning_copy_obj_version() {
 
         for i in 0..num {
             let new_key = format!("key_{}", i);
-            client
-                .copy_object()
-                .bucket(&bucket2)
-                .key(&new_key)
-                .copy_source(copy_source_with_version(&bucket, key, &version_ids[i]))
-                .send()
-                .await
-                .unwrap();
+            copy_object_retrying_operation_aborted(
+                client,
+                &bucket2,
+                &new_key,
+                copy_source_with_version(&bucket, key, &version_ids[i]),
+            )
+            .await;
 
             let resp = client
                 .get_object()
@@ -1626,14 +1652,13 @@ fn test_versioning_copy_obj_version() {
         }
 
         // Copy latest (no versionId) to another bucket
-        client
-            .copy_object()
-            .bucket(&bucket2)
-            .key("new_key")
-            .copy_source(format!("{}/{}", bucket, key))
-            .send()
-            .await
-            .unwrap();
+        copy_object_retrying_operation_aborted(
+            client,
+            &bucket2,
+            "new_key",
+            format!("{}/{}", bucket, key),
+        )
+        .await;
 
         let resp = client
             .get_object()
