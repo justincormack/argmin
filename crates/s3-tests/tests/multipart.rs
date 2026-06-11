@@ -11,9 +11,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use aws_sdk_s3::error::BoxError;
+use aws_sdk_s3::error::{BoxError, ProvideErrorMetadata};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, EncodingType};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, EncodingType,
+    VersioningConfiguration,
+};
 use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
@@ -26,6 +29,7 @@ use s3_tests::{
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 const SLOW_PART_SIZE: usize = 8 * 1024 * 1024;
 const SLOW_PART_CHUNK_SIZE: usize = 64 * 1024;
+const CONCURRENT_MULTIPART_OPERATION_ATTEMPTS: usize = 20;
 
 fn external_test_mode() -> bool {
     std::env::var_os("S3_TEST_ENDPOINT").is_some()
@@ -88,6 +92,210 @@ async fn wait_for_slow_body_to_start(first_frame_sent: &AtomicBool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("slow UploadPart body did not start sending");
+}
+
+fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+}
+
+async fn put_bucket_versioning_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(status.clone())
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put bucket versioning during multipart setup: {err:?}"),
+        }
+    }
+    panic!("put bucket versioning during multipart setup did not complete");
+}
+
+async fn put_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put object during multipart setup: {err:?}"),
+        }
+    }
+    panic!("put object during multipart setup did not complete");
+}
+
+async fn delete_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::delete_object::DeleteObjectOutput {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client.delete_object().bucket(bucket).key(key).send().await {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("delete object during multipart setup: {err:?}"),
+        }
+    }
+    panic!("delete object during multipart setup did not complete");
+}
+
+async fn create_multipart_upload_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("create multipart upload during multipart setup: {err:?}"),
+        }
+    }
+    panic!("create multipart upload during multipart setup did not complete");
+}
+
+async fn upload_part_copy_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    copy_source: String,
+) -> Result<
+    aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::upload_part_copy::UploadPartCopyError>,
+> {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        let result = client
+            .upload_part_copy()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(copy_source.clone())
+            .send()
+            .await;
+        match result {
+            Ok(output) => return Ok(output),
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    panic!("upload part copy during multipart setup did not complete");
+}
+
+async fn complete_multipart_upload_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    etag: &str,
+) {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("complete multipart upload during multipart setup: {err:?}"),
+        }
+    }
+    panic!("complete multipart upload during multipart setup did not complete");
+}
+
+async fn abort_multipart_upload_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) {
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("abort multipart upload during multipart setup: {err:?}"),
+        }
+    }
+    panic!("abort multipart upload during multipart setup did not complete");
 }
 
 async fn assert_list_parts_no_such_upload(bucket: &str, key: &str, upload_id: &str) {
@@ -3553,86 +3761,47 @@ fn test_multipart_copy_special_names() {
 #[test]
 fn test_multipart_copy_versioned() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
 
-        // Enable versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
 
         let src_key = "versioned-src";
         let dst_key = "versioned-dst";
 
-        // Put version 1
         let data_v1 = vec![b'1'; PART_SIZE];
-        let put1 = client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(data_v1.clone()))
-            .send()
-            .await
-            .unwrap();
+        let put1 =
+            put_object_retrying_operation_aborted(client, &bucket, src_key, data_v1.clone()).await;
         let v1_id = put1.version_id().unwrap().to_string();
 
-        // Put version 2
         let data_v2 = vec![b'2'; PART_SIZE];
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(data_v2))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, data_v2).await;
 
-        // Copy version 1 specifically via ?versionId=
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(dst_key)
-            .send()
-            .await
-            .unwrap();
+        let create =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, dst_key).await;
         let upload_id = create.upload_id().unwrap();
 
-        let copy_resp = client
-            .upload_part_copy()
-            .bucket(&bucket)
-            .key(dst_key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .copy_source(copy_source_with_version(&bucket, src_key, &v1_id))
-            .send()
-            .await
-            .unwrap();
+        let copy_resp = upload_part_copy_retrying_operation_aborted(
+            client,
+            &bucket,
+            dst_key,
+            upload_id,
+            copy_source_with_version(&bucket, src_key, &v1_id),
+        )
+        .await
+        .unwrap();
 
         let etag = copy_resp.copy_part_result().unwrap().e_tag().unwrap();
 
-        client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key(dst_key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        complete_multipart_upload_retrying_operation_aborted(
+            client, &bucket, dst_key, upload_id, etag,
+        )
+        .await;
 
         // Verify we got version 1 data
         let get = client
@@ -3653,75 +3822,42 @@ fn test_multipart_copy_versioned() {
 #[test]
 fn test_multipart_copy_delete_marker_source() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
 
-        // Enable versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
 
         let src_key = "delete-marker-src";
         let dst_key = "delete-marker-dst";
 
-        // Put then delete to create a delete marker as current version
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(vec![b'd'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, vec![b'd'; PART_SIZE])
+            .await;
+        let delete = delete_object_retrying_operation_aborted(client, &bucket, src_key).await;
+        assert!(delete.delete_marker().unwrap_or(false));
 
-        // Attempt upload_part_copy from the delete-marked key
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(dst_key)
-            .send()
-            .await
-            .unwrap();
+        let create =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, dst_key).await;
         let upload_id = create.upload_id().unwrap();
 
-        let result = client
-            .upload_part_copy()
-            .bucket(&bucket)
-            .key(dst_key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
-            .await;
+        let result = upload_part_copy_retrying_operation_aborted(
+            client,
+            &bucket,
+            dst_key,
+            upload_id,
+            format!("{}/{}", bucket, src_key),
+        )
+        .await;
         let status = err_status(&result);
         assert_eq!(status, 404);
         assert_s3_err_code(&result, "NoSuchKey");
 
-        client
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key(dst_key)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .unwrap();
+        abort_multipart_upload_retrying_operation_aborted(client, &bucket, dst_key, upload_id)
+            .await;
         s3_tests::cleanup_versioned_bucket(client, &bucket).await;
     });
 }
@@ -3731,74 +3867,44 @@ fn test_multipart_copy_delete_marker_source() {
 #[test]
 fn test_multipart_copy_delete_marker_version_id() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
 
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
 
         let src_key = "dm-vid-src";
         let dst_key = "dm-vid-dst";
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(vec![b'd'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
-        let del = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, vec![b'd'; PART_SIZE])
+            .await;
+        let del = delete_object_retrying_operation_aborted(client, &bucket, src_key).await;
+        assert!(del.delete_marker().unwrap_or(false));
         let dm_version_id = del.version_id().unwrap();
 
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(dst_key)
-            .send()
-            .await
-            .unwrap();
+        let create =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, dst_key).await;
         let upload_id = create.upload_id().unwrap();
 
-        let result = client
-            .upload_part_copy()
-            .bucket(&bucket)
-            .key(dst_key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .copy_source(copy_source_with_version(&bucket, src_key, dm_version_id))
-            .send()
-            .await;
+        let result = upload_part_copy_retrying_operation_aborted(
+            client,
+            &bucket,
+            dst_key,
+            upload_id,
+            copy_source_with_version(&bucket, src_key, dm_version_id),
+        )
+        .await;
         assert!(result.is_err());
         let status = err_status(&result);
         assert_eq!(status, 400);
         assert_s3_err_code(&result, "InvalidRequest");
 
-        client
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key(dst_key)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .unwrap();
+        abort_multipart_upload_retrying_operation_aborted(client, &bucket, dst_key, upload_id)
+            .await;
         s3_tests::cleanup_versioned_bucket(client, &bucket).await;
     });
 }
