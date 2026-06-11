@@ -6,7 +6,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
-    delete_objects_with_md5, err_status, send_signed_request, unique_bucket, CTX,
+    delete_bucket_retrying_operation_aborted, delete_objects_with_md5, err_status,
+    send_signed_request, unique_bucket, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -170,6 +171,36 @@ async fn copy_object_retrying_operation_aborted(
     panic!("copy object during versioning setup did not complete");
 }
 
+async fn put_bucket_versioning_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) {
+    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
+        match client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(status.clone())
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put bucket versioning during versioning setup: {err:?}"),
+        }
+    }
+    panic!("put bucket versioning during versioning setup did not complete");
+}
+
 fn expected_raw_list_key(decoded_key: &str) -> String {
     let mut escaped = String::with_capacity(decoded_key.len());
     for ch in decoded_key.chars() {
@@ -204,17 +235,12 @@ async fn setup_versioned_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
     s3_tests::create_bucket(client, &bucket).await.unwrap();
-    client
-        .put_bucket_versioning()
-        .bucket(&bucket)
-        .versioning_configuration(
-            VersioningConfiguration::builder()
-                .status(BucketVersioningStatus::Enabled)
-                .build(),
-        )
-        .send()
-        .await
-        .unwrap();
+    put_bucket_versioning_retrying_operation_aborted(
+        client,
+        &bucket,
+        BucketVersioningStatus::Enabled,
+    )
+    .await;
     bucket
 }
 
@@ -240,12 +266,7 @@ fn test_bucket_versioning_raw_get_returns_canonical_xml() {
         assert_eq!(put.status, 200, "unexpected body: {}", put.body);
 
         let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
-        CTX.client()
-            .delete_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
 
         assert_eq!(get.status, 200, "unexpected body: {}", get.body);
         assert_eq!(get.body, expected);
@@ -303,12 +324,7 @@ async fn cleanup_versioned_bucket_with_encoding(client: &aws_sdk_s3::Client, buc
         }
     }
 
-    client
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .expect("delete bucket");
+    delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 /// Put multiple versions of the same key, returning (version_ids, contents).
@@ -357,7 +373,7 @@ async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
     for vid in version_ids {
         delete_object_version_retrying_operation_aborted(client, bucket, key, vid).await;
     }
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn create_versioned_object_concurrent(
@@ -568,7 +584,7 @@ fn test_versioning_obj_create_read_remove() {
             "expected no versions after removal"
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -648,7 +664,7 @@ fn test_versioning_obj_create_versions_remove_all() {
             .unwrap();
         assert!(resp.versions().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -759,17 +775,12 @@ fn test_versioning_obj_plain_null_version_removal() {
         put_object_retrying_operation_aborted(client, &bucket, key, b"fooz".to_vec()).await;
 
         // Enable versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
 
         // Delete the null version
         delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
@@ -787,7 +798,7 @@ fn test_versioning_obj_plain_null_version_removal() {
             .unwrap();
         assert!(resp.versions().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -803,17 +814,12 @@ fn test_versioning_obj_plain_null_version_overwrite() {
         put_object_retrying_operation_aborted(client, &bucket, key, b"fooz".to_vec()).await;
 
         // Enable versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
 
         // Put new version (gets a real version ID)
         let resp =
@@ -858,7 +864,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
             .unwrap();
         assert!(resp.versions().is_empty());
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -875,34 +881,24 @@ fn test_versioning_obj_suspend_versions() {
         let (version_ids, _) = create_multiple_versions(&bucket, key, num).await;
 
         // Suspend versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
 
         // Puts while suspended overwrite the null version
         put_object_retrying_operation_aborted(client, &bucket, key, b"suspended content".to_vec())
             .await;
 
         // Re-enable versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
 
         let (extra_vids, _) = create_multiple_versions(&bucket, key, 3).await;
 
@@ -913,7 +909,7 @@ fn test_versioning_obj_suspend_versions() {
         // Delete null version from suspended period
         delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -928,17 +924,12 @@ fn test_versioning_list_object_versions_suspended_null_is_latest() {
             put_object_retrying_operation_aborted(client, &bucket, key, b"older".to_vec()).await;
         let older_version_id = older.version_id().unwrap().to_string();
 
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
 
         put_object_retrying_operation_aborted(client, &bucket, key, b"current".to_vec()).await;
 
@@ -976,28 +967,18 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
         put_object_retrying_operation_aborted(client, &bucket, key, b"foooz".to_vec()).await;
 
         // Enable then suspend
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
 
         // Put while suspended overwrites null
         put_object_retrying_operation_aborted(client, &bucket, key, b"zzz".to_vec()).await;
@@ -1027,7 +1008,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
         let result = client.get_object().bucket(&bucket).key(key).send().await;
         assert_eq!(err_status(&result), 404);
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1043,17 +1024,12 @@ fn test_versioning_obj_suspended_copy() {
         let (_version_ids, _) = create_multiple_versions(&bucket, key1, 1).await;
 
         // Suspend versioning
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
 
         // Overwrite with null version
         put_object_retrying_operation_aborted(client, &bucket, key1, b"null content".to_vec())
@@ -1180,7 +1156,7 @@ fn test_versioning_obj_list_marker() {
         for vid in &version_ids2 {
             delete_object_version_retrying_operation_aborted(client, &bucket, key2, vid).await;
         }
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1732,7 +1708,7 @@ fn test_versioning_multi_object_delete() {
         .await
         .unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1796,7 +1772,7 @@ fn test_versioning_multi_object_delete_with_marker() {
         .await
         .unwrap();
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1843,7 +1819,7 @@ fn test_versioning_multi_object_delete_with_marker_create() {
 
         // Cleanup
         delete_object_version_retrying_operation_aborted(client, &bucket, key, &dm_vid).await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1888,27 +1864,17 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             .send()
             .await
             .unwrap();
-        client
-            .delete_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket2).await;
 
         // Suspended: should not return a version ID
         let bucket3 = unique_bucket();
         s3_tests::create_bucket(client, &bucket3).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket3)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket3,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
         let resp = put_object_retrying_operation_aborted(client, &bucket3, "baz", Vec::new()).await;
         assert!(
             resp.version_id().is_none(),
@@ -1958,7 +1924,7 @@ fn test_versioned_concurrent_object_create_concurrent_remove() {
             .await;
         }
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -1999,7 +1965,7 @@ fn test_versioned_concurrent_object_create_and_remove() {
         )
         .await;
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2063,7 +2029,7 @@ fn test_versioning_concurrent_multi_object_delete() {
         )
         .await;
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2089,7 +2055,7 @@ fn test_delete_marker_nonversioned() {
         // Non-versioned delete should not produce a delete marker
         assert!(!resp.delete_marker().unwrap_or(false));
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2109,7 +2075,7 @@ fn test_delete_marker_versioned() {
         // Cleanup
         delete_object_version_retrying_operation_aborted(client, &bucket, key, &dm_vid).await;
         delete_object_version_retrying_operation_aborted(client, &bucket, key, &vid).await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -2135,17 +2101,12 @@ fn test_versioning_bucket_create_suspend() {
         );
 
         // Suspend → Suspended
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
@@ -2155,17 +2116,12 @@ fn test_versioning_bucket_create_suspend() {
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Suspended));
 
         // Enable → Enabled
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
@@ -2175,17 +2131,12 @@ fn test_versioning_bucket_create_suspend() {
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Enabled));
 
         // Enable again (idempotent) → still Enabled
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
@@ -2195,17 +2146,12 @@ fn test_versioning_bucket_create_suspend() {
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Enabled));
 
         // Suspend → Suspended
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Suspended)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
@@ -2214,7 +2160,7 @@ fn test_versioning_bucket_create_suspend() {
             .unwrap();
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Suspended));
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 

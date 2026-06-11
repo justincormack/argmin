@@ -24,7 +24,7 @@ use base64::Engine;
 use md5_legacy::Digest;
 use ring::hmac;
 
-use crate::CTX;
+use crate::{configured_test_timeout, CTX};
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 static BUCKET_NAMESPACE: LazyLock<u64> = LazyLock::new(|| {
@@ -465,12 +465,7 @@ pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String
             .await
             .expect("delete object");
     }
-    client
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .expect("delete bucket");
+    delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 /// Build a DeleteObjects request that sets the required Content-MD5 header from
@@ -1190,10 +1185,26 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
         }
     }
 
-    match client.delete_bucket().bucket(bucket).send().await {
-        Ok(_) => {}
-        Err(err) if is_bucket_already_absent(&err) => {}
-        Err(err) => panic!("delete bucket: {err:?}"),
+    delete_bucket_retrying_operation_aborted(client, bucket).await;
+}
+
+pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &str) {
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+
+    loop {
+        match client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => return,
+            Err(err) if is_bucket_already_absent(&err) => return,
+            Err(err)
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("OperationAborted")
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => panic!("delete bucket: {err:?}"),
+        }
     }
 }
 
