@@ -62,7 +62,9 @@ mod request_ops;
 
 const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
 const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
+const DIRECT_PUT_METADATA_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
+const OBJECT_GENERATION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS: usize = 64;
 pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(2);
@@ -2772,7 +2774,12 @@ impl StorageCluster {
     ) -> Result<GenerationId, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut empty_log_conflicts = 0;
+        let mut work_budget =
+            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None);
         loop {
+            work_budget
+                .check("object generation reservation retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::ReserveObjectGeneration(reservation)
@@ -2788,12 +2795,24 @@ impl StorageCluster {
                                     "retryable partial pending generation reservation command",
                                 ));
                             }
-                            PendingMetadataCommandOutcome::Abandoned => continue,
+                            PendingMetadataCommandOutcome::Abandoned => {
+                                work_budget
+                                    .sleep_after_contention(
+                                        "object generation reservation abandoned pending retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
                         }
                     }
                     _ => {}
                 }
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
+                work_budget
+                    .sleep_after_contention(
+                        "object generation reservation pending drain retry budget exhausted",
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
                 continue;
             }
 
@@ -2816,6 +2835,11 @@ impl StorageCluster {
                 .next_object_generation_id(pg_id, bucket, key)?
                 != generation_id
             {
+                work_budget
+                    .sleep_after_contention(
+                        "object generation reservation stale generation retry budget exhausted",
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
                 continue;
             }
             self.maybe_run_before_metadata_command_pending_install_hook();
@@ -2841,6 +2865,11 @@ impl StorageCluster {
                 ObjectPgPendingCommandInstall::Installed(command) => command,
                 ObjectPgPendingCommandInstall::Pending(command) => {
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "object generation reservation pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
@@ -2851,6 +2880,11 @@ impl StorageCluster {
                         &mut empty_log_conflicts,
                         "object generation reservation log conflict without pending progress",
                     )?;
+                    work_budget
+                        .sleep_after_contention(
+                            "object generation reservation log conflict retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
             };
@@ -2933,6 +2967,11 @@ impl StorageCluster {
                         }
                         self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                             .map_err(ObjectPgActionError::from)?;
+                        work_budget
+                            .sleep_after_contention(
+                                "object generation reservation conflict cleanup retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         continue;
                     }
                     Err(error)
@@ -2957,6 +2996,11 @@ impl StorageCluster {
                                 return Err(bucket_snapshot_error_to_object_pg_action_error(error));
                             }
                         };
+                        work_budget
+                            .sleep_after_contention(
+                                "object generation reservation reissue retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         command = reissued;
                     }
                     Err(error) => {
@@ -4026,7 +4070,12 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let mut work_budget =
+            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None);
         loop {
+            work_budget
+                .check("object generation release retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::ReleaseObjectGeneration(reservation)
@@ -4041,17 +4090,34 @@ impl StorageCluster {
                                     "retryable partial pending generation release command",
                                 ));
                             }
-                            PendingMetadataCommandOutcome::Abandoned => continue,
+                            PendingMetadataCommandOutcome::Abandoned => {
+                                work_budget
+                                    .sleep_after_contention(
+                                        "object generation release abandoned pending retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
                         }
                     }
                     _ => {
                         self.drain_pending_object_metadata_command(pg_id, &command)?;
+                        work_budget
+                            .sleep_after_contention(
+                                "object generation release pending drain retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         continue;
                     }
                 }
             }
             let Some(command_id) = self.next_object_metadata_command_id_or_drain(pg_id, bucket)?
             else {
+                work_budget
+                    .sleep_after_contention(
+                        "object generation release command id retry budget exhausted",
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
                 continue;
             };
             let command = MetadataCommandEnvelope::new(
@@ -4065,6 +4131,11 @@ impl StorageCluster {
                 ),
             );
             if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
+                work_budget
+                    .sleep_after_contention(
+                        "object generation release pending install retry budget exhausted",
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
                 continue;
             }
             let mut command = command;
@@ -4120,6 +4191,11 @@ impl StorageCluster {
                         else {
                             break;
                         };
+                        work_budget
+                            .sleep_after_contention(
+                                "object generation release reissue retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         command = reissued;
                     }
                     Err(error) => {
@@ -4132,6 +4208,11 @@ impl StorageCluster {
                                 pg_id, bucket, &command,
                             )
                             .map_err(ObjectPgActionError::from)?;
+                            work_budget
+                                .sleep_after_contention(
+                                    "object generation release abandoned command retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
                             break;
                         }
                         return Err(bucket_snapshot_error_to_object_pg_action_error(
@@ -4181,6 +4262,23 @@ impl StorageCluster {
                 release_result?;
             }};
         }
+        let mut work_budget = RequestWorkBudget::new(DIRECT_PUT_METADATA_RETRY_BUDGET, None);
+        macro_rules! check_direct_put_work_before_command_ownership {
+            ($context:literal) => {{
+                if let Err(error) = work_budget.check($context) {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(ObjectPgActionError::Store(error));
+                }
+            }};
+        }
+        macro_rules! sleep_direct_put_before_command_ownership_after_contention {
+            ($context:literal) => {{
+                if let Err(error) = work_budget.sleep_after_contention($context) {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(ObjectPgActionError::Store(error));
+                }
+            }};
+        }
         let shard_batch: Vec<(&ShardKey, WriteAck)> = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
@@ -4198,7 +4296,13 @@ impl StorageCluster {
         let stale_commit_snapshot_deadline = Instant::now() + DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET;
         let mut empty_log_conflicts = 0;
         let (command, new_pending_command) = loop {
+            check_direct_put_work_before_command_ownership!(
+                "direct PUT metadata retry budget exhausted"
+            );
             let (command, new_pending_command, payload_acks_registered) = loop {
+                check_direct_put_work_before_command_ownership!(
+                    "direct PUT metadata pending retry budget exhausted"
+                );
                 let Some(command) =
                     (match self.pending_metadata_command_for_bucket(pg_id, &req.bucket) {
                         Ok(command) => command,
@@ -4267,6 +4371,9 @@ impl StorageCluster {
                                 && Instant::now() < stale_commit_snapshot_deadline =>
                         {
                             stale_commit_snapshot_retries += 1;
+                            sleep_direct_put_before_command_ownership_after_contention!(
+                                "direct PUT stale snapshot retry budget exhausted"
+                            );
                             continue;
                         }
                         Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
@@ -4298,6 +4405,9 @@ impl StorageCluster {
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
+                            sleep_direct_put_before_command_ownership_after_contention!(
+                                "direct PUT command log conflict retry budget exhausted"
+                            );
                             continue;
                         }
                         Err(error) => {
@@ -4369,6 +4479,9 @@ impl StorageCluster {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
+                    sleep_direct_put_before_command_ownership_after_contention!(
+                        "direct PUT abandoned pending drain retry budget exhausted"
+                    );
                     continue;
                 }
                 if is_matching_direct_put {
@@ -4378,6 +4491,9 @@ impl StorageCluster {
                     cleanup_direct_put_attempt_before_command_ownership!();
                     return Err(error);
                 }
+                sleep_direct_put_before_command_ownership_after_contention!(
+                    "direct PUT unrelated pending drain retry budget exhausted"
+                );
             };
 
             if !payload_acks_registered {
@@ -4458,6 +4574,9 @@ impl StorageCluster {
                     }
                 };
                 if !installed {
+                    sleep_direct_put_before_command_ownership_after_contention!(
+                        "direct PUT pending install retry budget exhausted"
+                    );
                     continue;
                 }
             }
@@ -4519,6 +4638,11 @@ impl StorageCluster {
                                 &command,
                                 waiter_outcome.metric_label(),
                             );
+                            work_budget
+                                .sleep_after_contention(
+                                    "direct PUT pending recovery retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
                             continue;
                         }
                     }
@@ -4618,6 +4742,11 @@ impl StorageCluster {
                                 "pending direct PUT command was displaced during reissue",
                             ));
                         };
+                        work_budget
+                            .sleep_after_contention(
+                                "direct PUT commit reissue retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         command = reissued;
                     }
                     Err(error) => {
