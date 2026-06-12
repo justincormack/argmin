@@ -38,9 +38,12 @@ const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
 const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 10_000;
+const BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS: u64 = 10_000;
+const COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
+const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
 const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1204,11 +1207,31 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
     ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        );
+        self.finish_pending_metadata_command_to_acting_set_with_work_budget(
+            pg_id,
+            command,
+            clear_pending_on_zero_apply,
+            &mut work_budget,
+        )
+    }
+
+    fn finish_pending_metadata_command_to_acting_set_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
         match self.finish_pending_metadata_command_to_acting_set_inner(
             pg_id,
             command,
             clear_pending_on_zero_apply,
             false,
+            work_budget,
         )? {
             FinishPendingMetadataCommandResult::Applied => {
                 Ok(super::PendingMetadataCommandOutcome::Applied)
@@ -1228,11 +1251,31 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        );
+        self.finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+            pg_id,
+            command,
+            clear_pending_on_zero_apply,
+            &mut work_budget,
+        )
+    }
+
+    fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         self.finish_pending_metadata_command_to_acting_set_inner(
             pg_id,
             command,
             clear_pending_on_zero_apply,
             true,
+            work_budget,
         )
     }
 
@@ -1242,9 +1285,11 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
         retry_partial_exact_conflict: bool,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         let mut command = command.clone();
         loop {
+            work_budget.check("metadata command apply retry budget exhausted")?;
             let command_bucket = command.bucket_name();
             if self
                 .metadata_command_has_abandoned_log_on_acting_set(&command)
@@ -1315,16 +1360,35 @@ impl super::StorageCluster {
     pub(super) fn drain_bucket_pg_pending_metadata_command(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
+        _bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
     ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
-        self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
-        self.finish_pending_metadata_command_to_acting_set(
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        );
+        self.drain_bucket_pg_pending_metadata_command_with_work_budget(
             pg_id,
-            bucket,
             command,
             clear_pending_on_zero_apply,
+            &mut work_budget,
+        )
+    }
+
+    fn drain_bucket_pg_pending_metadata_command_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
+        self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
+        self.finish_pending_metadata_command_to_acting_set_with_work_budget(
+            pg_id,
+            command,
+            clear_pending_on_zero_apply,
+            work_budget,
         )
     }
 
@@ -1346,6 +1410,26 @@ impl super::StorageCluster {
         Ok(true)
     }
 
+    fn drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let pending_bucket = Self::metadata_command_bucket_name(command).clone();
+        if pending_bucket == *bucket {
+            return Ok(false);
+        }
+        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+            pg_id,
+            &pending_bucket,
+            command,
+            work_budget,
+        )?;
+        Ok(true)
+    }
+
     pub(super) fn drain_pending_metadata_command_pg_slot(
         &self,
         pg_id: PgId,
@@ -1358,13 +1442,67 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    fn drain_pending_metadata_command_pg_slot_with_work_budget(
+        &self,
+        pg_id: PgId,
+        _pending_bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if Self::metadata_command_is_bucket_pg_command(command) {
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                    pg_id,
+                    command,
+                    false,
+                    work_budget,
+                )?;
+            return match outcome {
+                FinishPendingMetadataCommandResult::Applied
+                | FinishPendingMetadataCommandResult::Abandoned => Ok(()),
+                FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+                    Err(conflicting_pending_metadata_command(
+                        "retryable partial pending metadata command drain",
+                    ))
+                }
+            };
+        }
+
+        let _ = self
+            .drain_pending_metadata_command_with_recovery_gate(pg_id, command)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+        Ok(())
+    }
+
     fn drain_pending_completed_multipart_sequence_command(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
+        _bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let _ = self.drain_bucket_pg_pending_metadata_command(pg_id, bucket, command, false)?;
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        );
+        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+            pg_id,
+            command,
+            &mut work_budget,
+        )
+    }
+
+    fn drain_pending_completed_multipart_sequence_command_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let _ = self.drain_bucket_pg_pending_metadata_command_with_work_budget(
+            pg_id,
+            command,
+            false,
+            work_budget,
+        )?;
         Ok(())
     }
 
@@ -1373,9 +1511,16 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
-        self.next_bucket_metadata_command_id_or_drain_with_completion_admission(
-            pg_id, bucket, false,
-        )
+        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, false, None)
+    }
+
+    fn next_bucket_metadata_command_id_or_drain_with_work_budget(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
+        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, false, Some(work_budget))
     }
 
     fn next_completion_bucket_metadata_command_id_or_drain(
@@ -1383,14 +1528,15 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
-        self.next_bucket_metadata_command_id_or_drain_with_completion_admission(pg_id, bucket, true)
+        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, true, None)
     }
 
-    fn next_bucket_metadata_command_id_or_drain_with_completion_admission(
+    fn next_bucket_metadata_command_id_or_drain_inner(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         completion_admission: bool,
+        work_budget: Option<&mut super::RequestWorkBudget>,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
         let command_id_result = if completion_admission {
             self.next_completion_bucket_metadata_command_id(pg_id)
@@ -1404,7 +1550,20 @@ impl super::StorageCluster {
             })) => {
                 if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&command).clone();
-                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &command)?;
+                    if let Some(work_budget) = work_budget {
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            pg_id,
+                            &pending_bucket,
+                            &command,
+                            work_budget,
+                        )?;
+                    } else {
+                        self.drain_pending_metadata_command_pg_slot(
+                            pg_id,
+                            &pending_bucket,
+                            &command,
+                        )?;
+                    }
                 }
                 Ok(None)
             }
@@ -1431,6 +1590,43 @@ impl super::StorageCluster {
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
                     self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command) {
+            Ok(Some(())) => Ok(true),
+            Ok(None) => {
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        &pending_bucket,
+                        &pending,
+                        work_budget,
+                    )?;
+                }
+                Ok(false)
+            }
+            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        &pending_bucket,
+                        &pending,
+                        work_budget,
+                    )?;
                 }
                 Ok(false)
             }
@@ -2782,7 +2978,12 @@ impl super::StorageCluster {
             Ok(())
         };
 
-        let result = self.try_finalize_bucket_delete_claimed(bucket, bucket_pg_id);
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS),
+            None,
+        );
+        let result =
+            self.try_finalize_bucket_delete_claimed(bucket, bucket_pg_id, &mut work_budget);
         match result {
             Ok(
                 outcome @ (BucketDeleteFinalizeOutcome::Finalized
@@ -2815,8 +3016,10 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         bucket_pg_id: u32,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         loop {
+            work_budget.check("bucket delete finalize work budget exhausted")?;
             if let Some(source) = self.bucket_visible_data_source(bucket, false)? {
                 let _ = observability::event(
                     super::TRACE_TARGET,
@@ -2894,7 +3097,7 @@ impl super::StorageCluster {
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 
-        self.delete_completed_multipart_uploads_for_bucket(bucket)?;
+        self.delete_completed_multipart_uploads_for_bucket(bucket, work_budget)?;
 
         self.delete_bucket_from_acting_set(PgId::new(bucket_pg_id), bucket)
     }
@@ -3011,12 +3214,39 @@ impl super::StorageCluster {
     fn delete_completed_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
-        let records =
-            self.completed_multipart_upload_records_for_bucket::<BucketWriteDrainError>(bucket)?;
-        for (pg_id, record) in records {
-            self.delete_completed_multipart_upload_record_with_command(pg_id, record)
-                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            let mut upload_id_marker = None;
+            loop {
+                work_budget.check("completed multipart cleanup listing budget exhausted")?;
+                let page = node
+                    .object_mutation_metadata_client()
+                    .list_completed_multipart_upload_records_for_bucket_page(
+                        pg_id,
+                        bucket,
+                        upload_id_marker.as_ref(),
+                        INTERNAL_LIST_PAGE_SIZE,
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                let next_upload_id_marker = page.next_upload_id_marker;
+                for record in page.records {
+                    self.delete_completed_multipart_upload_record_with_command(
+                        pg_id,
+                        record,
+                        work_budget,
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                }
+                match next_upload_id_marker {
+                    Some(next) => upload_id_marker = Some(next),
+                    None => break,
+                }
+            }
         }
         Ok(())
     }
@@ -3024,6 +3254,7 @@ impl super::StorageCluster {
     fn completed_multipart_upload_records_for_bucket<E>(
         &self,
         bucket: &BucketName,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<Vec<(PgId, CompletedMultipartUploadRecord)>, E>
     where
         E: From<StoreError> + From<MetadataError>,
@@ -3036,6 +3267,7 @@ impl super::StorageCluster {
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
             let mut upload_id_marker = None;
             loop {
+                work_budget.check("completed multipart cleanup listing budget exhausted")?;
                 let page = node
                     .object_mutation_metadata_client()
                     .list_completed_multipart_upload_records_for_bucket_page(
@@ -3062,15 +3294,18 @@ impl super::StorageCluster {
         &self,
         pg_id: PgId,
         record: CompletedMultipartUploadRecord,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketSnapshotLoadError> {
         loop {
+            work_budget.check("completed multipart cleanup command budget exhausted")?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, &record.bucket)?
             {
-                if self.drain_unrelated_pending_metadata_command_for_bucket(
+                if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
                     pg_id,
                     &record.bucket,
                     &command,
+                    work_budget,
                 )? {
                     continue;
                 }
@@ -3081,34 +3316,39 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        let _ = self.drain_bucket_pg_pending_metadata_command(
+                        let _ = self.drain_bucket_pg_pending_metadata_command_with_work_budget(
                             pg_id,
-                            &record.bucket,
                             &command,
                             false,
+                            work_budget,
                         )?;
                         continue;
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command(
+                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
                             pg_id,
-                            &record.bucket,
                             &command,
+                            work_budget,
                         )?;
                         continue;
                     }
                     _ => {
-                        self.drain_pending_metadata_command_pg_slot(
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
                             pg_id,
                             &record.bucket,
                             &command,
+                            work_budget,
                         )?;
                         continue;
                     }
                 }
             } else {
-                let Some(command_id) =
-                    self.next_bucket_metadata_command_id_or_drain(pg_id, &record.bucket)?
+                let Some(command_id) = self
+                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                        pg_id,
+                        &record.bucket,
+                        work_budget,
+                    )?
                 else {
                     continue;
                 };
@@ -3120,20 +3360,21 @@ impl super::StorageCluster {
                         },
                     )),
                 );
-                if !self.try_set_bucket_pg_pending_command_or_retry(
+                if !self.try_set_bucket_pg_pending_command_or_retry_with_work_budget(
                     pg_id,
                     &record.bucket,
                     &command,
+                    work_budget,
                 )? {
                     continue;
                 }
                 (command, true)
             };
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
+            let outcome = self.finish_pending_metadata_command_to_acting_set_with_work_budget(
                 pg_id,
-                &record.bucket,
                 &command,
                 clear_pending_on_zero_apply,
+                work_budget,
             )?;
             if outcome == super::PendingMetadataCommandOutcome::Abandoned {
                 continue;
@@ -3680,8 +3921,22 @@ impl super::StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         crate::node::maybe_run_before_completed_multipart_prune_hook(bucket)?;
 
-        let mut uploads =
-            self.completed_multipart_upload_records_for_bucket::<ObjectPgActionError>(bucket)?;
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS),
+            None,
+        );
+        if keep == 0 {
+            return self.delete_all_completed_multipart_uploads_for_bucket_as_object_action(
+                bucket,
+                &mut work_budget,
+            );
+        }
+
+        let mut uploads = self
+            .completed_multipart_upload_records_for_bucket::<ObjectPgActionError>(
+                bucket,
+                &mut work_budget,
+            )?;
         uploads.sort_by(|(left_pg, left), (right_pg, right)| {
             right
                 .completion_order
@@ -3690,8 +3945,52 @@ impl super::StorageCluster {
                 .then_with(|| left.upload_id.as_str().cmp(right.upload_id.as_str()))
         });
         for (pg_id, record) in uploads.into_iter().skip(keep) {
-            self.delete_completed_multipart_upload_record_with_command(pg_id, record)
-                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+            self.delete_completed_multipart_upload_record_with_command(
+                pg_id,
+                record,
+                &mut work_budget,
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        }
+        Ok(())
+    }
+
+    fn delete_all_completed_multipart_uploads_for_bucket_as_object_action(
+        &self,
+        bucket: &BucketName,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            let mut upload_id_marker = None;
+            loop {
+                work_budget.check("completed multipart cleanup listing budget exhausted")?;
+                let page = node
+                    .object_mutation_metadata_client()
+                    .list_completed_multipart_upload_records_for_bucket_page(
+                        pg_id,
+                        bucket,
+                        upload_id_marker.as_ref(),
+                        INTERNAL_LIST_PAGE_SIZE,
+                    )
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                let next_upload_id_marker = page.next_upload_id_marker;
+                for record in page.records {
+                    self.delete_completed_multipart_upload_record_with_command(
+                        pg_id,
+                        record,
+                        work_budget,
+                    )
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                }
+                match next_upload_id_marker {
+                    Some(next) => upload_id_marker = Some(next),
+                    None => break,
+                }
+            }
         }
         Ok(())
     }
@@ -4908,7 +5207,12 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
         let mut command = command.clone();
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        );
         loop {
+            work_budget.check("object metadata command apply retry budget exhausted")?;
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
                     self.release_applied_metadata_command_bucket_write_reservations(&command)
