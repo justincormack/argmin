@@ -395,6 +395,10 @@ print_slowdown_summary() {
         local metadata_recovery_wait_us_max
         local metadata_recovery_timeout
         local metadata_recovery_outcome
+        local metadata_budget_exhausted
+        local metadata_backoff
+        local metadata_backoff_us
+        local metadata_backoff_us_max
         slow_down="$(latest_metric_sample_value "$metrics_log" slow_down_response_total)"
         admission_timeout="$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)"
         admission_wait="$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)"
@@ -412,6 +416,10 @@ print_slowdown_summary() {
         metadata_recovery_wait_us_max="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_wait_us_max)"
         metadata_recovery_timeout="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_timeout_total)"
         metadata_recovery_outcome="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_outcome_total)"
+        metadata_budget_exhausted="$(latest_metric_sample_value "$metrics_log" metadata_command_budget_exhausted_total)"
+        metadata_backoff="$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_total)"
+        metadata_backoff_us="$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_us_total)"
+        metadata_backoff_us_max="$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_us_max)"
         if ((storage_rpc_admission_total > 0)); then
             storage_rpc_admission_wait_percent="$(awk -v waited="$storage_rpc_admission_wait" -v total="$storage_rpc_admission_total" 'BEGIN { printf "%.2f", (waited * 100.0) / total }')"
         else
@@ -419,12 +427,21 @@ print_slowdown_summary() {
         fi
         echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
         echo "metadata_recovery leader_total=$metadata_recovery_leader wait_total=$metadata_recovery_wait wait_us_total=$metadata_recovery_wait_us wait_us_max=$metadata_recovery_wait_us_max timeout_total=$metadata_recovery_timeout outcome_total=$metadata_recovery_outcome" >&2
+        echo "metadata_budget exhausted_total=$metadata_budget_exhausted backoff_total=$metadata_backoff backoff_us_total=$metadata_backoff_us backoff_us_max=$metadata_backoff_us_max" >&2
         echo "metadata_recovery_top admission" >&2
         latest_metric_family_top "$metrics_log" metadata_command_recovery_admission_by_pg_command_total 10 >&2 || true
         echo "metadata_recovery_top outcome" >&2
         latest_metric_family_top "$metrics_log" metadata_command_recovery_outcome_by_pg_command_total 10 >&2 || true
         echo "metadata_pending_slot_top action" >&2
         latest_metric_family_top "$metrics_log" metadata_command_pending_slot_action_by_pg_command_total 10 >&2 || true
+        echo "metadata_budget_top exhausted" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_budget_exhausted_by_pg_context_total 10 >&2 || true
+        echo "metadata_budget_top elapsed_us" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_budget_exhausted_by_pg_context_elapsed_us_total 10 >&2 || true
+        echo "metadata_backoff_top count" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_backoff_by_pg_context_total 10 >&2 || true
+        echo "metadata_backoff_top sleep_us" >&2
+        latest_metric_family_top "$metrics_log" metadata_command_backoff_by_pg_context_sleep_us_total 10 >&2 || true
     else
         echo "metrics unavailable" >&2
     fi

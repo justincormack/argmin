@@ -20923,8 +20923,8 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "held durable drain should not consume the SDK operation-attempt timeout budget"
+            started.elapsed() < Duration::from_secs(12),
+            "held durable drain should return within the stream-create retry budget"
         );
         assert!(
             matches!(

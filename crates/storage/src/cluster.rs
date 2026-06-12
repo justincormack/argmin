@@ -79,6 +79,8 @@ pub(super) struct RequestWorkBudget {
     attempts: usize,
     contention_retries: usize,
     max_attempts: Option<usize>,
+    operation: &'static str,
+    pg_id: Option<PgId>,
 }
 
 impl RequestWorkBudget {
@@ -89,7 +91,19 @@ impl RequestWorkBudget {
             attempts: 0,
             contention_retries: 0,
             max_attempts,
+            operation: "unknown",
+            pg_id: None,
         }
+    }
+
+    fn for_operation(mut self, operation: &'static str) -> Self {
+        self.operation = operation;
+        self
+    }
+
+    fn for_pg(mut self, pg_id: PgId) -> Self {
+        self.pg_id = Some(pg_id);
+        self
     }
 
     fn check(&mut self, context: &'static str) -> Result<(), StoreError> {
@@ -98,6 +112,7 @@ impl RequestWorkBudget {
                 .max_attempts
                 .is_some_and(|max_attempts| self.attempts >= max_attempts)
         {
+            self.emit_budget_exhausted(context);
             return Err(StoreError::MetadataCommandContention { context });
         }
         self.attempts += 1;
@@ -110,6 +125,7 @@ impl RequestWorkBudget {
                 .max_attempts
                 .is_some_and(|max_attempts| self.attempts >= max_attempts)
         {
+            self.emit_budget_exhausted(context);
             return Err(StoreError::MetadataCommandContention { context });
         }
         self.contention_retries = self.contention_retries.saturating_add(1);
@@ -119,21 +135,62 @@ impl RequestWorkBudget {
             .checked_sub(self.started.elapsed())
             .unwrap_or(Duration::ZERO);
         let cap = cap.min(remaining);
-        sleep_for_metadata_contention_cap(cap);
+        let delay = sleep_for_metadata_contention_cap(cap);
+        emit_metadata_contention_backoff(self.operation, self.pg_id, context, delay);
         Ok(())
+    }
+
+    fn emit_budget_exhausted(&self, context: &'static str) {
+        let _ = observability::emit_metadata_command_budget_exhausted(
+            TRACE_TARGET,
+            observability::MetadataCommandBudgetExhaustedSummary {
+                pg_id: self.pg_id.map(|pg_id| pg_id.get()),
+                operation: self.operation,
+                context,
+                elapsed_us: self.started.elapsed().as_micros(),
+                budget_us: self.budget.as_micros(),
+                attempts: self.attempts,
+                max_attempts: self.max_attempts,
+            },
+        );
     }
 }
 
-pub(super) fn sleep_after_metadata_contention_retry(contention_retries: &mut usize) {
+pub(super) fn sleep_after_metadata_contention_retry_for(
+    operation: &'static str,
+    pg_id: Option<PgId>,
+    context: &'static str,
+    contention_retries: &mut usize,
+) {
     *contention_retries = (*contention_retries).saturating_add(1);
-    sleep_for_metadata_contention_cap(metadata_contention_backoff_cap(*contention_retries));
+    let delay =
+        sleep_for_metadata_contention_cap(metadata_contention_backoff_cap(*contention_retries));
+    emit_metadata_contention_backoff(operation, pg_id, context, delay);
 }
 
-fn sleep_for_metadata_contention_cap(cap: Duration) {
+fn sleep_for_metadata_contention_cap(cap: Duration) -> Duration {
     let delay = jittered_metadata_contention_backoff_delay(cap);
     if delay > Duration::ZERO {
         std::thread::sleep(delay);
     }
+    delay
+}
+
+fn emit_metadata_contention_backoff(
+    operation: &'static str,
+    pg_id: Option<PgId>,
+    context: &'static str,
+    delay: Duration,
+) {
+    let _ = observability::emit_metadata_command_backoff(
+        TRACE_TARGET,
+        observability::MetadataCommandBackoffSummary {
+            pg_id: pg_id.map(|pg_id| pg_id.get()),
+            operation,
+            context,
+            sleep_us: delay.as_micros(),
+        },
+    );
 }
 
 fn jittered_metadata_contention_backoff_delay(cap: Duration) -> Duration {
@@ -2776,7 +2833,9 @@ impl StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut empty_log_conflicts = 0;
         let mut work_budget =
-            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None);
+            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
+                .for_operation("reserve_object_generation")
+                .for_pg(pg_id);
         loop {
             work_budget
                 .check("object generation reservation retry budget exhausted")
@@ -3053,7 +3112,9 @@ impl StorageCluster {
         let mut work_budget = RequestWorkBudget::new(
             OBJECT_VERSION_RESERVATION_RETRY_BUDGET,
             Some(OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS),
-        );
+        )
+        .for_operation("reserve_object_version")
+        .for_pg(pg_id);
         loop {
             work_budget
                 .check("object version reservation retry budget exhausted")
@@ -4076,7 +4137,9 @@ impl StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut work_budget =
-            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None);
+            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
+                .for_operation("release_object_generation")
+                .for_pg(pg_id);
         loop {
             work_budget
                 .check("object generation release retry budget exhausted")
@@ -4267,7 +4330,9 @@ impl StorageCluster {
                 release_result?;
             }};
         }
-        let mut work_budget = RequestWorkBudget::new(DIRECT_PUT_METADATA_RETRY_BUDGET, None);
+        let mut work_budget = RequestWorkBudget::new(DIRECT_PUT_METADATA_RETRY_BUDGET, None)
+            .for_operation("commit_direct_put_metadata")
+            .for_pg(pg_id);
         macro_rules! check_direct_put_work_before_command_ownership {
             ($context:literal) => {{
                 if let Err(error) = work_budget.check($context) {
@@ -5081,7 +5146,10 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
-        let mut work_budget = RequestWorkBudget::new(PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET, None);
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let mut work_budget = RequestWorkBudget::new(PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET, None)
+            .for_operation("create_put_object_stream_session")
+            .for_pg(pg_id);
         loop {
             work_budget
                 .check("put object stream create retry budget exhausted")
@@ -5098,7 +5166,6 @@ impl StorageCluster {
                 Err(error) => return Err(bucket_snapshot_error_to_object_pg_action_error(error)),
             };
             let proof = BucketWriteReservationProof::from(&reservation.record);
-            let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
             let result = self.create_put_object_stream_session_record_under_reservation(
                 bucket,
                 key,

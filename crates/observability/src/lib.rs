@@ -112,6 +112,10 @@ static METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_RECOVERY_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_RECOVERY_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_RECOVERY_OUTCOME_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_BUDGET_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_BACKOFF_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_BACKOFF_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_BACKOFF_US_MAX: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
     OnceLock::new();
 static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
@@ -122,6 +126,12 @@ static METADATA_COMMAND_RECOVERY_ADMISSION_DIMENSIONS: OnceLock<
 > = OnceLock::new();
 static METADATA_COMMAND_RECOVERY_OUTCOME_DIMENSIONS: OnceLock<
     Mutex<Vec<MetadataCommandDimensionCounter>>,
+> = OnceLock::new();
+static METADATA_COMMAND_BUDGET_DIMENSIONS: OnceLock<
+    Mutex<Vec<MetadataCommandBudgetDimensionCounter>>,
+> = OnceLock::new();
+static METADATA_COMMAND_BACKOFF_DIMENSIONS: OnceLock<
+    Mutex<Vec<MetadataCommandBackoffDimensionCounter>>,
 > = OnceLock::new();
 static STREAM_UPLOAD_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SESSION_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -166,11 +176,51 @@ pub struct MetadataCommandDimensionSample {
     pub count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataCommandBudgetDimensionSample {
+    pub pg_id: Option<u32>,
+    pub operation: &'static str,
+    pub context: &'static str,
+    pub count: u64,
+    pub elapsed_us_total: u64,
+    pub elapsed_us_max: u64,
+    pub budget_us_max: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataCommandBackoffDimensionSample {
+    pub pg_id: Option<u32>,
+    pub operation: &'static str,
+    pub context: &'static str,
+    pub count: u64,
+    pub sleep_us_total: u64,
+    pub sleep_us_max: u64,
+}
+
 struct MetadataCommandDimensionCounter {
     pg_id: u32,
     classifier: &'static str,
     command_kind: &'static str,
     count: u64,
+}
+
+struct MetadataCommandBudgetDimensionCounter {
+    pg_id: Option<u32>,
+    operation: &'static str,
+    context: &'static str,
+    count: u64,
+    elapsed_us_total: u64,
+    elapsed_us_max: u64,
+    budget_us_max: u64,
+}
+
+struct MetadataCommandBackoffDimensionCounter {
+    pg_id: Option<u32>,
+    operation: &'static str,
+    context: &'static str,
+    count: u64,
+    sleep_us_total: u64,
+    sleep_us_max: u64,
 }
 
 impl FlightRecorder {
@@ -283,6 +333,16 @@ fn metadata_command_recovery_outcome_dimensions(
     METADATA_COMMAND_RECOVERY_OUTCOME_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn metadata_command_budget_dimensions() -> &'static Mutex<Vec<MetadataCommandBudgetDimensionCounter>>
+{
+    METADATA_COMMAND_BUDGET_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn metadata_command_backoff_dimensions(
+) -> &'static Mutex<Vec<MetadataCommandBackoffDimensionCounter>> {
+    METADATA_COMMAND_BACKOFF_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn fetch_max_atomic(counter: &AtomicU64, value: u64) {
     let mut current = counter.load(Ordering::Relaxed);
     while value > current {
@@ -334,6 +394,67 @@ fn metadata_command_dimension_snapshot(
         .collect()
 }
 
+fn increment_metadata_command_budget_dimension(
+    pg_id: Option<u32>,
+    operation: &'static str,
+    context: &'static str,
+    elapsed_us: u64,
+    budget_us: u64,
+) {
+    let mut counters = metadata_command_budget_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters.iter_mut().find(|counter| {
+        counter.pg_id == pg_id && counter.operation == operation && counter.context == context
+    }) {
+        counter.count = counter.count.saturating_add(1);
+        counter.elapsed_us_total = counter.elapsed_us_total.saturating_add(elapsed_us);
+        counter.elapsed_us_max = counter.elapsed_us_max.max(elapsed_us);
+        counter.budget_us_max = counter.budget_us_max.max(budget_us);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(MetadataCommandBudgetDimensionCounter {
+            pg_id,
+            operation,
+            context,
+            count: 1,
+            elapsed_us_total: elapsed_us,
+            elapsed_us_max: elapsed_us,
+            budget_us_max: budget_us,
+        });
+    }
+}
+
+fn increment_metadata_command_backoff_dimension(
+    pg_id: Option<u32>,
+    operation: &'static str,
+    context: &'static str,
+    sleep_us: u64,
+) {
+    let mut counters = metadata_command_backoff_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters.iter_mut().find(|counter| {
+        counter.pg_id == pg_id && counter.operation == operation && counter.context == context
+    }) {
+        counter.count = counter.count.saturating_add(1);
+        counter.sleep_us_total = counter.sleep_us_total.saturating_add(sleep_us);
+        counter.sleep_us_max = counter.sleep_us_max.max(sleep_us);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(MetadataCommandBackoffDimensionCounter {
+            pg_id,
+            operation,
+            context,
+            count: 1,
+            sleep_us_total: sleep_us,
+            sleep_us_max: sleep_us,
+        });
+    }
+}
+
 #[must_use]
 pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDimensionSample> {
     metadata_command_dimension_snapshot(metadata_command_conflict_dimensions())
@@ -355,6 +476,41 @@ pub fn metadata_command_recovery_admission_dimension_snapshot(
 pub fn metadata_command_recovery_outcome_dimension_snapshot() -> Vec<MetadataCommandDimensionSample>
 {
     metadata_command_dimension_snapshot(metadata_command_recovery_outcome_dimensions())
+}
+
+#[must_use]
+pub fn metadata_command_budget_dimension_snapshot() -> Vec<MetadataCommandBudgetDimensionSample> {
+    metadata_command_budget_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| MetadataCommandBudgetDimensionSample {
+            pg_id: counter.pg_id,
+            operation: counter.operation,
+            context: counter.context,
+            count: counter.count,
+            elapsed_us_total: counter.elapsed_us_total,
+            elapsed_us_max: counter.elapsed_us_max,
+            budget_us_max: counter.budget_us_max,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn metadata_command_backoff_dimension_snapshot() -> Vec<MetadataCommandBackoffDimensionSample> {
+    metadata_command_backoff_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| MetadataCommandBackoffDimensionSample {
+            pg_id: counter.pg_id,
+            operation: counter.operation,
+            context: counter.context,
+            count: counter.count,
+            sleep_us_total: counter.sleep_us_total,
+            sleep_us_max: counter.sleep_us_max,
+        })
+        .collect()
 }
 
 fn truncate_detail(mut detail: String) -> String {
@@ -775,6 +931,25 @@ pub struct MetadataCommandRecoveryOutcomeSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandBudgetExhaustedSummary {
+    pub pg_id: Option<u32>,
+    pub operation: &'static str,
+    pub context: &'static str,
+    pub elapsed_us: u128,
+    pub budget_us: u128,
+    pub attempts: usize,
+    pub max_attempts: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandBackoffSummary {
+    pub pg_id: Option<u32>,
+    pub operation: &'static str,
+    pub context: &'static str,
+    pub sleep_us: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageRpcErrorSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
@@ -821,6 +996,10 @@ pub struct MetricsSnapshot {
     pub metadata_command_recovery_wait_us_max: u64,
     pub metadata_command_recovery_timeout_total: u64,
     pub metadata_command_recovery_outcome_total: u64,
+    pub metadata_command_budget_exhausted_total: u64,
+    pub metadata_command_backoff_total: u64,
+    pub metadata_command_backoff_us_total: u64,
+    pub metadata_command_backoff_us_max: u64,
     pub stream_upload_active_sessions: u64,
     pub stream_upload_session_created_total: u64,
     pub stream_upload_session_aborted_total: u64,
@@ -914,6 +1093,12 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         metadata_command_recovery_outcome_total: METADATA_COMMAND_RECOVERY_OUTCOME_TOTAL
             .load(Ordering::Relaxed),
+        metadata_command_budget_exhausted_total: METADATA_COMMAND_BUDGET_EXHAUSTED_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_backoff_total: METADATA_COMMAND_BACKOFF_TOTAL.load(Ordering::Relaxed),
+        metadata_command_backoff_us_total: METADATA_COMMAND_BACKOFF_US_TOTAL
+            .load(Ordering::Relaxed),
+        metadata_command_backoff_us_max: METADATA_COMMAND_BACKOFF_US_MAX.load(Ordering::Relaxed),
         stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
             .load(Ordering::Relaxed),
@@ -1580,6 +1765,101 @@ pub fn emit_metadata_command_recovery_outcome(
     )
 }
 
+pub fn emit_metadata_command_budget_exhausted(
+    target: &'static str,
+    summary: MetadataCommandBudgetExhaustedSummary,
+) -> bool {
+    METADATA_COMMAND_BUDGET_EXHAUSTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let elapsed_us = saturating_u128_to_u64(summary.elapsed_us);
+    let budget_us = saturating_u128_to_u64(summary.budget_us);
+    increment_metadata_command_budget_dimension(
+        summary.pg_id,
+        summary.operation,
+        summary.context,
+        elapsed_us,
+        budget_us,
+    );
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let pg_id = summary
+        .pg_id
+        .map(|pg_id| pg_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let max_attempts = summary
+        .max_attempts
+        .map(|max_attempts| max_attempts.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let detail = format!(
+        "pg_id={} operation={} context={:?} elapsed_us={} budget_us={} attempts={} max_attempts={}",
+        pg_id,
+        summary.operation,
+        summary.context,
+        summary.elapsed_us,
+        summary.budget_us,
+        summary.attempts,
+        max_attempts
+    );
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_budget_exhausted",
+        detail,
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_budget_exhausted",
+        Some(format_args!(
+            "pg_id={} operation={} context={:?} elapsed_us={} budget_us={} attempts={} max_attempts={}",
+            pg_id,
+            summary.operation,
+            summary.context,
+            summary.elapsed_us,
+            summary.budget_us,
+            summary.attempts,
+            max_attempts
+        )),
+    )
+}
+
+pub fn emit_metadata_command_backoff(
+    target: &'static str,
+    summary: MetadataCommandBackoffSummary,
+) -> bool {
+    METADATA_COMMAND_BACKOFF_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let sleep_us = saturating_u128_to_u64(summary.sleep_us);
+    METADATA_COMMAND_BACKOFF_US_TOTAL.fetch_add(sleep_us, Ordering::Relaxed);
+    fetch_max_atomic(&METADATA_COMMAND_BACKOFF_US_MAX, sleep_us);
+    increment_metadata_command_backoff_dimension(
+        summary.pg_id,
+        summary.operation,
+        summary.context,
+        sleep_us,
+    );
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let pg_id = summary
+        .pg_id
+        .map(|pg_id| pg_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let detail = format!(
+        "pg_id={} operation={} context={:?} sleep_us={}",
+        pg_id, summary.operation, summary.context, summary.sleep_us
+    );
+    record_flight_event(&context, target, "metadata_command_backoff", detail);
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_backoff",
+        Some(format_args!(
+            "pg_id={} operation={} context={:?} sleep_us={}",
+            pg_id, summary.operation, summary.context, summary.sleep_us
+        )),
+    )
+}
+
 pub fn emit_storage_rpc_error(target: &'static str, summary: StorageRpcErrorSummary<'_>) -> bool {
     STORAGE_RPC_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(context) = current_context() else {
@@ -2213,6 +2493,27 @@ mod tests {
                 command_kind: Some("ReserveObjectVersion"),
             },
         );
+        emit_metadata_command_budget_exhausted(
+            "storage",
+            MetadataCommandBudgetExhaustedSummary {
+                pg_id: Some(11),
+                operation: "bucket_delete_begin",
+                context: "bucket delete begin metadata convergence budget exhausted",
+                elapsed_us: 10_123_456,
+                budget_us: 10_000_000,
+                attempts: 37,
+                max_attempts: None,
+            },
+        );
+        emit_metadata_command_backoff(
+            "storage",
+            MetadataCommandBackoffSummary {
+                pg_id: Some(11),
+                operation: "bucket_delete_begin",
+                context: "bucket delete drain bucket pg command",
+                sleep_us: 12_345,
+            },
+        );
         emit_storage_rpc_error(
             "storage",
             StorageRpcErrorSummary {
@@ -2411,6 +2712,35 @@ mod tests {
             after.metadata_command_recovery_outcome_total,
             before.metadata_command_recovery_outcome_total + 1
         );
+        assert_eq!(
+            after.metadata_command_budget_exhausted_total,
+            before.metadata_command_budget_exhausted_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_backoff_total,
+            before.metadata_command_backoff_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_backoff_us_total,
+            before.metadata_command_backoff_us_total + 12_345
+        );
+        assert!(after.metadata_command_backoff_us_max >= 12_345);
+        assert!(metadata_command_budget_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(11)
+                && sample.operation == "bucket_delete_begin"
+                && sample.context == "bucket delete begin metadata convergence budget exhausted"
+                && sample.count >= 1
+                && sample.elapsed_us_max >= 10_123_456
+                && sample.budget_us_max >= 10_000_000));
+        assert!(metadata_command_backoff_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(11)
+                && sample.operation == "bucket_delete_begin"
+                && sample.context == "bucket delete drain bucket pg command"
+                && sample.count >= 1
+                && sample.sleep_us_total >= 12_345
+                && sample.sleep_us_max >= 12_345));
         assert_eq!(
             after.storage_rpc_error_total,
             before.storage_rpc_error_total + 1

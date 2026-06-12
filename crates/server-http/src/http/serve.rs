@@ -1092,6 +1092,10 @@ fn local_debug_metrics_body() -> String {
             "metadata_command_recovery_wait_us_max {}\n",
             "metadata_command_recovery_timeout_total {}\n",
             "metadata_command_recovery_outcome_total {}\n",
+            "metadata_command_budget_exhausted_total {}\n",
+            "metadata_command_backoff_total {}\n",
+            "metadata_command_backoff_us_total {}\n",
+            "metadata_command_backoff_us_max {}\n",
             "stream_upload_active_sessions {}\n",
             "stream_upload_session_created_total {}\n",
             "stream_upload_session_aborted_total {}\n",
@@ -1130,6 +1134,10 @@ fn local_debug_metrics_body() -> String {
         snapshot.metadata_command_recovery_wait_us_max,
         snapshot.metadata_command_recovery_timeout_total,
         snapshot.metadata_command_recovery_outcome_total,
+        snapshot.metadata_command_budget_exhausted_total,
+        snapshot.metadata_command_backoff_total,
+        snapshot.metadata_command_backoff_us_total,
+        snapshot.metadata_command_backoff_us_max,
         snapshot.stream_upload_active_sessions,
         snapshot.stream_upload_session_created_total,
         snapshot.stream_upload_session_aborted_total,
@@ -1169,7 +1177,70 @@ fn local_debug_metrics_body() -> String {
             sample.pg_id, sample.classifier, sample.command_kind, sample.count
         );
     }
+    for sample in observability::metadata_command_budget_dimension_snapshot() {
+        let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
+        let operation = debug_metric_label_value(sample.operation);
+        let context = debug_metric_label_value(sample.context);
+        let _ = writeln!(
+            body,
+            "metadata_command_budget_exhausted_by_pg_context_total{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.count
+        );
+        let _ = writeln!(
+            body,
+            "metadata_command_budget_exhausted_by_pg_context_elapsed_us_total{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.elapsed_us_total
+        );
+        let _ = writeln!(
+            body,
+            "metadata_command_budget_exhausted_by_pg_context_elapsed_us_max{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.elapsed_us_max
+        );
+        let _ = writeln!(
+            body,
+            "metadata_command_budget_exhausted_by_pg_context_budget_us_max{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.budget_us_max
+        );
+    }
+    for sample in observability::metadata_command_backoff_dimension_snapshot() {
+        let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
+        let operation = debug_metric_label_value(sample.operation);
+        let context = debug_metric_label_value(sample.context);
+        let _ = writeln!(
+            body,
+            "metadata_command_backoff_by_pg_context_total{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.count
+        );
+        let _ = writeln!(
+            body,
+            "metadata_command_backoff_by_pg_context_sleep_us_total{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.sleep_us_total
+        );
+        let _ = writeln!(
+            body,
+            "metadata_command_backoff_by_pg_context_sleep_us_max{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
+            pg_id, operation, context, sample.sleep_us_max
+        );
+    }
     body
+}
+
+fn debug_metric_optional_pg_id_label(pg_id: Option<u32>) -> String {
+    pg_id.map_or_else(|| "unknown".to_string(), |pg_id| pg_id.to_string())
+}
+
+fn debug_metric_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            ch if ch.is_ascii_whitespace() => escaped.push('_'),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 async fn append_actual_cors_headers(
@@ -4460,6 +4531,10 @@ mod tests {
         assert!(response.contains("storage_rpc_admission_wait_total "));
         assert!(response.contains("storage_rpc_admission_wait_us_total "));
         assert!(response.contains("storage_rpc_admission_timeout_total "));
+        assert!(response.contains("metadata_command_budget_exhausted_total "));
+        assert!(response.contains("metadata_command_backoff_total "));
+        assert!(response.contains("metadata_command_backoff_us_total "));
+        assert!(response.contains("metadata_command_backoff_us_max "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));
