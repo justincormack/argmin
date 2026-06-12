@@ -1,0 +1,160 @@
+Direct PUT cleanup bypass on pending-visibility error
+Link: https://chatgpt.com/codex/cloud/security/findings/f3d3b3236f648191a05beebeb53adb45?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 753ed86
+Author: justin@specialbusservice.com
+Created: 11/06/2026, 23:00:57
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit `e443424 Clean up direct put pending visibility errors`.
+
+The direct PUT `MetadataCommandLogConflict` branch now handles
+`pending_metadata_command_for_bucket` errors explicitly instead of using `?`.
+If the pending-visibility read fails before metadata-command ownership has been
+transferred, `commit_direct_put_object_from_payload_shards` first runs
+`cleanup_direct_put_attempt_before_command_ownership!()` and only then returns
+the mapped error. This preserves the existing pre-command cleanup invariant for
+the caller-owned bucket write proof and unowned direct PUT payload shards.
+
+The fix added regression coverage in
+`direct_put_log_conflict_pending_visibility_error_cleans_new_payload`, which
+forces a command-id conflict followed by a malformed pending-slot visibility
+error after direct PUT shards have been written. The test verifies that the
+bucket write reservation is released and the newly written payload shard files
+are deleted.
+
+# Summary
+Introduced bug: the new `pending_visible = self.pending_metadata_command_for_bucket(...)?` statement in the direct PUT log-conflict branch can early-return without invoking the existing cleanup path for already-written shards and reservations.
+In `commit_direct_put_object_from_payload_shards`, direct PUT payload shards have already been written before metadata commit handling begins. The function defines `cleanup_direct_put_attempt_before_command_ownership!()` to release the bucket write proof, release the object generation reservation, and delete the just-written payload shards on failures before a metadata command owns them. This commit changed the `MetadataCommandLogConflict` handling path to first call `pending_metadata_command_for_bucket(...)?` to decide whether a pending command is visible. Because this uses `?` directly, any error from that metadata read returns from the function immediately and bypasses the cleanup macro. The old code routed errors from `drain_one_pending_object_metadata_command` through an `if let Err(error)` block that performed cleanup before returning. As a result, under a log-conflict plus pending-metadata-read failure, the server can leave orphaned payload shards and leaked bucket/object generation reservations. Repeated failures can consume disk space and leave stale write state, impacting availability.
+
+# Validation
+## Rubric
+- [x] Confirm direct PUT payload shards are written before metadata commit ownership is established.
+- [x] Confirm the cleanup macro is the intended pre-command-ownership cleanup path for direct PUT failures.
+- [x] Confirm the log-conflict branch contains a direct `?` on `pending_metadata_command_for_bucket` before cleanup is invoked.
+- [x] Dynamically trigger a log conflict followed by a pending-command visibility/read error after shards and reservations exist.
+- [x] Verify observable leaked state after the error: shard files remain and bucket write reservation remains; object generation reservation was also observed remaining.
+## Report
+Validated the finding with a targeted Rust unit-test PoC. Code review confirmed the vulnerable control flow: direct PUT shards are written before metadata commit (`crates/server-core/src/coordinator/put.rs:155-163`, commit invoked at `:245-249`). The intended cleanup macro releases the caller bucket write proof, best-effort releases object generation reservation, and deletes direct PUT shard files (`crates/storage/src/cluster.rs:4028-4045`). In the new log-conflict branch, `pending_metadata_command_for_bucket(pg_id, &req.bucket)?` is executed before the cleanup-guarded `drain_after_object_pg_log_conflict` path (`crates/storage/src/cluster.rs:4133-4148`), so an error there returns immediately. I added a PoC test using the existing `before_direct_put_command_id` hook to race in a malformed pending slot after the initial pending-slot check but before command construction. The slot is valid enough for `next_metadata_command_id_from_locked_pg_at_least()` to report `MetadataCommandLogConflict` (`crates/storage/src/node_client.rs:6288-6297`), but `pending_metadata_command_envelope()` then fails due a mismatched scope bucket (`crates/storage/src/pg_store.rs:2620-2627`). Running `cargo test -p storage poc_direct_put_log_conflict_pending_visibility_error_should_cleanup -- --nocapture` produced a reproducible panic showing cleanup state leaked: `leaked_shards=3; bucket_write_reservation_leaked=true; generation_reservation_leaked=true`. Existing nearby cleanup-oriented test `zero_apply_direct_put_commit_records_tombstone_and_cleans_new_payload` passed before the PoC, confirming the build/test environment was functional. Valgrind was attempted but not installed. lldb batch execution reproduced the same test failure and backtrace to the PoC assertion.
+
+# Evidence
+crates/server-core/src/coordinator/put.rs (L155 to 163)
+  Note: Direct PUT payload shards are written before the storage commit routine is called, so later commit-path failures must delete these shards.
+```
+                let written_segment =
+                    match self.storage_node.write_direct_put_segment_payload_shards(
+                        authorized.bucket_typed(),
+                        authorized.key_typed(),
+                        generation_id,
+                        segment_index,
+                        &segment_okh,
+                        &storage_bytes,
+                    ) {
+```
+
+crates/storage/src/cluster.rs (L4028 to 4045)
+  Note: Cleanup macro releases the bucket write proof, releases the object generation reservation, and deletes the direct PUT payload shards when ownership was not transferred to a metadata command.
+```
+        macro_rules! cleanup_direct_put_attempt_before_command_ownership {
+            () => {{
+                let release_result = release_caller_bucket_write_proof_if_unowned!();
+                self.release_object_generation_reservation_after_pending_drain_best_effort(
+                    pg_id,
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                release_result?;
+            }};
+```
+
+crates/storage/src/cluster.rs (L4133 to 4138)
+  Note: New code added by the commit performs a pending-command visibility read with `?`; if this read errors, control returns immediately and bypasses the cleanup macro.
+```
+                        Err(ObjectPgActionError::Store(
+                            StoreError::MetadataCommandLogConflict { .. },
+                        )) => {
+                            let pending_visible = self
+                                .pending_metadata_command_for_bucket(pg_id, &req.bucket)?
+                                .is_some();
+```
+
+crates/storage/src/cluster.rs (L4139 to 4149)
+  Note: Cleanup is only performed if `drain_after_object_pg_log_conflict` returns an error, not if the preceding `pending_metadata_command_for_bucket` call fails.
+```
+                            let drain_result = self.drain_after_object_pg_log_conflict(
+                                pg_id,
+                                &req.bucket,
+                                pending_visible,
+                                &mut empty_log_conflicts,
+                                "direct put commit command log conflict without pending progress",
+                            );
+                            if let Err(error) = drain_result {
+                                cleanup_direct_put_attempt_before_command_ownership!();
+                                return Err(error);
+                            }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The original medium rating is appropriate but should be interpreted as a low-likelihood availability issue, not a high/critical compromise. The affected code is in the main argmin-s3 runtime PutObject path and the cleanup bypass is directly evidenced at `crates/storage/src/cluster.rs:4133-4138`. The service can be reached over HTTP(S), and authorized or public-write clients can drive direct PUTs. However, exploitation additionally requires a MetadataCommandLogConflict and an error from `pending_metadata_command_for_bucket`; static analysis and the provided PoC do not prove a normal remote client can reliably create that pending-read error without internal storage corruption/fault injection. Impact is limited to disk/write-state exhaustion and availability, with no confidentiality, privilege, or code-execution impact. Therefore medium is the ceiling and remains justified only because repeated failures can exhaust storage or stale reservations in a single-service object store.
+## Likelihood
+high - PutObject is a normal network-reachable S3 operation for authorized users, but the vulnerable branch requires a high-complexity combination of metadata log conflict and pending metadata read failure. The validation PoC proved the cleanup bug with an internal test hook/malformed pending slot; normal external control of the read-error precondition remains uncertain. | Remote network vector
+## Impact
+medium - The demonstrated effect is availability degradation: orphaned direct PUT payload shard files consume local disk, and leaked bucket/generation reservations can block or confuse later writes. There is no evidence of data exfiltration, auth bypass, RCE, or integrity compromise of other objects.
+## Assumptions
+- The attacker has write authorization to a bucket via SigV4 credentials, presigned credentials, or an intentionally public-write bucket.
+- The service is deployed with its HTTP listener reachable by that attacker; the repository has no deployment manifests proving a public load balancer.
+- The exploit condition requires a metadata command log conflict plus an error while reading the pending metadata command; static review does not prove a normal remote client can deterministically create the pending-read error without an internal storage fault or corrupted pending slot.
+- Reachable argmin-s3 HTTP/S3 endpoint
+- PutObject authorization for the target bucket/key, or bucket configured for effective public write
+- Single-segment/direct PUT path
+- MetadataCommandLogConflict during direct PUT metadata command construction
+- pending_metadata_command_for_bucket returns an error before ownership transfers to a metadata command
+## Path
+S3 PutObject -> authz/public-write -> direct PUT -> shards+reservations written -> log conflict -> pending read Err via '?' -> cleanup skipped -> disk/write-state leak
+## Path evidence
+- `crates/argmin-s3/src/config.rs:94-100` - Configuration documents required access credentials and default listener `ARGMIN_LISTEN_ADDR` of 127.0.0.1:9000.
+- `crates/argmin-s3/src/config.rs:152-180` - Secrets and listener configuration are loaded from environment variables; no secret values are embedded in code.
+- `crates/argmin-s3/src/main.rs:358-432` - The production binary binds the configured TCP listener and starts the HTTP or TLS server.
+- `crates/server-http/src/http/mod.rs:3083-3113` - Requests are authenticated through SigV4; missing auth becomes anonymous, which is only useful if bucket policy/ACL permits it.
+- `crates/server-core/src/coordinator/authz/acl.rs:79-115` - PutObject authorization is enforced through bucket policy/ACL-aware coordinator checks before writes proceed.
+- `crates/server-core/src/coordinator/authz.rs:1383-1415` - Write authorization can be granted to bucket owner/admin, ACL grantees, bucket policy, or effective public-write configuration.
+- `crates/server-http/src/http/mod.rs:3772-3776` - HTTP streaming PutObject setup explicitly drives either a direct single-segment fast path or promoted streaming session.
+- `crates/server-http/src/http/serve.rs:2558-2573` - When no streaming session is created, the server calls `put_single_segment_object`, reaching the direct PUT commit path.
+- `crates/server-core/src/coordinator/put.rs:23-65` - Coordinator uses the direct single-segment path for objects no larger than `INTERNAL_SEGMENT_SIZE`.
+- `crates/server-core/src/coordinator/put.rs:145-163` - The direct PUT path reserves a generation and writes payload shards before metadata commit ownership is established.
+- `crates/server-core/src/coordinator/put.rs:244-249` - After shards are written, the coordinator calls `commit_direct_put_object_from_payload_shards` with the written shard acknowledgements.
+- `crates/storage/src/cluster.rs:4028-4045` - The intended cleanup macro releases bucket write proof, releases object generation reservation, and deletes direct PUT shard files.
+- `crates/storage/src/cluster.rs:4064-4084` - Nearby error paths explicitly call the cleanup macro before returning, confirming cleanup is expected before command ownership.
+- `crates/storage/src/cluster.rs:4133-4138` - The vulnerable MetadataCommandLogConflict branch calls `pending_metadata_command_for_bucket(...)?`; an Err here returns before cleanup.
+- `crates/storage/src/cluster.rs:4139-4149` - Cleanup is only invoked for `drain_after_object_pg_log_conflict` errors, not for the preceding pending-visibility read error.
+## Narrative
+This is a real in-scope runtime bug in the direct PUT path. Repository code shows small PutObject requests reach a direct single-segment path, reserve a generation, write payload shards, and then call `commit_direct_put_object_from_payload_shards`. That function defines a cleanup macro that releases the bucket write proof, releases the object generation reservation, and deletes written shards. Most pre-command-ownership error paths call it, but the MetadataCommandLogConflict branch now performs `pending_metadata_command_for_bucket(pg_id, &req.bucket)?` before cleanup-guarded drain handling. If that read returns Err, Rust's `?` returns immediately and skips cleanup. The availability impact is credible when the rare conflict-plus-pending-read-error condition occurs repeatedly, but exploitability is constrained: a normal remote attacker can control PutObject traffic but is not shown by static evidence to be able to force the pending-read error without an internal storage fault/corrupt pending slot. Medium severity is reasonable and should not be raised above medium.
+## Controls
+- SigV4 authentication and presigned URL validation
+- Bucket policy and ACL authorization, including public access block behavior
+- Default listener is loopback 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- max_connections and max_inflight_requests request backpressure
+- Header/body idle timeouts
+- Large objects are promoted to streaming session path rather than direct single-segment path
+## Blindspots
+- No Kubernetes, Terraform, compose, Dockerfile, or ingress manifests were found in the checked paths, so public exposure and load balancer type cannot be proven from repository artifacts.
+- Static review cannot prove a remote client can deterministically make `pending_metadata_command_for_bucket` return Err in production; the validation PoC used a cfg(test) hook to insert malformed pending state.
+- The checkout is read-only and no cloud APIs were called, so runtime deployment controls, filesystem quotas, service user permissions, and external reverse-proxy/TLS configuration are unknown.
+- The project appears primarily single-node/single-tenant; cross-tenant blast radius depends on deployment and bucket sharing not represented in the repository.
