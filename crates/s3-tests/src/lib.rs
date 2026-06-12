@@ -542,7 +542,7 @@ async fn create_external_setup_probe_bucket(
 }
 
 async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label: &str) {
-    const RETRY_DELAY: Duration = Duration::from_millis(200);
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
     let deadline = Instant::now() + configured_test_timeout();
 
     loop {
@@ -692,7 +692,7 @@ fn is_delete_bucket_retryable_backpressure(
 ) -> bool {
     matches!(
         err.as_service_error().and_then(ProvideErrorMetadata::code),
-        Some("OperationAborted" | "SlowDown")
+        Some("OperationAborted" | "SlowDown" | "BucketNotEmpty")
     )
 }
 
