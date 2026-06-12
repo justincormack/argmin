@@ -63,6 +63,41 @@ mod request_ops;
 const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
 const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
 const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
+const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS: usize = 64;
+pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+pub(super) struct RequestWorkBudget {
+    started: Instant,
+    budget: Duration,
+    attempts: usize,
+    max_attempts: Option<usize>,
+}
+
+impl RequestWorkBudget {
+    fn new(budget: Duration, max_attempts: Option<usize>) -> Self {
+        Self {
+            started: Instant::now(),
+            budget,
+            attempts: 0,
+            max_attempts,
+        }
+    }
+
+    fn check(&mut self, context: &'static str) -> Result<(), StoreError> {
+        if self.started.elapsed() >= self.budget
+            || self
+                .max_attempts
+                .is_some_and(|max_attempts| self.attempts >= max_attempts)
+        {
+            return Err(StoreError::MetadataCommandContention { context });
+        }
+        self.attempts += 1;
+        Ok(())
+    }
+}
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2916,7 +2951,14 @@ impl StorageCluster {
         completion_admission: bool,
     ) -> Result<VersionId, ObjectPgActionError> {
         let mut empty_log_conflicts = 0;
+        let mut work_budget = RequestWorkBudget::new(
+            OBJECT_VERSION_RESERVATION_RETRY_BUDGET,
+            Some(OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS),
+        );
         loop {
+            work_budget
+                .check("object version reservation retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
                 {
@@ -4812,7 +4854,11 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
+        let mut work_budget = RequestWorkBudget::new(PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET, None);
         loop {
+            work_budget
+                .check("put object stream create retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             let reservation = match self
                 .acquire_durable_put_object_stream_write_reservation(bucket, key)
             {

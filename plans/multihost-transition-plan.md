@@ -6785,6 +6785,16 @@ Status:
   a local budget, but the plan now tracks extending that fixed-budget pattern to
   durable bucket-drain callers, bucket-delete finalization, completed-MPU
   cleanup/pruning, and other whole-bucket/page helpers.
+- Added the first request-work budget slice after versioning soak failures in
+  `test_versioned_concurrent_object_create_concurrent_remove` and
+  `test_versioning_multi_object_delete`. The retained UAT logs and metadata DBs
+  showed hot object PGs with a primary-only `ReserveObjectVersion` pending slot
+  at the next log index, many waiters timing out behind single-flight recovery,
+  and leftover durable bucket-write drain rows from cancelled cleanup. Object
+  version reservation retries, stream PUT session creation behind an active
+  durable drain, and the common bucket write-reservation snapshot loops now use
+  request-local retry budgets that return retryable metadata contention instead
+  of consuming an SDK operation-attempt timeout.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

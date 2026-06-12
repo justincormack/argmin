@@ -20809,6 +20809,68 @@ mod tests {
     }
 
     #[test]
+    fn low_level_put_object_stream_create_bounds_durable_delete_drain_wait() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "stream-create-held-drain-");
+        let key = key_for_object_pg(topology, &bucket, 1, "key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let _drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+            super::super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                panic!("active test bucket should acquire a temporary durable delete drain")
+            }
+        };
+
+        let session_id = crate::SessionId::try_from("c0".repeat(16)).unwrap();
+        let started = std::time::Instant::now();
+        let err = cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "held durable drain should not consume the SDK operation-attempt timeout budget"
+        );
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                    context: "put object stream create retry budget exhausted",
+                })
+            ),
+            "held durable drain should return retryable contention, got {err:?}"
+        );
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).is_err(),
+            "timed out stream create must not publish a session"
+        );
+    }
+
+    #[test]
     fn metadata_state_digest_covers_completed_multipart_order_sequence() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

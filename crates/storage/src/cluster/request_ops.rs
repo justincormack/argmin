@@ -1684,7 +1684,10 @@ impl super::StorageCluster {
         )
             -> Result<super::BucketWriteSnapshotAction<T, E>, BucketSnapshotLoadError>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        let mut work_budget =
+            super::RequestWorkBudget::new(super::BUCKET_WRITE_DRAIN_RETRY_BUDGET, None);
         loop {
+            work_budget.check("bucket write snapshot retry budget exhausted")?;
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
                 "bucket-write-snapshot",
@@ -1730,7 +1733,10 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<Result<T, E>, BucketSnapshotLoadError>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        let mut work_budget =
+            super::RequestWorkBudget::new(super::BUCKET_WRITE_DRAIN_RETRY_BUDGET, None);
         loop {
+            work_budget.check("bucket write reservation snapshot retry budget exhausted")?;
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
                 "bucket-write-snapshot",
