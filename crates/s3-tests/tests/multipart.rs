@@ -608,7 +608,7 @@ fn test_abort_multipart_upload_with_completed_part_hides_upload_for_list_parts()
             .to_string();
 
         upload_part_retrying_operation_aborted(
-            &client,
+            client,
             &bucket,
             key,
             &upload_id,

@@ -59,8 +59,7 @@ async fn create_bucket_in_test_region(bucket: &str) {
 
 async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
     for key in keys {
-        let _ =
-            s3_tests::delete_object_retrying_operation_aborted(CTX.client(), bucket, *key).await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(CTX.client(), bucket, key).await;
     }
     let _ = CTX
         .client()

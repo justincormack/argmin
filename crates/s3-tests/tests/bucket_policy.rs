@@ -83,7 +83,7 @@ macro_rules! with_sse_s3_header {
 
 async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
     for key in keys {
-        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
 
     for _ in 0..10 {

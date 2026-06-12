@@ -17,7 +17,7 @@ async fn setup_public_bucket() -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }

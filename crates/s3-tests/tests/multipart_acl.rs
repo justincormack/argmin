@@ -40,7 +40,7 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
 
     for _ in 0..10 {

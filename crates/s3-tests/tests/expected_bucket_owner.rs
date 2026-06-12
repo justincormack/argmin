@@ -213,7 +213,7 @@ async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) {
 async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -240,7 +240,7 @@ async fn cleanup_multipart_bucket(bucket: &str, keys: &[&str]) {
         }
 
         for key in keys {
-            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
+            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
         }
 
         match client

@@ -92,7 +92,7 @@ async fn cleanup_plain_bucket(
 ) {
     for client in [root_client, non_root_client] {
         for key in keys {
-            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
+            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
         }
     }
 
