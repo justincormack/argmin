@@ -245,6 +245,7 @@ impl MetadataCommandRecoveryWaiterOutcome {
         }
     }
 
+    #[cfg(test)]
     fn pending_outcome(self) -> Option<PendingMetadataCommandOutcome> {
         match self {
             Self::StillPending => None,
@@ -3302,10 +3303,14 @@ impl StorageCluster {
                         command,
                         waiter_outcome.metric_label(),
                     );
-                    match waiter_outcome.pending_outcome() {
-                        Some(outcome) => return Ok(outcome),
-                        None => {
-                            continue;
+                    match waiter_outcome {
+                        MetadataCommandRecoveryWaiterOutcome::StillPending => continue,
+                        MetadataCommandRecoveryWaiterOutcome::Applied => {
+                            return Ok(PendingMetadataCommandOutcome::Applied);
+                        }
+                        MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                        | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                            return Ok(PendingMetadataCommandOutcome::Abandoned);
                         }
                     }
                 }

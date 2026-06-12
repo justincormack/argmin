@@ -16932,6 +16932,84 @@ mod tests {
     }
 
     #[test]
+    fn recovery_waiter_drain_treats_missing_unapplied_command_as_abandoned() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "drain-waiter-missing-");
+        let key = key_for_object_pg(topology, &bucket, 1, "stream-key-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                bucket.clone(),
+                key,
+                crate::SessionId::try_from("71".repeat(16)).unwrap(),
+                crate::GenerationId::MIN,
+                crate::clock::current_time_millis(),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+        let MetadataCommandRecoveryAdmission::Leader(leader_guard) = map
+            .runtime_state()
+            .join_metadata_command_recovery(pg_id, &command)
+        else {
+            panic!("first recovery caller should lead the single-flight");
+        };
+
+        let waiter_cluster = cluster.clone();
+        let waiter_command = command.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            outcome_tx
+                .send(
+                    waiter_cluster
+                        .drain_pending_metadata_command_with_recovery_gate(pg_id, &waiter_command)
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            outcome_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "waiter should block while another request owns command recovery"
+        );
+
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        pg.connection()
+            .execute(
+                "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+            )
+            .unwrap();
+        drop(pg);
+        drop(leader_guard);
+
+        let outcome = outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(outcome, PendingMetadataCommandOutcome::Abandoned);
+        waiter.join().unwrap();
+        assert_clean_metadata_command_stream(&map, &[1]);
+    }
+
+    #[test]
     fn reissue_accepts_terminal_pending_command_after_stale_primary_max_snapshot() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
