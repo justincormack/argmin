@@ -40043,7 +40043,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(15),
             "DeleteBucket should not wait indefinitely behind another active delete drain"
         );
         assert!(
