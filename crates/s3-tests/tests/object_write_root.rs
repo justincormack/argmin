@@ -28,6 +28,27 @@ async fn get_object_body(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -
         .to_vec()
 }
 
+async fn upload_part_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: &'static [u8],
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
+    s3_tests::retrying_operation_aborted("upload part in root write test", || {
+        client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from_static(body))
+            .send()
+    })
+    .await
+}
+
 async fn cleanup_plain_bucket(
     root_client: &aws_sdk_s3::Client,
     non_root_client: &aws_sdk_s3::Client,
@@ -62,14 +83,13 @@ fn test_same_account_root_put_object_into_non_root_bucket() {
         let client = CTX.client();
         let bucket = create_standard_bucket(client).await;
 
-        root_client
-            .put_object()
-            .bucket(&bucket)
-            .key("root-write")
-            .body(ByteStream::from_static(b"root-body"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            root_client,
+            &bucket,
+            "root-write",
+            b"root-body".to_vec(),
+        )
+        .await;
 
         let body = get_object_body(client, &bucket, "root-write").await;
         assert_eq!(body.as_slice(), b"root-body");
@@ -85,14 +105,13 @@ fn test_same_account_non_root_put_object_into_root_bucket() {
         let client = CTX.client();
         let bucket = create_standard_bucket(root_client).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("non-root-write")
-            .body(ByteStream::from_static(b"non-root-body"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "non-root-write",
+            b"non-root-body".to_vec(),
+        )
+        .await;
 
         let body = get_object_body(root_client, &bucket, "non-root-write").await;
         assert_eq!(body.as_slice(), b"non-root-body");
@@ -108,41 +127,37 @@ fn test_same_account_root_and_non_root_can_overwrite_each_others_objects() {
         let client = CTX.client();
         let bucket = create_standard_bucket(client).await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("cross-overwrite")
-            .body(ByteStream::from_static(b"non-root-initial"))
-            .send()
-            .await
-            .unwrap();
-        root_client
-            .put_object()
-            .bucket(&bucket)
-            .key("cross-overwrite")
-            .body(ByteStream::from_static(b"root-overwrite"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "cross-overwrite",
+            b"non-root-initial".to_vec(),
+        )
+        .await;
+        s3_tests::put_object_retrying_operation_aborted(
+            root_client,
+            &bucket,
+            "cross-overwrite",
+            b"root-overwrite".to_vec(),
+        )
+        .await;
         let root_overwrite_body = get_object_body(client, &bucket, "cross-overwrite").await;
         assert_eq!(root_overwrite_body.as_slice(), b"root-overwrite");
 
-        root_client
-            .put_object()
-            .bucket(&bucket)
-            .key("root-initial")
-            .body(ByteStream::from_static(b"root-initial"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("root-initial")
-            .body(ByteStream::from_static(b"non-root-overwrite"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            root_client,
+            &bucket,
+            "root-initial",
+            b"root-initial".to_vec(),
+        )
+        .await;
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "root-initial",
+            b"non-root-overwrite".to_vec(),
+        )
+        .await;
         let non_root_overwrite_body = get_object_body(root_client, &bucket, "root-initial").await;
         assert_eq!(non_root_overwrite_body.as_slice(), b"non-root-overwrite");
 
@@ -168,21 +183,20 @@ fn test_same_account_non_root_can_finish_root_multipart_upload() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create root multipart upload")
             .await
             .unwrap();
         let current_upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&current_upload_id)
-            .part_number(1)
-            .body(ByteStream::from_static(b"non-root-part"))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &current_upload_id,
+            1,
+            b"non-root-part",
+        )
+        .await;
 
         client
             .complete_multipart_upload()
@@ -199,7 +213,7 @@ fn test_same_account_non_root_can_finish_root_multipart_upload() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete root-created multipart upload")
             .await
             .unwrap();
 
@@ -222,21 +236,20 @@ fn test_same_account_root_can_finish_non_root_multipart_upload() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create non-root multipart upload")
             .await
             .unwrap();
         let current_upload_id = create.upload_id().unwrap().to_string();
 
-        let part = root_client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&current_upload_id)
-            .part_number(1)
-            .body(ByteStream::from_static(b"root-part"))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_aborted(
+            root_client,
+            &bucket,
+            key,
+            &current_upload_id,
+            1,
+            b"root-part",
+        )
+        .await;
 
         root_client
             .complete_multipart_upload()
@@ -253,7 +266,7 @@ fn test_same_account_root_can_finish_non_root_multipart_upload() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete non-root-created multipart upload")
             .await
             .unwrap();
 
