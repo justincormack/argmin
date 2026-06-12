@@ -64,11 +64,11 @@ const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
 const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
 const DIRECT_PUT_METADATA_RETRY_BUDGET: Duration = Duration::from_secs(25);
 const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
-const OBJECT_GENERATION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(2);
-const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const OBJECT_GENERATION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS: usize = 64;
-pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(2);
-const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(2);
+pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 
