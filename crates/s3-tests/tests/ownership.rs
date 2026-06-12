@@ -72,6 +72,43 @@ async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
         .unwrap();
 }
 
+async fn put_bucket_policy_retrying(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    policy: serde_json::Value,
+    context: &str,
+) {
+    client
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(policy.to_string())
+        .send_retrying_operation_aborted(context)
+        .await
+        .unwrap();
+}
+
+async fn put_object_static_retrying(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+    acl: Option<ObjectCannedAcl>,
+    context: &str,
+) {
+    s3_tests::retrying_operation_aborted(context, || {
+        let mut request = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body));
+        if let Some(acl) = acl.clone() {
+            request = request.acl(acl);
+        }
+        async move { request.send().await }
+    })
+    .await;
+}
+
 async fn eventually_ok<T, E, F, Fut>(description: &str, mut op: F) -> T
 where
     E: std::fmt::Debug,
@@ -97,7 +134,7 @@ async fn delete_bucket_ownership(bucket: &str) {
     CTX.client()
         .delete_bucket_ownership_controls()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("delete bucket ownership controls")
         .await
         .unwrap();
 }
@@ -124,7 +161,7 @@ async fn put_alt_object_access_policy(bucket: &str) {
         .put_bucket_policy()
         .bucket(bucket)
         .policy(policy.to_string())
-        .send()
+        .send_retrying_operation_aborted("put alternate object access bucket policy")
         .await
         .unwrap();
 }
@@ -133,7 +170,7 @@ async fn bucket_owner_id(bucket: &str) -> String {
     CTX.client()
         .get_bucket_acl()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("get ownership bucket ACL")
         .await
         .unwrap()
         .owner()
@@ -148,7 +185,7 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get canonical owner bucket ACL")
         .await
         .unwrap()
         .owner()
@@ -192,7 +229,7 @@ async fn set_bucket_acl_with_alt_read_grant(bucket: &str) {
                 canonical_user_grant(&alt_owner_id, Permission::Read),
             ],
         ))
-        .send()
+        .send_retrying_operation_aborted("set bucket ACL with alternate read grant")
         .await
         .unwrap();
 }
@@ -261,7 +298,7 @@ async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -
         .get_object_acl()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get ownership object ACL")
         .await
         .unwrap()
         .owner()
@@ -395,16 +432,16 @@ async fn complete_single_part_multipart_and_assert_owner(
         .unwrap();
     let upload_id = upload.upload_id().expect("expected upload ID");
 
-    let part = alt
-        .upload_part()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload_id)
-        .part_number(1)
-        .body(ByteStream::from_static(b"data"))
-        .send()
-        .await
-        .unwrap();
+    let part = s3_tests::retrying_operation_aborted("upload ownership multipart part", || {
+        alt.upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+    })
+    .await;
     let etag = part.e_tag().expect("expected upload part ETag");
     let completed = CompletedMultipartUpload::builder()
         .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
@@ -414,7 +451,7 @@ async fn complete_single_part_multipart_and_assert_owner(
         .key(key)
         .upload_id(upload_id)
         .multipart_upload(completed)
-        .send()
+        .send_retrying_operation_aborted("complete ownership multipart upload")
         .await
         .unwrap();
 
@@ -462,19 +499,21 @@ async fn run_cross_account_object_tagging_matrix_case(ownership: ObjectOwnership
     let bucket = create_bucket_with_alt_object_access(ownership).await;
     let key = "writer-owned-tags";
 
-    alt.put_object()
-        .bucket(&bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"data"))
-        .send()
-        .await
-        .unwrap();
+    put_object_static_retrying(
+        alt,
+        &bucket,
+        key,
+        b"data",
+        None,
+        "put cross-account ownership tagging object",
+    )
+    .await;
 
     let owner_initial = client
         .get_object_tagging()
         .bucket(&bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get owner object tagging before ownership update")
         .await
         .unwrap();
     assert!(owner_initial.tag_set().is_empty());
@@ -497,7 +536,7 @@ async fn run_cross_account_object_tagging_matrix_case(ownership: ObjectOwnership
         .bucket(&bucket)
         .key(key)
         .tagging(tagging)
-        .send()
+        .send_retrying_operation_aborted("put owner object tagging")
         .await
         .unwrap();
 
@@ -505,7 +544,7 @@ async fn run_cross_account_object_tagging_matrix_case(ownership: ObjectOwnership
         .get_object_tagging()
         .bucket(&bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get owner object tagging after ownership update")
         .await
         .unwrap();
     assert!(owner_updated
@@ -517,7 +556,7 @@ async fn run_cross_account_object_tagging_matrix_case(ownership: ObjectOwnership
         .delete_object()
         .bucket(&bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("delete cross-account ownership tagging object")
         .await
         .unwrap();
     s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -558,7 +597,7 @@ fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
         let bucket = unique_bucket();
         s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::ObjectWriter)
-            .send()
+            .send_retrying_operation_aborted("create ObjectWriter ownership test bucket")
             .await
             .unwrap();
 
@@ -573,7 +612,7 @@ fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
         let resp = client
             .get_bucket_ownership_controls()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("get ownership controls after existing-bucket create")
             .await
             .unwrap();
         let rules = resp.ownership_controls().unwrap().rules();
@@ -591,14 +630,15 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
         let alt_client = CTX.alt_client();
         let bucket = create_bucket_with_alt_object_access(ObjectOwnership::ObjectWriter).await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key("writer-owned")
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            "writer-owned",
+            b"data",
+            None,
+            "put foreign-owned object",
+        )
+        .await;
 
         owner_get_object_access_denied_eventually(&bucket, "writer-owned").await;
 
@@ -606,7 +646,7 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
             .delete_object()
             .bucket(&bucket)
             .key("writer-owned")
-            .send()
+            .send_retrying_operation_aborted("delete foreign-owned object")
             .await
             .unwrap();
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -641,22 +681,23 @@ fn test_bucket_policy_does_not_grant_bucket_owner_read_of_private_foreign_owned_
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put foreign-owned object read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key("writer-owned")
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            "writer-owned",
+            b"data",
+            None,
+            "put foreign-owned private object",
+        )
+        .await;
 
         owner_get_object_access_denied_eventually(&bucket, "writer-owned").await;
 
@@ -694,22 +735,23 @@ fn test_create_time_object_writer_bucket_policy_does_not_grant_bucket_owner_read
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put create-time foreign-owned object read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put create-time foreign-owned object",
+        )
+        .await;
 
         owner_get_object_access_denied_eventually(&bucket, key).await;
 
@@ -746,22 +788,23 @@ fn test_bucket_policy_does_not_grant_bucket_owner_get_object_acl_of_private_fore
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put foreign-owned object ACL read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put foreign-owned object for ACL read",
+        )
+        .await;
 
         let acl = client
             .get_object_acl()
@@ -805,22 +848,23 @@ fn test_bucket_policy_does_not_grant_bucket_owner_get_object_attributes_of_priva
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put foreign-owned object attributes policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put foreign-owned object for attributes read",
+        )
+        .await;
 
         let attrs = client
             .get_object_attributes()
@@ -866,22 +910,23 @@ fn test_probe_bucket_owner_enforced_bucket_policy_get_object_sequence_for_pre_bo
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put pre-create BOE foreign-owned read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put pre-create BOE foreign-owned object",
+        )
+        .await;
 
         assert_eq!(object_owner_id(alt_client, &bucket, key).await, alt_owner);
         owner_get_object_access_denied_eventually(&bucket, key).await;
@@ -959,22 +1004,23 @@ fn test_probe_bucket_owner_enforced_bucket_policy_get_object_sequence_for_post_c
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put post-create BOE foreign-owned read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put post-create BOE foreign-owned object",
+        )
+        .await;
 
         assert_eq!(object_owner_id(alt_client, &bucket, key).await, alt_owner);
         owner_get_object_access_denied_eventually(&bucket, key).await;
@@ -1043,22 +1089,23 @@ fn test_probe_bucket_owner_enforced_get_object_sequence_without_read_policy_for_
                 "Resource": format!("arn:aws:s3:::{bucket}/*"),
             }],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put pre-create BOE foreign-owned write policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put pre-create BOE foreign-owned object without read policy",
+        )
+        .await;
 
         assert_eq!(object_owner_id(alt_client, &bucket, key).await, alt_owner);
         owner_get_object_access_denied_eventually(&bucket, key).await;
@@ -1144,22 +1191,23 @@ fn test_probe_bucket_policy_foreign_owned_object_access_matrix() {
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put foreign-owned object access matrix policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"data",
+            None,
+            "put foreign-owned access matrix object",
+        )
+        .await;
 
         let get_object = client
             .get_object()
@@ -1253,22 +1301,18 @@ fn test_bucket_policy_allows_bucket_owner_put_object_overwrite_of_private_foreig
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(client, &bucket, policy, "put bucket-owner overwrite policy")
+            .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"writer-data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"writer-data",
+            None,
+            "put foreign-owned object before owner overwrite",
+        )
+        .await;
 
         eventually_ok(
             "bucket-owner PutObject overwrite of private foreign-owned object",
@@ -1319,22 +1363,23 @@ fn test_bucket_owner_can_delete_private_foreign_owned_object() {
                 "Resource": format!("arn:aws:s3:::{bucket}/*"),
             }],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put bucket-owner delete foreign-owned object policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"writer-data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            key,
+            b"writer-data",
+            None,
+            "put foreign-owned object before owner delete",
+        )
+        .await;
 
         eventually_ok(
             "bucket-owner DeleteObject on private foreign-owned object",
@@ -1376,22 +1421,23 @@ fn test_bucket_policy_does_not_grant_bucket_owner_copy_object_from_private_forei
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put bucket-owner copy source read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"writer-data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            src_key,
+            b"writer-data",
+            None,
+            "put foreign-owned copy source object",
+        )
+        .await;
 
         let copy = client
             .copy_object()
@@ -1437,28 +1483,29 @@ fn test_bucket_policy_does_not_grant_bucket_owner_upload_part_copy_from_private_
                 }
             ],
         });
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy.to_string())
-            .send()
-            .await
-            .unwrap();
+        put_bucket_policy_retrying(
+            client,
+            &bucket,
+            policy,
+            "put bucket-owner upload-part-copy source read policy",
+        )
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"writer-data"))
-            .send()
-            .await
-            .unwrap();
+        put_object_static_retrying(
+            alt_client,
+            &bucket,
+            src_key,
+            b"writer-data",
+            None,
+            "put foreign-owned upload-part-copy source object",
+        )
+        .await;
 
         let upload = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("create ownership upload-part-copy MPU")
             .await
             .unwrap();
         let upload_id = upload.upload_id().expect("expected upload id").to_string();
@@ -1479,7 +1526,7 @@ fn test_bucket_policy_does_not_grant_bucket_owner_upload_part_copy_from_private_
             .bucket(&bucket)
             .key(dst_key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort ownership upload-part-copy MPU")
             .await
             .unwrap();
 

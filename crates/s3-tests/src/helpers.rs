@@ -397,6 +397,11 @@ impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::get_bucket_policy::GetBucketPolicyError
 );
 impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_policy_status::builders::GetBucketPolicyStatusFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_policy_status::GetBucketPolicyStatusOutput,
+    aws_sdk_s3::operation::get_bucket_policy_status::GetBucketPolicyStatusError
+);
+impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::get_bucket_tagging::builders::GetBucketTaggingFluentBuilder,
     aws_sdk_s3::operation::get_bucket_tagging::GetBucketTaggingOutput,
     aws_sdk_s3::operation::get_bucket_tagging::GetBucketTaggingError
@@ -415,6 +420,11 @@ impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::get_object_acl::builders::GetObjectAclFluentBuilder,
     aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput,
     aws_sdk_s3::operation::get_object_acl::GetObjectAclError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_object_lock_configuration::builders::GetObjectLockConfigurationFluentBuilder,
+    aws_sdk_s3::operation::get_object_lock_configuration::GetObjectLockConfigurationOutput,
+    aws_sdk_s3::operation::get_object_lock_configuration::GetObjectLockConfigurationError
 );
 impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::get_object_attributes::builders::GetObjectAttributesFluentBuilder,
@@ -477,6 +487,16 @@ impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::put_bucket_acl::PutBucketAclError
 );
 impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_abac::builders::PutBucketAbacFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_abac::PutBucketAbacOutput,
+    aws_sdk_s3::operation::put_bucket_abac::PutBucketAbacError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_cors::builders::PutBucketCorsFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_cors::PutBucketCorsOutput,
+    aws_sdk_s3::operation::put_bucket_cors::PutBucketCorsError
+);
+impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::put_bucket_encryption::builders::PutBucketEncryptionFluentBuilder,
     aws_sdk_s3::operation::put_bucket_encryption::PutBucketEncryptionOutput,
     aws_sdk_s3::operation::put_bucket_encryption::PutBucketEncryptionError
@@ -510,6 +530,21 @@ impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::put_object_tagging::builders::PutObjectTaggingFluentBuilder,
     aws_sdk_s3::operation::put_object_tagging::PutObjectTaggingOutput,
     aws_sdk_s3::operation::put_object_tagging::PutObjectTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_object_legal_hold::builders::PutObjectLegalHoldFluentBuilder,
+    aws_sdk_s3::operation::put_object_legal_hold::PutObjectLegalHoldOutput,
+    aws_sdk_s3::operation::put_object_legal_hold::PutObjectLegalHoldError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_object_lock_configuration::builders::PutObjectLockConfigurationFluentBuilder,
+    aws_sdk_s3::operation::put_object_lock_configuration::PutObjectLockConfigurationOutput,
+    aws_sdk_s3::operation::put_object_lock_configuration::PutObjectLockConfigurationError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_object_retention::builders::PutObjectRetentionFluentBuilder,
+    aws_sdk_s3::operation::put_object_retention::PutObjectRetentionOutput,
+    aws_sdk_s3::operation::put_object_retention::PutObjectRetentionError
 );
 impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::put_object_acl::builders::PutObjectAclFluentBuilder,

@@ -1,4 +1,3 @@
-use aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -30,14 +29,13 @@ fn test_anon_get_object_private_bucket_fail() {
         let client = CTX.client();
         let bucket = setup_private_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"private data"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            b"private data".to_vec(),
+        )
+        .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let mut resp = agent().get(&url).call().expect("transport error");
@@ -236,14 +234,7 @@ fn test_object_anon_put() {
         let client = CTX.client();
         let bucket = setup_private_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(client, &bucket, "foo", Vec::new()).await;
 
         let url = format!("{}/{}/foo", CTX.endpoint(), bucket);
         let mut resp = agent()

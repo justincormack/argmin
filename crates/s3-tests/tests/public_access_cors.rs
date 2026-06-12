@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ObjectCannedAcl};
-use s3_tests::{object_url, presign_url, CTX};
+use s3_tests::{object_url, presign_url, SendRetryingOperationAborted, CTX};
 
 fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
@@ -21,14 +21,14 @@ async fn setup_public_cors_bucket(rules: Vec<CorsRule>) -> String {
         .put_bucket_cors()
         .bucket(&bucket)
         .cors_configuration(config)
-        .send()
+        .send_retrying_operation_aborted("put public CORS bucket configuration")
         .await
         .unwrap();
 
     client
         .get_bucket_cors()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get public CORS bucket configuration")
         .await
         .unwrap();
 
@@ -71,19 +71,20 @@ fn test_cors_actual_request_public_bucket() {
             .put_bucket_cors()
             .bucket(&bucket)
             .cors_configuration(config)
-            .send()
+            .send_retrying_operation_aborted("put public CORS actual-request configuration")
             .await
             .unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::retrying_operation_aborted("put public CORS object", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"hello"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let mut resp = agent()
@@ -134,19 +135,20 @@ fn test_cors_actual_request_no_match() {
             .put_bucket_cors()
             .bucket(&bucket)
             .cors_configuration(config)
-            .send()
+            .send_retrying_operation_aborted("put public CORS no-match configuration")
             .await
             .unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::retrying_operation_aborted("put public CORS no-match object", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"hello"))
+                .send()
+        })
+        .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let mut resp = agent()
@@ -249,15 +251,16 @@ fn test_cors_actual_request_origin_wildcard_matrix() {
         ])
         .await;
         let client = CTX.client();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::retrying_operation_aborted("put public CORS wildcard object", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"hello"))
+                .send()
+        })
+        .await;
 
         let cases = [
             ("http://foo.suffix", Some("http://foo.suffix")),
@@ -306,15 +309,16 @@ fn test_cors_presigned_get_object_preflight() {
         let bucket =
             setup_public_cors_bucket(vec![simple_rule("http://example.com", &["GET"])]).await;
         let client = CTX.client();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .acl(ObjectCannedAcl::PublicRead)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::retrying_operation_aborted("put public CORS presigned object", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .acl(ObjectCannedAcl::PublicRead)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+        })
+        .await;
 
         let presigned = presign_url(
             "GET",

@@ -91,7 +91,7 @@ async fn upload_part_copy_eventually(
             .upload_id(upload_id)
             .part_number(part_number)
             .copy_source(copy_source.clone())
-            .send()
+            .send_retrying_operation_aborted("upload part copy in ABAC bucket policy test")
             .await
         {
             Ok(output) => return output,
@@ -204,7 +204,9 @@ async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
             .get_object()
             .bucket(bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted(
+                "get object as alternate account while waiting for denial",
+            )
             .await;
         match &result {
             Ok(_) => {}
@@ -264,14 +266,14 @@ async fn enable_bucket_abac_with_security_tag(
         .put_bucket_tagging()
         .bucket(bucket)
         .tagging(simple_bucket_tagging("security", value))
-        .send()
+        .send_retrying_operation_aborted("put ABAC security bucket tag")
         .await
         .unwrap();
     client
         .put_bucket_abac()
         .bucket(bucket)
         .abac_status(enabled_abac_status())
-        .send()
+        .send_retrying_operation_aborted("enable bucket ABAC")
         .await
         .unwrap();
 }
@@ -301,7 +303,7 @@ async fn put_bucket_tag_condition_policy_for_alt(
             })
             .to_string(),
         )
-        .send()
+        .send_retrying_operation_aborted("put bucket tag condition policy")
         .await
         .unwrap();
 }
@@ -330,7 +332,7 @@ async fn create_versioned_bucket_allowing_public_policy(client: &aws_sdk_s3::Cli
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("enable versioning for ABAC policy bucket")
         .await
         .unwrap();
     bucket
@@ -342,17 +344,18 @@ async fn put_versioned_object(
     key: &str,
     body: &'static [u8],
 ) -> String {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap()
-        .version_id()
-        .expect("expected VersionId for versioned object")
-        .to_string()
+    s3_tests::retrying_operation_aborted("put versioned object for ABAC policy test", || {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+    })
+    .await
+    .version_id()
+    .expect("expected VersionId for versioned object")
+    .to_string()
 }
 
 fn bucket_resource_arn(bucket: &str) -> String {

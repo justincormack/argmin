@@ -164,7 +164,7 @@ async fn alt_list_objects_v2_eventually(
             .alt_client()
             .list_objects_v2()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects v2 as alternate account")
             .await
         {
             Ok(output) => return output,
@@ -216,7 +216,7 @@ async fn upload_part_copy_eventually(
             .upload_id(upload_id)
             .part_number(part_number)
             .copy_source(copy_source.clone())
-            .send()
+            .send_retrying_operation_aborted("upload part copy in bucket policy test")
             .await
         {
             Ok(output) => return output,
@@ -324,7 +324,11 @@ async fn get_object_eventually(
     key: &str,
 ) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
     eventually_ok("GetObject", || {
-        client.get_object().bucket(bucket).key(key).send()
+        client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object in bucket policy test")
     })
     .await
 }
@@ -334,7 +338,10 @@ async fn get_bucket_policy_status_eventually(
     bucket: &str,
 ) -> aws_sdk_s3::operation::get_bucket_policy_status::GetBucketPolicyStatusOutput {
     eventually_ok("GetBucketPolicyStatus", || {
-        client.get_bucket_policy_status().bucket(bucket).send()
+        client
+            .get_bucket_policy_status()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("get bucket policy status")
     })
     .await
 }
@@ -350,7 +357,7 @@ async fn alt_get_bucket_policy_status_access_denied_eventually(bucket: &str) {
             .alt_client()
             .get_bucket_policy_status()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("get bucket policy status as alternate account")
             .await;
         match &result {
             Ok(_) => {}
@@ -505,7 +512,7 @@ async fn create_object_lock_bucket(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
-        .send()
+        .send_retrying_operation_aborted("create object lock bucket for bucket policy test")
         .await
         .unwrap();
     bucket

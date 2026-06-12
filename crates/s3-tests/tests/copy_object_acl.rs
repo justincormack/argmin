@@ -1,11 +1,10 @@
 //! CopyObject tests that intentionally exercise legacy ACL authorization.
 
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     AccessControlPolicy, Grant, Grantee, ObjectOwnership, Owner, Permission, Type,
 };
 use aws_sdk_s3::Client;
-use s3_tests::{create_acl_enabled_bucket, unique_bucket, CTX};
+use s3_tests::{create_acl_enabled_bucket, unique_bucket, SendRetryingOperationAborted, CTX};
 
 async fn canonical_owner_id(client: &Client) -> String {
     let bucket = unique_bucket();
@@ -13,7 +12,7 @@ async fn canonical_owner_id(client: &Client) -> String {
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get canonical owner bucket ACL")
         .await
         .unwrap()
         .owner()
@@ -65,19 +64,18 @@ fn test_object_copy_not_owned_object_bucket() {
         let alt_client = CTX.alt_client();
 
         let bucket = create_acl_enabled_bucket(client, ObjectOwnership::ObjectWriter).await;
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .body(ByteStream::from_static(b"foo"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "foo123bar",
+            b"foo".to_vec(),
+        )
+        .await;
 
         let bucket_owner_id = client
             .get_bucket_acl()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("get copy ACL bucket owner")
             .await
             .unwrap()
             .owner()
@@ -88,7 +86,7 @@ fn test_object_copy_not_owned_object_bucket() {
             .get_object_acl()
             .bucket(&bucket)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("get copy ACL source owner")
             .await
             .unwrap()
             .owner()
@@ -108,7 +106,7 @@ fn test_object_copy_not_owned_object_bucket() {
                     canonical_user_full_control_grant(&alt_owner_id),
                 ],
             ))
-            .send()
+            .send_retrying_operation_aborted("grant alternate full control on source object")
             .await
             .unwrap();
         client
@@ -121,7 +119,7 @@ fn test_object_copy_not_owned_object_bucket() {
                     canonical_user_full_control_grant(&alt_owner_id),
                 ],
             ))
-            .send()
+            .send_retrying_operation_aborted("grant alternate full control on source bucket")
             .await
             .unwrap();
 
@@ -129,7 +127,7 @@ fn test_object_copy_not_owned_object_bucket() {
             .get_object()
             .bucket(&bucket)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("get copy ACL source object as alternate")
             .await
             .unwrap();
         let src_body = src.body.collect().await.unwrap().into_bytes();
@@ -140,7 +138,7 @@ fn test_object_copy_not_owned_object_bucket() {
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object as alternate with ACL access")
             .await
             .unwrap();
 
@@ -148,7 +146,7 @@ fn test_object_copy_not_owned_object_bucket() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get copied ACL object as alternate")
             .await
             .unwrap();
         let dst_body = dst.body.collect().await.unwrap().into_bytes();
@@ -158,7 +156,7 @@ fn test_object_copy_not_owned_object_bucket() {
             .get_object_acl()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get copied ACL object ACL")
             .await
             .unwrap();
         assert_eq!(
@@ -176,18 +174,11 @@ fn test_object_copy_not_owned_object_bucket() {
             dst_acl.grants()
         );
 
-        let _ = alt_client
-            .delete_object()
-            .bucket(&bucket)
-            .key("bar321foo")
-            .send()
-            .await;
-        let _ = client
-            .delete_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .send()
-            .await;
+        let _ =
+            s3_tests::delete_object_retrying_operation_aborted(alt_client, &bucket, "bar321foo")
+                .await;
+        let _ =
+            s3_tests::delete_object_retrying_operation_aborted(client, &bucket, "foo123bar").await;
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

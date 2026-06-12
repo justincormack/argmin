@@ -1,6 +1,5 @@
 //! Request checksum tests for legacy ACL subresources.
 
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration, ObjectOwnership};
 use s3_tests::{
     content_md5_header, sdk_checksum_headers, send_signed_request, unique_bucket,
@@ -147,14 +146,13 @@ fn test_object_acl_checksum_requirements() {
     s3_tests::run(async {
         let bucket = create_bucket_in_test_region(ObjectOwnership::BucketOwnerPreferred).await;
         let key = "obj";
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            CTX.client(),
+            &bucket,
+            key,
+            b"hello".to_vec(),
+        )
+        .await;
 
         let acl_url = format!("{}/{}/{}?acl", CTX.endpoint(), bucket, key);
         let owner_id = object_owner_id(&bucket, key).await;
