@@ -4143,9 +4143,15 @@ impl StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            let pending_visible = self
-                                .pending_metadata_command_for_bucket(pg_id, &req.bucket)?
-                                .is_some();
+                            let pending_visible = match self
+                                .pending_metadata_command_for_bucket(pg_id, &req.bucket)
+                            {
+                                Ok(pending) => pending.is_some(),
+                                Err(error) => {
+                                    cleanup_direct_put_attempt_before_command_ownership!();
+                                    return Err(error.into());
+                                }
+                            };
                             let drain_result = self.drain_after_object_pg_log_conflict(
                                 pg_id,
                                 &req.bucket,

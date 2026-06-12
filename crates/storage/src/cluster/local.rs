@@ -14133,6 +14133,116 @@ mod tests {
     }
 
     #[test]
+    fn direct_put_log_conflict_pending_visibility_error_cleans_new_payload() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_ids = [0, 1, 2, 3];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut local_map =
+            LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        let topology = local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "direct-put-pending-read-error-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        let wrong_scope_bucket = bucket_for_pg(topology, 1, "wrong-pending-scope-");
+        set_route_primary(&mut local_map, 1, NodeId::new(1));
+        set_route_primary(&mut local_map, 2, NodeId::new(1));
+
+        let map = Arc::new(local_map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+
+        let reservation_id =
+            crate::SessionId::try_from("36363636363636363636363636363636".to_string()).unwrap();
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        let payload = b"direct put pending visibility error";
+        let segment_okh = [0xc6; 16];
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+        let commit_req = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key: &key,
+                reservation_id: reservation_id.clone(),
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let hook_wrong_scope_bucket = wrong_scope_bucket.clone();
+        let hook_ran_for_closure = Arc::clone(&hook_ran);
+        let _hook_guard =
+            cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+                if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let pg_id = PgId::new(2);
+                let command =
+                    create_bucket_metadata_command(pg_id, 2, hook_wrong_scope_bucket.clone());
+                force_insert_pending_metadata_command_for_test(
+                    &hook_map,
+                    pg_id,
+                    &hook_bucket,
+                    &command,
+                );
+            }));
+
+        let err = cluster
+            .commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(
+                    StoreError::MetadataCommandPendingConflict { .. }
+                )
+            ),
+            "expected malformed pending slot visibility error, got {err:?}"
+        );
+
+        assert_bucket_write_reservations_released(&map, &bucket);
+        // The unreadable pending slot still blocks command-log-preserving
+        // generation-reservation release. This regression pins the cleanup that
+        // must not be bypassed by the pending-visibility error: the caller-owned
+        // bucket write proof and unowned direct PUT payload shards.
+        for shard_index in 0..written.ec.k + written.ec.m {
+            assert!(!cluster
+                .test_payload_shard_file_exists(
+                    written.data_pg_id,
+                    written.ec,
+                    &segment_okh,
+                    generation_id,
+                    shard_index,
+                )
+                .unwrap());
+        }
+    }
+
+    #[test]
     fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
