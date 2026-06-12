@@ -3,8 +3,8 @@ use aws_sdk_s3::types::{ChecksumType, ObjectAttributes};
 use aws_sdk_s3::Client;
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
-    retrying_operation_aborted, send_signed_request, unique_bucket, SendRetryingOperationAborted,
-    CTX,
+    retrying_operation_aborted, retrying_operation_aborted_result, send_signed_request,
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::Duration;
 
@@ -132,7 +132,7 @@ fn test_object_copy_zero_size() {
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -141,7 +141,7 @@ fn test_object_copy_zero_size() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(resp.content_length(), Some(0));
@@ -161,7 +161,7 @@ fn test_object_copy_same_bucket() {
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -170,7 +170,7 @@ fn test_object_copy_same_bucket() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -186,19 +186,21 @@ fn test_object_copy_wrong_expected_source_bucket_owner() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "foo123bar", b"foo").await;
 
-        let result = CTX
-            .client()
-            .copy_object()
-            .bucket(&bucket)
-            .key("bar321foo")
-            .copy_source(format!("{}/foo123bar", bucket))
-            .customize()
-            .mutate_request(|req| {
-                req.headers_mut()
-                    .insert("x-amz-source-expected-bucket-owner", "000000000000");
-            })
-            .send()
-            .await;
+        let result = retrying_operation_aborted_result(|| async {
+            CTX.client()
+                .copy_object()
+                .bucket(&bucket)
+                .key("bar321foo")
+                .copy_source(format!("{}/foo123bar", bucket))
+                .customize()
+                .mutate_request(|req| {
+                    req.headers_mut()
+                        .insert("x-amz-source-expected-bucket-owner", "000000000000");
+                })
+                .send()
+                .await
+        })
+        .await;
         assert_eq!(err_status(&result), 403);
         assert_s3_err_code(&result, "AccessDenied");
 
@@ -211,22 +213,24 @@ fn test_object_copy_verify_contenttype() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .content_type("text/bla")
-            .body(ByteStream::from_static(b"foo"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put copy source object with content type", || async {
+            CTX.client()
+                .put_object()
+                .bucket(&bucket)
+                .key("foo123bar")
+                .content_type("text/bla")
+                .body(ByteStream::from_static(b"foo"))
+                .send()
+                .await
+        })
+        .await;
 
         CTX.client()
             .copy_object()
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -235,7 +239,7 @@ fn test_object_copy_verify_contenttype() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(resp.content_type(), Some("text/bla"));
@@ -259,7 +263,7 @@ fn test_object_copy_to_itself() {
             .bucket(&bucket)
             .key("foo123bar")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert_eq!(err_status(&result), 400);
 
@@ -281,7 +285,7 @@ fn test_object_copy_to_itself_with_metadata() {
             .copy_source(format!("{}/foo123bar", bucket))
             .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
             .metadata("foo", "bar")
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -290,7 +294,7 @@ fn test_object_copy_to_itself_with_metadata() {
             .get_object()
             .bucket(&bucket)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         let meta = resp.metadata().unwrap();
@@ -313,7 +317,7 @@ fn test_object_copy_diff_bucket() {
             .bucket(&bucket2)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket1))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -322,7 +326,7 @@ fn test_object_copy_diff_bucket() {
             .get_object()
             .bucket(&bucket2)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -338,17 +342,19 @@ fn test_object_copy_retaining_metadata() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .content_type("audio/ogg")
-            .metadata("key1", "value1")
-            .metadata("key2", "value2")
-            .body(ByteStream::from_static(b"foo"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put copy source object with metadata", || async {
+            CTX.client()
+                .put_object()
+                .bucket(&bucket)
+                .key("foo123bar")
+                .content_type("audio/ogg")
+                .metadata("key1", "value1")
+                .metadata("key2", "value2")
+                .body(ByteStream::from_static(b"foo"))
+                .send()
+                .await
+        })
+        .await;
 
         // Default directive is COPY — metadata should be retained
         CTX.client()
@@ -356,7 +362,7 @@ fn test_object_copy_retaining_metadata() {
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -365,7 +371,7 @@ fn test_object_copy_retaining_metadata() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(resp.content_type(), Some("audio/ogg"));
@@ -383,17 +389,19 @@ fn test_object_copy_replacing_metadata() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("foo123bar")
-            .content_type("audio/ogg")
-            .metadata("key1", "value1")
-            .metadata("key2", "value2")
-            .body(ByteStream::from_static(b"foo"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put copy source object with metadata", || async {
+            CTX.client()
+                .put_object()
+                .bucket(&bucket)
+                .key("foo123bar")
+                .content_type("audio/ogg")
+                .metadata("key1", "value1")
+                .metadata("key2", "value2")
+                .body(ByteStream::from_static(b"foo"))
+                .send()
+                .await
+        })
+        .await;
 
         // REPLACE directive — new metadata replaces original
         CTX.client()
@@ -405,7 +413,7 @@ fn test_object_copy_replacing_metadata() {
             .content_type("audio/mpeg")
             .metadata("key3", "value3")
             .metadata("key2", "value2")
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -414,7 +422,7 @@ fn test_object_copy_replacing_metadata() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(resp.content_type(), Some("audio/mpeg"));
@@ -441,7 +449,7 @@ fn test_object_copy_bucket_not_found() {
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(fake_source)
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert_eq!(err_status(&result), 404);
 
@@ -460,7 +468,7 @@ fn test_object_copy_key_not_found() {
             .bucket(&bucket)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert_eq!(err_status(&result), 404);
 
@@ -475,21 +483,27 @@ fn test_object_copy_16m() {
         let size = 16 * 1024 * 1024;
         let data = vec![0u8; size];
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj1")
-            .body(ByteStream::from(data))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put large copy source object", || {
+            let bucket = bucket.clone();
+            let data = data.clone();
+            async move {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj1")
+                    .body(ByteStream::from(data))
+                    .send()
+                    .await
+            }
+        })
+        .await;
 
         CTX.client()
             .copy_object()
             .bucket(&bucket)
             .key("obj2")
             .copy_source(format!("{}/obj1", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -498,7 +512,7 @@ fn test_object_copy_16m() {
             .get_object()
             .bucket(&bucket)
             .key("obj2")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(resp.content_length(), Some(size as i64));
@@ -514,21 +528,27 @@ fn test_object_copy_read_16m() {
         let size = 16 * 1024 * 1024;
         let data = vec![0u8; size];
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj1")
-            .body(ByteStream::from(data.clone()))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put large copy source object", || {
+            let bucket = bucket.clone();
+            let data = data.clone();
+            async move {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj1")
+                    .body(ByteStream::from(data))
+                    .send()
+                    .await
+            }
+        })
+        .await;
 
         CTX.client()
             .copy_object()
             .bucket(&bucket)
             .key("obj2")
             .copy_source(format!("{}/obj1", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -537,7 +557,7 @@ fn test_object_copy_read_16m() {
             .get_object()
             .bucket(&bucket)
             .key("obj2")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(resp.content_length(), Some(size as i64));
@@ -566,25 +586,27 @@ fn test_object_copy_versioned_bucket() {
                     .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning during copy tests")
             .await
             .unwrap();
 
         let data = b"hello";
-        client
-            .put_object()
-            .bucket(&bucket1)
-            .key("foo123bar")
-            .body(ByteStream::from_static(data))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put versioned copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket1)
+                .key("foo123bar")
+                .body(ByteStream::from_static(data))
+                .send()
+                .await
+        })
+        .await;
 
         let resp = client
             .get_object()
             .bucket(&bucket1)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         let version_id = resp.version_id().unwrap().to_string();
@@ -595,7 +617,7 @@ fn test_object_copy_versioned_bucket() {
             .bucket(&bucket1)
             .key("bar321foo")
             .copy_source(copy_source_with_version(&bucket1, "foo123bar", &version_id))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -613,7 +635,7 @@ fn test_object_copy_versioned_bucket() {
                 "bar321foo",
                 &version_id2,
             ))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -630,7 +652,7 @@ fn test_object_copy_versioned_bucket() {
                     .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning during copy tests")
             .await
             .unwrap();
 
@@ -639,7 +661,7 @@ fn test_object_copy_versioned_bucket() {
             .bucket(&bucket2)
             .key("bar321foo3")
             .copy_source(copy_source_with_version(&bucket1, "foo123bar", &version_id))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -653,7 +675,7 @@ fn test_object_copy_versioned_bucket() {
             .bucket(&bucket3)
             .key("bar321foo4")
             .copy_source(copy_source_with_version(&bucket1, "foo123bar", &version_id))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -666,7 +688,7 @@ fn test_object_copy_versioned_bucket() {
             .bucket(&bucket1)
             .key("foo123bar2")
             .copy_source(format!("{}/bar321foo4", bucket3))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -694,26 +716,28 @@ fn test_object_copy_versioned_url_encoding() {
                     .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning during copy tests")
             .await
             .unwrap();
 
         // Key with special characters that need URL encoding
         let src_key = "foo?bar";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put versioned copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(src_key)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await
+        })
+        .await;
 
         let resp = client
             .head_object()
             .bucket(&bucket)
             .key(src_key)
-            .send()
+            .send_retrying_operation_aborted("head object during copy tests")
             .await
             .unwrap();
         let version_id = resp.version_id().unwrap().to_string();
@@ -725,7 +749,7 @@ fn test_object_copy_versioned_url_encoding() {
             .bucket(&bucket)
             .key(dst_key)
             .copy_source(copy_source_with_version(&bucket, src_key, &version_id))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -756,7 +780,7 @@ fn test_object_copy_versioning_multipart_upload() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning during copy tests")
             .await
             .unwrap();
 
@@ -767,20 +791,26 @@ fn test_object_copy_versioning_multipart_upload() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(src_key)
-            .send()
+            .send_retrying_operation_aborted("create multipart upload during copy tests")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
-        let part_resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(src_key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_data.clone()))
-            .send()
-            .await
-            .unwrap();
+        let part_resp = retrying_operation_aborted("upload multipart copy source part", || {
+            let bucket = bucket.clone();
+            let part_data = part_data.clone();
+            async move {
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(src_key)
+                    .upload_id(upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(part_data))
+                    .send()
+                    .await
+            }
+        })
+        .await;
         let complete = client
             .complete_multipart_upload()
             .bucket(&bucket)
@@ -796,7 +826,7 @@ fn test_object_copy_versioning_multipart_upload() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete multipart upload during copy tests")
             .await
             .unwrap();
         assert!(complete.version_id().is_some());
@@ -808,7 +838,7 @@ fn test_object_copy_versioning_multipart_upload() {
             .bucket(&bucket)
             .key(dst_key)
             .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
         assert!(copy_resp.version_id().is_some());
@@ -818,7 +848,7 @@ fn test_object_copy_versioning_multipart_upload() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         assert_eq!(get.content_length(), Some(5 * 1024 * 1024));
@@ -846,21 +876,23 @@ fn test_object_copy_not_owned_bucket() {
         s3_tests::create_bucket(client, &bucket1).await.unwrap();
         s3_tests::create_bucket(alt_client, &bucket2).await.unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket1)
-            .key("foo123bar")
-            .body(ByteStream::from_static(b"foo"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put cross-account copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket1)
+                .key("foo123bar")
+                .body(ByteStream::from_static(b"foo"))
+                .send()
+                .await
+        })
+        .await;
 
         let result = alt_client
             .copy_object()
             .bucket(&bucket2)
             .key("bar321foo")
             .copy_source(format!("{}/foo123bar", bucket1))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert_eq!(err_status(&result), 403);
         assert_s3_err_code(&result, "AccessDenied");
@@ -869,7 +901,7 @@ fn test_object_copy_not_owned_bucket() {
             .delete_object()
             .bucket(&bucket1)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("delete object during copy tests")
             .await
             .unwrap();
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket1).await;
@@ -894,7 +926,7 @@ fn test_copy_object_delete_marker_source() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning during copy tests")
             .await
             .unwrap();
 
@@ -902,19 +934,21 @@ fn test_copy_object_delete_marker_source() {
         let dst_key = "delete-marker-dst";
 
         // Put then delete to create a delete marker as current version
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"original"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put delete-marker copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(src_key)
+                .body(ByteStream::from_static(b"original"))
+                .send()
+                .await
+        })
+        .await;
         client
             .delete_object()
             .bucket(&bucket)
             .key(src_key)
-            .send()
+            .send_retrying_operation_aborted("delete object during copy tests")
             .await
             .unwrap();
 
@@ -924,7 +958,7 @@ fn test_copy_object_delete_marker_source() {
             .bucket(&bucket)
             .key(dst_key)
             .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         let status = err_status(&result);
         assert_eq!(status, 404);
@@ -952,7 +986,7 @@ fn test_copy_object_delete_marker_version_id() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning during copy tests")
             .await
             .unwrap();
 
@@ -960,19 +994,21 @@ fn test_copy_object_delete_marker_version_id() {
         let dst_key = "dm-version-dst";
 
         // Put then delete to create a delete marker
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put delete-marker copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(src_key)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await
+        })
+        .await;
         let del = client
             .delete_object()
             .bucket(&bucket)
             .key(src_key)
-            .send()
+            .send_retrying_operation_aborted("delete object during copy tests")
             .await
             .unwrap();
         let dm_version_id = del.version_id().unwrap();
@@ -983,7 +1019,7 @@ fn test_copy_object_delete_marker_version_id() {
             .bucket(&bucket)
             .key(dst_key)
             .copy_source(copy_source_with_version(&bucket, src_key, dm_version_id))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert!(
             result.is_err(),
@@ -1019,7 +1055,7 @@ fn test_copy_object_replace_strips_bogus_inline_checksum() {
             .copy_source(format!("{}/src", bucket))
             .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
             .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -1029,7 +1065,7 @@ fn test_copy_object_replace_strips_bogus_inline_checksum() {
             .bucket(&bucket)
             .key("dst")
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-            .send()
+            .send_retrying_operation_aborted("head object during copy tests")
             .await
             .unwrap();
         let crc32_val = head
@@ -1060,7 +1096,7 @@ fn test_copy_object_replace_rejects_system_metadata_over_limit() {
             .copy_source(format!("{}/src", bucket))
             .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
             .content_disposition("d".repeat(3000))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
 
         assert_eq!(err_status(&result), 400);
@@ -1088,7 +1124,7 @@ fn test_copy_object_replace_checksum_algorithm_recomputes() {
             .copy_source(format!("{}/src", bucket))
             .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
             .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await
             .unwrap();
 
@@ -1098,7 +1134,7 @@ fn test_copy_object_replace_checksum_algorithm_recomputes() {
             .bucket(&bucket)
             .key("dst")
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-            .send()
+            .send_retrying_operation_aborted("get object during copy tests")
             .await
             .unwrap();
         let sha256_val = get
@@ -1128,7 +1164,7 @@ fn test_copy_object_default_checksum_is_crc64nvme() {
             .bucket(&bucket)
             .key("src")
             .object_attributes(ObjectAttributes::Checksum)
-            .send()
+            .send_retrying_operation_aborted("get object attributes during copy tests")
             .await
             .unwrap();
         let src_checksum = src_attrs.checksum().expect("expected source checksum");
@@ -1156,7 +1192,7 @@ fn test_copy_object_default_checksum_is_crc64nvme() {
             .bucket(&bucket)
             .key("dst")
             .object_attributes(ObjectAttributes::Checksum)
-            .send()
+            .send_retrying_operation_aborted("get object attributes during copy tests")
             .await
             .unwrap();
         let dst_checksum = dst_attrs.checksum().expect("expected destination checksum");
@@ -1186,7 +1222,7 @@ fn test_copy_object_source_missing_key() {
             .bucket(&bucket)
             .key("dst")
             .copy_source(&bucket)
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert!(
             result.is_err(),
@@ -1213,7 +1249,7 @@ fn test_copy_object_source_empty_key() {
             .bucket(&bucket)
             .key("dst")
             .copy_source(format!("{}/", bucket))
-            .send()
+            .send_retrying_operation_aborted("copy object during copy tests")
             .await;
         assert!(
             result.is_err(),

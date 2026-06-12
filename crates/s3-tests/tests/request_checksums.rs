@@ -109,27 +109,66 @@ async fn cleanup_bucket_with_keys(bucket: &str, keys: &[&str]) {
 
 async fn cleanup_object_lock_bucket_with_version(bucket: &str, key: &str, version_id: &str) {
     let client = CTX.client();
-    let _ = client
-        .put_object_legal_hold()
-        .bucket(bucket)
-        .key(key)
-        .version_id(version_id)
-        .legal_hold(
-            ObjectLockLegalHold::builder()
-                .status(ObjectLockLegalHoldStatus::Off)
-                .build(),
-        )
-        .send()
-        .await;
+    let _ = s3_tests::retrying_operation_aborted_result(|| {
+        client
+            .put_object_legal_hold()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .legal_hold(
+                ObjectLockLegalHold::builder()
+                    .status(ObjectLockLegalHoldStatus::Off)
+                    .build(),
+            )
+            .send()
+    })
+    .await;
     let _ = client
         .delete_object()
         .bucket(bucket)
         .key(key)
         .version_id(version_id)
         .bypass_governance_retention(true)
-        .send()
+        .send_retrying_operation_aborted("delete request checksum object-lock version")
         .await;
     cleanup_bucket(bucket).await;
+}
+
+async fn put_object(
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    s3_tests::retrying_operation_aborted("put request checksum setup object", || async move {
+        CTX.client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+    })
+    .await
+}
+
+async fn upload_part_retrying_operation_aborted(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: &'static [u8],
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
+    s3_tests::retrying_operation_aborted("upload request checksum multipart part", || async move {
+        CTX.client()
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+    })
+    .await
 }
 
 async fn current_version_id(bucket: &str, key: &str) -> String {
@@ -137,7 +176,7 @@ async fn current_version_id(bucket: &str, key: &str) -> String {
         .head_object()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("head request checksum object")
         .await
         .unwrap()
         .version_id()
@@ -151,7 +190,7 @@ async fn abort_multipart_upload(bucket: &str, key: &str, upload_id: &str) {
         .bucket(bucket)
         .key(key)
         .upload_id(upload_id)
-        .send()
+        .send_retrying_operation_aborted("abort request checksum multipart upload")
         .await
         .unwrap();
 }
@@ -160,7 +199,7 @@ async fn bucket_owner_id(bucket: &str) -> String {
     CTX.client()
         .get_bucket_acl()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("get request checksum bucket owner")
         .await
         .unwrap()
         .owner()
@@ -376,26 +415,11 @@ fn test_object_subresource_request_checksum_matrix() {
         let key = "obj";
 
         let bucket = create_bucket_in_test_region(None, false).await;
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, key, b"hello").await;
         cleanup_bucket_with_keys(&bucket, &[key]).await;
 
         let bucket = create_bucket_in_test_region(None, true).await;
-        let put = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        let put = put_object(&bucket, key, b"hello").await;
         let version_id = put.version_id().unwrap().to_string();
         let legal_hold_body =
             br#"<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>OFF</Status></LegalHold>"#;
@@ -433,15 +457,7 @@ fn test_object_subresource_request_checksum_matrix() {
         cleanup_object_lock_bucket_with_version(&bucket, key, &version_id).await;
 
         let bucket = create_bucket_in_test_region(None, true).await;
-        let put = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        let put = put_object(&bucket, key, b"hello").await;
         let version_id = put.version_id().unwrap().to_string();
         let retain_until = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -495,14 +511,7 @@ fn test_delete_objects_request_checksum_matrix() {
         let bucket = create_bucket_in_test_region(None, false).await;
         let key = "delete-me";
 
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, key, b"hello").await;
 
         let body = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
         let url = format!("{}/{}?delete", CTX.endpoint(), bucket);
@@ -560,14 +569,7 @@ fn test_allow_missing_checksum_exceptions() {
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let key = "tagging";
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, key, b"hello").await;
         let tagging_body =
             br#"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"#;
         let tagging_url = format!("{}/{}/{}?tagging", CTX.endpoint(), bucket, key);
@@ -681,7 +683,7 @@ fn test_allow_missing_checksum_exceptions() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create request checksum multipart upload")
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap();
@@ -709,7 +711,7 @@ fn test_allow_missing_checksum_exceptions() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create request checksum multipart upload")
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap();
@@ -740,7 +742,7 @@ fn test_allow_missing_checksum_exceptions() {
             .bucket(&bucket)
             .key(key)
             .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
-            .send()
+            .send_retrying_operation_aborted("create request checksum multipart upload")
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap();
@@ -770,21 +772,13 @@ fn test_allow_missing_checksum_exceptions() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create request checksum multipart upload")
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap().to_string();
-        let part = CTX
-            .client()
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from_static(b"hello multipart"))
-            .send()
-            .await
-            .unwrap();
+        let part =
+            upload_part_retrying_operation_aborted(&bucket, key, &upload_id, b"hello multipart")
+                .await;
         let complete_body = format!(
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
             part.e_tag().unwrap()
@@ -996,21 +990,17 @@ fn test_complete_multipart_upload_body_limit_matches_aws() {
                 .create_multipart_upload()
                 .bucket(&bucket)
                 .key(&key)
-                .send()
+                .send_retrying_operation_aborted("create request checksum multipart upload")
                 .await
                 .unwrap();
             let upload_id = upload.upload_id().unwrap().to_string();
-            let part = CTX
-                .client()
-                .upload_part()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(1)
-                .body(ByteStream::from_static(b"hello multipart"))
-                .send()
-                .await
-                .unwrap();
+            let part = upload_part_retrying_operation_aborted(
+                &bucket,
+                &key,
+                &upload_id,
+                b"hello multipart",
+            )
+            .await;
             let etag = part.e_tag().unwrap();
             let pad = comment_pad(pad_size);
             let body = format!(

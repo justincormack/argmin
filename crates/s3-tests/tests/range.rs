@@ -1,6 +1,7 @@
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    cleanup_versioned_bucket, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
+};
 
 async fn setup_bucket() -> String {
     let client = CTX.client();
@@ -29,10 +30,18 @@ async fn setup_versioned_bucket() -> String {
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("enable range test bucket versioning")
         .await
         .unwrap();
     bucket
+}
+
+async fn put_object(
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    s3_tests::put_object_retrying_operation_aborted(CTX.client(), bucket, key, body.to_vec()).await
 }
 
 // ── Valid range variants ──────────────────────────────────────────────
@@ -43,14 +52,7 @@ fn test_range_get_start_end() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", body).await;
 
         // bytes=0-4 → "abcde"
         let resp = client
@@ -58,7 +60,7 @@ fn test_range_get_start_end() {
             .bucket(&bucket)
             .key("r")
             .range("bytes=0-4")
-            .send()
+            .send_retrying_operation_aborted("get range object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -74,14 +76,7 @@ fn test_range_get_from_start() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", body).await;
 
         // bytes=23- → "xyz" (last 3 bytes)
         let resp = client
@@ -89,7 +84,7 @@ fn test_range_get_from_start() {
             .bucket(&bucket)
             .key("r")
             .range("bytes=23-")
-            .send()
+            .send_retrying_operation_aborted("get range object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -105,14 +100,7 @@ fn test_range_get_suffix() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", body).await;
 
         // bytes=-3 → last 3 bytes = "xyz"
         let resp = client
@@ -120,7 +108,7 @@ fn test_range_get_suffix() {
             .bucket(&bucket)
             .key("r")
             .range("bytes=-3")
-            .send()
+            .send_retrying_operation_aborted("get range object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -136,14 +124,7 @@ fn test_range_get_suffix_exceeds_size() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz"; // 26 bytes
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", body).await;
 
         // bytes=-999 → suffix exceeds size, returns whole object
         let resp = client
@@ -151,7 +132,7 @@ fn test_range_get_suffix_exceeds_size() {
             .bucket(&bucket)
             .key("r")
             .range("bytes=-999")
-            .send()
+            .send_retrying_operation_aborted("get range object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -167,14 +148,7 @@ fn test_range_get_unsatisfiable() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz"; // 26 bytes
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", body).await;
 
         // bytes=100-200 → start past end of object → 416
         let result = client
@@ -182,7 +156,7 @@ fn test_range_get_unsatisfiable() {
             .bucket(&bucket)
             .key("r")
             .range("bytes=100-200")
-            .send()
+            .send_retrying_operation_aborted("get unsatisfiable range object")
             .await;
         assert_eq!(err_status(&result), 416);
 
@@ -196,14 +170,7 @@ fn test_range_get_from_start_unsatisfiable() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz"; // 26 bytes
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", body).await;
 
         // bytes=100- → start past end → 416
         let result = client
@@ -211,7 +178,7 @@ fn test_range_get_from_start_unsatisfiable() {
             .bucket(&bucket)
             .key("r")
             .range("bytes=100-")
-            .send()
+            .send_retrying_operation_aborted("get unsatisfiable range object")
             .await;
         assert_eq!(err_status(&result), 416);
 
@@ -225,14 +192,7 @@ fn test_range_get_if_match_returns_partial_content() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"abcdefghijklmnopqrstuvwxyz";
-        let put = client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(body))
-            .send()
-            .await
-            .unwrap();
+        let put = put_object(&bucket, "r", body).await;
         let etag = put.e_tag().unwrap().to_string();
 
         let resp = client
@@ -241,7 +201,7 @@ fn test_range_get_if_match_returns_partial_content() {
             .key("r")
             .range("bytes=0-4")
             .if_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("get range object")
             .await
             .unwrap();
         assert_eq!(resp.accept_ranges(), Some("bytes"));
@@ -259,14 +219,7 @@ fn test_range_get_if_none_match_returns_not_modified() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let put = client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(b"abcdefghijklmnopqrstuvwxyz"))
-            .send()
-            .await
-            .unwrap();
+        let put = put_object(&bucket, "r", b"abcdefghijklmnopqrstuvwxyz").await;
         let etag = put.e_tag().unwrap().to_string();
 
         let result = client
@@ -275,7 +228,7 @@ fn test_range_get_if_none_match_returns_not_modified() {
             .key("r")
             .range("bytes=0-4")
             .if_none_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("get not-modified range object")
             .await;
         assert_eq!(err_status(&result), 304);
 
@@ -288,14 +241,7 @@ fn test_range_get_if_match_mismatch_returns_precondition_failed() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(b"abcdefghijklmnopqrstuvwxyz"))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", b"abcdefghijklmnopqrstuvwxyz").await;
 
         let result = client
             .get_object()
@@ -303,7 +249,7 @@ fn test_range_get_if_match_mismatch_returns_precondition_failed() {
             .key("r")
             .range("bytes=0-4")
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("get range object with failing precondition")
             .await;
         assert_eq!(err_status(&result), 412);
 
@@ -317,26 +263,10 @@ fn test_range_get_specific_version_returns_expected_slice_and_version_id() {
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
 
-        let put_v1 = client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(b"abcdefghijklmnopqrstuvwxyz"))
-            .send()
-            .await
-            .unwrap();
+        let put_v1 = put_object(&bucket, "r", b"abcdefghijklmnopqrstuvwxyz").await;
         let v1 = put_v1.version_id().unwrap().to_string();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("r")
-            .body(ByteStream::from_static(
-                b"0123456789abcdefghijklmnopqrstuvwxyz",
-            ))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "r", b"0123456789abcdefghijklmnopqrstuvwxyz").await;
 
         let resp = client
             .get_object()
@@ -344,7 +274,7 @@ fn test_range_get_specific_version_returns_expected_slice_and_version_id() {
             .key("r")
             .version_id(&v1)
             .range("bytes=2-5")
-            .send()
+            .send_retrying_operation_aborted("get range object version")
             .await
             .unwrap();
         assert_eq!(resp.version_id(), Some(v1.as_str()));

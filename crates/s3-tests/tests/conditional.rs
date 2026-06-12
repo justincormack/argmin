@@ -3,7 +3,9 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
 };
-use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    cleanup_versioned_bucket, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
+};
 use serde_json::json;
 
 /// Create a bucket, returning its name.
@@ -24,15 +26,30 @@ async fn setup_bucket_allowing_policy() -> String {
 /// Put an object and return its ETag (unquoted).
 async fn put_object(bucket: &str, key: &str, body: &'static [u8]) -> String {
     let client = CTX.client();
-    let resp = client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap();
+    let resp = put_object_result_retrying_operation_aborted("put conditional setup object", || {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+    })
+    .await
+    .unwrap();
     resp.e_tag().unwrap().to_string()
+}
+
+async fn put_object_result_retrying_operation_aborted(
+    _context: &str,
+    mut build: impl FnMut() -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+) -> Result<
+    aws_sdk_s3::operation::put_object::PutObjectOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+> {
+    s3_tests::retrying_operation_aborted_result(|| {
+        let request = build();
+        async move { request.send().await }
+    })
+    .await
 }
 
 /// Create a single-part multipart upload and return `(upload_id, part_etag)`.
@@ -46,20 +63,21 @@ async fn prepare_single_part_multipart_upload(
         .create_multipart_upload()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("create conditional multipart upload")
         .await
         .unwrap();
     let upload_id = create.upload_id().unwrap().to_string();
-    let part = client
-        .upload_part()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(&upload_id)
-        .part_number(1)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap();
+    let part = s3_tests::retrying_operation_aborted("upload conditional multipart part", || {
+        client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(body))
+            .send()
+    })
+    .await;
     (upload_id, part.e_tag().unwrap().to_string())
 }
 
@@ -96,21 +114,24 @@ async fn put_bucket_policy_for_alt(bucket: &str, actions: serde_json::Value) {
             })
             .to_string(),
         )
-        .send()
+        .send_retrying_operation_aborted("put conditional bucket policy")
         .await
         .unwrap();
 }
 
 async fn wait_for_alt_put_object(bucket: &str, key: &str) {
     for attempt in 0..20 {
-        let result = CTX
-            .alt_client()
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"policy-convergence"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put alt policy convergence object",
+            || {
+                CTX.alt_client()
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(b"policy-convergence"))
+            },
+        )
+        .await;
         if result.is_ok() {
             return;
         }
@@ -129,7 +150,7 @@ async fn wait_for_alt_get_object(bucket: &str, key: &str) {
             .get_object()
             .bucket(bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         if result.is_ok() {
             return;
@@ -156,7 +177,7 @@ fn test_get_object_ifmatch_good() {
             .bucket(&bucket)
             .key("obj")
             .if_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -178,7 +199,7 @@ fn test_get_object_ifmatch_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert_eq!(err_status(&result), 412);
 
@@ -198,7 +219,7 @@ fn test_get_object_ifmatch_wildcard() {
             .bucket(&bucket)
             .key("obj")
             .if_match("*")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -223,7 +244,7 @@ fn test_get_object_ifnonematch_good() {
             .bucket(&bucket)
             .key("obj")
             .if_none_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -246,7 +267,7 @@ fn test_get_object_ifnonematch_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_none_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert!(result.is_err(), "expected 304 NotModified");
 
@@ -267,7 +288,7 @@ fn test_get_object_ifnonematch_wildcard() {
             .bucket(&bucket)
             .key("obj")
             .if_none_match("*")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert!(result.is_err(), "expected 304 NotModified");
 
@@ -291,7 +312,7 @@ fn test_get_object_ifmodifiedsince_good() {
             .bucket(&bucket)
             .key("obj")
             .if_modified_since(past)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -314,7 +335,7 @@ fn test_get_object_ifmodifiedsince_failed() {
             .head_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         let last_modified = *head.last_modified().unwrap();
@@ -324,7 +345,7 @@ fn test_get_object_ifmodifiedsince_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_modified_since(last_modified)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert_eq!(err_status(&result), 304);
 
@@ -346,7 +367,7 @@ fn test_get_object_ifmodifiedsince_future_ignored() {
             .bucket(&bucket)
             .key("obj")
             .if_modified_since(future)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -372,7 +393,7 @@ fn test_get_object_ifunmodifiedsince_good() {
             .bucket(&bucket)
             .key("obj")
             .if_unmodified_since(future)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -396,7 +417,7 @@ fn test_get_object_ifunmodifiedsince_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_unmodified_since(past)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -417,7 +438,7 @@ fn test_get_object_ifmatch_ignores_ifunmodifiedsince_when_etag_matches() {
             .key("obj")
             .if_match(&etag)
             .if_unmodified_since(DateTime::from_secs(0))
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -438,7 +459,7 @@ fn test_get_object_ifnonematch_ignores_ifmodifiedsince_when_etag_differs() {
             .head_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         let last_modified = *head.last_modified().unwrap();
@@ -450,7 +471,7 @@ fn test_get_object_ifnonematch_ignores_ifmodifiedsince_when_etag_differs() {
             .key("obj")
             .if_none_match("\"0000000000000000\"")
             .if_modified_since(last_modified)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -474,7 +495,7 @@ fn test_head_object_ifmatch_good() {
             .bucket(&bucket)
             .key("obj")
             .if_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         assert!(resp.e_tag().is_some());
@@ -495,7 +516,7 @@ fn test_head_object_ifmatch_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -515,7 +536,7 @@ fn test_head_object_ifnonematch_good() {
             .bucket(&bucket)
             .key("obj")
             .if_none_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         assert!(resp.e_tag().is_some());
@@ -536,7 +557,7 @@ fn test_head_object_ifnonematch_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_none_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await;
         assert!(result.is_err(), "expected 304 NotModified");
 
@@ -557,7 +578,7 @@ fn test_head_object_ifmatch_ignores_ifunmodifiedsince_when_etag_matches() {
             .key("obj")
             .if_match(&etag)
             .if_unmodified_since(DateTime::from_secs(0))
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         assert!(resp.e_tag().is_some());
@@ -577,7 +598,7 @@ fn test_head_object_ifnonematch_ignores_ifmodifiedsince_when_etag_differs() {
             .head_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         let last_modified = *head.last_modified().unwrap();
@@ -589,7 +610,7 @@ fn test_head_object_ifnonematch_ignores_ifmodifiedsince_when_etag_differs() {
             .key("obj")
             .if_none_match("\"0000000000000000\"")
             .if_modified_since(last_modified)
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         assert!(resp.e_tag().is_some());
@@ -606,22 +627,23 @@ fn test_put_object_ifnonmatch_nonexisted_good() {
         let bucket = setup_bucket().await;
 
         // Object doesn't exist → should succeed
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("new")
-            .if_none_match("*")
-            .body(ByteStream::from_static(b"created"))
-            .send()
-            .await
-            .unwrap();
+        put_object_result_retrying_operation_aborted("put conditional new object", || {
+            CTX.client()
+                .put_object()
+                .bucket(&bucket)
+                .key("new")
+                .if_none_match("*")
+                .body(ByteStream::from_static(b"created"))
+        })
+        .await
+        .unwrap();
 
         let resp = CTX
             .client()
             .get_object()
             .bucket(&bucket)
             .key("new")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -638,15 +660,18 @@ fn test_put_object_ifnonmatch_overwrite_existed_failed() {
         put_object(&bucket, "existing", b"original").await;
 
         // Object already exists → should fail with 412
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key("existing")
-            .if_none_match("*")
-            .body(ByteStream::from_static(b"overwrite"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional existing object with if-none-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("existing")
+                    .if_none_match("*")
+                    .body(ByteStream::from_static(b"overwrite"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&result), 412);
 
         // Verify original content unchanged
@@ -655,7 +680,7 @@ fn test_put_object_ifnonmatch_overwrite_existed_failed() {
             .get_object()
             .bucket(&bucket)
             .key("existing")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -674,15 +699,18 @@ fn test_put_object_ifnonmatch_requires_put_object_only() {
 
         let allowed_key = "if-none-match-put-only-new";
         for attempt in 0..20 {
-            let result = CTX
-                .alt_client()
-                .put_object()
-                .bucket(&bucket)
-                .key(allowed_key)
-                .if_none_match("*")
-                .body(ByteStream::from_static(b"created"))
-                .send()
-                .await;
+            let result = put_object_result_retrying_operation_aborted(
+                "put alt conditional allowed object",
+                || {
+                    CTX.alt_client()
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(allowed_key)
+                        .if_none_match("*")
+                        .body(ByteStream::from_static(b"created"))
+                },
+            )
+            .await;
             if result.is_ok() {
                 break;
             }
@@ -697,19 +725,22 @@ fn test_put_object_ifnonmatch_requires_put_object_only() {
             .get_object()
             .bucket(&bucket)
             .key("existing")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert_eq!(err_status(&denied_read), 403);
 
-        let existing_write = CTX
-            .alt_client()
-            .put_object()
-            .bucket(&bucket)
-            .key("existing")
-            .if_none_match("*")
-            .body(ByteStream::from_static(b"overwrite"))
-            .send()
-            .await;
+        let existing_write = put_object_result_retrying_operation_aborted(
+            "put alt conditional existing object with if-none-match",
+            || {
+                CTX.alt_client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("existing")
+                    .if_none_match("*")
+                    .body(ByteStream::from_static(b"overwrite"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&existing_write), 412);
 
         let owner_read = CTX
@@ -717,7 +748,7 @@ fn test_put_object_ifnonmatch_requires_put_object_only() {
             .get_object()
             .bucket(&bucket)
             .key("existing")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = owner_read.body.collect().await.unwrap().into_bytes();
@@ -736,22 +767,26 @@ fn test_put_object_ifmatch_good() {
         let etag = put_object(&bucket, "obj", b"v1").await;
 
         // Matching etag → should succeed
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match(&etag)
-            .body(ByteStream::from_static(b"v2"))
-            .send()
-            .await
-            .unwrap();
+        put_object_result_retrying_operation_aborted(
+            "put conditional object with if-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match(&etag)
+                    .body(ByteStream::from_static(b"v2"))
+            },
+        )
+        .await
+        .unwrap();
 
         let resp = CTX
             .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -768,15 +803,18 @@ fn test_put_object_ifmatch_failed() {
         put_object(&bucket, "obj", b"v1").await;
 
         // Wrong etag → should fail with 412
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match("\"0000000000000000\"")
-            .body(ByteStream::from_static(b"v2"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional object with failing if-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match("\"0000000000000000\"")
+                    .body(ByteStream::from_static(b"v2"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&result), 412);
 
         // Verify original content unchanged
@@ -785,7 +823,7 @@ fn test_put_object_ifmatch_failed() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -804,36 +842,43 @@ fn test_put_object_ifmatch_requires_put_object_and_get_object() {
 
         wait_for_alt_put_object(&bucket, "if-match-put-only-control").await;
 
-        let missing_get = CTX
-            .alt_client()
-            .put_object()
-            .bucket(&bucket)
-            .key("existing")
-            .if_match(&etag)
-            .body(ByteStream::from_static(b"without-get"))
-            .send()
-            .await;
+        let missing_get = put_object_result_retrying_operation_aborted(
+            "put alt conditional object without get permission",
+            || {
+                CTX.alt_client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("existing")
+                    .if_match(&etag)
+                    .body(ByteStream::from_static(b"without-get"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&missing_get), 403);
 
         put_bucket_policy_for_alt(&bucket, json!(["s3:PutObject", "s3:GetObject"])).await;
         wait_for_alt_get_object(&bucket, "existing").await;
 
-        CTX.alt_client()
-            .put_object()
-            .bucket(&bucket)
-            .key("existing")
-            .if_match(&etag)
-            .body(ByteStream::from_static(b"with-get"))
-            .send()
-            .await
-            .unwrap();
+        put_object_result_retrying_operation_aborted(
+            "put alt conditional object with get permission",
+            || {
+                CTX.alt_client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("existing")
+                    .if_match(&etag)
+                    .body(ByteStream::from_static(b"with-get"))
+            },
+        )
+        .await
+        .unwrap();
 
         let overwritten = CTX
             .client()
             .get_object()
             .bucket(&bucket)
             .key("existing")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = overwritten.body.collect().await.unwrap().into_bytes();
@@ -849,15 +894,18 @@ fn test_put_object_ifmatch_nonexisted_failed() {
         let bucket = setup_bucket().await;
 
         // Object doesn't exist → If-Match fails with 404 NoSuchKey
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key("nonexistent")
-            .if_match("\"0000000000000000\"")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional missing object with if-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("nonexistent")
+                    .if_match("\"0000000000000000\"")
+                    .body(ByteStream::from_static(b"data"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&result), 404);
 
         cleanup(&bucket, &[]).await;
@@ -889,7 +937,7 @@ fn test_complete_multipart_ifnonmatch_nonexisted_good() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await
             .unwrap();
 
@@ -898,7 +946,7 @@ fn test_complete_multipart_ifnonmatch_nonexisted_good() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -933,7 +981,7 @@ fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 412);
         CTX.client()
@@ -941,7 +989,7 @@ fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
             .bucket(&bucket)
             .key("obj")
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort conditional multipart upload")
             .await
             .unwrap();
 
@@ -950,7 +998,7 @@ fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -984,7 +1032,7 @@ fn test_complete_multipart_ifmatch_good() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await
             .unwrap();
 
@@ -993,7 +1041,7 @@ fn test_complete_multipart_ifmatch_good() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1028,7 +1076,7 @@ fn test_complete_multipart_ifmatch_failed() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 412);
         CTX.client()
@@ -1036,7 +1084,7 @@ fn test_complete_multipart_ifmatch_failed() {
             .bucket(&bucket)
             .key("obj")
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort conditional multipart upload")
             .await
             .unwrap();
 
@@ -1045,7 +1093,7 @@ fn test_complete_multipart_ifmatch_failed() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1079,7 +1127,7 @@ fn test_complete_multipart_ifmatch_nonexisted_failed() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 404);
         CTX.client()
@@ -1087,7 +1135,7 @@ fn test_complete_multipart_ifmatch_nonexisted_failed() {
             .bucket(&bucket)
             .key("obj")
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort conditional multipart upload")
             .await
             .unwrap();
 
@@ -1109,28 +1157,36 @@ fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("put conditional bucket versioning")
             .await
             .unwrap();
 
-        let first = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        let first = put_object_result_retrying_operation_aborted(
+            "put first versioned conditional object",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .body(ByteStream::from_static(b"v1"))
+            },
+        )
+        .await
+        .unwrap();
         assert!(first.version_id().is_some());
 
-        let second = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"v2"))
-            .send()
-            .await
-            .unwrap();
+        let second = put_object_result_retrying_operation_aborted(
+            "put second versioned conditional object",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .body(ByteStream::from_static(b"v2"))
+            },
+        )
+        .await
+        .unwrap();
         assert!(second.version_id().is_some());
 
         let (upload_id, part_etag) =
@@ -1151,7 +1207,7 @@ fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 412);
         client
@@ -1159,7 +1215,7 @@ fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
             .bucket(&bucket)
             .key("obj")
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort conditional multipart upload")
             .await
             .unwrap();
 
@@ -1181,28 +1237,36 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("put conditional bucket versioning")
             .await
             .unwrap();
 
-        let first = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        let first = put_object_result_retrying_operation_aborted(
+            "put first versioned conditional object",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .body(ByteStream::from_static(b"v1"))
+            },
+        )
+        .await
+        .unwrap();
         let first_etag = first.e_tag().unwrap().to_string();
 
-        let second = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"v2"))
-            .send()
-            .await
-            .unwrap();
+        let second = put_object_result_retrying_operation_aborted(
+            "put second versioned conditional object",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .body(ByteStream::from_static(b"v2"))
+            },
+        )
+        .await
+        .unwrap();
         let second_etag = second.e_tag().unwrap().to_string();
 
         let (stale_upload_id, stale_part_etag) =
@@ -1223,7 +1287,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&stale), 412);
         client
@@ -1231,7 +1295,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
             .bucket(&bucket)
             .key("obj")
             .upload_id(&stale_upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort conditional multipart upload")
             .await
             .unwrap();
 
@@ -1253,7 +1317,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete conditional multipart upload")
             .await
             .unwrap();
 
@@ -1261,7 +1325,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1285,7 +1349,7 @@ fn test_delete_object_ifmatch_good() {
             .bucket(&bucket)
             .key("obj")
             .if_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("delete conditional object")
             .await
             .unwrap();
 
@@ -1295,7 +1359,7 @@ fn test_delete_object_ifmatch_good() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await;
         assert_eq!(err_status(&result), 404);
 
@@ -1316,7 +1380,7 @@ fn test_delete_object_ifmatch_failed() {
             .bucket(&bucket)
             .key("obj")
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("delete conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -1326,7 +1390,7 @@ fn test_delete_object_ifmatch_failed() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1350,7 +1414,7 @@ fn test_copy_object_source_ifmatch_good() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await
             .unwrap();
 
@@ -1359,7 +1423,7 @@ fn test_copy_object_source_ifmatch_good() {
             .get_object()
             .bucket(&bucket)
             .key("dst")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1382,7 +1446,7 @@ fn test_copy_object_source_ifmatch_failed() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -1403,7 +1467,7 @@ fn test_copy_object_source_ifnonematch_good() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_none_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await
             .unwrap();
 
@@ -1412,7 +1476,7 @@ fn test_copy_object_source_ifnonematch_good() {
             .get_object()
             .bucket(&bucket)
             .key("dst")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1436,7 +1500,7 @@ fn test_copy_object_source_ifnonematch_failed() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_none_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -1458,7 +1522,7 @@ fn test_copy_object_source_ifmodifiedsince_good() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_modified_since(past)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await
             .unwrap();
 
@@ -1479,7 +1543,7 @@ fn test_copy_object_source_ifmodifiedsince_failed() {
             .head_object()
             .bucket(&bucket)
             .key("src")
-            .send()
+            .send_retrying_operation_aborted("head conditional object")
             .await
             .unwrap();
         let last_modified = *head.last_modified().unwrap();
@@ -1490,7 +1554,7 @@ fn test_copy_object_source_ifmodifiedsince_failed() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_modified_since(last_modified)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -1512,7 +1576,7 @@ fn test_copy_object_source_ifmodifiedsince_future_ignored() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_modified_since(future)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await
             .unwrap();
 
@@ -1534,7 +1598,7 @@ fn test_copy_object_source_ifunmodifiedsince_good() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_unmodified_since(future)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await
             .unwrap();
 
@@ -1557,7 +1621,7 @@ fn test_copy_object_source_ifunmodifiedsince_failed() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .copy_source_if_unmodified_since(past)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
@@ -1574,22 +1638,26 @@ fn test_put_object_if_match() {
         let etag = put_object(&bucket, "obj", b"data").await;
 
         // Basic If-Match PUT
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match(&etag)
-            .body(ByteStream::from_static(b"updated"))
-            .send()
-            .await
-            .unwrap();
+        put_object_result_retrying_operation_aborted(
+            "put conditional object with if-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match(&etag)
+                    .body(ByteStream::from_static(b"updated"))
+            },
+        )
+        .await
+        .unwrap();
 
         let resp = CTX
             .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1606,22 +1674,26 @@ fn test_put_object_ifmatch_overwrite_existed_good() {
         let etag = put_object(&bucket, "obj", b"original").await;
 
         // Overwrite existing object with matching etag
-        CTX.client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match(&etag)
-            .body(ByteStream::from_static(b"overwritten"))
-            .send()
-            .await
-            .unwrap();
+        put_object_result_retrying_operation_aborted(
+            "put conditional overwrite object with if-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match(&etag)
+                    .body(ByteStream::from_static(b"overwritten"))
+            },
+        )
+        .await
+        .unwrap();
 
         let resp = CTX
             .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1640,15 +1712,18 @@ fn test_put_object_ifmatch_wildcard_not_implemented() {
         put_object(&bucket, "obj", b"data").await;
 
         // If-Match: * on write → 501 NotImplemented
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match("*")
-            .body(ByteStream::from_static(b"updated"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional object with unsupported if-match wildcard",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match("*")
+                    .body(ByteStream::from_static(b"updated"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&result), 501);
 
         cleanup(&bucket, &["obj"]).await;
@@ -1662,15 +1737,18 @@ fn test_put_object_ifnonematch_specific_not_implemented() {
         let etag = put_object(&bucket, "obj", b"data").await;
 
         // If-None-Match: <specific etag> on write → 501 NotImplemented
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_none_match(&etag)
-            .body(ByteStream::from_static(b"updated"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional object with unsupported if-none-match etag",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_none_match(&etag)
+                    .body(ByteStream::from_static(b"updated"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&result), 501);
 
         cleanup(&bucket, &["obj"]).await;
@@ -1686,16 +1764,19 @@ fn test_put_object_both_ifmatch_and_ifnonematch_rejected() {
         let etag = put_object(&bucket, "obj", b"data").await;
 
         // Both If-Match: <etag> and If-None-Match: * on the same PUT → error
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match(&etag)
-            .if_none_match("*")
-            .body(ByteStream::from_static(b"updated"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional object with both conditional headers",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match(&etag)
+                    .if_none_match("*")
+                    .body(ByteStream::from_static(b"updated"))
+            },
+        )
+        .await;
         assert_eq!(err_status(&result), 501);
 
         // Verify original content unchanged
@@ -1704,7 +1785,7 @@ fn test_put_object_both_ifmatch_and_ifnonematch_rejected() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1730,7 +1811,7 @@ fn test_copy_object_ifmatch_good() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .if_match(&dst_etag)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await
             .unwrap();
 
@@ -1739,7 +1820,7 @@ fn test_copy_object_ifmatch_good() {
             .get_object()
             .bucket(&bucket)
             .key("dst")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1764,7 +1845,7 @@ fn test_copy_object_ifmatch_failed() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert_eq!(err_status(&result), 412);
 
@@ -1789,7 +1870,7 @@ fn test_copy_object_ifmatch_wildcard_not_implemented() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .if_match("*")
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert_eq!(err_status(&result), 501);
 
@@ -1812,7 +1893,7 @@ fn test_copy_object_ifnonematch_specific_not_implemented() {
             .key("dst")
             .copy_source(format!("{}/src", bucket))
             .if_none_match(&dst_etag)
-            .send()
+            .send_retrying_operation_aborted("copy conditional object")
             .await;
         assert_eq!(err_status(&result), 501);
 
@@ -1835,7 +1916,7 @@ fn test_delete_object_if_match() {
             .bucket(&bucket)
             .key("obj")
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("delete conditional object")
             .await;
         assert_eq!(err_status(&result), 412);
 
@@ -1845,7 +1926,7 @@ fn test_delete_object_if_match() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1869,18 +1950,22 @@ fn test_delete_object_version_if_match_not_implemented() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("put conditional bucket versioning")
             .await
             .unwrap();
 
-        let put = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        let put = put_object_result_retrying_operation_aborted(
+            "put versioned object before delete-marker conditional get",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .body(ByteStream::from_static(b"hello"))
+            },
+        )
+        .await
+        .unwrap();
         let version_id = put.version_id().unwrap().to_string();
         let etag = put.e_tag().unwrap().to_string();
 
@@ -1890,7 +1975,7 @@ fn test_delete_object_version_if_match_not_implemented() {
             .key("obj")
             .version_id(&version_id)
             .if_match("\"0000000000000000\"")
-            .send()
+            .send_retrying_operation_aborted("delete conditional object")
             .await;
         assert_eq!(err_status(&bad), 501);
 
@@ -1900,7 +1985,7 @@ fn test_delete_object_version_if_match_not_implemented() {
             .key("obj")
             .version_id(&version_id)
             .if_match(&etag)
-            .send()
+            .send_retrying_operation_aborted("delete conditional object")
             .await;
         assert_eq!(err_status(&good), 501);
 
@@ -1909,7 +1994,7 @@ fn test_delete_object_version_if_match_not_implemented() {
             .bucket(&bucket)
             .key("obj")
             .version_id(&version_id)
-            .send()
+            .send_retrying_operation_aborted("get conditional object")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();

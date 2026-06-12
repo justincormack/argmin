@@ -1,4 +1,3 @@
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
 };
@@ -75,6 +74,15 @@ fn object_tagging(key: &str, value: &str) -> aws_sdk_s3::types::Tagging {
         .unwrap()
 }
 
+async fn put_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: impl Into<Vec<u8>>,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    s3_tests::put_object_retrying_operation_aborted(client, bucket, key, body.into()).await
+}
+
 // ── Multi-object delete ─────────────────────────────────────────────
 
 #[test]
@@ -85,10 +93,8 @@ fn test_multi_object_delete() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 3);
         assert!(resp.errors().is_empty());
@@ -116,14 +122,7 @@ fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         for key in [public_key, private_key] {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(key)
-                .body(ByteStream::from_static(b"data"))
-                .send()
-                .await
-                .unwrap();
+            put_object(client, &bucket, key, b"data").await;
         }
 
         client
@@ -131,7 +130,7 @@ fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
             .bucket(&bucket)
             .key(public_key)
             .tagging(object_tagging("security", "public"))
-            .send()
+            .send_retrying_operation_aborted("put object tagging during delete tests")
             .await
             .unwrap();
         client
@@ -139,7 +138,7 @@ fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
             .bucket(&bucket)
             .key(private_key)
             .tagging(object_tagging("security", "private"))
-            .send()
+            .send_retrying_operation_aborted("put object tagging during delete tests")
             .await
             .unwrap();
 
@@ -163,7 +162,7 @@ fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during delete tests")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -172,14 +171,14 @@ fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
             .delete_object()
             .bucket(&bucket)
             .key(private_key)
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await
             .unwrap();
         client
             .delete_object()
             .bucket(&bucket)
             .key(public_key)
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await
             .unwrap();
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -202,29 +201,17 @@ fn test_bucket_policy_delete_object_version_existing_tag_condition_is_rejected()
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket versioning during delete tests")
             .await
             .unwrap();
 
-        let public_version = client
-            .put_object()
-            .bucket(&bucket)
-            .key(public_key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
+        let public_version = put_object(client, &bucket, public_key, b"data")
             .await
-            .unwrap()
             .version_id()
             .expect("expected version id")
             .to_string();
-        let private_version = client
-            .put_object()
-            .bucket(&bucket)
-            .key(private_key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
+        let private_version = put_object(client, &bucket, private_key, b"data")
             .await
-            .unwrap()
             .version_id()
             .expect("expected version id")
             .to_string();
@@ -235,7 +222,7 @@ fn test_bucket_policy_delete_object_version_existing_tag_condition_is_rejected()
             .key(public_key)
             .version_id(&public_version)
             .tagging(object_tagging("security", "public"))
-            .send()
+            .send_retrying_operation_aborted("put object tagging during delete tests")
             .await
             .unwrap();
         client
@@ -244,7 +231,7 @@ fn test_bucket_policy_delete_object_version_existing_tag_condition_is_rejected()
             .key(private_key)
             .version_id(&private_version)
             .tagging(object_tagging("security", "private"))
-            .send()
+            .send_retrying_operation_aborted("put object tagging during delete tests")
             .await
             .unwrap();
 
@@ -268,7 +255,7 @@ fn test_bucket_policy_delete_object_version_existing_tag_condition_is_rejected()
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during delete tests")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -285,20 +272,13 @@ fn test_bucket_policy_delete_and_delete_tagging_existing_tag_condition_is_reject
         let key = "mixed-delete-action";
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object(client, &bucket, key, b"data").await;
         client
             .put_object_tagging()
             .bucket(&bucket)
             .key(key)
             .tagging(object_tagging("security", "public"))
-            .send()
+            .send_retrying_operation_aborted("put object tagging during delete tests")
             .await
             .unwrap();
 
@@ -322,7 +302,7 @@ fn test_bucket_policy_delete_and_delete_tagging_existing_tag_condition_is_reject
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during delete tests")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -339,16 +319,13 @@ fn test_multi_objectv2_delete() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         // Verify objects are gone via V2 list
         let list = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during delete tests")
             .await
             .unwrap();
         assert_eq!(list.key_count(), Some(0));
@@ -366,10 +343,8 @@ fn test_multi_object_delete_quiet() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, true);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         // Quiet mode: successfully deleted items not listed in response
         assert!(resp.deleted().is_empty());
@@ -379,7 +354,7 @@ fn test_multi_object_delete_quiet() {
         let list = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during delete tests")
             .await
             .unwrap();
         assert!(list.contents().is_empty());
@@ -396,10 +371,8 @@ fn test_multi_object_delete_large() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 35);
         assert!(resp.errors().is_empty());
@@ -407,7 +380,7 @@ fn test_multi_object_delete_large() {
         let list = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during delete tests")
             .await
             .unwrap();
         assert!(list.contents().is_empty());
@@ -425,10 +398,8 @@ fn test_multi_object_delete_nonexistent_keys() {
 
         // Delete keys that were never created — should succeed (idempotent)
         let delete = make_delete_request(&["nokey1", "nokey2", "nokey3"], false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 3);
         assert!(resp.errors().is_empty());
@@ -445,10 +416,8 @@ fn test_multi_object_delete_mixed() {
 
         // Delete mix of existing and nonexistent keys
         let delete = make_delete_request(&["existing1", "nonexistent", "existing2"], false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         // All should be reported as deleted (including nonexistent)
         assert_eq!(resp.deleted().len(), 3);
@@ -458,7 +427,7 @@ fn test_multi_object_delete_mixed() {
         let list = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during delete tests")
             .await
             .unwrap();
         assert!(list.contents().is_empty());
@@ -478,10 +447,8 @@ fn test_multi_object_delete_special_keys() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 4);
         assert!(resp.errors().is_empty());
@@ -489,7 +456,7 @@ fn test_multi_object_delete_special_keys() {
         let list = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during delete tests")
             .await
             .unwrap();
         assert!(list.contents().is_empty());
@@ -506,10 +473,8 @@ fn test_multi_object_delete_single() {
 
         // Delete just one key via multi-delete API
         let delete = make_delete_request(&["only"], false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 1);
         assert!(resp.errors().is_empty());
@@ -518,7 +483,7 @@ fn test_multi_object_delete_single() {
         let list = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during delete tests")
             .await
             .unwrap();
         assert_eq!(get_keys(list.contents()), vec!["survivor"]);
@@ -534,10 +499,8 @@ fn test_multi_object_delete_verify_response() {
         let (bucket, _keys) = create_objects_with_keys(client, &["alpha", "beta", "gamma"]).await;
 
         let delete = make_delete_request(&["alpha", "beta", "gamma"], false);
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         // Verify response lists the correct deleted keys
         let mut deleted_keys: Vec<String> = resp
@@ -560,22 +523,8 @@ fn test_multi_object_delete_per_object_if_match() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let ok = client
-            .put_object()
-            .bucket(&bucket)
-            .key("ok")
-            .body(ByteStream::from_static(b"ok"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("stale")
-            .body(ByteStream::from_static(b"stale"))
-            .send()
-            .await
-            .unwrap();
+        let ok = put_object(client, &bucket, "ok", b"ok").await;
+        put_object(client, &bucket, "stale", b"stale").await;
 
         let delete = Delete::builder()
             .set_objects(Some(vec![
@@ -585,10 +534,8 @@ fn test_multi_object_delete_per_object_if_match() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 1);
         assert_eq!(resp.deleted()[0].key(), Some("ok"));
@@ -600,7 +547,7 @@ fn test_multi_object_delete_per_object_if_match() {
             .head_object()
             .bucket(&bucket)
             .key("stale")
-            .send()
+            .send_retrying_operation_aborted("head object after conditional multi-delete")
             .await
             .unwrap();
 
@@ -642,7 +589,7 @@ fn test_object_delete_nonexistent_bucket() {
             .delete_object()
             .bucket(&bucket)
             .key("somekey")
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await;
         assert!(result.is_err());
     });
@@ -696,7 +643,7 @@ fn test_object_delete_key_bucket_gone() {
             .delete_object()
             .bucket(&bucket)
             .key("somekey")
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await;
         assert_eq!(err_status(&result), 404);
     });
@@ -716,7 +663,7 @@ async fn setup_versioned_bucket() -> String {
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("put bucket versioning during delete tests")
         .await
         .unwrap();
     bucket
@@ -732,14 +679,7 @@ async fn create_multiple_versions(
     let mut contents = Vec::new();
     for i in 0..num {
         let body = format!("content-{}", i);
-        let resp = client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(body.clone().into_bytes()))
-            .send()
-            .await
-            .unwrap();
+        let resp = put_object(client, bucket, key, body.clone().into_bytes()).await;
         version_ids.push(resp.version_id().unwrap().to_string());
         contents.push(body);
     }
@@ -753,7 +693,7 @@ async fn cleanup_versioned_bucket(bucket: &str) {
     let resp = client
         .list_object_versions()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("list object versions during delete tests")
         .await
         .unwrap();
     for v in resp.versions() {
@@ -762,7 +702,7 @@ async fn cleanup_versioned_bucket(bucket: &str) {
             .bucket(bucket)
             .key(v.key().unwrap())
             .version_id(v.version_id().unwrap())
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await
             .unwrap();
     }
@@ -772,7 +712,7 @@ async fn cleanup_versioned_bucket(bucket: &str) {
             .bucket(bucket)
             .key(dm.key().unwrap())
             .version_id(dm.version_id().unwrap())
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await
             .unwrap();
     }
@@ -808,10 +748,8 @@ fn test_versioning_multi_object_delete() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), num_versions);
         assert!(resp.errors().is_empty());
@@ -820,7 +758,7 @@ fn test_versioning_multi_object_delete() {
         let list = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list object versions during delete tests")
             .await
             .unwrap();
         assert!(
@@ -848,10 +786,8 @@ fn test_versioning_multi_object_delete() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp2 = delete_objects_with_md5(client, &bucket, delete2)
-            .send()
-            .await
-            .unwrap();
+        let resp2 =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete2).await;
         assert_eq!(resp2.deleted().len(), num_versions);
         assert!(resp2.errors().is_empty());
 
@@ -875,7 +811,7 @@ fn test_versioning_multi_object_delete_with_marker() {
             .delete_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("delete object during delete tests")
             .await
             .unwrap();
         assert!(del_resp.delete_marker().unwrap_or(false));
@@ -900,10 +836,8 @@ fn test_versioning_multi_object_delete_with_marker() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 4);
         assert!(resp.errors().is_empty());
@@ -922,7 +856,7 @@ fn test_versioning_multi_object_delete_with_marker() {
         let list = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list object versions during delete tests")
             .await
             .unwrap();
         assert!(list.versions().is_empty());
@@ -941,14 +875,7 @@ fn test_versioning_multi_object_delete_marker_create() {
         let key = "testobj";
 
         // Put one version
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(b"data".to_vec()))
-            .send()
-            .await
-            .unwrap();
+        put_object(client, &bucket, key, b"data").await;
 
         // Batch-delete WITHOUT specifying versionId → should create a delete marker
         let objects = vec![ObjectIdentifier::builder().key(key).build().unwrap()];
@@ -957,10 +884,8 @@ fn test_versioning_multi_object_delete_marker_create() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 1);
         assert!(resp.errors().is_empty());
@@ -987,7 +912,7 @@ fn test_versioning_multi_object_delete_marker_create() {
         let list = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list object versions during delete tests")
             .await
             .unwrap();
         assert_eq!(
@@ -1006,14 +931,7 @@ fn test_versioning_multi_object_delete_current_if_match() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_versioned_bucket().await;
-        let put = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        let put = put_object(client, &bucket, "obj", b"data").await;
 
         let bad_delete = Delete::builder()
             .set_objects(Some(vec![make_object_id_with_etag(
@@ -1023,10 +941,8 @@ fn test_versioning_multi_object_delete_current_if_match() {
             .quiet(false)
             .build()
             .unwrap();
-        let bad_resp = delete_objects_with_md5(client, &bucket, bad_delete)
-            .send()
-            .await
-            .unwrap();
+        let bad_resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, bad_delete).await;
         assert!(bad_resp.deleted().is_empty());
         assert_eq!(bad_resp.errors().len(), 1);
         assert_eq!(bad_resp.errors()[0].key(), Some("obj"));
@@ -1040,10 +956,8 @@ fn test_versioning_multi_object_delete_current_if_match() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 1);
         let deleted = &resp.deleted()[0];
@@ -1070,25 +984,11 @@ fn test_versioning_multi_object_delete_version_id_with_etag_not_implemented() {
         let bucket = setup_versioned_bucket().await;
         let key = "obj";
 
-        let first = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"v1"))
-            .send()
-            .await
-            .unwrap();
+        let first = put_object(client, &bucket, key, b"v1").await;
         let first_version = first.version_id().unwrap().to_string();
         let first_etag = first.e_tag().unwrap().to_string();
 
-        let second = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"v2"))
-            .send()
-            .await
-            .unwrap();
+        let second = put_object(client, &bucket, key, b"v2").await;
         let second_version = second.version_id().unwrap().to_string();
 
         // AWS does not support DeleteObjects entries that combine VersionId
@@ -1103,10 +1003,8 @@ fn test_versioning_multi_object_delete_version_id_with_etag_not_implemented() {
             .quiet(false)
             .build()
             .unwrap();
-        let bad_resp = delete_objects_with_md5(client, &bucket, bad_delete)
-            .send()
-            .await
-            .unwrap();
+        let bad_resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, bad_delete).await;
 
         assert!(bad_resp.deleted().is_empty());
         assert_eq!(bad_resp.errors().len(), 1);
@@ -1126,10 +1024,8 @@ fn test_versioning_multi_object_delete_version_id_with_etag_not_implemented() {
             .quiet(false)
             .build()
             .unwrap();
-        let good_resp = delete_objects_with_md5(client, &bucket, good_delete)
-            .send()
-            .await
-            .unwrap();
+        let good_resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, good_delete).await;
 
         assert!(good_resp.deleted().is_empty());
         assert_eq!(good_resp.errors().len(), 1);
@@ -1145,7 +1041,7 @@ fn test_versioning_multi_object_delete_version_id_with_etag_not_implemented() {
             .bucket(&bucket)
             .key(key)
             .version_id(&first_version)
-            .send()
+            .send_retrying_operation_aborted("get first version after conditional multi-delete")
             .await
             .unwrap();
         let first_data = first_get.body.collect().await.unwrap().into_bytes();
@@ -1156,7 +1052,7 @@ fn test_versioning_multi_object_delete_version_id_with_etag_not_implemented() {
             .bucket(&bucket)
             .key(key)
             .version_id(&second_version)
-            .send()
+            .send_retrying_operation_aborted("get second version after conditional multi-delete")
             .await
             .unwrap();
         let data = second_get.body.collect().await.unwrap().into_bytes();
@@ -1183,10 +1079,8 @@ fn test_versioning_multi_object_delete_nonexistent_creates_marker() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = delete_objects_with_md5(client, &bucket, delete)
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
 
         assert_eq!(resp.deleted().len(), 1);
         assert!(resp.errors().is_empty());
@@ -1204,7 +1098,7 @@ fn test_versioning_multi_object_delete_nonexistent_creates_marker() {
         let list = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list object versions during delete tests")
             .await
             .unwrap();
         assert!(list.versions().is_empty());
