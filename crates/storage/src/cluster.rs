@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
@@ -60,6 +61,7 @@ mod local;
 mod request_ops;
 
 const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
+const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
 const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -4058,6 +4060,7 @@ impl StorageCluster {
             };
 
         let mut stale_commit_snapshot_retries = 0;
+        let stale_commit_snapshot_deadline = Instant::now() + DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET;
         let mut empty_log_conflicts = 0;
         let (command, new_pending_command) = loop {
             let (command, new_pending_command, payload_acks_registered) = loop {
@@ -4125,10 +4128,17 @@ impl StorageCluster {
                     ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::StaleDirectPutCommitSnapshot)
-                            if stale_commit_snapshot_retries < DIRECT_PUT_STALE_COMMIT_RETRIES =>
+                            if stale_commit_snapshot_retries < DIRECT_PUT_STALE_COMMIT_RETRIES
+                                && Instant::now() < stale_commit_snapshot_deadline =>
                         {
                             stale_commit_snapshot_retries += 1;
                             continue;
+                        }
+                        Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(conflicting_pending_object_metadata_command(
+                                "direct PUT stale commit snapshot retry budget exhausted",
+                            ));
                         }
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
