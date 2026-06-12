@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 0762e3292d1c408785f426a82a79ef3ddbb3cf68e1778a11db91eb4b56b29248 # shrinks to (keys, ops, sweep_selector) = (["t", "w__-w-9_", "x0-"], [SetVersioning(Disabled), PutLive { key: "w__-w-9_", size: 0 }, PutLive { key: "t", size: 2 }, SetVersioning(Disabled), PutLive { key: "t", size: 4 }], 179)
+cc 6063818d7545be58282b9d577a97a0759bf0835a19d3cf3de560d6cbe42d2e55 # shrinks to (keys, ops, sweep_selector) = (["g_/"], [SetVersioning(Disabled), PutLive { key: "g_/", size: 8 }, PutLive { key: "g_/", size: 6 }, PutLive { key: "g_/", size: 6 }, PutLive { key: "g_/", size: 8 }, SetVersioning(Enabled), PutLive { key: "g_/", size: 3 }], 179)

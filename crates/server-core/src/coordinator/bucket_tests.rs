@@ -1567,6 +1567,12 @@ mod lifecycle_prop_tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LifecycleCurrentExpirationSweep {
+        expired_current: u64,
+        enabled_delete_marker_min_version_ids: BTreeMap<String, VersionId>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct LifecycleModel {
         versioning: BucketVersioningState,
         objects: BTreeMap<String, Vec<LifecycleVersion>>,
@@ -1696,7 +1702,10 @@ mod lifecycle_prop_tests {
             candidates.into_iter().collect()
         }
 
-        fn apply_current_expiration_sweep(&mut self, now_millis: u64) -> u64 {
+        fn apply_current_expiration_sweep(
+            &mut self,
+            now_millis: u64,
+        ) -> LifecycleCurrentExpirationSweep {
             let eligible_keys: Vec<String> = self
                 .objects
                 .iter()
@@ -1714,6 +1723,7 @@ mod lifecycle_prop_tests {
                 })
                 .collect();
 
+            let mut enabled_delete_marker_min_version_ids = BTreeMap::new();
             for key in &eligible_keys {
                 match self.versioning {
                     BucketVersioningState::Disabled => {
@@ -1721,6 +1731,7 @@ mod lifecycle_prop_tests {
                     }
                     BucketVersioningState::Enabled => {
                         let next = self.next_numbered_version_id(key);
+                        enabled_delete_marker_min_version_ids.insert(key.clone(), next);
                         self.insert_version(
                             key.clone(),
                             next,
@@ -1741,7 +1752,10 @@ mod lifecycle_prop_tests {
                 }
             }
 
-            eligible_keys.len() as u64
+            LifecycleCurrentExpirationSweep {
+                expired_current: eligible_keys.len() as u64,
+                enabled_delete_marker_min_version_ids,
+            }
         }
     }
 
@@ -1960,6 +1974,56 @@ mod lifecycle_prop_tests {
         Ok(())
     }
 
+    fn assert_namespace_matches_after_current_expiration_sweep(
+        coord: &Coordinator,
+        model: &LifecycleModel,
+        sweep: &LifecycleCurrentExpirationSweep,
+        context: &str,
+    ) -> TestCaseResult {
+        let actual_live = list_live_snapshots(coord)?;
+        let expected_live = model.live_listing();
+        prop_assert_eq!(actual_live, expected_live, "{}", context);
+
+        let actual_versions = list_version_snapshots(coord)?;
+        let expected_versions = model.version_listing();
+        prop_assert_eq!(
+            actual_versions.len(),
+            expected_versions.len(),
+            "{}\nactual_versions={:?}\nexpected_versions={:?}",
+            context,
+            actual_versions,
+            expected_versions
+        );
+        for (actual, expected) in actual_versions.iter().zip(expected_versions.iter()) {
+            let lifecycle_marker_min_version_id = sweep
+                .enabled_delete_marker_min_version_ids
+                .get(&expected.key)
+                .filter(|min_version_id| {
+                    expected.kind == LifecycleVersionKind::DeleteMarker
+                        && expected.is_latest
+                        && expected.size.is_none()
+                        && expected.version_id == **min_version_id
+                });
+            if let Some(min_version_id) = lifecycle_marker_min_version_id {
+                prop_assert_eq!(&actual.key, &expected.key, "{}", context);
+                prop_assert_eq!(actual.kind, expected.kind, "{}", context);
+                prop_assert_eq!(actual.size, expected.size, "{}", context);
+                prop_assert_eq!(actual.is_latest, expected.is_latest, "{}", context);
+                prop_assert!(
+                    actual.version_id.is_versioned()
+                        && actual.version_id.to_u64() >= min_version_id.to_u64(),
+                    "{}\nactual lifecycle marker version {:?} should be versioned and at least {:?}",
+                    context,
+                    actual.version_id,
+                    min_version_id
+                );
+            } else {
+                prop_assert_eq!(actual, expected, "{}", context);
+            }
+        }
+        Ok(())
+    }
+
     fn apply_trace_op(
         coord: &Coordinator,
         model: &mut LifecycleModel,
@@ -2034,8 +2098,7 @@ mod lifecycle_prop_tests {
             let sweep_candidates = model.sweep_candidates();
             let sweep_at = sweep_candidates[(sweep_selector as usize) % sweep_candidates.len()];
             let mut expected_after_sweep = model.clone();
-            let expected_expired_current =
-                expected_after_sweep.apply_current_expiration_sweep(sweep_at);
+            let expected_sweep = expected_after_sweep.apply_current_expiration_sweep(sweep_at);
 
             let sweep_context = format!(
                 "after lifecycle sweep at {sweep_at}\nkeys={keys:?}\nsweep_candidates={sweep_candidates:?}\nfull trace:\n{trace}"
@@ -2049,14 +2112,19 @@ mod lifecycle_prop_tests {
             prop_assert_eq!(stats.scanned_buckets, 1, "{}", sweep_context);
             prop_assert_eq!(
                 stats.expired_current_objects,
-                expected_expired_current,
+                expected_sweep.expired_current,
                 "{}",
                 sweep_context
             );
             prop_assert_eq!(stats.expired_noncurrent_versions, 0, "{}", sweep_context);
             prop_assert_eq!(stats.expired_delete_markers, 0, "{}", sweep_context);
             prop_assert_eq!(stats.aborted_multipart_uploads, 0, "{}", sweep_context);
-            assert_namespace_matches(&coord, &expected_after_sweep, &sweep_context)?;
+            assert_namespace_matches_after_current_expiration_sweep(
+                &coord,
+                &expected_after_sweep,
+                &expected_sweep,
+                &sweep_context,
+            )?;
         }
     }
 }
