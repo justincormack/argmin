@@ -37,6 +37,7 @@ use crate::*;
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
+const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 2_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
@@ -1930,11 +1931,25 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn begin_durable_bucket_delete_drain(
         &self,
         bucket: &BucketName,
     ) -> Result<super::DurableBucketDeleteDrainBegin, BucketWriteDrainError> {
+        self.begin_durable_bucket_delete_drain_with_budget(bucket, None)
+    }
+
+    fn begin_durable_bucket_delete_drain_with_budget(
+        &self,
+        bucket: &BucketName,
+        started: Option<std::time::Instant>,
+    ) -> Result<super::DurableBucketDeleteDrainBegin, BucketWriteDrainError> {
         loop {
+            self.check_bucket_delete_begin_work_budget(
+                bucket,
+                started,
+                "bucket delete durable drain acquisition budget exhausted",
+            )?;
             let pg_id = self.bucket_metadata_pg_id(bucket);
             let node = self
                 .local_map
@@ -2037,9 +2052,15 @@ impl super::StorageCluster {
     fn wait_for_durable_bucket_write_reservations_empty(
         &self,
         bucket: &BucketName,
+        delete_started: std::time::Instant,
     ) -> Result<(), BucketWriteDrainError> {
         let started = std::time::Instant::now();
         loop {
+            self.check_bucket_delete_begin_work_budget(
+                bucket,
+                Some(delete_started),
+                "bucket delete reservation wait begin budget exhausted",
+            )?;
             let pg_id = self.bucket_metadata_pg_id(bucket);
             let node = self
                 .local_map
@@ -2072,7 +2093,10 @@ impl super::StorageCluster {
                 );
                 return Err(MetadataError::BucketNotEmpty.into());
             }
-            self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+            self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                bucket,
+                Some(delete_started),
+            )?;
             crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -2189,11 +2213,17 @@ impl super::StorageCluster {
         crate::error::MetadataError::BucketNotEmpty.into()
     }
 
-    fn drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(
+    fn drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
         &self,
         bucket: &BucketName,
+        started: Option<std::time::Instant>,
     ) -> Result<(), BucketWriteDrainError> {
         for raw_pg_id in self.metadata_pg_ids() {
+            self.check_bucket_delete_begin_work_budget(
+                bucket,
+                started,
+                "bucket delete exact-bucket drain budget exhausted",
+            )?;
             self.drain_pending_object_metadata_commands_for_exact_bucket(
                 PgId::new(raw_pg_id),
                 bucket,
@@ -2202,6 +2232,30 @@ impl super::StorageCluster {
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         }
         Ok(())
+    }
+
+    fn check_bucket_delete_begin_work_budget(
+        &self,
+        bucket: &BucketName,
+        started: Option<std::time::Instant>,
+        context: &'static str,
+    ) -> Result<(), BucketWriteDrainError> {
+        let Some(started) = started else {
+            return Ok(());
+        };
+        if started.elapsed()
+            < std::time::Duration::from_millis(BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS)
+        {
+            return Ok(());
+        }
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_work_budget_exhausted",
+            Some(format_args!("bucket={:?} context={}", bucket, context)),
+        );
+        Err(bucket_snapshot_error_to_bucket_write_drain_error(
+            conflicting_pending_metadata_command(context),
+        ))
     }
 
     fn finish_bucket_write_snapshot_operation<T, E>(
@@ -2278,6 +2332,7 @@ impl super::StorageCluster {
     }
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let started = std::time::Instant::now();
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node_store = self
             .local_map
@@ -2332,20 +2387,26 @@ impl super::StorageCluster {
         if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
             return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
         }
-        let durable_drain = match self.begin_durable_bucket_delete_drain(bucket)? {
-            super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
-            super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
-                let _ = observability::event(
-                    super::TRACE_TARGET,
-                    "bucket_delete_begin_done",
-                    Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
-                );
-                return Ok(());
-            }
-        };
+        let durable_drain =
+            match self.begin_durable_bucket_delete_drain_with_budget(bucket, Some(started))? {
+                super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+                super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_done",
+                        Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                    );
+                    return Ok(());
+                }
+            };
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
         let result = (|| loop {
+            self.check_bucket_delete_begin_work_budget(
+                bucket,
+                Some(started),
+                "bucket delete begin metadata convergence budget exhausted",
+            )?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
@@ -2411,19 +2472,18 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
                     | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                        for raw_pg_id in self.metadata_pg_ids() {
-                            self.drain_pending_object_metadata_commands_for_exact_bucket(
-                                PgId::new(raw_pg_id),
-                                bucket,
-                            )
-                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
-                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                        }
+                        self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                            bucket,
+                            Some(started),
+                        )?;
                         continue;
                     }
                 }
             } else {
-                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                    bucket,
+                    Some(started),
+                )?;
                 if self
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()
@@ -2434,10 +2494,16 @@ impl super::StorageCluster {
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
-                self.wait_for_durable_bucket_write_reservations_empty(bucket)?;
-                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+                self.wait_for_durable_bucket_write_reservations_empty(bucket, started)?;
+                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                    bucket,
+                    Some(started),
+                )?;
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
-                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs(bucket)?;
+                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                    bucket,
+                    Some(started),
+                )?;
                 if self
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()

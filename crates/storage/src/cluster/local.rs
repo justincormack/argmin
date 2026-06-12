@@ -39753,6 +39753,80 @@ mod tests {
     }
 
     #[test]
+    fn begin_bucket_delete_bounds_active_delete_drain_wait() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "delete-active-drain-")
+        };
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let drain = crate::PgMetadataStore::begin_durable_bucket_write_drain(
+            &*bucket_pg,
+            &bucket,
+            "held-delete-drain",
+            "other-delete-owner",
+            crate::ClusterEpoch::INITIAL,
+            crate::clock::current_time_millis(),
+            None,
+        )
+        .unwrap();
+        drop(bucket_pg);
+
+        let started = std::time::Instant::now();
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "DeleteBucket should not wait indefinitely behind another active delete drain"
+        );
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+            ),
+            "active delete drain should make DeleteBucket return retryable contention, got {err:?}"
+        );
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+                .unwrap()
+                .as_ref()
+                .map(|record| record.drain_id.as_str()),
+            Some(drain.drain_id.as_str()),
+            "DeleteBucket must not clear another caller's active delete drain"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Active,
+            "timed out DeleteBucket begin must leave the bucket active"
+        );
+    }
+
+    #[test]
     fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
