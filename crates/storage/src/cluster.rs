@@ -67,12 +67,15 @@ const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(2)
 const OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS: usize = 64;
 pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
+const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub(super) struct RequestWorkBudget {
     started: Instant,
     budget: Duration,
     attempts: usize,
+    contention_retries: usize,
     max_attempts: Option<usize>,
 }
 
@@ -82,6 +85,7 @@ impl RequestWorkBudget {
             started: Instant::now(),
             budget,
             attempts: 0,
+            contention_retries: 0,
             max_attempts,
         }
     }
@@ -97,6 +101,56 @@ impl RequestWorkBudget {
         self.attempts += 1;
         Ok(())
     }
+
+    fn sleep_after_contention(&mut self, context: &'static str) -> Result<(), StoreError> {
+        if self.started.elapsed() >= self.budget
+            || self
+                .max_attempts
+                .is_some_and(|max_attempts| self.attempts >= max_attempts)
+        {
+            return Err(StoreError::MetadataCommandContention { context });
+        }
+        self.contention_retries = self.contention_retries.saturating_add(1);
+        let cap = metadata_contention_backoff_cap(self.contention_retries);
+        let remaining = self
+            .budget
+            .checked_sub(self.started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let cap = cap.min(remaining);
+        sleep_for_metadata_contention_cap(cap);
+        Ok(())
+    }
+}
+
+pub(super) fn sleep_after_metadata_contention_retry(contention_retries: &mut usize) {
+    *contention_retries = (*contention_retries).saturating_add(1);
+    sleep_for_metadata_contention_cap(metadata_contention_backoff_cap(*contention_retries));
+}
+
+fn sleep_for_metadata_contention_cap(cap: Duration) {
+    let delay = jittered_metadata_contention_backoff_delay(cap);
+    if delay > Duration::ZERO {
+        std::thread::sleep(delay);
+    }
+}
+
+fn jittered_metadata_contention_backoff_delay(cap: Duration) -> Duration {
+    let max_nanos = cap.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if max_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let mut bytes = [0u8; 8];
+    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+        return Duration::from_nanos((max_nanos / 2).max(1));
+    }
+    Duration::from_nanos((u64::from_le_bytes(bytes) % max_nanos.saturating_add(1)).max(1))
+}
+
+fn metadata_contention_backoff_cap(contention_retries: usize) -> Duration {
+    let multiplier = 1u32 << contention_retries.saturating_sub(1).min(8);
+    METADATA_CONTENTION_BACKOFF_INITIAL
+        .saturating_mul(multiplier)
+        .min(METADATA_CONTENTION_BACKOFF_MAX)
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -2989,12 +3043,22 @@ impl StorageCluster {
                                     pg_id, bucket, &command,
                                 )
                                 .map_err(ObjectPgActionError::from)?;
+                                work_budget
+                                    .sleep_after_contention(
+                                        "object version reservation stale cleanup retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
                                 continue;
                             }
                             Err(error) => return Err(error),
                         }
                     } else {
                         self.drain_pending_object_metadata_command(pg_id, &command)?;
+                        work_budget
+                            .sleep_after_contention(
+                                "object version reservation pending drain retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         continue;
                     };
                     match outcome {
@@ -3007,10 +3071,22 @@ impl StorageCluster {
                             ));
                         }
                         PendingMetadataCommandOutcome::Applied
-                        | PendingMetadataCommandOutcome::Abandoned => continue,
+                        | PendingMetadataCommandOutcome::Abandoned => {
+                            work_budget
+                                .sleep_after_contention(
+                                    "object version reservation pending completion retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
+                            continue;
+                        }
                     }
                 }
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
+                work_budget
+                    .sleep_after_contention(
+                        "object version reservation unrelated pending retry budget exhausted",
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
                 continue;
             }
 
@@ -3040,6 +3116,11 @@ impl StorageCluster {
                 ObjectPgPendingCommandInstall::Installed(command) => command,
                 ObjectPgPendingCommandInstall::Pending(command) => {
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "object version reservation pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
@@ -3050,6 +3131,11 @@ impl StorageCluster {
                         &mut empty_log_conflicts,
                         "object version reservation log conflict without pending progress",
                     )?;
+                    work_budget
+                        .sleep_after_contention(
+                            "object version reservation log conflict retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
             };
@@ -3059,7 +3145,14 @@ impl StorageCluster {
                     MetadataError::ObjectVersionReservationConflict {
                         version_id: stale_version,
                     },
-                )) if stale_version == version_id => continue,
+                )) if stale_version == version_id => {
+                    work_budget
+                        .sleep_after_contention(
+                            "object version reservation stale version retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
             return Ok(version_id);
@@ -4878,6 +4971,7 @@ impl StorageCluster {
                 session_id,
                 encryption,
                 proof.clone(),
+                &mut work_budget,
             );
             let release_result = match &result {
                 Ok(BucketWriteReservationDisposition::TransferredToCommand) => Ok(()),
@@ -4912,6 +5006,7 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
         bucket_write_reservation: BucketWriteReservationProof,
+        work_budget: &mut RequestWorkBudget,
     ) -> Result<BucketWriteReservationDisposition, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let request = CreateStreamUploadReq {
@@ -4922,6 +5017,9 @@ impl StorageCluster {
             encryption,
         };
         loop {
+            work_budget
+                .check("put object stream create retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             let applied_commands =
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
             let expected_command = applied_stream_create_command(&applied_commands, &request);
@@ -4944,6 +5042,11 @@ impl StorageCluster {
                 Ok(command) => command,
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     self.release_object_generation_reservation(bucket, key, session_id)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "put object stream create stale read retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
@@ -4951,6 +5054,11 @@ impl StorageCluster {
                 })) => {
                     self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                     self.release_object_generation_reservation(bucket, key, session_id)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "put object stream create log conflict retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 Err(error) => {
@@ -4965,6 +5073,11 @@ impl StorageCluster {
                         self.release_object_generation_reservation(bucket, key, session_id)
                     });
                 cleanup?;
+                work_budget
+                    .sleep_after_contention(
+                        "put object stream create pending install retry budget exhausted",
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
                 continue;
             }
             if let Err(error) =
@@ -6543,6 +6656,26 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
 mod reissue_decision_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn metadata_contention_backoff_cap_grows_and_clamps() {
+        assert_eq!(
+            metadata_contention_backoff_cap(1),
+            METADATA_CONTENTION_BACKOFF_INITIAL
+        );
+        assert_eq!(
+            metadata_contention_backoff_cap(2),
+            METADATA_CONTENTION_BACKOFF_INITIAL * 2
+        );
+        assert_eq!(
+            metadata_contention_backoff_cap(3),
+            METADATA_CONTENTION_BACKOFF_INITIAL * 4
+        );
+        assert_eq!(
+            metadata_contention_backoff_cap(64),
+            METADATA_CONTENTION_BACKOFF_MAX
+        );
+    }
 
     #[test]
     fn placed_segment_direct_read_recovers_when_read_handle_acquire_hits_delete_fence() {

@@ -2407,6 +2407,7 @@ impl super::StorageCluster {
             };
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
+        let mut metadata_contention_retries = 0usize;
         let result = (|| loop {
             self.check_bucket_delete_begin_work_budget(
                 bucket,
@@ -2420,6 +2421,7 @@ impl super::StorageCluster {
                     .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
+                    super::sleep_after_metadata_contention_retry(&mut metadata_contention_retries);
                     continue;
                 }
                 match command.payload() {
@@ -2447,6 +2449,9 @@ impl super::StorageCluster {
                                 pg_id, bucket, &command, false,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        super::sleep_after_metadata_contention_retry(
+                            &mut metadata_contention_retries,
+                        );
                         continue;
                     }
                     MetadataCommandPayload::CreateBucket(_)
@@ -2461,6 +2466,9 @@ impl super::StorageCluster {
                                 pg_id, bucket, &command, false,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        super::sleep_after_metadata_contention_retry(
+                            &mut metadata_contention_retries,
+                        );
                         continue;
                     }
                     MetadataCommandPayload::ReserveObjectGeneration(_)
@@ -2482,6 +2490,9 @@ impl super::StorageCluster {
                             bucket,
                             Some(started),
                         )?;
+                        super::sleep_after_metadata_contention_retry(
+                            &mut metadata_contention_retries,
+                        );
                         continue;
                     }
                 }
@@ -2494,6 +2505,7 @@ impl super::StorageCluster {
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()
                 {
+                    super::sleep_after_metadata_contention_retry(&mut metadata_contention_retries);
                     continue;
                 }
                 if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
@@ -2514,6 +2526,7 @@ impl super::StorageCluster {
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
                     .is_some()
                 {
+                    super::sleep_after_metadata_contention_retry(&mut metadata_contention_retries);
                     continue;
                 }
                 if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
@@ -2525,7 +2538,12 @@ impl super::StorageCluster {
                 );
                 let command_id = match self.next_metadata_command_id(pg_id) {
                     Ok(command_id) => command_id,
-                    Err(StoreError::MetadataCommandLogConflict { .. }) => continue,
+                    Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                        super::sleep_after_metadata_contention_retry(
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
                     Err(error) => return Err(BucketWriteDrainError::from(error)),
                 };
                 let command = match node_store
@@ -2540,6 +2558,7 @@ impl super::StorageCluster {
                     .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
+                    super::sleep_after_metadata_contention_retry(&mut metadata_contention_retries);
                     continue;
                 }
                 (command, true)
@@ -2560,7 +2579,10 @@ impl super::StorageCluster {
                         ),
                     ));
                 }
-                FinishPendingMetadataCommandResult::Abandoned => continue,
+                FinishPendingMetadataCommandResult::Abandoned => {
+                    super::sleep_after_metadata_contention_retry(&mut metadata_contention_retries);
+                    continue;
+                }
             }
 
             return Ok(());
