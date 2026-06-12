@@ -2,7 +2,10 @@ use aws_sdk_s3::types::{
     AccessControlPolicy, BucketCannedAcl, Grant, Grantee, ObjectCannedAcl, ObjectOwnership, Owner,
     Permission, Type,
 };
-use s3_tests::{assert_s3_err_code, create_acl_enabled_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, create_acl_enabled_bucket, err_status, unique_bucket,
+    SendRetryingOperationAborted, CTX,
+};
 use std::time::Duration;
 
 const AUTHENTICATED_USERS_GROUP_URI: &str =
@@ -512,7 +515,11 @@ fn test_ignore_public_acls() {
         .await;
 
         // Authenticated owner access should still work
-        let info = client.head_bucket().bucket(&bucket).send().await;
+        let info = client
+            .head_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("head bucket after public access block ACL change")
+            .await;
         assert!(info.is_ok(), "authenticated head_bucket should still work");
 
         let get_resp = client

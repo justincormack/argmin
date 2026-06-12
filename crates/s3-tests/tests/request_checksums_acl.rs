@@ -2,7 +2,10 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration, ObjectOwnership};
-use s3_tests::{content_md5_header, sdk_checksum_headers, send_signed_request, unique_bucket, CTX};
+use s3_tests::{
+    content_md5_header, sdk_checksum_headers, send_signed_request, unique_bucket,
+    SendRetryingOperationAborted, CTX,
+};
 
 async fn create_bucket_in_test_region(object_ownership: ObjectOwnership) -> String {
     let client = CTX.client();
@@ -17,7 +20,10 @@ async fn create_bucket_in_test_region(object_ownership: ObjectOwnership) -> Stri
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create request checksum ACL bucket")
+        .await
+        .unwrap();
     bucket
 }
 
@@ -28,7 +34,12 @@ async fn cleanup_bucket(bucket: &str) {
 async fn cleanup_bucket_with_keys(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = client
+            .delete_object()
+            .bucket(bucket)
+            .key(*key)
+            .send_retrying_operation_aborted("delete request checksum ACL cleanup object")
+            .await;
     }
     cleanup_bucket(bucket).await;
 }
@@ -37,7 +48,7 @@ async fn bucket_owner_id(bucket: &str) -> String {
     CTX.client()
         .get_bucket_acl()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("get request checksum bucket owner")
         .await
         .unwrap()
         .owner()
@@ -51,7 +62,7 @@ async fn object_owner_id(bucket: &str, key: &str) -> String {
         .get_object_acl()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get request checksum object owner")
         .await
         .unwrap()
         .owner()

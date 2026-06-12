@@ -1,38 +1,12 @@
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     AccessControlPolicy, BucketVersioningStatus, Grant, Grantee, ObjectOwnership, Owner,
     OwnershipControls, OwnershipControlsRule, Permission, Type, VersioningConfiguration,
 };
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, unique_bucket, CTX};
-use std::future::Future;
-use tokio::time::{sleep, Duration};
-
-const VERSIONING_ACL_SETUP_ATTEMPTS: usize = 20;
-
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
-
-async fn retrying_operation_aborted<T, E, F, Fut>(description: &str, mut op: F) -> T
-where
-    E: ProvideErrorMetadata + std::fmt::Debug,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
-{
-    for attempt in 0..VERSIONING_ACL_SETUP_ATTEMPTS {
-        match op().await {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err) && attempt + 1 < VERSIONING_ACL_SETUP_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("{description}: {err:?}"),
-        }
-    }
-    panic!("{description} did not complete");
-}
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, retrying_operation_aborted, unique_bucket,
+    SendRetryingOperationAborted, CTX,
+};
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -112,7 +86,7 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get bucket ACL during versioning ACL setup")
         .await
         .unwrap()
         .owner()
@@ -186,7 +160,7 @@ fn test_versioned_object_acl() {
             .get_object_acl()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object ACL during versioning ACL test")
             .await
             .unwrap()
             .owner()
@@ -219,7 +193,7 @@ fn test_versioned_object_acl() {
             .bucket(&bucket)
             .key(key)
             .version_id(&target_version_id)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await
             .unwrap();
         let target_body = target.body.collect().await.unwrap().into_bytes();
@@ -235,7 +209,7 @@ fn test_versioned_object_acl() {
             .bucket(&bucket)
             .key(key)
             .version_id(&current_version_id)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await;
         assert_s3_err_code(&current, "AccessDenied");
 
@@ -244,7 +218,7 @@ fn test_versioned_object_acl() {
             .bucket(&bucket)
             .key(key)
             .version_id(&older_version_id)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await;
         assert_s3_err_code(&older, "AccessDenied");
 
@@ -252,7 +226,7 @@ fn test_versioned_object_acl() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await;
         assert_s3_err_code(&head, "AccessDenied");
 
@@ -275,7 +249,7 @@ fn test_versioned_object_acl_no_version_specified() {
             .get_object_acl()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object ACL during versioning ACL test")
             .await
             .unwrap()
             .owner()
@@ -304,7 +278,7 @@ fn test_versioned_object_acl_no_version_specified() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await
             .unwrap();
         let current_body = current.body.collect().await.unwrap().into_bytes();
@@ -315,7 +289,7 @@ fn test_versioned_object_acl_no_version_specified() {
             .bucket(&bucket)
             .key(key)
             .version_id(&current_version_id)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await
             .unwrap();
         let current_version_body = current_version.body.collect().await.unwrap().into_bytes();
@@ -329,7 +303,7 @@ fn test_versioned_object_acl_no_version_specified() {
             .bucket(&bucket)
             .key(key)
             .version_id(&older_version_id)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning ACL test")
             .await;
         assert_s3_err_code(&older, "AccessDenied");
 

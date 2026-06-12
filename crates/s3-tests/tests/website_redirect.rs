@@ -6,10 +6,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, object_url, post_object_raw_to_test_endpoint_with_headers,
-    sigv4_post_fields_for_credentials, unique_bucket, CTX,
+    sigv4_post_fields_for_credentials, unique_bucket, SendRetryingOperationAborted, CTX,
 };
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
@@ -19,79 +17,6 @@ const WEBSITE_REDIRECT_OPERATION_ATTEMPTS: usize = 20;
 fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
 }
-
-type RetrySendFuture<T, E> =
-    Pin<Box<dyn Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>>>;
-
-trait SendRetryingOperationAborted: Clone {
-    type Output;
-    type Error: ProvideErrorMetadata;
-
-    fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error>;
-
-    async fn send_retrying_operation_aborted(
-        self,
-        description: &str,
-    ) -> Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>> {
-        for attempt in 0..WEBSITE_REDIRECT_OPERATION_ATTEMPTS {
-            match self.clone().send_once().await {
-                Ok(output) => return Ok(output),
-                Err(err)
-                    if is_operation_aborted(&err)
-                        && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        unreachable!("{description} retry loop must return on final attempt");
-    }
-}
-
-macro_rules! impl_send_retrying_operation_aborted {
-    ($builder:path, $output:path, $error:path) => {
-        impl SendRetryingOperationAborted for $builder {
-            type Output = $output;
-            type Error = $error;
-
-            fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
-                Box::pin(async move { self.send().await })
-            }
-        }
-    };
-}
-
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
-    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
-    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
-    aws_sdk_s3::operation::copy_object::CopyObjectOutput,
-    aws_sdk_s3::operation::copy_object::CopyObjectError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
-    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
-    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::delete_bucket::builders::DeleteBucketFluentBuilder,
-    aws_sdk_s3::operation::delete_bucket::DeleteBucketOutput,
-    aws_sdk_s3::operation::delete_bucket::DeleteBucketError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
-    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
-    aws_sdk_s3::operation::delete_object::DeleteObjectError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::put_bucket_versioning::builders::PutBucketVersioningFluentBuilder,
-    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningOutput,
-    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningError
-);
 
 async fn put_object_retrying_operation_aborted(
     bucket: &str,
@@ -121,6 +46,38 @@ async fn put_object_retrying_operation_aborted(
         }
     }
     unreachable!("put object retry loop must return on final attempt");
+}
+
+async fn put_object_result_retrying_operation_aborted(
+    bucket: &str,
+    key: &str,
+    redirect: Option<&str>,
+    body: Vec<u8>,
+) -> Result<
+    aws_sdk_s3::operation::put_object::PutObjectOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+> {
+    for attempt in 0..WEBSITE_REDIRECT_OPERATION_ATTEMPTS {
+        let mut put = CTX
+            .client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()));
+        if let Some(redirect) = redirect {
+            put = put.website_redirect_location(redirect);
+        }
+        match put.send().await {
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("put object result retry loop must return on final attempt");
 }
 
 async fn upload_part_retrying_operation_aborted(
@@ -314,7 +271,7 @@ fn test_put_object_website_redirect_round_trips_on_head_and_get() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect));
@@ -324,7 +281,7 @@ fn test_put_object_website_redirect_round_trips_on_head_and_get() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(get.website_redirect_location(), Some(redirect));
@@ -356,7 +313,7 @@ fn test_put_object_website_redirect_without_leading_slash_rejected() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await;
         assert!(head.is_err(), "invalid redirect should not create object");
 
@@ -370,15 +327,13 @@ fn test_put_object_website_redirect_unsupported_scheme_rejected() {
         let bucket = setup_bucket().await;
         let key = "invalid-scheme";
 
-        let result = CTX
-            .client()
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .website_redirect_location("ftp://example.com/out")
-            .body(ByteStream::from_static(b"invalid-scheme-body"))
-            .send()
-            .await;
+        let result = put_object_result_retrying_operation_aborted(
+            &bucket,
+            key,
+            Some("ftp://example.com/out"),
+            b"invalid-scheme-body".to_vec(),
+        )
+        .await;
 
         assert_s3_err_code(&result, "InvalidRedirectLocation");
 
@@ -387,7 +342,7 @@ fn test_put_object_website_redirect_unsupported_scheme_rejected() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await;
         assert!(head.is_err(), "invalid redirect should not create object");
 
@@ -419,7 +374,7 @@ fn test_put_object_website_redirect_exact_2k_with_header_name_is_accepted() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect.as_str()));
@@ -453,7 +408,7 @@ fn test_put_object_website_redirect_lengths_over_aggregate_limit_are_rejected() 
                 .head_object()
                 .bucket(&bucket)
                 .key(&key)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during website redirect test")
                 .await;
             assert!(
                 head.is_err(),
@@ -490,7 +445,7 @@ fn test_put_object_website_redirect_exact_2k_plus_small_system_header_is_rejecte
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await;
         assert!(
             head.is_err(),
@@ -532,7 +487,7 @@ fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
             .head_object()
             .bucket(&bucket)
             .key(src_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(src_head.website_redirect_location(), Some(redirect));
@@ -542,7 +497,7 @@ fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
             .head_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(dst_head.website_redirect_location(), None);
@@ -588,7 +543,7 @@ fn test_copy_object_explicit_redirect_persists_on_destination() {
             .head_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(
@@ -630,7 +585,7 @@ fn test_copy_object_same_key_redirect_only_change_is_allowed() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(
@@ -674,7 +629,7 @@ fn test_copy_object_same_key_with_explicit_same_redirect_is_allowed() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect));
@@ -703,7 +658,7 @@ fn test_multipart_upload_redirect_persists_from_initiation() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect));
@@ -726,7 +681,7 @@ fn test_multipart_upload_without_redirect_remains_absent() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), None);
@@ -771,7 +726,7 @@ fn test_post_object_website_redirect_persists() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect));
@@ -823,7 +778,7 @@ fn test_post_object_website_redirect_policy_missing_field_is_rejected() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await;
         assert!(head.is_err(), "policy rejection should not create object");
 
@@ -876,7 +831,7 @@ fn test_post_object_website_redirect_policy_mismatch_is_rejected() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await;
         assert!(head.is_err(), "policy mismatch should not create object");
 
@@ -913,7 +868,7 @@ fn test_versioned_objects_surface_redirect_metadata_per_version() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(
@@ -927,7 +882,7 @@ fn test_versioned_objects_surface_redirect_metadata_per_version() {
             .bucket(&bucket)
             .key(key)
             .version_id(&v1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(v1_head.website_redirect_location(), Some("/docs/v1.html"));
@@ -938,7 +893,7 @@ fn test_versioned_objects_surface_redirect_metadata_per_version() {
             .bucket(&bucket)
             .key(key)
             .version_id(&v2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(v2_get.website_redirect_location(), Some("/docs/v2.html"));
@@ -951,7 +906,7 @@ fn test_versioned_objects_surface_redirect_metadata_per_version() {
             .bucket(&bucket)
             .key(key)
             .version_id(&v1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(v1_get.website_redirect_location(), Some("/docs/v1.html"));

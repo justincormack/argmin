@@ -4,7 +4,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
-    delete_objects_with_md5, err_status, unique_bucket, CTX,
+    delete_objects_with_md5, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 
@@ -94,7 +94,12 @@ fn test_multi_object_delete() {
         assert!(resp.errors().is_empty());
 
         // Verify objects are gone via V1 list
-        let list = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let list = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list objects after multi-object delete")
+            .await
+            .unwrap();
         assert!(list.contents().is_empty());
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -970,7 +975,12 @@ fn test_versioning_multi_object_delete_marker_create() {
         );
 
         // The object should now be inaccessible (404) via normal GET
-        let get_result = client.get_object().bucket(&bucket).key(key).send().await;
+        let get_result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object after versioned multi-object delete")
+            .await;
         assert!(get_result.is_err());
 
         // But list_object_versions should show both the version and the delete marker
@@ -1041,7 +1051,12 @@ fn test_versioning_multi_object_delete_current_if_match() {
         assert_eq!(deleted.delete_marker(), Some(true));
         assert!(deleted.delete_marker_version_id().is_some());
 
-        let get_result = client.get_object().bucket(&bucket).key("obj").send().await;
+        let get_result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get object after versioned multi-object delete")
+            .await;
         assert!(get_result.is_err());
 
         cleanup_versioned_bucket(&bucket).await;

@@ -4,7 +4,8 @@ use aws_sdk_s3::types::{
     ObjectAttributes, StorageClass, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -53,7 +54,7 @@ macro_rules! with_sse_c_headers {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -915,7 +916,10 @@ async fn do_checksummed_multipart_upload(
     if let Some(ct) = checksum_type {
         create = create.checksum_type(ct);
     }
-    let create_resp = create.send().await.unwrap();
+    let create_resp = create
+        .send_retrying_operation_aborted("create multipart upload for object attributes")
+        .await
+        .unwrap();
     let upload_id = create_resp.upload_id().unwrap();
 
     let part_data = vec![b'Z'; PART_SIZE];

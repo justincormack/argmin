@@ -1,7 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
 use s3_tests::{
-    assert_s3_err_code, delete_all_and_bucket, err_status, send_signed_request, unique_bucket, CTX,
+    assert_s3_err_code, delete_all_and_bucket, err_status, send_signed_request, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -422,7 +423,12 @@ fn test_object_read_nonexistent_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        let result = client.get_object().bucket(&bucket).key("key").send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("key")
+            .send_retrying_operation_aborted("get object from nonexistent bucket")
+            .await;
         assert!(result.is_err());
     });
 }
@@ -1509,12 +1515,17 @@ fn test_object_write_read_update_read_delete() {
             .delete_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("delete object CRUD object")
             .await
             .unwrap();
 
         // Verify gone
-        let result = client.get_object().bucket(&bucket).key("obj").send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get object after delete")
+            .await;
         assert!(result.is_err());
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;

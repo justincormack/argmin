@@ -6,7 +6,8 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,7 +105,7 @@ macro_rules! with_sse_c_copy_headers {
 
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
-    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
 
     for _ in 0..10 {
         let uploads = client
@@ -119,11 +120,16 @@ async fn cleanup(bucket: &str, key: &str) {
                 .bucket(bucket)
                 .key(upload.key().unwrap_or_default())
                 .upload_id(upload.upload_id().unwrap_or_default())
-                .send()
+                .send_retrying_operation_aborted("abort SSE-C multipart upload during cleanup")
                 .await;
         }
 
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete SSE-C bucket during cleanup")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
@@ -1023,7 +1029,12 @@ fn test_sse_c_get_requires_headers() {
         .await
         .unwrap();
 
-        let result = client.get_object().bucket(&bucket).key("obj").send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get SSE-C object without headers")
+            .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidRequest");
 
@@ -1057,7 +1068,12 @@ fn test_sse_c_head_requires_headers() {
         .await
         .unwrap();
 
-        let result = client.head_object().bucket(&bucket).key("obj").send().await;
+        let result = client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("head SSE-C object without headers")
+            .await;
         assert_eq!(err_status(&result), 400);
 
         cleanup(&bucket, "obj").await;
@@ -1388,7 +1404,12 @@ fn test_sse_c_multipart_round_trip() {
             body.as_slice()
         );
 
-        let missing_headers = client.get_object().bucket(&bucket).key("obj").send().await;
+        let missing_headers = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get SSE-C object without headers")
+            .await;
         assert_eq!(err_status(&missing_headers), 400);
         assert_s3_err_code(&missing_headers, "InvalidRequest");
 

@@ -4,7 +4,7 @@ use aws_sdk_s3::types::{Tag, Tagging};
 use s3_tests::{
     disable_bucket_public_access_block,
     send_signed_request_to_endpoint_for_service_with_credentials, unique_bucket,
-    SignedRequestCredentials, CTX,
+    SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -13,11 +13,16 @@ use std::time::Duration;
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
 
     for _ in 0..10 {
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket policy multivalue bucket")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");

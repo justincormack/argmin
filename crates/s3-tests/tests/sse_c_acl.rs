@@ -1,7 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ObjectOwnership};
 use s3_tests::{
-    create_acl_enabled_bucket, enable_bucket_sse_c, sse_c_header_values, test_sse_c_key, CTX,
+    create_acl_enabled_bucket, enable_bucket_sse_c, sse_c_header_values, test_sse_c_key,
+    SendRetryingOperationAborted, CTX,
 };
 
 const MULTIPART_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
@@ -48,7 +49,12 @@ async fn create_acl_sse_c_bucket() -> String {
 
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
-    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    let _ = client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("delete SSE-C ACL cleanup object")
+        .await;
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 

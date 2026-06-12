@@ -11,7 +11,8 @@ use aws_sdk_s3::types::{
 use base64::Engine;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, err_status, send_signed_request, unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, err_status, send_signed_request, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 
@@ -284,7 +285,7 @@ async fn delete_version_with_bypass(bucket: &str, key: &str, version_id: &str) {
         .key(key)
         .version_id(version_id)
         .bypass_governance_retention(true)
-        .send()
+        .send_retrying_operation_aborted("delete object-lock version with bypass")
         .await
         .unwrap();
 }
@@ -292,7 +293,7 @@ async fn delete_version_with_bypass(bucket: &str, key: &str, version_id: &str) {
 async fn cleanup_plain_bucket(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -304,12 +305,17 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
         let resp = client
             .list_object_versions()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list object-lock versions during cleanup")
             .await
             .unwrap();
 
         if resp.versions().is_empty() && resp.delete_markers().is_empty() {
-            match client.delete_bucket().bucket(bucket).send().await {
+            match client
+                .delete_bucket()
+                .bucket(bucket)
+                .send_retrying_operation_aborted("delete object-lock bucket during cleanup")
+                .await
+            {
                 Ok(_) => return,
                 Err(err) => {
                     let raw = format!("{err:?}");
@@ -2015,7 +2021,12 @@ fn test_object_lock_non_version_delete_with_bypass_header_does_not_require_bypas
             .await;
         deleted.unwrap();
 
-        let current = client.get_object().bucket(&bucket).key(key).send().await;
+        let current = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object-lock current object after delete")
+            .await;
         assert_eq!(err_status(&current), 404);
         assert_s3_err_code(&current, "NoSuchKey");
 
@@ -2145,7 +2156,12 @@ fn test_object_lock_put_object_headers_invalid_bucket_large_body() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidRequest");
 
-        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object-lock object after rejected put")
+            .await;
         assert_eq!(err_status(&head), 404);
 
         cleanup_plain_bucket(&bucket, &[]).await;
@@ -2171,7 +2187,14 @@ fn test_object_lock_put_object_headers_reject_past_retain_until() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted(
+                "head object-lock object after rejected past retention",
+            )
+            .await;
         assert_eq!(err_status(&head), 404);
 
         cleanup_object_lock_bucket(&bucket).await;

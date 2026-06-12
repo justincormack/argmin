@@ -23,7 +23,7 @@ use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect_or_status,
     object_url, send_signed_request, send_signed_request_with_credentials, unique_bucket,
-    RawResponse, SignedRequestCredentials, CTX,
+    RawResponse, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -103,29 +103,17 @@ async fn put_bucket_versioning_retrying_operation_aborted(
     bucket: &str,
     status: BucketVersioningStatus,
 ) {
-    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
-        match client
-            .put_bucket_versioning()
-            .bucket(bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(status.clone())
-                    .build(),
-            )
-            .send()
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
-            {
-                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("put bucket versioning during multipart setup: {err:?}"),
-        }
-    }
-    panic!("put bucket versioning during multipart setup did not complete");
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(status.clone())
+                .build(),
+        )
+        .send_retrying_operation_aborted("put bucket versioning during multipart setup")
+        .await
+        .unwrap();
 }
 
 async fn put_object_retrying_operation_aborted(
@@ -161,19 +149,13 @@ async fn delete_object_retrying_operation_aborted(
     bucket: &str,
     key: &str,
 ) -> aws_sdk_s3::operation::delete_object::DeleteObjectOutput {
-    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
-        match client.delete_object().bucket(bucket).key(key).send().await {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
-            {
-                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("delete object during multipart setup: {err:?}"),
-        }
-    }
-    panic!("delete object during multipart setup did not complete");
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("delete object during multipart setup")
+        .await
+        .unwrap()
 }
 
 async fn create_multipart_upload_retrying_operation_aborted(
@@ -181,11 +163,31 @@ async fn create_multipart_upload_retrying_operation_aborted(
     bucket: &str,
     key: &str,
 ) -> aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput {
+    client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("create multipart upload during multipart setup")
+        .await
+        .unwrap()
+}
+
+async fn upload_part_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
     for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
         match client
-            .create_multipart_upload()
+            .upload_part()
             .bucket(bucket)
             .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body.clone()))
             .send()
             .await
         {
@@ -196,30 +198,31 @@ async fn create_multipart_upload_retrying_operation_aborted(
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
             }
-            Err(err) => panic!("create multipart upload during multipart setup: {err:?}"),
+            Err(err) => panic!("upload part during multipart setup: {err:?}"),
         }
     }
-    panic!("create multipart upload during multipart setup did not complete");
+    panic!("upload part during multipart setup did not complete");
 }
 
-async fn upload_part_copy_retrying_operation_aborted(
+async fn upload_part_result_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
-    copy_source: String,
+    part_number: i32,
+    body: Vec<u8>,
 ) -> Result<
-    aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput,
-    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::upload_part_copy::UploadPartCopyError>,
+    aws_sdk_s3::operation::upload_part::UploadPartOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::upload_part::UploadPartError>,
 > {
     for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
         let result = client
-            .upload_part_copy()
+            .upload_part()
             .bucket(bucket)
             .key(key)
             .upload_id(upload_id)
-            .part_number(1)
-            .copy_source(copy_source.clone())
+            .part_number(part_number)
+            .body(ByteStream::from(body.clone()))
             .send()
             .await;
         match result {
@@ -233,7 +236,63 @@ async fn upload_part_copy_retrying_operation_aborted(
             Err(err) => return Err(err),
         }
     }
-    panic!("upload part copy during multipart setup did not complete");
+    panic!("upload part during multipart setup did not complete");
+}
+
+async fn upload_part_with_crc32_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+
+    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
+        match client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body.clone()))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("upload part with checksum during multipart setup: {err:?}"),
+        }
+    }
+    panic!("upload part with checksum during multipart setup did not complete");
+}
+
+async fn upload_part_copy_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    copy_source: String,
+) -> Result<
+    aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::upload_part_copy::UploadPartCopyError>,
+> {
+    client
+        .upload_part_copy()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .copy_source(copy_source)
+        .send_retrying_operation_aborted("upload part copy during multipart setup")
+        .await
 }
 
 async fn complete_multipart_upload_retrying_operation_aborted(
@@ -243,31 +302,19 @@ async fn complete_multipart_upload_retrying_operation_aborted(
     upload_id: &str,
     etag: &str,
 ) {
-    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
-        match client
-            .complete_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
-                    .build(),
-            )
-            .send()
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
-            {
-                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("complete multipart upload during multipart setup: {err:?}"),
-        }
-    }
-    panic!("complete multipart upload during multipart setup did not complete");
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                .build(),
+        )
+        .send_retrying_operation_aborted("complete multipart upload during multipart setup")
+        .await
+        .unwrap();
 }
 
 async fn abort_multipart_upload_retrying_operation_aborted(
@@ -276,26 +323,14 @@ async fn abort_multipart_upload_retrying_operation_aborted(
     key: &str,
     upload_id: &str,
 ) {
-    for attempt in 0..CONCURRENT_MULTIPART_OPERATION_ATTEMPTS {
-        match client
-            .abort_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .send()
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
-            {
-                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("abort multipart upload during multipart setup: {err:?}"),
-        }
-    }
-    panic!("abort multipart upload during multipart setup did not complete");
+    client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send_retrying_operation_aborted("abort multipart upload during multipart setup")
+        .await
+        .unwrap();
 }
 
 async fn assert_list_parts_no_such_upload(bucket: &str, key: &str, upload_id: &str) {
@@ -305,7 +340,7 @@ async fn assert_list_parts_no_such_upload(bucket: &str, key: &str, upload_id: &s
         .bucket(bucket)
         .key(key)
         .upload_id(upload_id)
-        .send()
+        .send_retrying_operation_aborted("list parts during multipart assertion")
         .await;
     assert_eq!(
         err_status(&result),
@@ -385,7 +420,13 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     let mut last_cleanup_error = None;
     for _ in 0..30 {
         for key in keys {
-            if let Err(err) = client.delete_object().bucket(bucket).key(*key).send().await {
+            if let Err(err) = client
+                .delete_object()
+                .bucket(bucket)
+                .key(*key)
+                .send_retrying_operation_aborted("delete object during multipart cleanup")
+                .await
+            {
                 let raw = format!("{err:?}");
                 if !raw.contains("NoSuchBucket") && !raw.contains("NoSuchKey") {
                     last_cleanup_error = Some(format!("delete_object {key:?}: {raw}"));
@@ -396,7 +437,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list multipart uploads during multipart cleanup")
             .await
             .unwrap();
         for upload in uploads.uploads() {
@@ -405,11 +446,16 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
                 .bucket(bucket)
                 .key(upload.key().unwrap())
                 .upload_id(upload.upload_id().unwrap())
-                .send()
+                .send_retrying_operation_aborted("abort multipart upload during multipart cleanup")
                 .await;
         }
 
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket during multipart cleanup")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
@@ -422,7 +468,11 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         }
     }
 
-    let result = client.delete_bucket().bucket(bucket).send().await;
+    let result = client
+        .delete_bucket()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("final delete bucket during multipart cleanup")
+        .await;
     if let Err(err) = result {
         panic!(
             "delete_bucket did not converge: {err:?}; last cleanup error: {}",
@@ -470,28 +520,21 @@ fn query_encode_value(value: &str) -> String {
 async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) -> String {
     let client = CTX.client();
 
-    let create = client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .unwrap();
+    let create = create_multipart_upload_retrying_operation_aborted(client, bucket, key).await;
     let upload_id = create.upload_id().unwrap();
 
     let mut completed_parts = Vec::new();
     for (i, data) in parts_data.iter().enumerate() {
         let part_number = (i + 1) as i32;
-        let resp = client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(data.clone()))
-            .send()
-            .await
-            .unwrap();
+        let resp = upload_part_retrying_operation_aborted(
+            client,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            data.clone(),
+        )
+        .await;
         completed_parts.push(
             CompletedPart::builder()
                 .e_tag(resp.e_tag().unwrap())
@@ -510,7 +553,7 @@ async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) ->
                 .set_parts(Some(completed_parts))
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete multipart upload")
         .await
         .unwrap();
     complete.e_tag().unwrap().to_string()
@@ -518,25 +561,12 @@ async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) ->
 
 async fn complete_single_part_multipart_upload(bucket: &str, key: &str, body: &[u8]) -> String {
     let client = CTX.client();
-    let create = client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .unwrap();
+    let create = create_multipart_upload_retrying_operation_aborted(client, bucket, key).await;
     let upload_id = create.upload_id().unwrap().to_string();
 
-    let part = client
-        .upload_part()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(&upload_id)
-        .part_number(1)
-        .body(ByteStream::from(body.to_vec()))
-        .send()
-        .await
-        .unwrap();
+    let part =
+        upload_part_retrying_operation_aborted(client, bucket, key, &upload_id, 1, body.to_vec())
+            .await;
 
     client
         .complete_multipart_upload()
@@ -553,7 +583,7 @@ async fn complete_single_part_multipart_upload(bucket: &str, key: &str, body: &[
                 )
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete single-part multipart upload")
         .await
         .unwrap();
 
@@ -570,30 +600,29 @@ fn test_abort_multipart_upload_with_completed_part_hides_upload_for_list_parts()
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap()
             .upload_id()
             .unwrap()
             .to_string();
 
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(
+            &client,
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            vec![b'a'; PART_SIZE],
+        )
+        .await;
 
         let before_abort = client
             .list_parts()
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(before_abort.parts().len(), 1);
@@ -604,7 +633,7 @@ fn test_abort_multipart_upload_with_completed_part_hides_upload_for_list_parts()
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -623,7 +652,7 @@ fn test_abort_multipart_upload_racing_started_upload_part_returns_success_or_no_
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap()
             .upload_id()
@@ -655,7 +684,7 @@ fn test_abort_multipart_upload_racing_started_upload_part_returns_success_or_no_
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -693,7 +722,7 @@ fn test_abort_multipart_upload_racing_started_upload_part_returns_success_or_no_
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         if let Ok(parts) = list_after_race {
             assert_eq!(parts.parts().len(), 1);
@@ -703,7 +732,7 @@ fn test_abort_multipart_upload_racing_started_upload_part_returns_success_or_no_
                 .bucket(&bucket)
                 .key(key)
                 .upload_id(&upload_id)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
         }
@@ -723,30 +752,29 @@ fn test_abort_multipart_upload_racing_started_second_part_returns_success_or_no_
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap()
             .upload_id()
             .unwrap()
             .to_string();
 
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(
+            &client,
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            vec![b'a'; PART_SIZE],
+        )
+        .await;
 
         let before_race = client
             .list_parts()
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(before_race.parts().len(), 1);
@@ -777,7 +805,7 @@ fn test_abort_multipart_upload_racing_started_second_part_returns_success_or_no_
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -815,7 +843,7 @@ fn test_abort_multipart_upload_racing_started_second_part_returns_success_or_no_
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         if let Ok(parts) = list_after_race {
             assert!(
@@ -827,7 +855,7 @@ fn test_abort_multipart_upload_racing_started_second_part_returns_success_or_no_
                 .bucket(&bucket)
                 .key(key)
                 .upload_id(&upload_id)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
         }
@@ -847,7 +875,7 @@ fn test_create_multipart_upload_rejects_system_metadata_over_limit() {
             .bucket(&bucket)
             .key("multipart-system-metadata-too-large")
             .content_disposition("d".repeat(3000))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
 
         assert_eq!(err_status(&result), 400);
@@ -877,7 +905,7 @@ fn test_multipart_upload_basic() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -904,7 +932,7 @@ fn test_multipart_upload_single_part() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -927,22 +955,14 @@ fn test_multipart_upload_abort() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
         // Upload a part
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![0u8; 1024]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, vec![0u8; 1024])
+            .await;
 
         // Abort the upload
         client
@@ -950,12 +970,17 @@ fn test_multipart_upload_abort() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
         // The object should not exist
-        let result = client.get_object().bucket(&bucket).key(key).send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await;
         assert!(result.is_err());
 
         cleanup(&bucket, &[]).await;
@@ -975,7 +1000,7 @@ fn test_abort_multipart_upload_after_complete_succeeds() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -983,7 +1008,7 @@ fn test_abort_multipart_upload_after_complete_succeeds() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1008,7 +1033,7 @@ fn test_abort_multipart_upload_after_complete_wrong_upload_id_fails() {
             .bucket(&bucket)
             .key(key)
             .upload_id("definitely-wrong-upload-id")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_s3_err_code(&result, "NoSuchUpload");
 
@@ -1031,7 +1056,7 @@ fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message_extern
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let valid_upload_id = create.upload_id().unwrap().to_string();
@@ -1057,7 +1082,7 @@ fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message_extern
             .bucket(&bucket)
             .key(key)
             .upload_id(&valid_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1079,7 +1104,7 @@ fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence_external(
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1150,7 +1175,7 @@ fn test_complete_multipart_upload_invalid_present_upload_id_overlong_auth_preced
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1221,7 +1246,7 @@ fn test_list_parts_invalid_present_upload_id_overlong_auth_precedence_external()
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1259,7 +1284,7 @@ fn test_abort_multipart_upload_after_complete_and_delete_succeeds() {
             .delete_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1268,11 +1293,16 @@ fn test_abort_multipart_upload_after_complete_and_delete_succeeds() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
-        let get = client.get_object().bucket(&bucket).key(key).send().await;
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await;
         assert_s3_err_code(&get, "NoSuchKey");
 
         cleanup(&bucket, &[]).await;
@@ -1294,7 +1324,7 @@ fn test_abort_multipart_upload_after_complete_and_overwrite_succeeds() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&first_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1303,7 +1333,7 @@ fn test_abort_multipart_upload_after_complete_and_overwrite_succeeds() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&second_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1311,7 +1341,7 @@ fn test_abort_multipart_upload_after_complete_and_overwrite_succeeds() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -1334,7 +1364,7 @@ fn test_abort_multipart_upload_after_bucket_delete_and_recreate_fails() {
             .delete_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -1347,7 +1377,7 @@ fn test_abort_multipart_upload_after_bucket_delete_and_recreate_fails() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_s3_err_code(&result, "NoSuchUpload");
 
@@ -1366,7 +1396,7 @@ fn test_list_multipart_uploads_empty() {
         let resp = client
             .list_multipart_uploads()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert!(resp.uploads().is_empty());
@@ -1386,7 +1416,7 @@ fn test_list_multipart_uploads_active() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key("key1")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uid1 = create1.upload_id().unwrap().to_string();
@@ -1395,7 +1425,7 @@ fn test_list_multipart_uploads_active() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key("key2")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uid2 = create2.upload_id().unwrap().to_string();
@@ -1403,7 +1433,7 @@ fn test_list_multipart_uploads_active() {
         let resp = client
             .list_multipart_uploads()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uploads = resp.uploads();
@@ -1419,7 +1449,7 @@ fn test_list_multipart_uploads_active() {
             .bucket(&bucket)
             .key("key1")
             .upload_id(&uid1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         client
@@ -1427,7 +1457,7 @@ fn test_list_multipart_uploads_active() {
             .bucket(&bucket)
             .key("key2")
             .upload_id(&uid2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -1435,7 +1465,7 @@ fn test_list_multipart_uploads_active() {
         let resp = client
             .list_multipart_uploads()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert!(resp.uploads().is_empty());
@@ -1454,7 +1484,7 @@ fn test_list_multipart_uploads_prefix() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key("photos/a.jpg")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uid1 = c1.upload_id().unwrap().to_string();
@@ -1463,7 +1493,7 @@ fn test_list_multipart_uploads_prefix() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key("docs/b.txt")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uid2 = c2.upload_id().unwrap().to_string();
@@ -1472,7 +1502,7 @@ fn test_list_multipart_uploads_prefix() {
             .list_multipart_uploads()
             .bucket(&bucket)
             .prefix("photos/")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uploads = resp.uploads();
@@ -1485,7 +1515,7 @@ fn test_list_multipart_uploads_prefix() {
             .bucket(&bucket)
             .key("photos/a.jpg")
             .upload_id(&uid1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         client
@@ -1493,7 +1523,7 @@ fn test_list_multipart_uploads_prefix() {
             .bucket(&bucket)
             .key("docs/b.txt")
             .upload_id(&uid2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1513,7 +1543,7 @@ fn test_list_multipart_uploads_pagination_and_markers() {
                 .create_multipart_upload()
                 .bucket(&bucket)
                 .key(key)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
             created.push((key.to_string(), create.upload_id().unwrap().to_string()));
@@ -1523,7 +1553,7 @@ fn test_list_multipart_uploads_pagination_and_markers() {
             .list_multipart_uploads()
             .bucket(&bucket)
             .max_uploads(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp1.uploads().len(), 1);
@@ -1538,7 +1568,7 @@ fn test_list_multipart_uploads_pagination_and_markers() {
             .key_marker(next_key_1)
             .upload_id_marker(next_upload_1)
             .max_uploads(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp2.uploads().len(), 1);
@@ -1553,7 +1583,7 @@ fn test_list_multipart_uploads_pagination_and_markers() {
             .key_marker(next_key_2)
             .upload_id_marker(next_upload_2)
             .max_uploads(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp3.uploads().len(), 1);
@@ -1566,7 +1596,7 @@ fn test_list_multipart_uploads_pagination_and_markers() {
                 .bucket(&bucket)
                 .key(key)
                 .upload_id(upload_id)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
         }
@@ -1586,7 +1616,7 @@ fn test_list_multipart_uploads_invalid_present_upload_id_marker_rejected() {
                 .create_multipart_upload()
                 .bucket(&bucket)
                 .key(key)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
             created.push((key.to_string(), create.upload_id().unwrap().to_string()));
@@ -1621,7 +1651,7 @@ fn test_list_multipart_uploads_invalid_present_upload_id_marker_rejected() {
                 .bucket(&bucket)
                 .key(key)
                 .upload_id(upload_id)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
         }
@@ -1641,7 +1671,7 @@ fn test_list_multipart_uploads_encoding_type_url() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
@@ -1650,7 +1680,7 @@ fn test_list_multipart_uploads_encoding_type_url() {
             .list_multipart_uploads()
             .bucket(&bucket)
             .encoding_type(EncodingType::Url)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
@@ -1663,7 +1693,7 @@ fn test_list_multipart_uploads_encoding_type_url() {
             .bucket(&bucket)
             .key(KEY)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1682,7 +1712,7 @@ fn test_list_multipart_uploads_raw_response_encodes_key_fields() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
@@ -1720,7 +1750,7 @@ fn test_list_multipart_uploads_raw_response_encodes_key_fields() {
             .bucket(&bucket)
             .key(KEY)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1740,7 +1770,7 @@ fn test_list_multipart_uploads_raw_response_without_encoding_type_keeps_raw_key_
             .create_multipart_upload()
             .bucket(&bucket)
             .key(KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
@@ -1779,7 +1809,7 @@ fn test_list_multipart_uploads_raw_response_without_encoding_type_keeps_raw_key_
             .bucket(&bucket)
             .key(KEY)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1799,7 +1829,7 @@ fn test_list_multipart_uploads_raw_response_encodes_key_marker() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(FIRST_KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let first_upload_id = create_first.upload_id().unwrap().to_string();
@@ -1808,7 +1838,7 @@ fn test_list_multipart_uploads_raw_response_encodes_key_marker() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(SECOND_KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let second_upload_id = create_second.upload_id().unwrap().to_string();
@@ -1840,7 +1870,7 @@ fn test_list_multipart_uploads_raw_response_encodes_key_marker() {
             .bucket(&bucket)
             .key(FIRST_KEY)
             .upload_id(&first_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         client
@@ -1848,7 +1878,7 @@ fn test_list_multipart_uploads_raw_response_encodes_key_marker() {
             .bucket(&bucket)
             .key(SECOND_KEY)
             .upload_id(&second_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1868,7 +1898,7 @@ fn test_list_multipart_uploads_raw_response_encodes_next_markers() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(FIRST_KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let first_upload_id = create_first.upload_id().unwrap().to_string();
@@ -1877,7 +1907,7 @@ fn test_list_multipart_uploads_raw_response_encodes_next_markers() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(SECOND_KEY)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let second_upload_id = create_second.upload_id().unwrap().to_string();
@@ -1910,7 +1940,7 @@ fn test_list_multipart_uploads_raw_response_encodes_next_markers() {
             .bucket(&bucket)
             .key(FIRST_KEY)
             .upload_id(&first_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         client
@@ -1918,7 +1948,7 @@ fn test_list_multipart_uploads_raw_response_encodes_next_markers() {
             .bucket(&bucket)
             .key(SECOND_KEY)
             .upload_id(&second_upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1938,40 +1968,38 @@ fn test_list_parts() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
         // Upload two parts
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![b'a'; PART_SIZE],
+        )
+        .await;
 
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(2)
-            .body(ByteStream::from(vec![b'b'; 1024]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            2,
+            vec![b'b'; 1024],
+        )
+        .await;
 
         let resp = client
             .list_parts()
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let parts = resp.parts();
@@ -1987,7 +2015,7 @@ fn test_list_parts() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -2005,21 +2033,20 @@ fn test_list_parts_zero_max_parts() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![b'a'; PART_SIZE],
+        )
+        .await;
 
         let resp = client
             .list_parts()
@@ -2027,7 +2054,7 @@ fn test_list_parts_zero_max_parts() {
             .key(key)
             .upload_id(upload_id)
             .max_parts(0)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.parts().len(), 0);
@@ -2039,7 +2066,7 @@ fn test_list_parts_zero_max_parts() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -2060,24 +2087,22 @@ fn test_list_parts_pagination_with_checksums() {
             .bucket(&bucket)
             .key(key)
             .checksum_algorithm(ChecksumAlgorithm::Crc32)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
         let mut expected = Vec::new();
         for (part_number, data) in [(1, vec![b'a'; PART_SIZE]), (2, vec![b'b'; 1024])] {
-            let resp = client
-                .upload_part()
-                .bucket(&bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(data))
-                .checksum_algorithm(ChecksumAlgorithm::Crc32)
-                .send()
-                .await
-                .unwrap();
+            let resp = upload_part_with_crc32_retrying_operation_aborted(
+                client,
+                &bucket,
+                key,
+                &upload_id,
+                part_number,
+                data,
+            )
+            .await;
             expected.push((part_number, resp.checksum_crc32().unwrap().to_string()));
         }
 
@@ -2087,7 +2112,7 @@ fn test_list_parts_pagination_with_checksums() {
             .key(key)
             .upload_id(&upload_id)
             .max_parts(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp1.parts().len(), 1);
@@ -2107,7 +2132,7 @@ fn test_list_parts_pagination_with_checksums() {
             .upload_id(&upload_id)
             .part_number_marker(next_marker)
             .max_parts(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp2.parts().len(), 1);
@@ -2124,7 +2149,7 @@ fn test_list_parts_pagination_with_checksums() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -2154,7 +2179,7 @@ fn test_complete_multipart_no_such_upload() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert!(result.is_err());
 
@@ -2173,7 +2198,7 @@ fn test_abort_multipart_no_such_upload() {
             .bucket(&bucket)
             .key("nokey")
             .upload_id("nonexistent-upload-id")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         // Our server returns NoSuchUpload for nonexistent upload IDs.
         s3_tests::assert_s3_err_code(&result, "NoSuchUpload");
@@ -2195,33 +2220,31 @@ fn test_multipart_part_too_small() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
         // Upload two parts, first one too small (< 5MB)
-        let resp1 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![0u8; 100]))
-            .send()
-            .await
-            .unwrap();
+        let resp1 = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![0u8; 100],
+        )
+        .await;
 
-        let resp2 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(2)
-            .body(ByteStream::from(vec![0u8; 100]))
-            .send()
-            .await
-            .unwrap();
+        let resp2 = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            2,
+            vec![0u8; 100],
+        )
+        .await;
 
         // CompleteMultipartUpload should fail with EntityTooSmall
         let result = client
@@ -2245,7 +2268,7 @@ fn test_multipart_part_too_small() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert!(result.is_err());
 
@@ -2255,7 +2278,7 @@ fn test_multipart_part_too_small() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -2273,20 +2296,20 @@ fn test_upload_part_invalid_part_number_exceeds_max() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        let result = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(10_001)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await;
+        let result = upload_part_result_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            10_001,
+            b"hello".to_vec(),
+        )
+        .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
@@ -2295,7 +2318,7 @@ fn test_upload_part_invalid_part_number_exceeds_max() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -2312,14 +2335,7 @@ fn test_multipart_overwrites_existing_object() {
         let key = "overwrite-me";
 
         // Put a regular object first
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"original"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"original".to_vec()).await;
 
         // Overwrite with multipart
         let new_data = vec![b'z'; 512];
@@ -2329,7 +2345,7 @@ fn test_multipart_overwrites_existing_object() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -2356,7 +2372,7 @@ fn test_multipart_head_object() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.content_length().unwrap(), (PART_SIZE + 2048) as i64);
@@ -2386,7 +2402,7 @@ fn test_multipart_range_read() {
             .bucket(&bucket)
             .key(key)
             .range(format!("bytes={}-{}", start, end))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -2415,7 +2431,7 @@ fn test_multipart_get_part_rejects_range_header() {
             .key(key)
             .part_number(2)
             .range("bytes=0-1")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidRequest");
@@ -2438,7 +2454,7 @@ fn test_multipart_concurrent_uploads_same_key() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uid1 = c1.upload_id().unwrap().to_string();
@@ -2447,7 +2463,7 @@ fn test_multipart_concurrent_uploads_same_key() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let uid2 = c2.upload_id().unwrap().to_string();
@@ -2457,22 +2473,15 @@ fn test_multipart_concurrent_uploads_same_key() {
         let resp = client
             .list_multipart_uploads()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.uploads().len(), 2);
 
         // Complete the first, abort the second
-        let r1 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&uid1)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'1'; 100]))
-            .send()
-            .await
-            .unwrap();
+        let r1 =
+            upload_part_retrying_operation_aborted(client, &bucket, key, &uid1, 1, vec![b'1'; 100])
+                .await;
 
         client
             .complete_multipart_upload()
@@ -2489,7 +2498,7 @@ fn test_multipart_concurrent_uploads_same_key() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -2498,7 +2507,7 @@ fn test_multipart_concurrent_uploads_same_key() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&uid2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -2507,7 +2516,7 @@ fn test_multipart_concurrent_uploads_same_key() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
@@ -2529,22 +2538,21 @@ fn test_complete_multipart_upload_accepts_matching_expected_object_size() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
         let body = b"hello world";
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body.to_vec()))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            body.to_vec(),
+        )
+        .await;
 
         client
             .complete_multipart_upload()
@@ -2562,7 +2570,7 @@ fn test_complete_multipart_upload_accepts_matching_expected_object_size() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -2570,7 +2578,7 @@ fn test_complete_multipart_upload_accepts_matching_expected_object_size() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(object.content_length(), Some(body.len() as i64));
@@ -2590,22 +2598,21 @@ fn test_complete_multipart_upload_rejects_mismatched_expected_object_size() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
         let body = b"hello world";
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body.to_vec()))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            body.to_vec(),
+        )
+        .await;
 
         let result = client
             .complete_multipart_upload()
@@ -2623,7 +2630,7 @@ fn test_complete_multipart_upload_rejects_mismatched_expected_object_size() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
 
         assert_eq!(err_status(&result), 400);
@@ -2646,34 +2653,25 @@ fn test_multipart_part_overwrite() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
         // Upload part 1 with data 'a'
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'a'; 256]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, vec![b'a'; 256])
+            .await;
 
         // Re-upload part 1 with data 'b' — should replace
-        let resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'b'; 512]))
-            .send()
-            .await
-            .unwrap();
+        let resp = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![b'b'; 512],
+        )
+        .await;
 
         // Complete with the second upload's ETag
         client
@@ -2691,7 +2689,7 @@ fn test_multipart_part_overwrite() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -2699,7 +2697,7 @@ fn test_multipart_part_overwrite() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let data = get.body.collect().await.unwrap().into_bytes();
@@ -2724,7 +2722,7 @@ fn test_multipart_complete_empty_parts() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -2735,7 +2733,7 @@ fn test_multipart_complete_empty_parts() {
             .key(key)
             .upload_id(upload_id)
             .multipart_upload(CompletedMultipartUpload::builder().build())
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert!(result.is_err());
 
@@ -2745,7 +2743,7 @@ fn test_multipart_complete_empty_parts() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -2763,21 +2761,13 @@ fn test_multipart_complete_incorrect_etag() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![0u8; 256]))
-            .send()
-            .await
-            .unwrap();
+        upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, vec![0u8; 256])
+            .await;
 
         // Complete with a fabricated ETag
         let result = client
@@ -2795,7 +2785,7 @@ fn test_multipart_complete_incorrect_etag() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_s3_err_code(&result, "InvalidPart");
 
@@ -2804,7 +2794,7 @@ fn test_multipart_complete_incorrect_etag() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -2822,22 +2812,21 @@ fn test_multipart_complete_missing_part() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
         // Upload part 1
-        let resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![0u8; 256]))
-            .send()
-            .await
-            .unwrap();
+        let resp = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![0u8; 256],
+        )
+        .await;
 
         // Complete referencing part 9999 (never uploaded)
         let result = client
@@ -2855,7 +2844,7 @@ fn test_multipart_complete_missing_part() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_s3_err_code(&result, "InvalidPart");
 
@@ -2864,7 +2853,7 @@ fn test_multipart_complete_missing_part() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -2884,21 +2873,20 @@ fn test_multipart_metadata_preserved() {
             .key(key)
             .content_type("application/octet-stream")
             .metadata("testkey", "testvalue")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        let resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'm'; 128]))
-            .send()
-            .await
-            .unwrap();
+        let resp = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![b'm'; 128],
+        )
+        .await;
 
         client
             .complete_multipart_upload()
@@ -2915,7 +2903,7 @@ fn test_multipart_metadata_preserved() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -2923,7 +2911,7 @@ fn test_multipart_metadata_preserved() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(head.content_type().unwrap(), "application/octet-stream");
@@ -2948,32 +2936,30 @@ fn test_multipart_complete_invalid_order() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        let r1 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
-            .send()
-            .await
-            .unwrap();
+        let r1 = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![b'a'; PART_SIZE],
+        )
+        .await;
 
-        let r2 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(2)
-            .body(ByteStream::from(vec![b'b'; 256]))
-            .send()
-            .await
-            .unwrap();
+        let r2 = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            2,
+            vec![b'b'; 256],
+        )
+        .await;
 
         // Complete with parts in reverse order (2, 1)
         let result = client
@@ -2997,7 +2983,7 @@ fn test_multipart_complete_invalid_order() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_s3_err_code(&result, "InvalidPartOrder");
 
@@ -3006,7 +2992,7 @@ fn test_multipart_complete_invalid_order() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -3047,36 +3033,28 @@ fn test_multipart_upload_resend_part() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
         // Upload part 1 with data 'A'
         let data_a = vec![b'A'; PART_SIZE];
-        let _resp_a = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(data_a))
-            .send()
-            .await
-            .unwrap();
+        let _resp_a =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, data_a)
+                .await;
 
         // Re-upload part 1 with data 'B' (replaces the first upload)
         let data_b = vec![b'B'; PART_SIZE];
-        let resp_b = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(data_b.clone()))
-            .send()
-            .await
-            .unwrap();
+        let resp_b = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            data_b.clone(),
+        )
+        .await;
 
         // Complete with the second ETag
         client
@@ -3094,7 +3072,7 @@ fn test_multipart_upload_resend_part() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3103,7 +3081,7 @@ fn test_multipart_upload_resend_part() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -3149,7 +3127,7 @@ fn test_multipart_upload_multiple_sizes() {
                 .head_object()
                 .bucket(bucket)
                 .key(key)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
             assert_eq!(
@@ -3205,7 +3183,7 @@ fn test_multipart_get_part() {
                 .bucket(&bucket)
                 .key(key)
                 .part_number(pn)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
             assert_eq!(
@@ -3225,7 +3203,7 @@ fn test_multipart_get_part() {
                 .bucket(&bucket)
                 .key(key)
                 .part_number(pn)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during multipart test")
                 .await
                 .unwrap();
             assert_eq!(
@@ -3256,7 +3234,7 @@ fn test_multipart_get_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(part_count + 1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 416);
 
@@ -3266,7 +3244,7 @@ fn test_multipart_get_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(part_count + 1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 416);
 
@@ -3281,14 +3259,8 @@ fn test_non_multipart_get_part() {
         let bucket = setup_bucket().await;
         let key = "singlepart";
 
-        let resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(b"body".to_vec()))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"body".to_vec()).await;
         let etag = resp.e_tag().unwrap().to_string();
 
         // GET PartNumber > 1 → 416 Range Not Satisfiable (AWS behavior)
@@ -3297,7 +3269,7 @@ fn test_non_multipart_get_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 416);
 
@@ -3307,7 +3279,7 @@ fn test_non_multipart_get_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 416);
 
@@ -3317,7 +3289,7 @@ fn test_non_multipart_get_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.e_tag().unwrap(), etag);
@@ -3347,7 +3319,7 @@ fn test_multipart_get_zero_byte_final_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.parts_count(), Some(2));
@@ -3361,7 +3333,7 @@ fn test_multipart_get_zero_byte_final_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(resp.parts_count(), Some(2));
@@ -3375,7 +3347,7 @@ fn test_multipart_get_zero_byte_final_part() {
             .bucket(&bucket)
             .key(key)
             .part_number(2)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         assert_eq!(head.parts_count(), Some(2));
@@ -3397,21 +3369,14 @@ fn test_multipart_copy_small() {
 
         // Create source object
         let src_data = vec![b'x'; PART_SIZE];
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(src_data.clone()))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, src_data.clone()).await;
 
         // Create multipart upload, upload_part_copy entire source as one part
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3423,7 +3388,7 @@ fn test_multipart_copy_small() {
             .upload_id(upload_id)
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3440,7 +3405,7 @@ fn test_multipart_copy_small() {
                     .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3449,7 +3414,7 @@ fn test_multipart_copy_small() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -3469,21 +3434,14 @@ fn test_multipart_copy_without_range() {
 
         // Create source with known data
         let src_data = vec![b'A'; PART_SIZE + 1000];
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(src_data.clone()))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, src_data.clone()).await;
 
         // UploadPartCopy without range copies full object
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3495,7 +3453,7 @@ fn test_multipart_copy_without_range() {
             .upload_id(upload_id)
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3511,7 +3469,7 @@ fn test_multipart_copy_without_range() {
                     .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3519,7 +3477,7 @@ fn test_multipart_copy_without_range() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -3540,20 +3498,13 @@ fn test_multipart_copy_invalid_range() {
 
         // Create small source
         let src_data = vec![b'Z'; 1000];
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(src_data))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, src_data).await;
 
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3567,7 +3518,7 @@ fn test_multipart_copy_invalid_range() {
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, src_key))
             .copy_source_range("bytes=0-9999")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         let status = err_status(&result);
         assert!(status == 400, "expected 400, got {status}");
@@ -3579,7 +3530,7 @@ fn test_multipart_copy_invalid_range() {
             .bucket(&bucket)
             .key(dst_key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[src_key]).await;
@@ -3595,20 +3546,13 @@ fn test_multipart_copy_improper_range() {
         let dst_key = "copy-dst-improper";
 
         let src_data = vec![b'M'; 1000];
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(src_data))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, src_data).await;
 
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3622,7 +3566,7 @@ fn test_multipart_copy_improper_range() {
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, src_key))
             .copy_source_range("bytes=500-100")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         let status = err_status(&result);
         assert!(status == 400, "expected 400, got {status}");
@@ -3633,7 +3577,7 @@ fn test_multipart_copy_improper_range() {
             .bucket(&bucket)
             .key(dst_key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[src_key]).await;
@@ -3648,20 +3592,13 @@ fn test_multipart_copy_invalid_part_number_exceeds_max() {
         let src_key = "copy-src-invalid-part-number";
         let dst_key = "copy-dst-invalid-part-number";
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from_static(b"hello"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, b"hello".to_vec()).await;
 
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3673,7 +3610,7 @@ fn test_multipart_copy_invalid_part_number_exceeds_max() {
             .upload_id(upload_id)
             .part_number(10_001)
             .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
@@ -3683,7 +3620,7 @@ fn test_multipart_copy_invalid_part_number_exceeds_max() {
             .bucket(&bucket)
             .key(dst_key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[src_key]).await;
@@ -3699,20 +3636,13 @@ fn test_multipart_copy_special_names() {
         let dst_key = "copy-dst-special";
 
         let src_data = vec![b'S'; PART_SIZE];
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(src_data.clone()))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, src_data.clone()).await;
 
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3724,7 +3654,7 @@ fn test_multipart_copy_special_names() {
             .upload_id(upload_id)
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, src_key))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3740,7 +3670,7 @@ fn test_multipart_copy_special_names() {
                     .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -3748,7 +3678,7 @@ fn test_multipart_copy_special_names() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -3808,7 +3738,7 @@ fn test_multipart_copy_versioned() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -3920,20 +3850,13 @@ fn test_multipart_copy_multiple_sizes() {
         // Create a source large enough for multiple range-copied parts
         let total_size = PART_SIZE * 2 + 500;
         let src_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(src_key)
-            .body(ByteStream::from(src_data.clone()))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, src_key, src_data.clone()).await;
 
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3947,7 +3870,7 @@ fn test_multipart_copy_multiple_sizes() {
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, src_key))
             .copy_source_range(format!("bytes=0-{}", PART_SIZE - 1))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let etag1 = p1.copy_part_result().unwrap().e_tag().unwrap().to_string();
@@ -3961,7 +3884,7 @@ fn test_multipart_copy_multiple_sizes() {
             .part_number(2)
             .copy_source(format!("{}/{}", bucket, src_key))
             .copy_source_range(format!("bytes={}-{}", PART_SIZE, PART_SIZE * 2 - 1))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let etag2 = p2.copy_part_result().unwrap().e_tag().unwrap().to_string();
@@ -3975,7 +3898,7 @@ fn test_multipart_copy_multiple_sizes() {
             .part_number(3)
             .copy_source(format!("{}/{}", bucket, src_key))
             .copy_source_range(format!("bytes={}-{}", PART_SIZE * 2, total_size - 1))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let etag3 = p3.copy_part_result().unwrap().e_tag().unwrap().to_string();
@@ -4007,7 +3930,7 @@ fn test_multipart_copy_multiple_sizes() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
 
@@ -4016,7 +3939,7 @@ fn test_multipart_copy_multiple_sizes() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -4042,30 +3965,16 @@ fn test_upload_part_copy_percent_encoded_key() {
         let raw_key = "anyfilename%.txt";
 
         // Put the copy source under the percent-encoded key
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(encoded_key)
-            .body(ByteStream::from(b"foo".to_vec()))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, encoded_key, b"foo".to_vec()).await;
 
         // Put the destination object (initial state)
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(dst_key)
-            .body(ByteStream::from(b"foo".to_vec()))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, dst_key, b"foo".to_vec()).await;
 
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -4079,7 +3988,7 @@ fn test_upload_part_copy_percent_encoded_key() {
             .upload_id(upload_id)
             .part_number(1)
             .copy_source(format!("{}/{}", bucket, raw_key))
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert!(result.is_err(), "expected error copying with raw % key");
 
@@ -4088,7 +3997,7 @@ fn test_upload_part_copy_percent_encoded_key() {
             .get_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         let body = get.body.collect().await.unwrap().into_bytes();
@@ -4100,7 +4009,7 @@ fn test_upload_part_copy_percent_encoded_key() {
             .bucket(&bucket)
             .key(dst_key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();
         cleanup(&bucket, &[encoded_key, dst_key]).await;

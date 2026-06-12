@@ -14,7 +14,7 @@ use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
     send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
-    SignedRequestCredentials, CTX,
+    SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -83,14 +83,14 @@ macro_rules! with_sse_s3_header {
 
 async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
 
     for _ in 0..10 {
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list multipart uploads during bucket policy cleanup")
             .await
             .unwrap();
         for upload in uploads.uploads() {
@@ -99,11 +99,18 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
                 .bucket(bucket)
                 .key(upload.key().unwrap())
                 .upload_id(upload.upload_id().unwrap())
-                .send()
+                .send_retrying_operation_aborted(
+                    "abort multipart upload during bucket policy cleanup",
+                )
                 .await;
         }
 
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket policy test bucket")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
@@ -129,7 +136,13 @@ async fn alt_list_objects_v1_eventually(
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match CTX.alt_client().list_objects().bucket(bucket).send().await {
+        match CTX
+            .alt_client()
+            .list_objects()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("list objects as alternate account")
+            .await
+        {
             Ok(output) => return output,
             Err(_) if attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -722,11 +735,15 @@ fn test_bucket_policy_put_get_delete() {
         client
             .delete_bucket_policy()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete bucket policy")
             .await
             .unwrap();
 
-        let result = client.get_bucket_policy().bucket(&bucket).send().await;
+        let result = client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("get bucket policy after delete")
+            .await;
         assert_eq!(err_status(&result), 404);
         let err = result.unwrap_err();
         assert_eq!(
@@ -13717,7 +13734,11 @@ fn test_bucket_policy_get_bucket_acl_requires_dedicated_action() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let denied = alt_client.get_bucket_acl().bucket(&bucket).send().await;
+        let denied = alt_client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("get bucket ACL as alternate account")
+            .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
@@ -14534,7 +14555,11 @@ fn test_bucket_policy_head_bucket_list_bucket_policy_is_not_sufficient() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let denied = alt_client.head_bucket().bucket(&bucket).send().await;
+        let denied = alt_client
+            .head_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("head bucket as alternate account")
+            .await;
         assert_eq!(err_status(&denied), 403);
 
         client

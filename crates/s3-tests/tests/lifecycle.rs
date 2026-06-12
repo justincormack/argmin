@@ -11,7 +11,8 @@ use aws_sdk_s3::types::{
 use ring::hmac;
 use s3_tests::{
     cleanup_versioned_bucket, content_md5_header, delete_all_and_bucket, err_status,
-    put_bucket_lifecycle_with_md5, send_signed_request, unique_bucket, CTX,
+    put_bucket_lifecycle_with_md5, retrying_operation_aborted, send_signed_request, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 
 fn agent() -> s3_tests::Agent {
@@ -27,13 +28,20 @@ async fn create_bucket_in_test_region(bucket: &str) {
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create lifecycle bucket")
+        .await
+        .unwrap();
 }
 
 async fn cleanup_bucket(bucket: &str) {
     let client = CTX.client();
-    let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
-    let _ = client.delete_bucket().bucket(bucket).send().await;
+    let _ = client
+        .delete_bucket_lifecycle()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("delete lifecycle configuration during cleanup")
+        .await;
+    s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
 async fn enable_versioning(bucket: &str) {
@@ -45,14 +53,18 @@ async fn enable_versioning(bucket: &str) {
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("enable lifecycle test bucket versioning")
         .await
         .unwrap();
 }
 
 async fn cleanup_versioned_lifecycle_bucket(bucket: &str) {
     let client = CTX.client();
-    let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
+    let _ = client
+        .delete_bucket_lifecycle()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("delete lifecycle configuration during versioned cleanup")
+        .await;
     cleanup_versioned_bucket(client, bucket).await;
 }
 
@@ -94,16 +106,20 @@ async fn put_object_until_expiration_header(
     const MAX_ATTEMPTS: usize = 10;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let mut request = CTX
-            .client()
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(body.to_vec()));
-        if let Some(tagging) = tagging {
-            request = request.tagging(tagging);
-        }
-        let output = request.send().await.unwrap();
+        let output =
+            retrying_operation_aborted("put lifecycle object until expiration header", || {
+                let mut request = CTX
+                    .client()
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body.to_vec()));
+                if let Some(tagging) = tagging {
+                    request = request.tagging(tagging);
+                }
+                async move { request.send().await }
+            })
+            .await;
         if let Some(expiration) = output.expiration() {
             assert_lifecycle_expiration_header(Some(expiration), rule_id);
             return output;

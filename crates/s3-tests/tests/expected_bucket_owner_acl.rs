@@ -2,7 +2,10 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketCannedAcl, ObjectCannedAcl, ObjectOwnership, OwnershipControls, OwnershipControlsRule,
 };
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, err_status, retrying_operation_aborted, retrying_operation_aborted_result,
+    unique_bucket, CTX,
+};
 
 const WRONG_OWNER: &str = "000000000000";
 
@@ -30,16 +33,19 @@ fn assert_expected_bucket_owner_denied<T: std::fmt::Debug, E: std::fmt::Debug>(
 
 macro_rules! expect_owner_ok {
     ($op:expr) => {{
-        $op.expected_bucket_owner(CTX.account_id())
-            .send()
-            .await
-            .unwrap()
+        retrying_operation_aborted("expected-bucket-owner ACL success request", || async {
+            $op.expected_bucket_owner(CTX.account_id()).send().await
+        })
+        .await
     }};
 }
 
 macro_rules! expect_owner_denied {
     ($op:expr) => {{
-        let result = $op.expected_bucket_owner(WRONG_OWNER).send().await;
+        let result = retrying_operation_aborted_result(|| async {
+            $op.expected_bucket_owner(WRONG_OWNER).send().await
+        })
+        .await;
         assert_expected_bucket_owner_denied(&result);
     }};
 }
@@ -92,7 +98,7 @@ async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) {
 async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }

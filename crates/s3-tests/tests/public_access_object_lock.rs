@@ -10,7 +10,7 @@ use base64::Engine;
 use md5_legacy::Digest;
 use s3_tests::{
     assert_s3_err_code, content_md5_header, disable_bucket_public_access_block, err_status,
-    unique_bucket, CTX,
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 const GOVERNANCE_RETENTION_SECS: u64 = 24 * 60 * 60;
@@ -58,7 +58,7 @@ async fn setup_public_write_object_lock_bucket() -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
-        .send()
+        .send_retrying_operation_aborted("create public object-lock bucket")
         .await
         .unwrap();
 
@@ -76,33 +76,33 @@ async fn setup_public_write_object_lock_bucket() -> String {
         .put_bucket_ownership_controls()
         .bucket(&bucket)
         .ownership_controls(ownership)
-        .send()
+        .send_retrying_operation_aborted("put public object-lock ownership controls")
         .await
         .unwrap();
     client
         .put_bucket_acl()
         .bucket(&bucket)
         .acl(BucketCannedAcl::PublicReadWrite)
-        .send()
+        .send_retrying_operation_aborted("put public object-lock bucket ACL")
         .await
         .unwrap();
 
     client
         .get_public_access_block()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get public object-lock public access block")
         .await
         .unwrap();
     client
         .get_bucket_ownership_controls()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get public object-lock ownership controls")
         .await
         .unwrap();
     client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get public object-lock bucket ACL")
         .await
         .unwrap();
 
@@ -161,12 +161,17 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
         let resp = client
             .list_object_versions()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list public object-lock versions during cleanup")
             .await
             .unwrap();
 
         if resp.versions().is_empty() && resp.delete_markers().is_empty() {
-            match client.delete_bucket().bucket(bucket).send().await {
+            match client
+                .delete_bucket()
+                .bucket(bucket)
+                .send_retrying_operation_aborted("delete public object-lock bucket")
+                .await
+            {
                 Ok(_) => return,
                 Err(err) => {
                     let raw = format!("{err:?}");

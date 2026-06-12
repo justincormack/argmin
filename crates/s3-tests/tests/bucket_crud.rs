@@ -6,7 +6,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, delete_all_and_bucket, err_status,
-    send_signed_request, unique_bucket, RawResponse, CTX,
+    retrying_operation_aborted, retrying_operation_aborted_result, send_signed_request,
+    unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use s3_types::{is_legacy_create_bucket_region, BucketNamespace};
 
@@ -33,7 +34,23 @@ async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str)
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create bucket in test region")
+        .await
+        .unwrap();
+}
+
+async fn put_object(bucket: &str, key: &str, body: &'static [u8]) {
+    retrying_operation_aborted("put bucket CRUD object", || async move {
+        CTX.client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+    })
+    .await;
 }
 
 fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
@@ -114,7 +131,12 @@ fn test_bucket_create_exists() {
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Verify bucket exists via HEAD
-        client.head_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .head_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await
+            .unwrap();
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -134,7 +156,9 @@ fn test_bucket_create_already_exists() {
                 .build();
             request = request.create_bucket_configuration(config);
         }
-        let result = request.send().await;
+        let result = request
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         if CTX.region() == "us-east-1" {
             result.unwrap();
         } else {
@@ -155,14 +179,7 @@ fn test_bucket_recreate_not_overriding() {
 
         create_bucket_in_test_region(client, &bucket).await;
         for key in &keys {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(key)
-                .body(ByteStream::from_static(b"data"))
-                .send()
-                .await
-                .unwrap();
+            put_object(&bucket, key, b"data").await;
         }
 
         let mut request = client.create_bucket().bucket(&bucket);
@@ -172,7 +189,9 @@ fn test_bucket_recreate_not_overriding() {
                 .build();
             request = request.create_bucket_configuration(config);
         }
-        let result = request.send().await;
+        let result = request
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         if CTX.region() == "us-east-1" {
             result.unwrap();
         } else {
@@ -183,7 +202,7 @@ fn test_bucket_recreate_not_overriding() {
         let listed = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list bucket after recreate")
             .await
             .unwrap();
         let mut got: Vec<_> = listed
@@ -263,7 +282,11 @@ fn test_bucket_delete_notexist() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        let result = client.delete_bucket().bucket(&bucket).send().await;
+        let result = client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         assert_eq!(err_status(&result), 404);
     });
 }
@@ -275,25 +298,18 @@ fn test_bucket_delete_nonempty() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("key")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "key", b"data").await;
 
         // Delete bucket should fail (not empty)
-        let result = client.delete_bucket().bucket(&bucket).send().await;
+        let result = client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         assert_eq!(err_status(&result), 409);
 
         // Clean up
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key("key")
-            .send()
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, "key")
             .await
             .unwrap();
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -319,29 +335,26 @@ fn test_bucket_delete_nonempty_delete_markers() {
                     .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable versioning for delete marker bucket")
             .await
             .unwrap();
 
         // Put an object, then delete it (creates a delete marker)
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("key")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        put_object(&bucket, "key", b"data").await;
         client
             .delete_object()
             .bucket(&bucket)
             .key("key")
-            .send()
+            .send_retrying_operation_aborted("create versioned delete marker")
             .await
             .unwrap();
 
         // Bucket still has versions + delete marker; delete must fail
-        let result = client.delete_bucket().bucket(&bucket).send().await;
+        let result = client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         assert_eq!(err_status(&result), 409);
 
         // Clean up properly
@@ -376,7 +389,12 @@ fn test_bucket_head() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        client.head_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .head_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await
+            .unwrap();
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -392,7 +410,7 @@ fn test_bucket_get_location() {
         let output = client
             .get_bucket_location()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("get bucket location")
             .await
             .unwrap();
         assert_eq!(
@@ -412,20 +430,21 @@ fn test_bucket_head_expected_owner() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        client
-            .head_bucket()
-            .bucket(&bucket)
-            .customize()
-            .mutate_request({
-                let account_id = account_id.clone();
-                move |req| {
-                    req.headers_mut()
-                        .insert("x-amz-expected-bucket-owner", account_id.clone());
-                }
-            })
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("head bucket with expected owner", || {
+            let request = client
+                .head_bucket()
+                .bucket(&bucket)
+                .customize()
+                .mutate_request({
+                    let account_id = account_id.clone();
+                    move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-expected-bucket-owner", account_id.clone());
+                    }
+                });
+            async move { request.send().await }
+        })
+        .await;
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -438,16 +457,18 @@ fn test_bucket_head_wrong_expected_owner() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let result = client
-            .head_bucket()
-            .bucket(&bucket)
-            .customize()
-            .mutate_request(|req| {
-                req.headers_mut()
-                    .insert("x-amz-expected-bucket-owner", "000000000000");
-            })
-            .send()
-            .await;
+        let result = retrying_operation_aborted_result(|| {
+            let request = client
+                .head_bucket()
+                .bucket(&bucket)
+                .customize()
+                .mutate_request(|req| {
+                    req.headers_mut()
+                        .insert("x-amz-expected-bucket-owner", "000000000000");
+                });
+            async move { request.send().await }
+        })
+        .await;
         assert_eq!(err_status(&result), 403);
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -459,7 +480,11 @@ fn test_bucket_head_notexist() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        let result = client.head_bucket().bucket(&bucket).send().await;
+        let result = client
+            .head_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         assert!(result.is_err());
     });
 }
@@ -472,7 +497,11 @@ fn test_buckets_list_empty() {
         // Note: this test may see buckets from other concurrent tests.
         // We just verify that list_buckets returns without error.
         let client = CTX.client();
-        let _resp = client.list_buckets().send().await.unwrap();
+        let _resp = client
+            .list_buckets()
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await
+            .unwrap();
     });
 }
 
@@ -483,7 +512,11 @@ fn test_buckets_list_contains_created() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let resp = client.list_buckets().send().await.unwrap();
+        let resp = client
+            .list_buckets()
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await
+            .unwrap();
         let names: Vec<&str> = resp.buckets().iter().filter_map(|b| b.name()).collect();
         assert!(
             names.contains(&bucket.as_str()),
@@ -509,7 +542,7 @@ fn test_bucket_list_objects_empty() {
         let resp = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list empty bucket")
             .await
             .unwrap();
         assert_eq!(resp.key_count(), Some(0));
@@ -528,20 +561,13 @@ fn test_bucket_list_objects_with_objects() {
 
         for i in 0..3 {
             let key = format!("key{}", i);
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(ByteStream::from_static(b"content"))
-                .send()
-                .await
-                .unwrap();
+            put_object(&bucket, &key, b"content").await;
         }
 
         let resp = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list bucket with objects")
             .await
             .unwrap();
         assert_eq!(resp.key_count(), Some(3));
@@ -551,13 +577,13 @@ fn test_bucket_list_objects_with_objects() {
 
         // Clean up
         for i in 0..3 {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(format!("key{}", i))
-                .send()
-                .await
-                .unwrap();
+            s3_tests::delete_object_retrying_operation_aborted(
+                client,
+                &bucket,
+                &format!("key{}", i),
+            )
+            .await
+            .unwrap();
         }
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -568,7 +594,11 @@ fn test_bucket_list_objects_nonexistent_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        let result = client.list_objects_v2().bucket(&bucket).send().await;
+        let result = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         assert_eq!(err_status(&result), 404);
         assert_s3_err_code(&result, "NoSuchBucket");
     });
@@ -579,7 +609,11 @@ fn test_bucket_list_objects_nonexistent_bucket_alt_client() {
     s3_tests::run(async {
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        let result = alt_client.list_objects_v2().bucket(&bucket).send().await;
+        let result = alt_client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await;
         assert_eq!(err_status(&result), 404);
         assert_s3_err_code(&result, "NoSuchBucket");
     });
@@ -595,7 +629,12 @@ fn test_bucket_head_extended() {
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // HEAD should return without error and include standard headers
-        client.head_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .head_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await
+            .unwrap();
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -611,32 +650,21 @@ fn test_bucket_create_special_key_names() {
         // Create objects with special key names
         let special_keys = &["foo/bar", "foo&bar", "foo bar", "foo+bar"];
         for key in special_keys {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(*key)
-                .body(ByteStream::from_static(b"data"))
-                .send()
-                .await
-                .unwrap();
+            put_object(&bucket, key, b"data").await;
         }
 
         // Verify they all exist
         let resp = client
             .list_objects_v2()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list bucket with special keys")
             .await
             .unwrap();
         assert_eq!(resp.key_count(), Some(special_keys.len() as i32));
 
         // Clean up
         for key in special_keys {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(*key)
-                .send()
+            s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
                 .await
                 .unwrap();
         }
@@ -651,7 +679,11 @@ fn test_buckets_list_ctime() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let resp = client.list_buckets().send().await.unwrap();
+        let resp = client
+            .list_buckets()
+            .send_retrying_operation_aborted("bucket CRUD request")
+            .await
+            .unwrap();
         let found = resp
             .buckets()
             .iter()
@@ -676,7 +708,7 @@ fn test_bucket_create_exists_nonowner() {
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let result = s3_tests::create_bucket_request(alt_client, &bucket)
-            .send()
+            .send_retrying_operation_aborted("create bucket as nonowner")
             .await;
         assert_eq!(err_status(&result), 409);
         assert_s3_err_code(&result, "BucketAlreadyExists");

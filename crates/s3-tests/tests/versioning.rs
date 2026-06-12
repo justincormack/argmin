@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
-    err_status, send_signed_request, unique_bucket, RawResponse, CTX,
+    err_status, send_signed_request, unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -98,7 +98,7 @@ async fn create_multipart_upload_retrying_operation_aborted(
             .create_multipart_upload()
             .bucket(bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
         {
             Ok(output) => return output,
@@ -152,7 +152,7 @@ async fn delete_object_version_retrying_operation_aborted(
             .bucket(bucket)
             .key(key)
             .version_id(version_id)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
         {
             Ok(_) => return,
@@ -185,7 +185,7 @@ async fn complete_multipart_upload_retrying_operation_aborted(
                     .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
         {
             Ok(output) => return output,
@@ -213,7 +213,7 @@ async fn copy_object_retrying_operation_aborted(
             .bucket(bucket)
             .key(key)
             .copy_source(copy_source.clone())
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
         {
             Ok(output) => return output,
@@ -243,7 +243,7 @@ async fn put_bucket_versioning_retrying_operation_aborted(
                     .status(status.clone())
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
         {
             Ok(_) => return,
@@ -369,7 +369,7 @@ async fn cleanup_versioned_bucket_with_encoding(client: &aws_sdk_s3::Client, buc
             .list_object_versions()
             .bucket(bucket)
             .encoding_type(EncodingType::Url)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .expect("list object versions");
 
@@ -442,7 +442,7 @@ async fn check_obj_content(bucket: &str, key: &str, version_id: &str, expected: 
         .bucket(bucket)
         .key(key)
         .version_id(version_id)
-        .send()
+        .send_retrying_operation_aborted("S3 operation during versioning test")
         .await
         .unwrap();
     let body = resp.body.collect().await.unwrap().into_bytes();
@@ -490,7 +490,7 @@ async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: S
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
 
@@ -499,7 +499,7 @@ async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: S
             let confirm = client
                 .list_object_versions()
                 .bucket(&bucket)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during versioning test")
                 .await
                 .unwrap();
             if confirm.versions().is_empty() && confirm.delete_markers().is_empty() {
@@ -559,7 +559,7 @@ async fn wait_for_minimum_version_listing_counts(
         let resp = client
             .list_object_versions()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let counts = (resp.versions().len(), resp.delete_markers().len());
@@ -570,7 +570,7 @@ async fn wait_for_minimum_version_listing_counts(
             let confirm = client
                 .list_object_versions()
                 .bucket(bucket)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during versioning test")
                 .await
                 .unwrap();
             let confirmed = (confirm.versions().len(), confirm.delete_markers().len());
@@ -604,7 +604,7 @@ async fn wait_for_version_listing_counts(
         let resp = client
             .list_object_versions()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let counts = (resp.versions().len(), resp.delete_markers().len());
@@ -615,7 +615,7 @@ async fn wait_for_version_listing_counts(
             let confirm = client
                 .list_object_versions()
                 .bucket(bucket)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during versioning test")
                 .await
                 .unwrap();
             let confirmed = (confirm.versions().len(), confirm.delete_markers().len());
@@ -663,7 +663,7 @@ fn test_versioning_obj_create_read_remove() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(
@@ -695,7 +695,7 @@ fn test_versioning_obj_create_read_remove_head() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -712,7 +712,7 @@ fn test_versioning_obj_create_read_remove_head() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.versions().len(), num - 1);
@@ -746,7 +746,7 @@ fn test_versioning_obj_create_versions_remove_all() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(resp.versions().is_empty());
@@ -790,7 +790,10 @@ fn test_versioning_obj_create_versions_remove_special_names() {
                 req = req.version_id_marker(version_id_marker);
             }
 
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted("list object versions during versioning test")
+                .await
+                .unwrap();
             assert!(
                 resp.delete_markers().is_empty(),
                 "expected no delete markers after deleting explicit special-name versions"
@@ -838,7 +841,7 @@ fn test_versioning_stack_delete_merkers() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.versions().len(), 1);
@@ -873,14 +876,19 @@ fn test_versioning_obj_plain_null_version_removal() {
         delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
         // GET should now 404
-        let result = client.get_object().bucket(&bucket).key(key).send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object during versioning test")
+            .await;
         assert_eq!(err_status(&result), 404);
 
         // No versions should remain
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(resp.versions().is_empty());
@@ -918,7 +926,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -931,7 +939,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -940,13 +948,18 @@ fn test_versioning_obj_plain_null_version_overwrite() {
         // Delete the null version
         delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
-        let result = client.get_object().bucket(&bucket).key(key).send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object during versioning test")
+            .await;
         assert_eq!(err_status(&result), 404);
 
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(resp.versions().is_empty());
@@ -1024,7 +1037,7 @@ fn test_versioning_list_object_versions_suspended_null_is_latest() {
             .list_object_versions()
             .bucket(&bucket)
             .prefix(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
 
@@ -1074,7 +1087,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -1084,7 +1097,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.versions().len(), 1);
@@ -1092,7 +1105,12 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
         // Delete null version
         delete_object_version_retrying_operation_aborted(client, &bucket, key, "null").await;
 
-        let result = client.get_object().bucket(&bucket).key(key).send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object during versioning test")
+            .await;
         assert_eq!(err_status(&result), 404);
 
         delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -1124,33 +1142,31 @@ fn test_versioning_obj_suspended_copy() {
 
         // Copy to another key in same bucket
         let key2 = "testobj2";
-        client
-            .copy_object()
-            .bucket(&bucket)
-            .key(key2)
-            .copy_source(format!("{}/{}", bucket, key1))
-            .send()
-            .await
-            .unwrap();
+        copy_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key2,
+            format!("{}/{}", bucket, key1),
+        )
+        .await;
 
         // Copy to another non-versioned bucket
         let bucket2 = unique_bucket();
         s3_tests::create_bucket(client, &bucket2).await.unwrap();
-        client
-            .copy_object()
-            .bucket(&bucket2)
-            .key(key1)
-            .copy_source(format!("{}/{}", bucket, key1))
-            .send()
-            .await
-            .unwrap();
+        copy_object_retrying_operation_aborted(
+            client,
+            &bucket2,
+            key1,
+            format!("{}/{}", bucket, key1),
+        )
+        .await;
 
         // Delete source (creates delete marker or overwrites null)
         client
             .delete_object()
             .bucket(&bucket)
             .key(key1)
-            .send()
+            .send_retrying_operation_aborted("delete object during versioning suspended copy")
             .await
             .unwrap();
 
@@ -1159,7 +1175,7 @@ fn test_versioning_obj_suspended_copy() {
             .get_object()
             .bucket(&bucket)
             .key(key2)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning suspended copy")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -1169,7 +1185,7 @@ fn test_versioning_obj_suspended_copy() {
             .get_object()
             .bucket(&bucket2)
             .key(key1)
-            .send()
+            .send_retrying_operation_aborted("get object during versioning suspended copy")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -1198,7 +1214,7 @@ fn test_versioning_obj_list_marker() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let versions = resp.versions();
@@ -1284,7 +1300,10 @@ fn test_versioning_list_object_versions_pagination_and_markers() {
                 req = req.version_id_marker(vm);
             }
 
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted("list object versions during versioning test")
+                .await
+                .unwrap();
             pages += 1;
 
             if !resp.delete_markers().is_empty() {
@@ -1337,7 +1356,7 @@ fn test_versioning_list_object_versions_rejects_version_id_marker_without_key_ma
             .bucket(&bucket)
             .max_keys(10)
             .version_id_marker(alpha_v1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await;
 
         assert_eq!(err_status(&result), 400);
@@ -1365,7 +1384,7 @@ fn test_versioning_list_object_versions_oversized_max_keys_echoed_by_aws() {
             .list_object_versions()
             .bucket(&bucket)
             .max_keys(5000)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
 
@@ -1430,7 +1449,7 @@ fn test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_
             .list_object_versions()
             .bucket(&bucket)
             .max_keys(5000)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
 
@@ -1497,7 +1516,7 @@ fn test_versioning_list_object_versions_encoding_type_url() {
             .list_object_versions()
             .bucket(&bucket)
             .encoding_type(EncodingType::Url)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
@@ -1571,7 +1590,7 @@ fn test_versioning_list_object_versions_encoding_type_url_encodes_control_charac
             .list_object_versions()
             .bucket(&bucket)
             .encoding_type(EncodingType::Url)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
@@ -1693,7 +1712,7 @@ fn test_versioning_copy_obj_version() {
                 .get_object()
                 .bucket(&bucket)
                 .key(&new_key)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during versioning test")
                 .await
                 .unwrap();
             let body = resp.body.collect().await.unwrap().into_bytes();
@@ -1719,7 +1738,7 @@ fn test_versioning_copy_obj_version() {
                 .get_object()
                 .bucket(&bucket2)
                 .key(&new_key)
-                .send()
+                .send_retrying_operation_aborted("S3 operation during versioning test")
                 .await
                 .unwrap();
             let body = resp.body.collect().await.unwrap().into_bytes();
@@ -1739,7 +1758,7 @@ fn test_versioning_copy_obj_version() {
             .get_object()
             .bucket(&bucket2)
             .key("new_key")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -1792,7 +1811,7 @@ fn test_versioning_multi_object_delete() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(resp.versions().is_empty());
@@ -1861,7 +1880,7 @@ fn test_versioning_multi_object_delete_with_marker() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(resp.versions().is_empty());
@@ -1921,7 +1940,7 @@ fn test_versioning_multi_object_delete_with_marker_create() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.delete_markers().len(), 1);
@@ -1952,7 +1971,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.versions().len(), 1);
@@ -1975,7 +1994,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             .delete_object()
             .bucket(&bucket2)
             .key("baz")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         delete_bucket_retrying_operation_aborted(client, &bucket2).await;
@@ -2103,7 +2122,7 @@ fn test_versioning_concurrent_multi_object_delete() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let versions = resp.versions();
@@ -2166,7 +2185,7 @@ fn test_delete_marker_nonversioned() {
             .delete_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         // Non-versioned delete should not produce a delete marker
@@ -2209,7 +2228,7 @@ fn test_versioning_bucket_create_suspend() {
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert!(
@@ -2227,7 +2246,7 @@ fn test_versioning_bucket_create_suspend() {
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Suspended));
@@ -2242,7 +2261,7 @@ fn test_versioning_bucket_create_suspend() {
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Enabled));
@@ -2257,7 +2276,7 @@ fn test_versioning_bucket_create_suspend() {
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Enabled));
@@ -2272,7 +2291,7 @@ fn test_versioning_bucket_create_suspend() {
         let resp = client
             .get_bucket_versioning()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(resp.status(), Some(&BucketVersioningStatus::Suspended));
@@ -2316,7 +2335,7 @@ fn test_versioning_obj_create_overwrite_multipart() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         assert_eq!(get.content_length(), Some(5 * 1024 * 1024));
@@ -2327,7 +2346,7 @@ fn test_versioning_obj_create_overwrite_multipart() {
             .bucket(&bucket)
             .key(key)
             .version_id(&v1)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
         let body = get_old.body.collect().await.unwrap().into_bytes();
@@ -2348,7 +2367,7 @@ fn test_list_object_versions_includes_owner() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
 
@@ -2378,7 +2397,7 @@ fn test_list_object_versions_delete_marker_includes_owner() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during versioning test")
             .await
             .unwrap();
 

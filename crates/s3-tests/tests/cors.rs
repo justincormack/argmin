@@ -1,6 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
-use s3_tests::{content_md5_header, send_signed_request, unique_bucket, CTX};
+use s3_tests::{
+    content_md5_header, send_signed_request, unique_bucket, SendRetryingOperationAborted, CTX,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -154,7 +156,7 @@ fn simple_rule(origin: &str, methods: &[&str]) -> CorsRule {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -210,12 +212,16 @@ fn test_cors_set_get_delete() {
         client
             .delete_bucket_cors()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete bucket CORS")
             .await
             .unwrap();
 
         // GET after delete should fail
-        let result = client.get_bucket_cors().bucket(&bucket).send().await;
+        let result = client
+            .get_bucket_cors()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("get bucket CORS after delete")
+            .await;
         assert!(result.is_err());
 
         cleanup(&bucket, &[]).await;
@@ -425,7 +431,11 @@ fn test_cors_get_no_config() {
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // GET CORS with no config should return error
-        let result = client.get_bucket_cors().bucket(&bucket).send().await;
+        let result = client
+            .get_bucket_cors()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("get missing bucket CORS")
+            .await;
         assert!(result.is_err());
 
         cleanup(&bucket, &[]).await;

@@ -8,7 +8,10 @@ use aws_sdk_s3::types::{
     ObjectOwnership, Owner, OwnershipControls, OwnershipControlsRule, Permission, Tag, Tagging,
     Type,
 };
-use s3_tests::{assert_s3_err_code, content_md5_header, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, content_md5_header, err_status, unique_bucket,
+    SendRetryingOperationAborted, CTX,
+};
 use serde_json::json;
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -30,7 +33,10 @@ async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str)
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create ownership test bucket")
+        .await
+        .unwrap();
 }
 
 async fn create_bucket_in_test_region_with_ownership(
@@ -45,7 +51,10 @@ async fn create_bucket_in_test_region_with_ownership(
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create ownership test bucket with ownership")
+        .await
+        .unwrap();
 }
 
 async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
@@ -58,7 +67,7 @@ async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
         .put_bucket_ownership_controls()
         .bucket(bucket)
         .ownership_controls(controls)
-        .send()
+        .send_retrying_operation_aborted("set bucket ownership controls")
         .await
         .unwrap();
 }
@@ -353,15 +362,18 @@ async fn put_object_and_assert_owner(
     expected_owner_id: &str,
 ) {
     let alt = CTX.alt_client();
-    let mut request = alt
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"data"));
-    if let Some(acl) = acl {
-        request = request.acl(acl);
-    }
-    request.send().await.unwrap();
+    s3_tests::retrying_operation_aborted("put ownership test object", || {
+        let mut request = alt
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"));
+        if let Some(acl) = acl.clone() {
+            request = request.acl(acl);
+        }
+        async move { request.send().await }
+    })
+    .await;
 
     assert_eq!(object_owner_id(alt, bucket, key).await, expected_owner_id);
 }
@@ -377,7 +389,10 @@ async fn complete_single_part_multipart_and_assert_owner(
     if let Some(acl) = acl {
         create = create.acl(acl);
     }
-    let upload = create.send().await.unwrap();
+    let upload = create
+        .send_retrying_operation_aborted("create ownership multipart upload")
+        .await
+        .unwrap();
     let upload_id = upload.upload_id().expect("expected upload ID");
 
     let part = alt
@@ -422,7 +437,10 @@ async fn copy_object_and_assert_owner(
     if let Some(acl) = acl {
         request = request.acl(acl);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("copy ownership test object")
+        .await
+        .unwrap();
 
     assert_eq!(
         object_owner_id(alt, bucket, dst_key).await,
@@ -809,7 +827,7 @@ fn test_bucket_policy_does_not_grant_bucket_owner_get_object_attributes_of_priva
             .bucket(&bucket)
             .key(key)
             .object_attributes(ObjectAttributes::ObjectSize)
-            .send()
+            .send_retrying_operation_aborted("get object attributes after ownership controls")
             .await;
         assert_s3_err_code(&attrs, "AccessDenied");
 
@@ -1143,8 +1161,18 @@ fn test_probe_bucket_policy_foreign_owned_object_access_matrix() {
             .await
             .unwrap();
 
-        let get_object = client.get_object().bucket(&bucket).key(key).send().await;
-        let head_object = client.head_object().bucket(&bucket).key(key).send().await;
+        let get_object = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object after ownership controls")
+            .await;
+        let head_object = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after ownership controls")
+            .await;
         let get_object_attributes = client
             .get_object_attributes()
             .bucket(&bucket)
@@ -2170,7 +2198,7 @@ fn test_put_bucket_ownership_object_writer() {
 async fn cleanup_keys(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     cleanup(bucket).await;
 }
@@ -2929,7 +2957,10 @@ fn test_bucket_owner_enforced_bucket_acl_read_and_restore_semantics() {
                 .build();
             request = request.create_bucket_configuration(config);
         }
-        request.send().await.unwrap();
+        request
+            .send_retrying_operation_aborted("create BOE ownership bucket")
+            .await
+            .unwrap();
         let bucket_owner = bucket_owner_id(&bucket).await;
 
         let boe_acl = client

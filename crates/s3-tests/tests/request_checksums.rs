@@ -7,7 +7,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     content_md5_header, sdk_checksum_headers, send_signed_request,
-    send_signed_request_allow_response_body_error, unique_bucket, RawResponse, CTX,
+    send_signed_request_allow_response_body_error, unique_bucket, RawResponse,
+    SendRetryingOperationAborted, CTX,
 };
 
 const REQUIRED_CHECKSUM_MESSAGE: &str =
@@ -82,7 +83,10 @@ async fn create_bucket_in_test_region(
     if object_lock_enabled {
         request = request.object_lock_enabled_for_bucket(true);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create request checksum bucket")
+        .await
+        .unwrap();
     bucket
 }
 
@@ -93,7 +97,12 @@ async fn cleanup_bucket(bucket: &str) {
 async fn cleanup_bucket_with_keys(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = client
+            .delete_object()
+            .bucket(bucket)
+            .key(*key)
+            .send_retrying_operation_aborted("delete request checksum cleanup object")
+            .await;
     }
     cleanup_bucket(bucket).await;
 }

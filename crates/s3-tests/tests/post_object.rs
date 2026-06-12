@@ -5,7 +5,7 @@ use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
     sigv4_post_sse_c_fields_for_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
-    RawResponse, CTX,
+    RawResponse, SendRetryingOperationAborted, CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -795,7 +795,12 @@ fn test_post_object_sse_s3_bucket_policy_requires_explicit_header() {
         );
         assert_error_code(&denied_body, "AccessDenied");
 
-        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after denied POST")
+            .await;
         assert_eq!(err_status(&head), 404);
 
         let mut allowed_fields = sigv4_fields(
@@ -1321,7 +1326,12 @@ fn test_post_object_sse_c_requires_complete_form_fields() {
         assert_eq!(status, 400, "expected 400, got {} body={}", status, body);
         assert_error_code(&body, "InvalidArgument");
 
-        let get_result = client.get_object().bucket(&bucket).key(key).send().await;
+        let get_result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object after invalid POST")
+            .await;
         assert_eq!(err_status(&get_result), 404);
         assert_s3_err_code(&get_result, "NoSuchKey");
 
@@ -3300,7 +3310,12 @@ fn test_post_object_tags_malformed_xml() {
         assert_eq!(status, 400, "expected 400, got {status}: {body}");
         assert_error_code(&body, "MalformedXML");
 
-        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after malformed tagging POST")
+            .await;
         assert!(
             head.is_err(),
             "malformed tagging POST should not create object"
@@ -3338,7 +3353,12 @@ fn test_post_object_tags_duplicate_keys_rejected() {
         assert_eq!(status, 400, "expected 400, got {status}: {body}");
         assert_error_code(&body, "InvalidTag");
 
-        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after duplicate tag POST")
+            .await;
         assert!(head.is_err(), "duplicate-tag POST should not create object");
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;

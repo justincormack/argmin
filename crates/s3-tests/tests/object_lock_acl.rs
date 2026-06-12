@@ -5,7 +5,9 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
     ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectOwnership,
 };
-use s3_tests::{err_status, unique_bucket, CTX};
+use s3_tests::{
+    err_status, retrying_operation_aborted, unique_bucket, SendRetryingOperationAborted, CTX,
+};
 
 const GOVERNANCE_RETENTION_SECS: u64 = 24 * 60 * 60;
 
@@ -30,7 +32,7 @@ async fn setup_acl_object_lock_bucket() -> String {
     s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
         .object_ownership(ObjectOwnership::ObjectWriter)
-        .send()
+        .send_retrying_operation_aborted("create ACL object-lock bucket")
         .await
         .unwrap();
     bucket
@@ -48,17 +50,22 @@ fn legal_hold(status: ObjectLockLegalHoldStatus) -> ObjectLockLegalHold {
 }
 
 async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) -> String {
-    CTX.client()
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(body.to_vec()))
-        .send()
-        .await
-        .unwrap()
-        .version_id()
-        .expect("expected version_id on object lock bucket")
-        .to_string()
+    retrying_operation_aborted("put ACL object-lock object", || {
+        let body = body.to_vec();
+        async move {
+            CTX.client()
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+        }
+    })
+    .await
+    .version_id()
+    .expect("expected version_id on object lock bucket")
+    .to_string()
 }
 
 async fn delete_version_with_bypass(bucket: &str, key: &str, version_id: &str) {
@@ -68,7 +75,7 @@ async fn delete_version_with_bypass(bucket: &str, key: &str, version_id: &str) {
         .key(key)
         .version_id(version_id)
         .bypass_governance_retention(true)
-        .send()
+        .send_retrying_operation_aborted("delete ACL object-lock version with bypass")
         .await
         .unwrap();
 }
@@ -80,12 +87,17 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
         let resp = client
             .list_object_versions()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list ACL object-lock versions during cleanup")
             .await
             .unwrap();
 
         if resp.versions().is_empty() && resp.delete_markers().is_empty() {
-            match client.delete_bucket().bucket(bucket).send().await {
+            match client
+                .delete_bucket()
+                .bucket(bucket)
+                .send_retrying_operation_aborted("delete ACL object-lock bucket")
+                .await
+            {
                 Ok(_) => return,
                 Err(err) => {
                     let raw = format!("{err:?}");

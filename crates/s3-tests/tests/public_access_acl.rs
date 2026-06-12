@@ -8,7 +8,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_acl_enabled_bucket, err_status,
-    send_signed_request, CTX,
+    send_signed_request, SendRetryingOperationAborted, CTX,
 };
 use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
 use std::future::Future;
@@ -256,7 +256,7 @@ async fn bucket_owner_id(bucket: &str) -> String {
     CTX.client()
         .get_bucket_acl()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("S3 operation during public ACL test")
         .await
         .unwrap()
         .owner()
@@ -270,7 +270,7 @@ async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -
         .get_object_acl()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("S3 operation during public ACL test")
         .await
         .unwrap()
         .owner()
@@ -465,7 +465,7 @@ fn test_anonymous_public_write_put_bucket_owner_full_control_makes_bucket_owner_
             .get_object_acl()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         assert_eq!(
@@ -672,7 +672,7 @@ fn test_anon_delete_object_public_bucket_fail() {
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
 
@@ -868,7 +868,7 @@ fn test_anonymous_public_write_object_get_object_tagging_behavior() {
             .get_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         assert!(owner_view.tag_set().is_empty());
@@ -914,7 +914,7 @@ fn test_anonymous_public_write_object_put_object_tagging_behavior() {
             .get_object_tagging()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object tagging during public ACL test")
             .await;
 
         cleanup(&bucket, &[key]).await;
@@ -957,7 +957,7 @@ fn test_object_acl_canned_during_create() {
             .get_object_acl()
             .bucket(&bucket)
             .key("foo")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         let owner_id = acl
@@ -1008,7 +1008,7 @@ fn test_put_object_acl_canned_public_read_write_round_trip() {
             .get_object_acl()
             .bucket(&bucket)
             .key("foo")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         let owner_id = acl
@@ -1067,7 +1067,7 @@ fn test_put_object_acl_canned_authenticated_read_round_trip() {
             .get_object_acl()
             .bucket(&bucket)
             .key("foo")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         let owner_id = acl
@@ -1126,7 +1126,7 @@ fn test_put_object_acl_without_content_length_header() {
             .get_object_acl()
             .bucket(&bucket)
             .key("foo")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         let owner_id = acl
@@ -1175,7 +1175,7 @@ fn test_object_header_acl_grants_authenticated_users_read() {
             .get_object_acl()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         assert_exact_grants(
@@ -1259,7 +1259,7 @@ fn test_multipart_upload_public_read_acl_allows_anonymous_get() {
             .get_object_acl()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         assert!(
@@ -1319,7 +1319,7 @@ fn test_copy_object_public_read_acl_allows_cross_account_get() {
             .get_object()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         let copied_body = copied.body.collect().await.unwrap().into_bytes();
@@ -1329,7 +1329,7 @@ fn test_copy_object_public_read_acl_allows_cross_account_get() {
             .get_object_acl()
             .bucket(&bucket)
             .key("bar321foo")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         assert!(
@@ -1360,7 +1360,7 @@ fn test_copy_object_public_read_acl_allows_cross_account_get() {
             .get_object()
             .bucket(&bucket)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         let overwritten_body = overwritten.body.collect().await.unwrap().into_bytes();
@@ -1370,7 +1370,7 @@ fn test_copy_object_public_read_acl_allows_cross_account_get() {
             .head_object()
             .bucket(&bucket)
             .key("foo123bar")
-            .send()
+            .send_retrying_operation_aborted("S3 operation during public ACL test")
             .await
             .unwrap();
         assert_eq!(
@@ -1430,7 +1430,7 @@ fn test_signed_create_multipart_upload_public_write_bucket_rejects_existing_owne
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create multipart upload during public ACL test")
             .await;
         assert_eq!(err_status(&create), 403);
         assert_s3_err_code(&create, "AccessDenied");

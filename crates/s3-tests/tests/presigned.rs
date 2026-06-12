@@ -126,7 +126,7 @@ where
 /// Cleanup helper.
 async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }

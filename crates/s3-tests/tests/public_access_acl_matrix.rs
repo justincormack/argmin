@@ -11,9 +11,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, delete_all_and_bucket, disable_bucket_public_access_block, err_status,
-    unique_bucket, CTX,
+    retrying_operation_aborted, unique_bucket, SendRetryingOperationAborted, CTX,
 };
-use std::future::Future;
 use std::time::Duration;
 
 const ACL_KEY: &str = "foo";
@@ -23,24 +22,6 @@ const SETUP_OPERATION_ATTEMPTS: usize = 20;
 
 fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
-
-async fn retrying_operation_aborted<T, E, F, Fut>(description: &str, mut op: F) -> T
-where
-    E: ProvideErrorMetadata + std::fmt::Debug,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
-{
-    for attempt in 0..SETUP_OPERATION_ATTEMPTS {
-        match op().await {
-            Ok(output) => return output,
-            Err(err) if is_operation_aborted(&err) && attempt + 1 < SETUP_OPERATION_ATTEMPTS => {
-                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("{description}: {err:?}"),
-        }
-    }
-    unreachable!("{description} retry loop must return on final attempt");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +96,45 @@ async fn set_bucket_owner_preferred(bucket: &str) {
     .await;
 }
 
+async fn put_object_retrying_operation_aborted(bucket: &str, key: &str, body: &'static [u8]) {
+    retrying_operation_aborted("put object during ACL matrix setup", || {
+        CTX.client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+    })
+    .await;
+}
+
+async fn put_object_result_retrying_operation_aborted(
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) -> Result<
+    aws_sdk_s3::operation::put_object::PutObjectOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+> {
+    for attempt in 0..SETUP_OPERATION_ATTEMPTS {
+        match CTX
+            .alt_client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+        {
+            Err(err) if is_operation_aborted(&err) && attempt + 1 < SETUP_OPERATION_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("put object result retry loop must return on final attempt");
+}
+
 async fn setup_access_matrix(
     bucket_acl: BucketAclCase,
     object_acl: ObjectAclCase,
@@ -135,15 +155,7 @@ async fn setup_access_matrix(
     })
     .await;
 
-    retrying_operation_aborted("put object during ACL matrix setup", || {
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(ACL_KEY)
-            .body(ByteStream::from_static(b"foocontent"))
-            .send()
-    })
-    .await;
+    put_object_retrying_operation_aborted(&bucket, ACL_KEY, b"foocontent").await;
     retrying_operation_aborted("put object ACL during ACL matrix setup", || {
         client
             .put_object_acl()
@@ -154,27 +166,19 @@ async fn setup_access_matrix(
     })
     .await;
 
-    retrying_operation_aborted("put default object during ACL matrix setup", || {
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(DEFAULT_KEY)
-            .body(ByteStream::from_static(b"barcontent"))
-            .send()
-    })
-    .await;
+    put_object_retrying_operation_aborted(&bucket, DEFAULT_KEY, b"barcontent").await;
 
     client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get bucket ACL during ACL matrix setup")
         .await
         .unwrap();
     client
         .get_object_acl()
         .bucket(&bucket)
         .key(ACL_KEY)
-        .send()
+        .send_retrying_operation_aborted("get object ACL during ACL matrix setup")
         .await
         .unwrap();
 
@@ -193,7 +197,7 @@ async fn assert_alt_get_object_body(bucket: &str, key: &str, expected_body: &[u8
         .get_object()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get object during ACL matrix test")
         .await
         .unwrap();
     let body = response.body.collect().await.unwrap().into_bytes();
@@ -209,7 +213,7 @@ async fn assert_alt_get_object_body_eventually(bucket: &str, key: &str, expected
             .get_object()
             .bucket(bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object during ACL matrix test")
             .await
         {
             Ok(response) => {
@@ -240,7 +244,7 @@ async fn assert_alt_get_object_denied(bucket: &str, key: &str) {
         .get_object()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get object during ACL matrix test")
         .await;
     assert_access_denied(&result);
 }
@@ -254,7 +258,7 @@ async fn assert_alt_get_object_denied_eventually(bucket: &str, key: &str) {
             .get_object()
             .bucket(bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("get object during ACL matrix test")
             .await;
         if result.is_err() && err_status(&result) == 403 {
             assert_s3_err_code(&result, "AccessDenied");
@@ -269,26 +273,20 @@ async fn assert_alt_get_object_denied_eventually(bucket: &str, key: &str) {
 }
 
 async fn assert_alt_put_object_denied(bucket: &str, key: &str, body: &'static [u8]) {
-    let result = CTX
-        .alt_client()
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await;
+    let result = put_object_result_retrying_operation_aborted(bucket, key, body).await;
     assert_access_denied(&result);
 }
 
 async fn assert_alt_put_object_allowed(bucket: &str, key: &str, body: &'static [u8]) {
-    CTX.alt_client()
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted("put object during ACL matrix test", || {
+        CTX.alt_client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+    })
+    .await;
 }
 
 async fn assert_alt_list_allowed(bucket: &str, api: ListApi) {
@@ -297,7 +295,7 @@ async fn assert_alt_list_allowed(bucket: &str, api: ListApi) {
             .alt_client()
             .list_objects()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects during ACL matrix test")
             .await
             .unwrap()
             .contents()
@@ -308,7 +306,7 @@ async fn assert_alt_list_allowed(bucket: &str, api: ListApi) {
             .alt_client()
             .list_objects_v2()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list objects v2 during ACL matrix test")
             .await
             .unwrap()
             .contents()
@@ -323,7 +321,12 @@ async fn assert_alt_list_allowed(bucket: &str, api: ListApi) {
 async fn assert_alt_list_denied(bucket: &str, api: ListApi) {
     match api {
         ListApi::V1 => {
-            let result = CTX.alt_client().list_objects().bucket(bucket).send().await;
+            let result = CTX
+                .alt_client()
+                .list_objects()
+                .bucket(bucket)
+                .send_retrying_operation_aborted("list objects during ACL matrix test")
+                .await;
             assert_access_denied(&result);
         }
         ListApi::V2 => {
@@ -331,7 +334,7 @@ async fn assert_alt_list_denied(bucket: &str, api: ListApi) {
                 .alt_client()
                 .list_objects_v2()
                 .bucket(bucket)
-                .send()
+                .send_retrying_operation_aborted("list objects v2 during ACL matrix test")
                 .await;
             assert_access_denied(&result);
         }

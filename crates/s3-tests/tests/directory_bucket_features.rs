@@ -1,6 +1,9 @@
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
-use s3_tests::{err_status, send_signed_request, unique_bucket, RawResponse, CTX};
+use s3_tests::{
+    err_status, retrying_operation_aborted, send_signed_request, unique_bucket, RawResponse,
+    SendRetryingOperationAborted, CTX,
+};
 
 fn assert_error_code(body: &str, code: &str) {
     let expected = format!("<Code>{code}</Code>");
@@ -48,31 +51,36 @@ async fn create_bucket_in_test_region(bucket: &str) {
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.unwrap();
+    request
+        .send_retrying_operation_aborted("create directory feature test bucket")
+        .await
+        .unwrap();
 }
 
 async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
     for key in keys {
-        let _ = CTX
-            .client()
-            .delete_object()
-            .bucket(bucket)
-            .key(*key)
-            .send()
-            .await;
+        let _ =
+            s3_tests::delete_object_retrying_operation_aborted(CTX.client(), bucket, *key).await;
     }
-    let _ = CTX.client().delete_bucket().bucket(bucket).send().await;
+    let _ = CTX
+        .client()
+        .delete_bucket()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("delete directory feature test bucket")
+        .await;
 }
 
 async fn put_object(bucket: &str, key: &str, body: &'static [u8]) {
-    CTX.client()
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap();
+    retrying_operation_aborted("put directory feature object", || async move {
+        CTX.client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+    })
+    .await;
 }
 
 #[test]

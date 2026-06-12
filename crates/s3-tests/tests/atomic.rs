@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{err_status, unique_bucket, CTX};
+use s3_tests::{err_status, unique_bucket, SendRetryingOperationAborted, CTX};
 
 const ONE_MIB: usize = 1024 * 1024;
 const FOUR_MIB: usize = 4 * ONE_MIB;
@@ -34,7 +34,7 @@ async fn delete_test_keys(bucket: &str, keys: &[&str]) {
             .delete_object()
             .bucket(bucket)
             .key(*key)
-            .send()
+            .send_retrying_operation_aborted("delete object during atomic cleanup")
             .await
             .unwrap_or_else(|err| panic!("delete object during atomic cleanup: {err:?}"));
     }
@@ -44,7 +44,12 @@ async fn delete_bucket_after_object_cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for attempt in 1..=CLEANUP_DELETE_BUCKET_ATTEMPTS {
         delete_test_keys(bucket, keys).await;
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket during atomic cleanup")
+            .await
+        {
             Ok(_) => return,
             Err(err)
                 if attempt < CLEANUP_DELETE_BUCKET_ATTEMPTS

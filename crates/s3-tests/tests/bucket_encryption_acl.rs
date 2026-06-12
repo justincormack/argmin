@@ -74,7 +74,7 @@ async fn create_acl_bucket() -> String {
 async fn cleanup(bucket: &str, key: Option<&str>) {
     let client = CTX.client();
     if let Some(key) = key {
-        let _ = client.delete_object().bucket(bucket).key(key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }

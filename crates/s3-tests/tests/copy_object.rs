@@ -3,7 +3,8 @@ use aws_sdk_s3::types::{ChecksumType, ObjectAttributes};
 use aws_sdk_s3::Client;
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
-    send_signed_request, unique_bucket, CTX,
+    retrying_operation_aborted, send_signed_request, unique_bucket, SendRetryingOperationAborted,
+    CTX,
 };
 use std::time::Duration;
 
@@ -30,15 +31,16 @@ fn assert_raw_s3_error(response: &s3_tests::RawResponse, status: u16, code: &str
 
 /// Put an object and return its ETag (quoted, as returned by S3).
 async fn put_object(bucket: &str, key: &str, body: &'static [u8]) -> String {
-    let resp = CTX
-        .client()
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap();
+    let resp = retrying_operation_aborted("put copy source object", || async move {
+        CTX.client()
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+    })
+    .await;
     resp.e_tag().unwrap().to_string()
 }
 
@@ -46,7 +48,7 @@ async fn put_object(bucket: &str, key: &str, body: &'static [u8]) -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -59,7 +61,13 @@ async fn get_object_eventually_after_copy(
     const MAX_ATTEMPTS: usize = 10;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match client.get_object().bucket(bucket).key(key).send().await {
+        match client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object after copy")
+            .await
+        {
             Ok(output) => return output,
             Err(err)
                 if err
@@ -86,7 +94,13 @@ async fn head_object_eventually_after_copy(
     const MAX_ATTEMPTS: usize = 10;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match client.head_object().bucket(bucket).key(key).send().await {
+        match client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after copy")
+            .await
+        {
             Ok(output) => return output,
             Err(err)
                 if err

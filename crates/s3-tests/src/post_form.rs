@@ -1,8 +1,13 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 
 use crate::{build_test_agent, sse_c_header_values, RawResponse};
+
+fn is_operation_aborted_response(status: u16, body: &str) -> bool {
+    status == 409 && body.contains("<Code>OperationAborted</Code>")
+}
 
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
     let k_secret = format!("AWS4{}", secret);
@@ -227,14 +232,22 @@ pub fn post_object_to_test_endpoint_with_headers(
     let url = format!("{}/{}", endpoint, bucket);
     let (content_type, body) = build_multipart(fields, file_data, file_name);
     let agent = build_test_agent(endpoint, tls_ca_pem, crate::configured_test_timeout());
-    let req = agent.post(&url).header("Content-Type", &content_type);
-    let req = headers
-        .iter()
-        .fold(req, |req, (name, value)| req.header(*name, *value));
-    let mut resp = req.send(&body[..]).expect("HTTP transport error");
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body)
+    let deadline = Instant::now() + crate::configured_test_timeout();
+
+    loop {
+        let req = agent.post(&url).header("Content-Type", &content_type);
+        let req = headers
+            .iter()
+            .fold(req, |req, (name, value)| req.header(*name, *value));
+        let mut resp = req.send(&body[..]).expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let response_body = resp.body_mut().read_to_string().unwrap_or_default();
+        if is_operation_aborted_response(status, &response_body) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return (status, response_body);
+    }
 }
 
 pub fn post_object_raw_to_test_endpoint_with_headers(
@@ -253,31 +266,39 @@ pub fn post_object_raw_to_test_endpoint_with_headers(
         .collect();
     let (content_type, body) = build_multipart(&field_refs, file_data, file_name);
     let agent = build_test_agent(endpoint, tls_ca_pem, crate::configured_test_timeout());
-    let req = agent.post(&url).header("Content-Type", &content_type);
-    let req = headers.iter().fold(req, |req, (name, value)| {
-        req.header(name.as_str(), value.as_str())
-    });
-    let mut resp = req.send(&body[..]).expect("HTTP transport error");
-    let status = resp.status().as_u16();
-    let headers = resp
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value
-                    .to_str()
-                    .expect("response header is valid utf-8")
-                    .to_string(),
-            )
-        })
-        .collect();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    RawResponse {
-        status,
-        headers,
-        body,
-        body_read_error: None,
+    let deadline = Instant::now() + crate::configured_test_timeout();
+
+    loop {
+        let req = agent.post(&url).header("Content-Type", &content_type);
+        let req = headers.iter().fold(req, |req, (name, value)| {
+            req.header(name.as_str(), value.as_str())
+        });
+        let mut resp = req.send(&body[..]).expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value
+                        .to_str()
+                        .expect("response header is valid utf-8")
+                        .to_string(),
+                )
+            })
+            .collect();
+        let response_body = resp.body_mut().read_to_string().unwrap_or_default();
+        if is_operation_aborted_response(status, &response_body) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return RawResponse {
+            status,
+            headers,
+            body: response_body,
+            body_read_error: None,
+        };
     }
 }
 

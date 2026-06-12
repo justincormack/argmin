@@ -1,6 +1,6 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, err_status, unique_bucket, SendRetryingOperationAborted, CTX};
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
@@ -21,7 +21,7 @@ async fn get_object_body(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -
         .get_object()
         .bucket(bucket)
         .key(key)
-        .send()
+        .send_retrying_operation_aborted("get object body in constrained write test")
         .await
         .unwrap()
         .body
@@ -40,12 +40,18 @@ async fn cleanup_plain_bucket(
 ) {
     for client in [root_client, constrained_client] {
         for key in keys {
-            let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
         }
     }
 
     for client in [root_client, constrained_client] {
-        if client.delete_bucket().bucket(bucket).send().await.is_ok() {
+        if client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket during constrained write cleanup")
+            .await
+            .is_ok()
+        {
             return;
         }
     }

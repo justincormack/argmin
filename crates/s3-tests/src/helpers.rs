@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::thread;
@@ -116,20 +117,33 @@ pub async fn disable_bucket_public_access_block(client: &Client, bucket: &str) {
 }
 
 async fn create_test_bucket(client: &Client, bucket: &str) {
-    let mut request = client.create_bucket().bucket(bucket);
-    if CTX.region() != "us-east-1" {
-        request = request.create_bucket_configuration(
-            CreateBucketConfiguration::builder()
-                .location_constraint(BucketLocationConstraint::from(CTX.region()))
-                .build(),
-        );
-    }
-    match request.send().await {
-        Ok(_) => {}
-        Err(err) if is_create_bucket_lost_success_retry(&err) => {
-            verify_bucket_exists_after_create_conflict(client, bucket, "create bucket").await;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+
+    loop {
+        let mut request = client.create_bucket().bucket(bucket);
+        if CTX.region() != "us-east-1" {
+            request = request.create_bucket_configuration(
+                CreateBucketConfiguration::builder()
+                    .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                    .build(),
+            );
         }
-        Err(err) => panic!("create bucket: {err:?}"),
+        match request.send().await {
+            Ok(_) => return,
+            Err(err) if is_create_bucket_lost_success_retry(&err) => {
+                verify_bucket_exists_after_create_conflict(client, bucket, "create bucket").await;
+                return;
+            }
+            Err(err)
+                if (s3_error_code(&err) == Some("OperationAborted")
+                    || s3_error_code(&err) == Some("SlowDown"))
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => panic!("create bucket: {err:?}"),
+        }
     }
 }
 
@@ -138,28 +152,41 @@ async fn create_test_bucket_with_ownership(
     bucket: &str,
     ownership: ObjectOwnership,
 ) {
-    let mut request = client
-        .create_bucket()
-        .bucket(bucket)
-        .object_ownership(ownership.clone());
-    if CTX.region() != "us-east-1" {
-        request = request.create_bucket_configuration(
-            CreateBucketConfiguration::builder()
-                .location_constraint(BucketLocationConstraint::from(CTX.region()))
-                .build(),
-        );
-    }
-    match request.send().await {
-        Ok(_) => {}
-        Err(err) if is_create_bucket_lost_success_retry(&err) => {
-            verify_bucket_exists_after_create_conflict(
-                client,
-                bucket,
-                "create bucket with ownership",
-            )
-            .await;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+
+    loop {
+        let mut request = client
+            .create_bucket()
+            .bucket(bucket)
+            .object_ownership(ownership.clone());
+        if CTX.region() != "us-east-1" {
+            request = request.create_bucket_configuration(
+                CreateBucketConfiguration::builder()
+                    .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                    .build(),
+            );
         }
-        Err(err) => panic!("create bucket with ownership: {err:?}"),
+        match request.send().await {
+            Ok(_) => break,
+            Err(err) if is_create_bucket_lost_success_retry(&err) => {
+                verify_bucket_exists_after_create_conflict(
+                    client,
+                    bucket,
+                    "create bucket with ownership",
+                )
+                .await;
+                break;
+            }
+            Err(err)
+                if (s3_error_code(&err) == Some("OperationAborted")
+                    || s3_error_code(&err) == Some("SlowDown"))
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => panic!("create bucket with ownership: {err:?}"),
+        }
     }
     wait_for_bucket_ownership_controls(client, bucket, ownership).await;
 }
@@ -182,7 +209,21 @@ fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) 
     err.as_service_error().and_then(ProvideErrorMetadata::code)
 }
 
-async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
+pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    match retrying_operation_aborted_result(&mut op).await {
+        Ok(output) => output,
+        Err(err) => panic!("{context}: {err:?}"),
+    }
+}
+
+pub async fn retrying_operation_aborted_result<T, E, F, Fut>(
+    mut op: F,
+) -> Result<T, aws_sdk_s3::error::SdkError<E>>
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
     F: FnMut() -> Fut,
@@ -193,17 +234,298 @@ where
 
     loop {
         match op().await {
-            Ok(output) => return output,
+            Ok(output) => return Ok(output),
             Err(err)
                 if s3_error_code(&err) == Some("OperationAborted")
                     && std::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
-            Err(err) => panic!("{context}: {err:?}"),
+            Err(err) => return Err(err),
         }
     }
 }
+
+pub type RetrySendFuture<T, E> =
+    Pin<Box<dyn Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>> + Send>>;
+
+pub trait SendRetryingOperationAborted: Clone {
+    type Output;
+    type Error: ProvideErrorMetadata;
+
+    fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error>;
+
+    fn send_retrying_operation_aborted(
+        self,
+        _description: &str,
+    ) -> impl Future<Output = Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>>> {
+        async move {
+            const RETRY_DELAY: Duration = Duration::from_millis(100);
+            let deadline = std::time::Instant::now() + configured_test_timeout();
+
+            loop {
+                match self.clone().send_once().await {
+                    Err(err)
+                        if s3_error_code(&err) == Some("OperationAborted")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+}
+
+macro_rules! impl_send_retrying_operation_aborted {
+    ($builder:path, $output:path, $error:path) => {
+        impl SendRetryingOperationAborted for $builder {
+            type Output = $output;
+            type Error = $error;
+
+            fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
+                Box::pin(async move { self.send().await })
+            }
+        }
+    };
+}
+
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::abort_multipart_upload::builders::AbortMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput,
+    aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
+    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
+    aws_sdk_s3::operation::copy_object::CopyObjectOutput,
+    aws_sdk_s3::operation::copy_object::CopyObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::create_bucket::builders::CreateBucketFluentBuilder,
+    aws_sdk_s3::operation::create_bucket::CreateBucketOutput,
+    aws_sdk_s3::operation::create_bucket::CreateBucketError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
+    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket::builders::DeleteBucketFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket::DeleteBucketOutput,
+    aws_sdk_s3::operation::delete_bucket::DeleteBucketError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_cors::builders::DeleteBucketCorsFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_cors::DeleteBucketCorsOutput,
+    aws_sdk_s3::operation::delete_bucket_cors::DeleteBucketCorsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_encryption::builders::DeleteBucketEncryptionFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_encryption::DeleteBucketEncryptionOutput,
+    aws_sdk_s3::operation::delete_bucket_encryption::DeleteBucketEncryptionError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_lifecycle::builders::DeleteBucketLifecycleFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_lifecycle::DeleteBucketLifecycleOutput,
+    aws_sdk_s3::operation::delete_bucket_lifecycle::DeleteBucketLifecycleError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_ownership_controls::builders::DeleteBucketOwnershipControlsFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_ownership_controls::DeleteBucketOwnershipControlsOutput,
+    aws_sdk_s3::operation::delete_bucket_ownership_controls::DeleteBucketOwnershipControlsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_tagging::builders::DeleteBucketTaggingFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_tagging::DeleteBucketTaggingOutput,
+    aws_sdk_s3::operation::delete_bucket_tagging::DeleteBucketTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_bucket_policy::builders::DeleteBucketPolicyFluentBuilder,
+    aws_sdk_s3::operation::delete_bucket_policy::DeleteBucketPolicyOutput,
+    aws_sdk_s3::operation::delete_bucket_policy::DeleteBucketPolicyError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
+    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
+    aws_sdk_s3::operation::delete_object::DeleteObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_object_tagging::builders::DeleteObjectTaggingFluentBuilder,
+    aws_sdk_s3::operation::delete_object_tagging::DeleteObjectTaggingOutput,
+    aws_sdk_s3::operation::delete_object_tagging::DeleteObjectTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::delete_public_access_block::builders::DeletePublicAccessBlockFluentBuilder,
+    aws_sdk_s3::operation::delete_public_access_block::DeletePublicAccessBlockOutput,
+    aws_sdk_s3::operation::delete_public_access_block::DeletePublicAccessBlockError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_acl::builders::GetBucketAclFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_acl::GetBucketAclOutput,
+    aws_sdk_s3::operation::get_bucket_acl::GetBucketAclError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_cors::builders::GetBucketCorsFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_cors::GetBucketCorsOutput,
+    aws_sdk_s3::operation::get_bucket_cors::GetBucketCorsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_encryption::builders::GetBucketEncryptionFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_encryption::GetBucketEncryptionOutput,
+    aws_sdk_s3::operation::get_bucket_encryption::GetBucketEncryptionError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_location::builders::GetBucketLocationFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_location::GetBucketLocationOutput,
+    aws_sdk_s3::operation::get_bucket_location::GetBucketLocationError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_ownership_controls::builders::GetBucketOwnershipControlsFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_ownership_controls::GetBucketOwnershipControlsOutput,
+    aws_sdk_s3::operation::get_bucket_ownership_controls::GetBucketOwnershipControlsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_policy::builders::GetBucketPolicyFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_policy::GetBucketPolicyOutput,
+    aws_sdk_s3::operation::get_bucket_policy::GetBucketPolicyError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_tagging::builders::GetBucketTaggingFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_tagging::GetBucketTaggingOutput,
+    aws_sdk_s3::operation::get_bucket_tagging::GetBucketTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_bucket_versioning::builders::GetBucketVersioningFluentBuilder,
+    aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningOutput,
+    aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder,
+    aws_sdk_s3::operation::get_object::GetObjectOutput,
+    aws_sdk_s3::operation::get_object::GetObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_object_acl::builders::GetObjectAclFluentBuilder,
+    aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput,
+    aws_sdk_s3::operation::get_object_acl::GetObjectAclError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_object_attributes::builders::GetObjectAttributesFluentBuilder,
+    aws_sdk_s3::operation::get_object_attributes::GetObjectAttributesOutput,
+    aws_sdk_s3::operation::get_object_attributes::GetObjectAttributesError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_object_tagging::builders::GetObjectTaggingFluentBuilder,
+    aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingOutput,
+    aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder,
+    aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    aws_sdk_s3::operation::head_object::HeadObjectError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::head_bucket::builders::HeadBucketFluentBuilder,
+    aws_sdk_s3::operation::head_bucket::HeadBucketOutput,
+    aws_sdk_s3::operation::head_bucket::HeadBucketError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::get_public_access_block::builders::GetPublicAccessBlockFluentBuilder,
+    aws_sdk_s3::operation::get_public_access_block::GetPublicAccessBlockOutput,
+    aws_sdk_s3::operation::get_public_access_block::GetPublicAccessBlockError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::list_buckets::builders::ListBucketsFluentBuilder,
+    aws_sdk_s3::operation::list_buckets::ListBucketsOutput,
+    aws_sdk_s3::operation::list_buckets::ListBucketsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::list_multipart_uploads::builders::ListMultipartUploadsFluentBuilder,
+    aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput,
+    aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::list_objects::builders::ListObjectsFluentBuilder,
+    aws_sdk_s3::operation::list_objects::ListObjectsOutput,
+    aws_sdk_s3::operation::list_objects::ListObjectsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder,
+    aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+    aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::list_object_versions::builders::ListObjectVersionsFluentBuilder,
+    aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput,
+    aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::list_parts::builders::ListPartsFluentBuilder,
+    aws_sdk_s3::operation::list_parts::ListPartsOutput,
+    aws_sdk_s3::operation::list_parts::ListPartsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_acl::builders::PutBucketAclFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_acl::PutBucketAclOutput,
+    aws_sdk_s3::operation::put_bucket_acl::PutBucketAclError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_encryption::builders::PutBucketEncryptionFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_encryption::PutBucketEncryptionOutput,
+    aws_sdk_s3::operation::put_bucket_encryption::PutBucketEncryptionError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_lifecycle_configuration::builders::PutBucketLifecycleConfigurationFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_lifecycle_configuration::PutBucketLifecycleConfigurationOutput,
+    aws_sdk_s3::operation::put_bucket_lifecycle_configuration::PutBucketLifecycleConfigurationError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_ownership_controls::builders::PutBucketOwnershipControlsFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_ownership_controls::PutBucketOwnershipControlsOutput,
+    aws_sdk_s3::operation::put_bucket_ownership_controls::PutBucketOwnershipControlsError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_policy::builders::PutBucketPolicyFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_policy::PutBucketPolicyOutput,
+    aws_sdk_s3::operation::put_bucket_policy::PutBucketPolicyError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_tagging::builders::PutBucketTaggingFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_tagging::PutBucketTaggingOutput,
+    aws_sdk_s3::operation::put_bucket_tagging::PutBucketTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_bucket_versioning::builders::PutBucketVersioningFluentBuilder,
+    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningOutput,
+    aws_sdk_s3::operation::put_bucket_versioning::PutBucketVersioningError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_object_tagging::builders::PutObjectTaggingFluentBuilder,
+    aws_sdk_s3::operation::put_object_tagging::PutObjectTaggingOutput,
+    aws_sdk_s3::operation::put_object_tagging::PutObjectTaggingError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_object_acl::builders::PutObjectAclFluentBuilder,
+    aws_sdk_s3::operation::put_object_acl::PutObjectAclOutput,
+    aws_sdk_s3::operation::put_object_acl::PutObjectAclError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::put_public_access_block::builders::PutPublicAccessBlockFluentBuilder,
+    aws_sdk_s3::operation::put_public_access_block::PutPublicAccessBlockOutput,
+    aws_sdk_s3::operation::put_public_access_block::PutPublicAccessBlockError
+);
+impl_send_retrying_operation_aborted!(
+    aws_sdk_s3::operation::upload_part_copy::builders::UploadPartCopyFluentBuilder,
+    aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput,
+    aws_sdk_s3::operation::upload_part_copy::UploadPartCopyError
+);
 
 async fn verify_bucket_exists_after_create_conflict(client: &Client, bucket: &str, context: &str) {
     client
@@ -288,7 +610,13 @@ async fn wait_for_bucket_public_access_block_disabled(client: &Client, bucket: &
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let result = client.get_public_access_block().bucket(bucket).send().await;
+        let result = client
+            .get_public_access_block()
+            .bucket(bucket)
+            .send_retrying_operation_aborted(
+                "get public access block while waiting for disablement",
+            )
+            .await;
         if let Ok(resp) = result {
             if let Some(config) = resp.public_access_block_configuration() {
                 if config.block_public_acls() == Some(false)
@@ -347,7 +675,13 @@ async fn wait_for_bucket_sse_c_enabled(client: &Client, bucket: &str) {
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let result = client.get_bucket_encryption().bucket(bucket).send().await;
+        let result = client
+            .get_bucket_encryption()
+            .bucket(bucket)
+            .send_retrying_operation_aborted(
+                "get bucket encryption while waiting for SSE-C enablement",
+            )
+            .await;
         if let Ok(resp) = result {
             if let Some(config) = resp.server_side_encryption_configuration() {
                 if bucket_encryption_blocks_sse_c(config) == Some(false) {
@@ -374,7 +708,7 @@ pub async fn enable_bucket_sse_c(client: &Client, bucket: &str) {
         .put_bucket_encryption()
         .bucket(bucket)
         .server_side_encryption_configuration(sse_c_enabled_bucket_encryption())
-        .send()
+        .send_retrying_operation_aborted("enable bucket SSE-C")
         .await
         .expect("enable bucket SSE-C");
     wait_for_bucket_sse_c_enabled(client, bucket).await;
@@ -400,14 +734,7 @@ pub async fn create_objects(client: &Client, prefix: &str, n: usize) -> (String,
     let mut keys = Vec::with_capacity(n);
     for i in 0..n {
         let key = format!("{}key{}", prefix, i);
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(&key)
-            .body(ByteStream::from_static(b"content"))
-            .send()
-            .await
-            .expect("put object");
+        put_object_retrying_operation_aborted(client, &bucket, &key, b"content".to_vec()).await;
         keys.push(key);
     }
     (bucket, keys)
@@ -422,14 +749,7 @@ pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String
 
     let mut owned_keys = Vec::with_capacity(keys.len());
     for key in keys {
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(*key)
-            .body(ByteStream::from_static(b"content"))
-            .send()
-            .await
-            .expect("put object");
+        put_object_retrying_operation_aborted(client, &bucket, key, b"content".to_vec()).await;
         owned_keys.push((*key).to_string());
     }
     (bucket, owned_keys)
@@ -478,19 +798,19 @@ pub async fn create_public_write_bucket(client: &Client) -> String {
     client
         .get_public_access_block()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("read public access block")
         .await
         .expect("read public access block");
     client
         .get_bucket_ownership_controls()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("read ownership controls")
         .await
         .expect("read ownership controls");
     client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("read bucket ACL")
         .await
         .expect("read bucket ACL");
 
@@ -500,13 +820,7 @@ pub async fn create_public_write_bucket(client: &Client) -> String {
 /// Delete all listed keys from the bucket, then delete the bucket itself.
 pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String]) {
     for key in keys {
-        client
-            .delete_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .expect("delete object");
+        let _ = delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
     delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -1018,6 +1332,7 @@ where
 
     const MAX_SLOWDOWN_RETRIES: u32 = 4;
     const MAX_TRANSPORT_RETRIES: u32 = 3;
+    let operation_aborted_deadline = std::time::Instant::now() + configured_test_timeout();
     let mut attempt = 0;
     loop {
         let response_result = if method == "HEAD" {
@@ -1104,6 +1419,13 @@ where
             let backoff_ms = 200u64 << attempt;
             thread::sleep(Duration::from_millis(backoff_ms));
             attempt += 1;
+            continue;
+        }
+        if status == 409
+            && body_text.contains("<Code>OperationAborted</Code>")
+            && std::time::Instant::now() < operation_aborted_deadline
+        {
+            thread::sleep(Duration::from_millis(100));
             continue;
         }
         let headers = response
@@ -1255,7 +1577,12 @@ pub fn copy_source_with_version(bucket: &str, source_key: &str, version_id: &str
 /// delete markers rather than removing objects.
 pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
     loop {
-        let resp = match client.list_object_versions().bucket(bucket).send().await {
+        let resp = match client
+            .list_object_versions()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("list object versions during versioned cleanup")
+            .await
+        {
             Ok(resp) => resp,
             Err(err) if is_bucket_already_absent(&err) => return,
             Err(err) => panic!("list object versions: {err:?}"),
@@ -1320,6 +1647,7 @@ pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &
             Err(err) if is_bucket_already_absent(&err) => return,
             Err(err)
                 if (s3_error_code(&err) == Some("OperationAborted")
+                    || s3_error_code(&err) == Some("SlowDown")
                     || is_bucket_not_empty(&err))
                     && std::time::Instant::now() < deadline =>
             {
@@ -1328,6 +1656,43 @@ pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &
             Err(err) => panic!("delete bucket: {err:?}"),
         }
     }
+}
+
+pub async fn put_object_retrying_operation_aborted(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    retrying_operation_aborted("put object", || {
+        let body = body.clone();
+        async move {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+        }
+    })
+    .await
+}
+
+pub async fn delete_object_retrying_operation_aborted(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<
+    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::delete_object::DeleteObjectError>,
+> {
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("delete object")
+        .await
 }
 
 /// Assert that an S3 SDK error contains the expected error code string.

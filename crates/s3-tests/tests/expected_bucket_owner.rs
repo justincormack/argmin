@@ -15,7 +15,10 @@ use aws_sdk_s3::types::{
 };
 use base64::Engine;
 use md5_legacy::Digest;
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, retrying_operation_aborted,
+    retrying_operation_aborted_result, unique_bucket, SendRetryingOperationAborted, CTX,
+};
 use serde_json::json;
 
 const PART_SIZE: usize = 5 * 1024 * 1024;
@@ -45,16 +48,19 @@ fn assert_expected_bucket_owner_denied<T: std::fmt::Debug, E: std::fmt::Debug>(
 
 macro_rules! expect_owner_ok {
     ($op:expr) => {{
-        $op.expected_bucket_owner(CTX.account_id())
-            .send()
-            .await
-            .unwrap()
+        retrying_operation_aborted("expected-bucket-owner success request", || async {
+            $op.expected_bucket_owner(CTX.account_id()).send().await
+        })
+        .await
     }};
 }
 
 macro_rules! expect_owner_denied {
     ($op:expr) => {{
-        let result = $op.expected_bucket_owner(WRONG_OWNER).send().await;
+        let result = retrying_operation_aborted_result(|| async {
+            $op.expected_bucket_owner(WRONG_OWNER).send().await
+        })
+        .await;
         assert_expected_bucket_owner_denied(&result);
     }};
 }
@@ -207,7 +213,7 @@ async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) {
 async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -218,7 +224,7 @@ async fn cleanup_multipart_bucket(bucket: &str, keys: &[&str]) {
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list multipart uploads during expected-owner cleanup")
             .await
             .unwrap();
         for upload in uploads.uploads() {
@@ -227,15 +233,22 @@ async fn cleanup_multipart_bucket(bucket: &str, keys: &[&str]) {
                 .bucket(bucket)
                 .key(upload.key().unwrap())
                 .upload_id(upload.upload_id().unwrap())
-                .send()
+                .send_retrying_operation_aborted(
+                    "abort multipart upload during expected-owner cleanup",
+                )
                 .await;
         }
 
         for key in keys {
-            let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
         }
 
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete expected-owner cleanup bucket")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
@@ -258,12 +271,17 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
         let resp = client
             .list_object_versions()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list object versions during expected-owner cleanup")
             .await
             .unwrap();
 
         if resp.versions().is_empty() && resp.delete_markers().is_empty() {
-            match client.delete_bucket().bucket(bucket).send().await {
+            match client
+                .delete_bucket()
+                .bucket(bucket)
+                .send_retrying_operation_aborted("delete expected-owner versioned bucket")
+                .await
+            {
                 Ok(_) => return,
                 Err(err) => {
                     let raw = format!("{err:?}");
@@ -380,7 +398,12 @@ fn test_create_bucket_ignores_expected_bucket_owner() {
 
         match result {
             Ok(_) => {
-                client.head_bucket().bucket(&bucket).send().await.unwrap();
+                client
+                    .head_bucket()
+                    .bucket(&bucket)
+                    .send_retrying_operation_aborted("head expected-owner bucket after create")
+                    .await
+                    .unwrap();
                 s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
             }
             Err(err) => {
@@ -847,7 +870,7 @@ fn test_multipart_expected_bucket_owner() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .multipart_upload(completed));
+            .multipart_upload(completed.clone()));
 
         let resp = client
             .get_object()

@@ -1,7 +1,7 @@
 use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
-    err_status, send_signed_request, unique_bucket, CTX,
+    err_status, send_signed_request, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::Duration;
 
@@ -112,7 +112,12 @@ async fn head_object_eventually_after_versioning_enable(
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let result = client.head_object().bucket(bucket).key(key).send().await;
+        let result = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after enabling versioning")
+            .await;
         match result {
             Ok(head) => return head,
             Err(_) if attempt + 1 < MAX_ATTEMPTS => {
@@ -134,7 +139,12 @@ fn test_bucket_list_empty() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         assert!(resp.contents().is_empty());
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -221,7 +231,12 @@ fn test_bucket_list_unordered() {
         let (bucket, keys) =
             create_objects_with_keys(client, &["zoo", "asdf", "mango", "bar"]).await;
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         let result_keys = get_keys(resp.contents());
         assert_eq!(result_keys, vec!["asdf", "bar", "mango", "zoo"]);
 
@@ -244,7 +259,10 @@ fn test_bucket_list_many() {
             if !marker.is_empty() {
                 req = req.marker(&marker);
             }
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted("list bucket objects")
+                .await
+                .unwrap();
             let page_keys = get_keys(resp.contents());
             if let Some(last) = page_keys.last() {
                 marker = last.clone();
@@ -309,7 +327,12 @@ fn test_bucket_list_maxkeys_none() {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, SET_B).await;
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         assert_eq!(
             get_keys(resp.contents()),
             vec!["bar", "baz", "cab", "dog", "foo/bar", "foo/baz", "quux"]
@@ -335,7 +358,10 @@ fn test_bucket_listv2_many() {
             if let Some(ref token) = continuation_token {
                 req = req.continuation_token(token);
             }
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted("list bucket objects")
+                .await
+                .unwrap();
             collected.extend(get_keys(resp.contents()));
             if resp.is_truncated() != Some(true) {
                 break;
@@ -587,7 +613,12 @@ fn test_bucket_list_delimiter_none() {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, SET_A).await;
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         assert_eq!(get_keys(resp.contents()).len(), 6);
         assert!(resp.common_prefixes().is_empty());
 
@@ -719,7 +750,10 @@ fn test_bucket_list_prefix_delimiter_basic() {
             if !marker.is_empty() {
                 req = req.marker(&marker);
             }
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted("list bucket objects")
+                .await
+                .unwrap();
 
             let page_keys = get_keys(resp.contents());
             let page_prefixes = get_prefixes(resp.common_prefixes());
@@ -1175,7 +1209,12 @@ fn test_bucket_list_prefix_none() {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, SET_B).await;
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         assert_eq!(get_keys(resp.contents()).len(), 7);
 
         delete_all_and_bucket(client, &bucket, &keys).await;
@@ -1470,7 +1509,12 @@ fn test_bucket_list_marker_none() {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, SET_B).await;
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         assert_eq!(
             get_keys(resp.contents()),
             vec!["bar", "baz", "cab", "dog", "foo/bar", "foo/baz", "quux"]
@@ -2529,7 +2573,12 @@ fn test_bucket_list_return_data() {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, &["bar", "baz"]).await;
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         let objects = resp.contents();
         assert_eq!(objects.len(), 2);
 
@@ -2612,7 +2661,12 @@ fn test_bucket_list_long_name() {
         assert_eq!(bucket.len(), 63);
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list bucket objects")
+            .await
+            .unwrap();
         assert!(resp.contents().is_empty());
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -2679,7 +2733,10 @@ fn test_bucket_listv2_delimiter_prefix() {
             if let Some(ref token) = continuation_token {
                 req = req.continuation_token(token);
             }
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted("list bucket objects")
+                .await
+                .unwrap();
 
             let page_keys = get_keys(resp.contents());
             let page_prefixes = get_prefixes(resp.common_prefixes());

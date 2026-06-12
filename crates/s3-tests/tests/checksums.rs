@@ -5,8 +5,8 @@ use aws_sdk_s3::types::{
 };
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, err_status, send_signed_request, unique_bucket,
-    CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, retrying_operation_aborted,
+    send_signed_request, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,7 +40,7 @@ async fn setup_versioned_bucket() -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -802,7 +802,7 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
         .key(key)
         .checksum_algorithm(tc.algo.clone())
         .checksum_type(tc.cksum_type.clone())
-        .send()
+        .send_retrying_operation_aborted("create checksum multipart upload")
         .await
         .unwrap();
     let upload_id = create.upload_id().unwrap();
@@ -816,16 +816,19 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
     let mut completed_parts = Vec::new();
     for (i, (data, cksum)) in parts_data.iter().enumerate() {
         let part_number = (i + 1) as i32;
-        let builder = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(data.to_vec()))
-            .checksum_algorithm(tc.algo.clone());
-        let builder = upload_part_with_checksum(builder, &tc.algo, cksum);
-        let resp = builder.send().await.unwrap();
+        let resp = retrying_operation_aborted("upload checksum multipart part", || {
+            let builder = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data.to_vec()))
+                .checksum_algorithm(tc.algo.clone());
+            let builder = upload_part_with_checksum(builder, &tc.algo, cksum);
+            async move { builder.send().await }
+        })
+        .await;
         let returned_cksum = get_cksum_from_upload_part(&resp, &tc.algo)
             .expect("upload_part should return checksum");
         assert_eq!(returned_cksum, *cksum, "upload_part checksum mismatch");

@@ -1,7 +1,4 @@
-use std::future::Future;
-use std::time::{Duration, Instant};
-
-use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::delete_bucket_policy::{
     DeleteBucketPolicyError, DeleteBucketPolicyOutput,
 };
@@ -9,9 +6,13 @@ use aws_sdk_s3::operation::put_bucket_policy::{PutBucketPolicyError, PutBucketPo
 use aws_sdk_s3::operation::put_public_access_block::{
     PutPublicAccessBlockError, PutPublicAccessBlockOutput,
 };
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::PublicAccessBlockConfiguration;
 use aws_sdk_s3::Client;
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, err_status, retrying_operation_aborted, retrying_operation_aborted_result,
+    unique_bucket, SendRetryingOperationAborted, CTX,
+};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
@@ -22,42 +23,6 @@ fn agent() -> s3_tests::Agent {
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
-}
-
-async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
-where
-    E: ProvideErrorMetadata + std::fmt::Debug,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, SdkError<E>>>,
-{
-    match retrying_operation_aborted_result(&mut op).await {
-        Ok(output) => output,
-        Err(err) => panic!("{context}: {err:?}"),
-    }
-}
-
-async fn retrying_operation_aborted_result<T, E, F, Fut>(mut op: F) -> Result<T, SdkError<E>>
-where
-    E: ProvideErrorMetadata,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, SdkError<E>>>,
-{
-    const RETRY_DELAY: Duration = Duration::from_millis(100);
-    let deadline = Instant::now() + Duration::from_secs(30);
-
-    loop {
-        match op().await {
-            Ok(output) => return Ok(output),
-            Err(err)
-                if err.as_service_error().and_then(ProvideErrorMetadata::code)
-                    == Some("OperationAborted")
-                    && Instant::now() < deadline =>
-            {
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 async fn put_public_access_block_retrying_operation_aborted(
@@ -122,6 +87,23 @@ async fn delete_bucket_policy_retrying_operation_aborted(
     .await
 }
 
+async fn put_object_retrying_operation_aborted(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) {
+    retrying_operation_aborted("put object during public access policy setup", || {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+    })
+    .await;
+}
+
 #[test]
 fn test_block_public_policy() {
     s3_tests::run(async {
@@ -152,7 +134,7 @@ fn test_block_public_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during public access policy test")
             .await;
         assert_eq!(err_status(&result), 403);
         assert_s3_err_code(&result, "AccessDenied");
@@ -194,7 +176,7 @@ fn test_block_public_policy_with_principal() {
         let resp = client
             .get_bucket_policy()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("get bucket policy during public access policy test")
             .await
             .unwrap();
         let actual_policy: serde_json::Value =
@@ -218,18 +200,13 @@ fn test_block_public_restrict_public_buckets() {
         client
             .delete_public_access_block()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted(
+                "delete public access block during public access policy test",
+            )
             .await
             .unwrap();
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, "foo", b"bar".to_vec()).await;
 
         let policy = serde_json::json!({
             "Version": "2012-10-17",
@@ -251,7 +228,9 @@ fn test_block_public_restrict_public_buckets() {
                         .delete_object()
                         .bucket(&bucket)
                         .key("foo")
-                        .send()
+                        .send_retrying_operation_aborted(
+                            "delete object during public access policy cleanup",
+                        )
                         .await
                         .unwrap();
                     cleanup(&bucket).await;
@@ -284,7 +263,7 @@ fn test_block_public_restrict_public_buckets() {
             .get_object()
             .bucket(&bucket)
             .key("foo")
-            .send()
+            .send_retrying_operation_aborted("get object during public access policy test")
             .await
             .unwrap();
         let body = owner_resp.body.collect().await.unwrap().into_bytes();
@@ -294,7 +273,7 @@ fn test_block_public_restrict_public_buckets() {
             .delete_object()
             .bucket(&bucket)
             .key("foo")
-            .send()
+            .send_retrying_operation_aborted("delete object during public access policy cleanup")
             .await
             .unwrap();
         cleanup(&bucket).await;
@@ -319,7 +298,9 @@ fn test_get_public_block_deny_bucket_policy() {
         let resp = client
             .get_public_access_block()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted(
+                "get public access block during public access policy test",
+            )
             .await
             .unwrap();
         let config = resp.public_access_block_configuration().unwrap();
@@ -343,7 +324,9 @@ fn test_get_public_block_deny_bucket_policy() {
         let denied = client
             .get_public_access_block()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted(
+                "get public access block during public access policy test",
+            )
             .await;
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");

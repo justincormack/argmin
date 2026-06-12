@@ -10,7 +10,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, create_acl_enabled_bucket, create_public_write_bucket, err_status,
-    unique_bucket, CTX,
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024;
@@ -25,7 +25,7 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
-        .send()
+        .send_retrying_operation_aborted("get bucket ACL owner for multipart ACL test")
         .await
         .unwrap()
         .owner()
@@ -40,14 +40,14 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
 
     for _ in 0..10 {
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list multipart uploads during ACL cleanup")
             .await
             .unwrap();
         for upload in uploads.uploads() {
@@ -56,11 +56,16 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
                 .bucket(bucket)
                 .key(upload.key().unwrap())
                 .upload_id(upload.upload_id().unwrap())
-                .send()
+                .send_retrying_operation_aborted("abort multipart upload during ACL cleanup")
                 .await;
         }
 
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete multipart ACL bucket during cleanup")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
@@ -108,7 +113,10 @@ async fn complete_single_part_multipart_upload_with_client_and_acl(
     if let Some(acl) = acl {
         create_req = create_req.acl(acl);
     }
-    let create = create_req.send().await.unwrap();
+    let create = create_req
+        .send_retrying_operation_aborted("create multipart upload with ACL")
+        .await
+        .unwrap();
     let upload_id = create.upload_id().unwrap().to_string();
 
     let part = client

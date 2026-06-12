@@ -9,7 +9,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, disable_bucket_public_access_block, err_status, send_signed_request,
-    unique_bucket, CTX,
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
@@ -68,7 +68,7 @@ async fn setup_acl_enabled_bucket() -> String {
         .put_bucket_ownership_controls()
         .bucket(&bucket)
         .ownership_controls(controls)
-        .send()
+        .send_retrying_operation_aborted("put bucket ownership controls for ACL test")
         .await
         .unwrap();
     bucket
@@ -77,7 +77,7 @@ async fn setup_acl_enabled_bucket() -> String {
 async fn setup_named_acl_enabled_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
     s3_tests::create_bucket_request(client, bucket)
         .object_ownership(ObjectOwnership::ObjectWriter)
-        .send()
+        .send_retrying_operation_aborted("create named ACL-enabled bucket")
         .await
         .unwrap();
     disable_bucket_public_access_block(client, bucket).await;
@@ -86,7 +86,11 @@ async fn setup_named_acl_enabled_bucket(client: &aws_sdk_s3::Client, bucket: &st
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
     for attempt in 0..20 {
-        let result = client.delete_bucket().bucket(bucket).send().await;
+        let result = client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket ACL cleanup bucket")
+            .await;
         match result {
             Ok(_) => return,
             Err(err) => {
@@ -105,7 +109,7 @@ async fn cleanup(bucket: &str) {
 
 async fn cleanup_object_if_present(bucket: &str, key: &str) {
     let client = CTX.client();
-    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
 }
 
 async fn anonymous_get(url: &str) -> s3_tests::Response {
@@ -267,13 +271,18 @@ async fn assert_alt_head_bucket_allowed(bucket: &str) {
     CTX.alt_client()
         .head_bucket()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("head bucket as alternate account")
         .await
         .unwrap();
 }
 
 async fn assert_alt_head_bucket_denied(bucket: &str) {
-    let result = CTX.alt_client().head_bucket().bucket(bucket).send().await;
+    let result = CTX
+        .alt_client()
+        .head_bucket()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("head bucket as alternate account")
+        .await;
     assert_eq!(err_status(&result), 403);
 }
 
@@ -281,7 +290,7 @@ async fn assert_alt_get_bucket_acl_allowed(bucket: &str) {
     CTX.alt_client()
         .get_bucket_acl()
         .bucket(bucket)
-        .send()
+        .send_retrying_operation_aborted("get bucket ACL as alternate account")
         .await
         .unwrap();
 }

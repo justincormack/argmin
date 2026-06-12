@@ -11,15 +11,17 @@ pub use helpers::{
     create_bucket_with_ownership, create_bucket_with_sse_c_enabled, create_objects,
     create_objects_with_keys, create_public_bucket, create_public_write_bucket,
     delete_all_and_bucket, delete_bucket_retrying_operation_aborted,
-    delete_objects_retrying_operation_aborted, delete_objects_with_md5,
-    disable_bucket_public_access_block, enable_bucket_sse_c, err_status, is_sdk_stream_disconnect,
-    is_sdk_stream_disconnect_or_status, object_url, presign_url, presign_url_with_credentials,
-    put_bucket_lifecycle_with_md5, sdk_checksum_headers, send_signed_request,
+    delete_object_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
+    delete_objects_with_md5, disable_bucket_public_access_block, enable_bucket_sse_c, err_status,
+    is_sdk_stream_disconnect, is_sdk_stream_disconnect_or_status, object_url, presign_url,
+    presign_url_with_credentials, put_bucket_lifecycle_with_md5,
+    put_object_retrying_operation_aborted, retrying_operation_aborted,
+    retrying_operation_aborted_result, sdk_checksum_headers, send_signed_request,
     send_signed_request_allow_response_body_error,
     send_signed_request_for_service_with_credentials,
     send_signed_request_to_endpoint_for_service_with_credentials,
     send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
-    PresignedRequest, RawResponse, SignedRequestCredentials,
+    PresignedRequest, RawResponse, SendRetryingOperationAborted, SignedRequestCredentials,
 };
 pub use post_form::{
     post_object_raw_to_test_endpoint_with_headers, post_object_to_test_endpoint,
@@ -547,7 +549,9 @@ async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label
         match client.delete_bucket().bucket(bucket).send().await {
             Ok(_) => return,
             Err(err) if err.code() == Some("NoSuchBucket") => return,
-            Err(err) if is_delete_bucket_operation_aborted(&err) && Instant::now() < deadline => {
+            Err(err)
+                if is_delete_bucket_retryable_backpressure(&err) && Instant::now() < deadline =>
+            {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
             Err(err) => {
@@ -627,7 +631,12 @@ async fn create_bucket_in_region_accepting_verified_lost_success(
                 tokio::time::sleep(RETRY_DELAY).await;
             }
             Err(err) if is_create_bucket_lost_success_retry(&err) => {
-                match client.head_bucket().bucket(bucket).send().await {
+                match client
+                    .head_bucket()
+                    .bucket(bucket)
+                    .send_retrying_operation_aborted("head bucket after create lost success")
+                    .await
+                {
                     Ok(_) => return Ok(()),
                     Err(head_err) => {
                         eprintln!(
@@ -678,10 +687,13 @@ fn is_create_bucket_operation_aborted(
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
 }
 
-fn is_delete_bucket_operation_aborted(
+fn is_delete_bucket_retryable_backpressure(
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::delete_bucket::DeleteBucketError>,
 ) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+    matches!(
+        err.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("OperationAborted" | "SlowDown")
+    )
 }
 
 pub fn test_agent() -> Agent {

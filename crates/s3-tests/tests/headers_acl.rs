@@ -198,7 +198,7 @@ fn test_put_object_acl_header_raw_request_succeeds_on_acl_bucket() {
             acl.grants()
         );
 
-        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key).await;
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

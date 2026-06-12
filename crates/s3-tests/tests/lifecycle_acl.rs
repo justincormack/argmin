@@ -2,11 +2,17 @@ use aws_sdk_s3::types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
     LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectOwnership,
 };
-use s3_tests::{assert_s3_err_code, create_acl_enabled_bucket, err_status, CTX};
+use s3_tests::{
+    assert_s3_err_code, create_acl_enabled_bucket, err_status, SendRetryingOperationAborted, CTX,
+};
 
 async fn cleanup_bucket(bucket: &str) {
     let client = CTX.client();
-    let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
+    let _ = client
+        .delete_bucket_lifecycle()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("delete lifecycle ACL config during cleanup")
+        .await;
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 

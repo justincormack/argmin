@@ -3,9 +3,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, MetadataDirective, ObjectOwnership,
 };
-use s3_tests::{create_acl_enabled_bucket, CTX};
-use std::future::Future;
-use std::pin::Pin;
+use s3_tests::{create_acl_enabled_bucket, SendRetryingOperationAborted, CTX};
 use std::time::Duration;
 
 const WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS: usize = 20;
@@ -13,69 +11,6 @@ const WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS: usize = 20;
 fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
 }
-
-type RetrySendFuture<T, E> =
-    Pin<Box<dyn Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>>>;
-
-trait SendRetryingOperationAborted: Clone {
-    type Output;
-    type Error: ProvideErrorMetadata;
-
-    fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error>;
-
-    async fn send_retrying_operation_aborted(
-        self,
-        description: &str,
-    ) -> Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>> {
-        for attempt in 0..WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS {
-            match self.clone().send_once().await {
-                Ok(output) => return Ok(output),
-                Err(err)
-                    if is_operation_aborted(&err)
-                        && attempt + 1 < WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        unreachable!("{description} retry loop must return on final attempt");
-    }
-}
-
-macro_rules! impl_send_retrying_operation_aborted {
-    ($builder:path, $output:path, $error:path) => {
-        impl SendRetryingOperationAborted for $builder {
-            type Output = $output;
-            type Error = $error;
-
-            fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
-                Box::pin(async move { self.send().await })
-            }
-        }
-    };
-}
-
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
-    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
-    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
-    aws_sdk_s3::operation::copy_object::CopyObjectOutput,
-    aws_sdk_s3::operation::copy_object::CopyObjectError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
-    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
-    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError
-);
-impl_send_retrying_operation_aborted!(
-    aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
-    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
-    aws_sdk_s3::operation::delete_object::DeleteObjectError
-);
 
 async fn put_object_retrying_operation_aborted(
     bucket: &str,
@@ -225,7 +160,7 @@ fn test_website_redirect_acl_put_object_round_trip() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect));
@@ -235,7 +170,7 @@ fn test_website_redirect_acl_put_object_round_trip() {
             .get_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(get.website_redirect_location(), Some(redirect));
@@ -278,7 +213,7 @@ fn test_website_redirect_acl_copy_object_explicit_redirect() {
             .head_object()
             .bucket(&bucket)
             .key(src_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(
@@ -291,7 +226,7 @@ fn test_website_redirect_acl_copy_object_explicit_redirect() {
             .head_object()
             .bucket(&bucket)
             .key(dst_key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(dst_head.website_redirect_location(), Some(redirect));
@@ -314,7 +249,7 @@ fn test_website_redirect_acl_multipart_persists_from_initiation() {
             .head_object()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("S3 operation during website redirect test")
             .await
             .unwrap();
         assert_eq!(head.website_redirect_location(), Some(redirect));

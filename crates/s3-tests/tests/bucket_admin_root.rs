@@ -13,7 +13,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     put_bucket_lifecycle_with_md5, send_signed_request_to_endpoint_for_service_with_credentials,
-    unique_bucket, SignedRequestCredentials, CTX,
+    unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
@@ -144,7 +144,10 @@ async fn eventually_list_contains(
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let result = client.list_buckets().send().await;
+        let result = client
+            .list_buckets()
+            .send_retrying_operation_aborted("list buckets for admin root test")
+            .await;
         match result {
             Ok(output) => {
                 let names: Vec<&str> = output
@@ -202,29 +205,51 @@ async fn cleanup_bucket(
     bucket: &str,
 ) {
     for client in [root_client, non_root_client] {
-        let _ = client.delete_bucket_policy().bucket(bucket).send().await;
-        let _ = client.delete_bucket_cors().bucket(bucket).send().await;
-        let _ = client.delete_bucket_tagging().bucket(bucket).send().await;
-        let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
+        let _ = client
+            .delete_bucket_policy()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket policy during admin cleanup")
+            .await;
+        let _ = client
+            .delete_bucket_cors()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket CORS during admin cleanup")
+            .await;
+        let _ = client
+            .delete_bucket_tagging()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket tagging during admin cleanup")
+            .await;
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket lifecycle during admin cleanup")
+            .await;
         let _ = client
             .delete_public_access_block()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("delete public access block during admin cleanup")
             .await;
         let _ = client
             .delete_bucket_ownership_controls()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("delete ownership controls during admin cleanup")
             .await;
         let _ = client
             .delete_bucket_encryption()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("delete bucket encryption during admin cleanup")
             .await;
     }
 
     for client in [root_client, non_root_client] {
-        if client.delete_bucket().bucket(bucket).send().await.is_ok() {
+        if client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete bucket during admin cleanup")
+            .await
+            .is_ok()
+        {
             return;
         }
     }

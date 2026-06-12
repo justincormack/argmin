@@ -14,7 +14,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, disable_bucket_public_access_block, err_status,
     put_bucket_lifecycle_with_md5, send_signed_request_to_endpoint_for_service_with_credentials,
-    unique_bucket, SignedRequestCredentials, CTX,
+    unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -28,14 +28,14 @@ fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
 }
 async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
 
     for _ in 0..10 {
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list multipart uploads during ABAC cleanup")
             .await
             .unwrap();
         for upload in uploads.uploads() {
@@ -44,11 +44,16 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
                 .bucket(bucket)
                 .key(upload.key().unwrap())
                 .upload_id(upload.upload_id().unwrap())
-                .send()
+                .send_retrying_operation_aborted("abort multipart upload during ABAC cleanup")
                 .await;
         }
 
-        match client.delete_bucket().bucket(bucket).send().await {
+        match client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete ABAC policy bucket")
+            .await
+        {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
@@ -391,7 +396,10 @@ async fn eventually_get_object_succeeds(
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match op().send().await {
+        match op()
+            .send_retrying_operation_aborted("eventual ABAC get object")
+            .await
+        {
             Ok(_) => return,
             Err(_) if attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;

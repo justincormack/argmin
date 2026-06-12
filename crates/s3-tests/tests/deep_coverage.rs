@@ -9,7 +9,9 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging,
     VersioningConfiguration,
 };
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, unique_bucket, SendRetryingOperationAborted, CTX,
+};
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
@@ -41,7 +43,7 @@ async fn setup_versioned_bucket() -> String {
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
-        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+        let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -433,7 +435,12 @@ fn test_list_object_versions_full_pagination() {
                 req = req.version_id_marker(vm);
             }
 
-            let resp = req.send().await.unwrap();
+            let resp = req
+                .send_retrying_operation_aborted(
+                    "list object versions during deep coverage pagination",
+                )
+                .await
+                .unwrap();
             pages += 1;
 
             for v in resp.versions() {
@@ -511,12 +518,16 @@ fn test_delete_nonempty_versioned_bucket() {
             .delete_object()
             .bucket(&bucket)
             .key("still-here")
-            .send()
+            .send_retrying_operation_aborted("create deep coverage delete marker")
             .await
             .unwrap();
 
         // Bucket has a live version + a delete marker — not empty.
-        let result = client.delete_bucket().bucket(&bucket).send().await;
+        let result = client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("delete nonempty deep coverage bucket")
+            .await;
         assert_s3_err_code(&result, "BucketNotEmpty");
 
         // Clean up properly.

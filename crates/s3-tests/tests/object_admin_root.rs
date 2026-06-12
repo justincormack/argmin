@@ -3,7 +3,10 @@ use aws_sdk_s3::types::{
     ObjectCannedAcl, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
     ObjectLockRetentionMode, ObjectOwnership, Tag, Tagging,
 };
-use s3_tests::{cleanup_versioned_bucket, unique_bucket, CTX};
+use s3_tests::{
+    cleanup_versioned_bucket, retrying_operation_aborted, unique_bucket,
+    SendRetryingOperationAborted, CTX,
+};
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
@@ -13,7 +16,7 @@ async fn create_acl_enabled_bucket(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket_request(client, &bucket)
         .object_ownership(ObjectOwnership::ObjectWriter)
-        .send()
+        .send_retrying_operation_aborted("create object admin ACL-enabled bucket")
         .await
         .unwrap();
     bucket
@@ -29,7 +32,7 @@ async fn create_object_lock_bucket(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
-        .send()
+        .send_retrying_operation_aborted("create object admin object-lock bucket")
         .await
         .unwrap();
     bucket
@@ -41,14 +44,16 @@ async fn put_object(
     key: &str,
     body: &'static [u8],
 ) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap()
+    retrying_operation_aborted("put object admin test object", || async move {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+    })
+    .await
 }
 
 fn future_date(seconds_from_now: u64) -> DateTime {
@@ -87,12 +92,18 @@ async fn cleanup_plain_bucket(
 ) {
     for client in [root_client, non_root_client] {
         for key in keys {
-            let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+            let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, *key).await;
         }
     }
 
     for client in [root_client, non_root_client] {
-        if client.delete_bucket().bucket(bucket).send().await.is_ok() {
+        if client
+            .delete_bucket()
+            .bucket(bucket)
+            .send_retrying_operation_aborted("delete object admin bucket during cleanup")
+            .await
+            .is_ok()
+        {
             return;
         }
     }
