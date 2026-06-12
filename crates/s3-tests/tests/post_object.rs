@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::{primitives::ByteStream, types::ServerSideEncryption};
 use ring::hmac;
@@ -302,15 +302,33 @@ fn post_object_to_endpoint(
     let url = format!("{}/{}", endpoint, bucket);
     let (content_type, body) = build_multipart(fields, file_data, file_name);
 
-    let req = agent.post(&url).header("Content-Type", &content_type);
-    let req = headers
-        .iter()
-        .fold(req, |req, (name, value)| req.header(*name, *value));
-    let mut resp = req.send(&body[..]).expect("HTTP transport error");
+    let deadline = Instant::now() + configured_post_object_retry_timeout();
+    loop {
+        let req = agent.post(&url).header("Content-Type", &content_type);
+        let req = headers
+            .iter()
+            .fold(req, |req, (name, value)| req.header(*name, *value));
+        let mut resp = req.send(&body[..]).expect("HTTP transport error");
 
-    let status = resp.status().as_u16();
-    let body_str = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body_str)
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        if status == 409
+            && body_str.contains("<Code>OperationAborted</Code>")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return (status, body_str);
+    }
+}
+
+fn configured_post_object_retry_timeout() -> Duration {
+    let timeout_secs = std::env::var("S3_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    Duration::from_secs(timeout_secs)
 }
 
 fn post_object_raw(
