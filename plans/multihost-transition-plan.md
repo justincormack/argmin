@@ -6120,6 +6120,18 @@ through bugs. The goal is to make expected contention and overload explicit,
 observable, and S3-shaped, while preserving fail-closed behavior for real
 invariants.
 
+Scope boundary:
+
+Phase 10.9 is a stabilization gate, not the full production backpressure design.
+It should fix correctness-adjacent request behavior found by UAT: unbounded
+request work, retry storms, expected contention escaping as HTTP 500, storage
+RPC/session saturation surfacing as EOF or SDK operation-attempt timeout, and
+known places where the local six-process UAT harness can hide or amplify server
+progress bugs. Broader throughput tuning, adaptive admission, workload-specific
+capacity weights, and production SLO policy belong in
+[`production-backpressure-plan.md`](production-backpressure-plan.md) after a more
+representative production-style harness exists.
+
 Work items:
 
 1. error semantics audit
@@ -6289,13 +6301,11 @@ Work items:
      stream-session records. Delete-bucket begin now has a local budget, but the
      same pattern remains outside that path. Budget exhaustion must not become
      an SDK operation-attempt timeout or an internal storage error.
-   - make overload adaptive but bounded. Start with conservative configured
-     min/max limits for each resource, then use observed completion rate,
-     p95/p99 wait time, timeout count, and queue depth to adjust admission
-     inside those limits. Increase slowly only while wait time is below target
-     and no overload is emitted; decrease immediately when waits exceed budget,
-     storage-node resource exhaustion appears, or operation-attempt timeout risk
-     is detected. This is admission control, not blind sleeps.
+   - defer adaptive overload control to the production backpressure plan. Phase
+     10.9 may add fixed limits, typed overload, bounded waits, and diagnostics
+     needed to keep request behavior correct under stress, but it should not
+     tune adaptive capacity policy from the current single-host UAT harness as
+     if that harness represented production workload shape.
    - bias admission toward completing already-admitted work when unfinished work
      is accumulating, without starving new starts. Split mutating work into at
      least `Completion`, `Progress`, and `StartWrite` classes. Completion work
@@ -6376,6 +6386,19 @@ Work items:
      target is to make slow durable-drain or pending-command convergence return
      bounded `OperationAborted`/`SlowDown` responses rather than letting many
      small server-side waits accumulate past the SDK operation-attempt timeout.
+   - close the remaining unbounded request-work audit before Phase 11. Every
+     public request path and background worker entry point that can run because
+     of a public request must either finish within an operation-local work
+     budget, transfer ownership to durable background state, or return a typed
+     retryable S3 response. This includes retry loops around bucket write
+     drain waits, pending-command drain/reissue, command-id allocation,
+     object-version/generation reservation, stream-session create/finalize,
+     multipart create/complete/abort cleanup, bucket delete begin/finalize,
+     completed-MPU cleanup/pruning, lifecycle-triggered cleanup, and any
+     whole-bucket/page scan helper. A loop may be intentionally unbounded only
+     if it is outside the request path, owns no request worker, is paced by a
+     durable work queue or explicit capacity lease, and has observability that
+     proves it is not hiding request progress.
    - add foreground/background capacity classes and make lifecycle, reclaim,
      delete finalization, scavenger, repair, and scrub use low-priority leases
      with backoff.
@@ -6383,15 +6406,17 @@ Work items:
      classes before tuning limits. Large listing/page work must feel overload
      before ordinary cached reads, and metrics must report read/list admission
      totals, waits, timeouts, and active counts independently.
-   - add adaptive completion pressure after the static class split is stable.
-     The first version may use stepped configured thresholds rather than a
-     continuous controller, but it must reserve a floor for new starts while
-     shifting additional capacity to completion/progress work as unfinished
-     stream sessions, pending appends, pending metadata commands, staged
-     payloads, and cleanup backlog grow.
-   - only after the static limits pass UAT under forced low budgets, add the
-     bounded adaptive controller. It must be feature/config gated at first and
-     tested against deterministic pressure injection before becoming the default.
+   - add fixed or stepped completion-pressure shaping after the static class
+     split is stable. This Phase 10.9 version may use configured thresholds
+     rather than a continuous controller, but it must reserve a floor for new
+     starts while shifting additional capacity to completion/progress work as
+     unfinished stream sessions, pending appends, pending metadata commands,
+     staged payloads, and cleanup backlog grow.
+   - leave the bounded adaptive controller to
+     [`production-backpressure-plan.md`](production-backpressure-plan.md). Before
+     Phase 11, require only the fixed/static admission and bounded-work pieces
+     needed to avoid EOFs, HTTP 500s, unbounded request loops, and SDK
+     operation-attempt timeouts for expected contention.
    - after every slice, run the focused pressure tests with low limits, then a
      repeated UAT subset on the slow host before widening the tested surface.
 6. multihost UAT observability
@@ -6479,10 +6504,10 @@ Required tests:
 21. read/list class separation under forced list pressure keeps bounded
     `GET`/`HEAD` and shard-read work making progress while large listing/page
     operations either wait within budget or return S3 `SlowDown`
-22. adaptive completion pressure under many unfinished stream sessions/pending
-    appends shifts capacity toward append/finalize/cleanup work, reduces new
-    `CreateStreamUpload`/create-multipart admission, and still admits at least
-    the configured new-start floor
+22. fixed or stepped completion-pressure shaping under many unfinished stream
+    sessions/pending appends shifts capacity toward append/finalize/cleanup
+    work, reduces new `CreateStreamUpload`/create-multipart admission, and
+    still admits at least the configured new-start floor
 23. every HTTP 500 in a focused failure-injection test emits a structured cause
    label and enough request/RPC/PG context to debug without temporary tracing
 24. diagnostics and flight-recorder dumps redact secrets, payload context,
@@ -6493,6 +6518,12 @@ Required tests:
 26. guardrails fail if a new coordinator request path maps expected
     metadata-command contention directly to generic `Store`, `Metadata`, or
     internal errors
+27. guardrails or focused tests fail if a request-path retry loop waits on
+    durable drain convergence, pending-command recovery, command-id allocation,
+    reservation allocation, stream-session progress, multipart cleanup,
+    bucket-delete cleanup, lifecycle cleanup, or whole-bucket/page scanning
+    without consuming a request-local work budget or handing off to durable
+    background work
 
 Exit criteria:
 
@@ -6507,7 +6538,10 @@ Exit criteria:
    rather than ad hoc per-request mappings
 5. production diagnostics are sufficient to debug the known race classes without
    adding temporary trace code
-6. Phase 11 starts only after this stabilization gate is closed
+6. all request-path retry loops discovered in the unbounded-work audit are
+   either bounded, converted to typed capacity admission/backoff, or explicitly
+   moved behind durable background ownership with tests
+7. Phase 11 starts only after this stabilization gate is closed
 
 Status:
 
@@ -6820,6 +6854,11 @@ Status:
   metadata mutation admission and jittered contention backoff as the next
   throughput-oriented control, rather than increasing delete priority or tuning
   the oversized storage-RPC queue depth.
+- Clarified the Phase 10.9 unbounded-work target after soak tests exposed
+  bucket-delete and versioned-write contention paths. The stabilization gate now
+  requires closing the remaining request-path unbounded-loop audit before
+  Phase 11, while keeping longer-running cleanup behind durable background
+  ownership instead of request workers.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
@@ -6837,6 +6876,27 @@ Work items:
 8. implement metadata command-log retention and compaction using the Phase 7
    policy
 9. add cluster-map history retention and pruning
+10. define the distributed correctness invariants that Phase 11 must preserve
+    and wire them into trace/model checks where possible:
+    one PG primary per epoch, stale senders cannot mutate state, metadata
+    command ids/log indexes cannot fork, pending-command apply/reissue is
+    idempotent, reservations and drains cannot be silently lost or stolen,
+    bucket delete cannot finalize while visible object or MPU state remains,
+    committed object metadata references readable shards or an explicit durable
+    reclaim/repair state, and list operations fail closed across peering or
+    epoch ambiguity
+11. add deterministic fault-injection tests for operations that start under one
+    epoch and finish, retry, or clean up under another: primary changes while
+    commands are pending, stale frontend routes, storage-node RPC failure before
+    and after durable metadata writes, partial acting-set success, retry of the
+    same logical operation after leadership movement, and failure during bucket
+    delete drain/finalize or multipart/stream publish
+12. keep the single-host six-process UAT soak as an overload/backpressure signal,
+    but add a separate smaller real-multihost correctness soak with independent
+    storage processes, real interprocess transport, restarts, route/epoch
+    changes, and controlled failure injection. Treat the former as evidence
+    about request bounding and retry quality; treat the latter as evidence
+    about distributed correctness.
 
 Exit criteria:
 
@@ -6847,6 +6907,13 @@ Exit criteria:
 5. command-log retention bounds long-running disk growth without breaking
    restart, peering, or repair correctness
 6. failure-injection tests cover primary loss, replica loss, restart, and repair
+7. deterministic epoch-transition tests prove that stale frontends, stale
+   primaries, and operations crossing epoch changes either converge through the
+   command log or fail closed without duplicate mutation, leaked reservations,
+   orphaned visible payloads, or partial list results
+8. a real-multihost correctness soak runs separately from the single-host
+   overload soak and exercises restarts, route changes, and injected RPC/storage
+   failures without relying on host-local disk contention to find bugs
 
 ## Phase 12: Replicated Control Plane
 
@@ -6892,6 +6959,14 @@ Required test areas:
 10. in-flight read protection across cleanup
 11. local multi-process startup and shutdown
 12. failure injection for primary loss, replica loss, and stale sender writes
+13. operations crossing epoch changes, including started-before/finished-after
+    command publication, cleanup, retry, and response paths
+14. deterministic commit-boundary faults before shard write, after shard write
+    before metadata publish, after pending-command install before apply, after
+    apply before response, and during cleanup/finalization
+15. separate soak profiles for overload/backpressure and distributed
+    correctness, with the latter using real process/node boundaries plus
+    controlled restarts and route/epoch changes
 
 `./scripts/coverage` remains the main integration coverage signal. The full test
 suite should be run before committing each completed implementation slice.
