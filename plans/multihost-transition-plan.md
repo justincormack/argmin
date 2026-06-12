@@ -6259,6 +6259,19 @@ Work items:
      `commands_per_visible_commit`, and return `OperationAborted` or
      `SlowDown` according to whether the bottleneck is metadata contention or
      capacity.
+   - add request-local work budgets for bounded server progress, independent of
+     client SDK timeouts. Any public request path that waits for durable bucket
+     write drain, drains or reissues pending metadata commands, finalizes bucket
+     delete work, enumerates completed multipart-upload records, or performs
+     whole-bucket/page cleanup must consume a fixed operation budget and return
+     the operation-appropriate retryable S3 response when that budget is
+     exhausted. In particular, `wait_for_durable_bucket_write_drain` is only a
+     short sleep plus bucket-existence check today, while many callers wrap it in
+     unbounded outer loops for bucket writes, object metadata writes, stream
+     creation, multipart creation/completion, upload-part stream creation, and
+     stream-session records. Delete-bucket begin now has a local budget, but the
+     same pattern remains outside that path. Budget exhaustion must not become
+     an SDK operation-attempt timeout or an internal storage error.
    - make overload adaptive but bounded. Start with conservative configured
      min/max limits for each resource, then use observed completion rate,
      p95/p99 wait time, timeout count, and queue depth to adjust admission
@@ -6340,6 +6353,12 @@ Work items:
      cannot prove the exact command was applied must return typed retryable
      contention without performing owner-side payload/generation cleanup, because
      a recovery leader may have reissued and applied a matching command.
+   - add a shared request work-budget helper and thread it through durable
+     bucket-drain wait paths before widening it to bucket delete finalization,
+     completed-MPU cleanup/pruning, and other page/scan helpers. The first
+     target is to make slow durable-drain or pending-command convergence return
+     bounded `OperationAborted`/`SlowDown` responses rather than letting many
+     small server-side waits accumulate past the SDK operation-attempt timeout.
    - add foreground/background capacity classes and make lifecycle, reclaim,
      delete finalization, scavenger, repair, and scrub use low-priority leases
      with backoff.
@@ -6758,6 +6777,14 @@ Status:
   makes the next slow-host timeout distinguish between one legitimate recovery
   leader with bounded waiters, repeated reissue storms, and waiters timing out
   behind a stuck recovery leader.
+- Added the remaining unbounded request-work audit to Phase 10.9. The main
+  high-risk shape is request paths that repeatedly wait for durable bucket-write
+  drain, drain/reissue pending metadata commands, or perform page/cleanup work
+  without a request-local budget, so many individually small server-side waits
+  can extend past the SDK operation-attempt timeout. DeleteBucket begin now has
+  a local budget, but the plan now tracks extending that fixed-budget pattern to
+  durable bucket-drain callers, bucket-delete finalization, completed-MPU
+  cleanup/pruning, and other whole-bucket/page helpers.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
