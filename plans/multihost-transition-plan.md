@@ -6251,6 +6251,23 @@ Work items:
      reservation identity, and side-effect boundary before proceeding. A
      different contender's successful recovery is only a wakeup signal until
      that revalidation succeeds.
+   - add per-PG metadata mutation admission/backoff above the storage-RPC
+     queue. Slow-host UAT showed a hot metadata PG producing hundreds of
+     retryable `OperationAborted` responses without request-admission timeout,
+     storage-RPC admission wait, or metadata-recovery timeout. That means the
+     system admitted too many logical metadata contenders rather than filling a
+     low-level RPC queue. Bound the number of active new metadata mutation
+     attempts per PG, keep a reserved path for completion/recovery/drain work,
+     and make excess starts wait briefly within a request-local budget or
+     return `SlowDown` before doing expensive snapshot/command-build work.
+   - add jittered backoff after real metadata-command contention outcomes,
+     not blind sleeps. Triggers include metadata command log conflicts,
+     pending-slot conflicts, partial exact-command conflicts, command-id
+     allocation conflicts, and pending-slot install conflicts. Start with small
+     exponential full-jitter delays such as 2-5 ms initial, factor 2, capped at
+     50-100 ms, all charged to the request-local work budget. The goal is to
+     dephase same-PG retry herds while keeping the PG making useful command
+     progress.
    - cap object-version reservation retries as part of the same retry budget.
      A single client PUT attempt may not burn unbounded
      `ReserveObjectVersion` commands for one bucket/key. Reuse the request's
@@ -6795,6 +6812,14 @@ Status:
   durable drain, and the common bucket write-reservation snapshot loops now use
   request-local retry budgets that return retryable metadata contention instead
   of consuming an SDK operation-attempt timeout.
+- Added the next backpressure direction after a local UAT setup cleanup failure
+  deleting an owner-root probe bucket. The failed bucket's PG had fully
+  converged by shutdown and storage-RPC admission never waited, but the run
+  emitted hundreds of `OperationAborted` responses while a hot metadata PG
+  accepted many competing metadata mutations. The plan now calls out per-PG
+  metadata mutation admission and jittered contention backoff as the next
+  throughput-oriented control, rather than increasing delete priority or tuning
+  the oversized storage-RPC queue depth.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
