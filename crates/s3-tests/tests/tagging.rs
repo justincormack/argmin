@@ -116,6 +116,68 @@ impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::copy_object::CopyObjectError
 );
 
+async fn put_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    tagging: Option<&str>,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    for attempt in 0..CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
+        let mut request = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()));
+        if let Some(tagging) = tagging {
+            request = request.tagging(tagging);
+        }
+        match request.send().await {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("put object during tagging setup: {err:?}"),
+        }
+    }
+    panic!("put object during tagging setup did not complete");
+}
+
+async fn upload_part_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
+    for attempt in 0..CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
+        match client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(err)
+                if is_operation_aborted(&err)
+                    && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => panic!("upload part during tagging setup: {err:?}"),
+        }
+    }
+    panic!("upload part during tagging setup did not complete");
+}
+
 /// Cleanup helper.
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
@@ -1575,14 +1637,7 @@ async fn create_delete_marker() -> (String, String, String) {
     let key = "dm-test-obj";
 
     // Put an object
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"hello"))
-        .send()
-        .await
-        .unwrap();
+    put_object_retrying_operation_aborted(client, &bucket, key, b"hello".to_vec(), None).await;
 
     // Delete the object (creates a delete marker)
     let delete_resp = client
@@ -1742,15 +1797,14 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
         let key = "tagged-then-deleted";
 
         // Put an object with tags
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"hello"))
-            .tagging("env=prod&team=platform")
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"hello".to_vec(),
+            Some("env=prod&team=platform"),
+        )
+        .await;
 
         // Verify tags are set
         wait_for_tag_count(&bucket, key, 2, "tag visibility after put").await;
@@ -1818,16 +1872,8 @@ fn test_set_multipart_tagging() {
         let upload_id = create.upload_id().unwrap();
 
         let data = vec![b'a'; 5 * 1024 * 1024];
-        let upload = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(data))
-            .send()
-            .await
-            .unwrap();
+        let upload =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, data).await;
 
         complete_multipart_upload_retrying_operation_aborted(
             client,

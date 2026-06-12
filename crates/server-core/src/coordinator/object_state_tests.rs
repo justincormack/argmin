@@ -6,6 +6,7 @@ use crate::conditional::{ReadCondition, SpecificEtag, WriteCondition};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
 
 struct MultipartMetadataRaceSync {
     snapshot_reached: Arc<Barrier>,
@@ -5574,7 +5575,7 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
 
         let t1 = thread::spawn(move || {
             b1.wait();
-            test_helpers::put_object(
+            put_object_retrying_operation_aborted(
                 &coord_a,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -5598,7 +5599,7 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
         });
         let t2 = thread::spawn(move || {
             b2.wait();
-            test_helpers::put_object(
+            put_object_retrying_operation_aborted(
                 &coord_b,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -5633,6 +5634,24 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
         let v2 = r2.unwrap().version_id;
         assert_ne!(v1, v2, "concurrent puts must not reuse version IDs");
     }
+}
+
+fn put_object_retrying_operation_aborted(
+    coord: &Coordinator,
+    req: &PutObjectRequest<'_>,
+) -> Result<PutObjectResult, ServerError> {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match test_helpers::put_object(coord, req) {
+            Ok(result) => return Ok(result),
+            Err(ServerError::OperationAborted) if attempt + 1 < MAX_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("retry loop must return on final attempt")
 }
 
 #[test]
