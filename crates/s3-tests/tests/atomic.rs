@@ -9,8 +9,8 @@ use std::time::Duration;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{
-    err_status, put_object_retrying_operation_aborted, unique_bucket, SendRetryingOperationAborted,
-    CTX,
+    err_status, put_object_retrying_operation_aborted, retrying_operation_aborted_result,
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 const ONE_MIB: usize = 1024 * 1024;
@@ -169,25 +169,27 @@ async fn atomic_read_attempt(size: usize) -> Result<(), AtomicReadAttemptError> 
     let key = "atomic-read";
 
     let result = async {
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'A', size)))
-            .send()
-            .await
-            .map_err(|err| AtomicReadAttemptError::new("initial put", format!("{err:?}")))?;
+        retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'A', size)))
+                .send()
+        })
+        .await
+        .map_err(|err| AtomicReadAttemptError::new("initial put", format!("{err:?}")))?;
 
         let bucket2 = bucket.clone();
         let write_task = tokio::spawn(async move {
-            CTX.client()
-                .put_object()
-                .bucket(&bucket2)
-                .key("atomic-read")
-                .body(ByteStream::from(make_body(b'B', size)))
-                .send()
-                .await
-                .map_err(|err| format!("{err:?}"))
+            put_object_retrying_operation_aborted(
+                CTX.client(),
+                &bucket2,
+                "atomic-read",
+                make_body(b'B', size),
+            )
+            .await;
+            Ok::<(), String>(())
         });
 
         let bucket3 = bucket.clone();
@@ -222,26 +224,12 @@ async fn atomic_write_case(size: usize) {
     let bucket = setup_bucket().await;
     let key = "atomic-write";
 
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .body(ByteStream::from(make_body(b'A', size)))
-        .send()
-        .await
-        .unwrap();
+    put_object_retrying_operation_aborted(client, &bucket, key, make_body(b'A', size)).await;
     let body = get_body(&bucket, key).await;
     assert_uniform(&body, size);
     assert_eq!(body[0], b'A');
 
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .body(ByteStream::from(make_body(b'B', size)))
-        .send()
-        .await
-        .unwrap();
+    put_object_retrying_operation_aborted(client, &bucket, key, make_body(b'B', size)).await;
     let body = get_body(&bucket, key).await;
     assert_uniform(&body, size);
     assert_eq!(body[0], b'B');
@@ -254,37 +242,28 @@ async fn atomic_dual_write_case(size: usize) {
     let bucket = setup_bucket().await;
     let key = "atomic-dual-write";
 
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .body(ByteStream::from(make_body(b'X', size)))
-        .send()
-        .await
-        .unwrap();
+    put_object_retrying_operation_aborted(client, &bucket, key, make_body(b'X', size)).await;
 
     let bucket2 = bucket.clone();
     let write_a = tokio::spawn(async move {
-        CTX.client()
-            .put_object()
-            .bucket(&bucket2)
-            .key("atomic-dual-write")
-            .body(ByteStream::from(make_body(b'A', size)))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            CTX.client(),
+            &bucket2,
+            "atomic-dual-write",
+            make_body(b'A', size),
+        )
+        .await;
     });
 
     let bucket3 = bucket.clone();
     let write_b = tokio::spawn(async move {
-        CTX.client()
-            .put_object()
-            .bucket(&bucket3)
-            .key("atomic-dual-write")
-            .body(ByteStream::from(make_body(b'B', size)))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(
+            CTX.client(),
+            &bucket3,
+            "atomic-dual-write",
+            make_body(b'B', size),
+        )
+        .await;
     });
 
     let (a, b) = tokio::join!(write_a, write_b);
