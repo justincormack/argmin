@@ -1822,6 +1822,82 @@ impl super::StorageCluster {
             .load_bucket_snapshot(pg_id, bucket, request)
     }
 
+    /// Load the raw authorization snapshot used only by DeleteBucket retries
+    /// after normal write-snapshot authorization found no visible bucket.
+    ///
+    /// DeleteBucket itself installs or observes the bucket write drain. Once a
+    /// previous request has marked the bucket `Deleting`, normal bucket
+    /// snapshots intentionally hide it as not found, but an idempotent retry
+    /// still needs enough metadata to perform authorization and reach
+    /// `begin_bucket_delete`, where `AlreadyDeleting` is handled. Callers must
+    /// only accept this raw snapshot for an already-`Deleting` bucket; an active
+    /// bucket still requires the normal bucket-write-reserved snapshot.
+    pub fn load_bucket_delete_authorization_snapshot(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let client = node.bucket_metadata_client();
+        let bucket_info = client.head_bucket_raw(pg_id, bucket)?;
+        let policy = Self::load_bucket_delete_authorization_subresource(
+            &**client,
+            pg_id,
+            &bucket_info.name,
+            request.policy,
+            BucketSubresourceKind::Policy,
+        )?;
+        let tags = Self::load_bucket_delete_authorization_subresource(
+            &**client,
+            pg_id,
+            &bucket_info.name,
+            request.tags.should_load(&bucket_info),
+            BucketSubresourceKind::Tagging,
+        )?;
+        let lifecycle = Self::load_bucket_delete_authorization_subresource(
+            &**client,
+            pg_id,
+            &bucket_info.name,
+            request.lifecycle,
+            BucketSubresourceKind::Lifecycle,
+        )?;
+        let cors = Self::load_bucket_delete_authorization_subresource(
+            &**client,
+            pg_id,
+            &bucket_info.name,
+            request.cors,
+            BucketSubresourceKind::Cors,
+        )?;
+
+        Ok(BucketSnapshot {
+            bucket: bucket_info,
+            request,
+            policy,
+            tags,
+            lifecycle,
+            cors,
+        })
+    }
+
+    fn load_bucket_delete_authorization_subresource(
+        client: &dyn crate::node_client::BucketMetadataNodeClient,
+        pg_id: PgId,
+        bucket: &BucketName,
+        requested: bool,
+        kind: BucketSubresourceKind,
+    ) -> Result<LoadedBucketSubresource<String>, BucketSnapshotLoadError> {
+        if !requested {
+            return Ok(LoadedBucketSubresource::NotRequested);
+        }
+        Ok(match client.get_bucket_subresource(pg_id, bucket, kind)? {
+            Some(body) => LoadedBucketSubresource::Loaded(body),
+            None => LoadedBucketSubresource::Missing,
+        })
+    }
+
     pub fn load_available_bucket_execution_generation_batches(
         &self,
         buckets: &[BucketName],

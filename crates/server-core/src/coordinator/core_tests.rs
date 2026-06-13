@@ -4326,6 +4326,23 @@ fn delete_bucket_waits_for_bucket_write_handle_action() {
 }
 
 #[test]
+fn delete_bucket_authorizes_idempotent_retry_while_deleting() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-idempotent-auth";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+
+    delete_bucket_test(&coord, bucket)
+        .expect("idempotent DeleteBucket retry should authorize while bucket delete drain exists");
+}
+
+#[test]
 fn delete_bucket_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-no-lock";
