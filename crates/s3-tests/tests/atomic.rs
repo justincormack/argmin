@@ -182,13 +182,16 @@ async fn atomic_read_attempt(size: usize) -> Result<(), AtomicReadAttemptError> 
 
         let bucket2 = bucket.clone();
         let write_task = tokio::spawn(async move {
-            put_object_retrying_operation_aborted(
-                CTX.client(),
-                &bucket2,
-                "atomic-read",
-                make_body(b'B', size),
-            )
-            .await;
+            retrying_operation_aborted_result(|| {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket2)
+                    .key("atomic-read")
+                    .body(ByteStream::from(make_body(b'B', size)))
+                    .send()
+            })
+            .await
+            .map_err(|err| format!("{err:?}"))?;
             Ok::<(), String>(())
         });
 
