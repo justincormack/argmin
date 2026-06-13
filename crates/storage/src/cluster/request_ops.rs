@@ -6757,14 +6757,26 @@ impl super::StorageCluster {
             .enqueue_bucket_delete_finalize(bucket);
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;
         }
-        self.local_map
-            .runtime_state()
-            .try_take_reclaim_work_for_test()
+        self.local_map.runtime_state().try_take_reclaim_work()
+    }
+
+    pub fn enqueue_durable_reclaim_work(&self) {
+        self.enqueue_durable_reclaim_work_excluding_object_payload(&HashSet::new());
+    }
+
+    pub fn enqueue_durable_reclaim_work_excluding_object_payload(
+        &self,
+        excluded_object_payload_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
+    ) {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return;
+        }
+        self.enqueue_durable_object_payload_reclaim_roots_excluding(excluded_object_payload_roots);
+        self.enqueue_durable_bucket_delete_finalize_roots();
     }
 
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
@@ -6772,8 +6784,7 @@ impl super::StorageCluster {
             return None;
         }
         while !stop.load(Ordering::SeqCst) {
-            self.enqueue_durable_object_payload_reclaim_roots();
-            self.enqueue_durable_bucket_delete_finalize_roots();
+            self.enqueue_durable_reclaim_work();
             if let Some(work) = self
                 .local_map
                 .runtime_state()
@@ -7061,8 +7072,9 @@ impl super::StorageCluster {
         result
     }
 
-    pub(crate) fn enqueue_durable_object_payload_reclaim_roots(
+    pub(crate) fn enqueue_durable_object_payload_reclaim_roots_excluding(
         &self,
+        excluded_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
     ) -> DurableObjectPayloadReclaimScan {
         if self.operation_epoch() != self.cluster_epoch() {
             return DurableObjectPayloadReclaimScan::default();
@@ -7115,6 +7127,11 @@ impl super::StorageCluster {
             let Some(root) = root else {
                 continue;
             };
+            if excluded_roots.contains(&(root.bucket.clone(), root.key.clone(), root.generation_id))
+            {
+                emit_scan("deferred_locally");
+                continue;
+            }
             if self.object_metadata_pg_id(&root.bucket, &root.key) != pg_id.get() {
                 scan.errors += 1;
                 emit_scan("wrong_pg");

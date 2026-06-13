@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
@@ -36,9 +36,63 @@ static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
 > = OnceLock::new();
 
-const RECLAIM_DEFERRED_RETRY_SLEEP: Duration = Duration::from_millis(10);
+const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
+const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
+
+type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+fn earliest_object_payload_reclaim_retry_sleep(
+    storage_node: &StorageCluster,
+    deferred_work: &VecDeque<ObjectPayloadReclaimRoot>,
+    retry_after_by_pg: &HashMap<u32, Instant>,
+) -> Option<Duration> {
+    let now = Instant::now();
+    let mut earliest_retry: Option<Instant> = None;
+    for (bucket, key, _) in deferred_work {
+        let pg_id = storage_node.object_payload_reclaim_pg_id(bucket, key);
+        let Some(retry_after) = retry_after_by_pg.get(&pg_id) else {
+            return None;
+        };
+        if *retry_after <= now {
+            return None;
+        }
+        earliest_retry = Some(match earliest_retry {
+            Some(earliest_retry) => earliest_retry.min(*retry_after),
+            None => *retry_after,
+        });
+    }
+    earliest_retry.map(|retry_after| {
+        retry_after
+            .duration_since(now)
+            .min(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN)
+    })
+}
+
+fn defer_object_payload_reclaim(
+    deferred_work: &mut VecDeque<ObjectPayloadReclaimRoot>,
+    deferred_roots: &mut HashSet<ObjectPayloadReclaimRoot>,
+    root: ObjectPayloadReclaimRoot,
+) {
+    if deferred_roots.insert(root.clone()) {
+        deferred_work.push_back(root);
+    }
+}
+
+fn enqueue_durable_reclaim_work_if_due(
+    storage_node: &StorageCluster,
+    excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
+    next_scan_at: &mut Instant,
+) {
+    let now = Instant::now();
+    if now < *next_scan_at {
+        return;
+    }
+    storage_node
+        .enqueue_durable_reclaim_work_excluding_object_payload(excluded_object_payload_roots);
+    *next_scan_at = now + RECLAIM_DURABLE_SCAN_INTERVAL;
+}
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
@@ -102,24 +156,101 @@ impl ReclaimSweeper {
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
             .spawn(move || {
-                while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
+                let mut object_payload_reclaim_pg_retry_after: HashMap<u32, Instant> =
+                    HashMap::new();
+                let mut deferred_object_payload_reclaim = VecDeque::new();
+                let mut deferred_object_payload_reclaim_roots = HashSet::new();
+                let mut next_durable_scan_at = Instant::now();
+                let mut pending_work = None;
+                while !worker_stop.load(Ordering::SeqCst) {
+                    let Some(work) = pending_work
+                        .take()
+                        .or_else(|| worker_node.try_take_reclaim_work())
+                        .or_else(|| {
+                            if deferred_object_payload_reclaim.is_empty() {
+                                return None;
+                            }
+                            enqueue_durable_reclaim_work_if_due(
+                                &worker_node,
+                                &deferred_object_payload_reclaim_roots,
+                                &mut next_durable_scan_at,
+                            );
+                            worker_node.try_take_reclaim_work().or_else(|| {
+                                deferred_object_payload_reclaim.pop_front().map(|root| {
+                                    deferred_object_payload_reclaim_roots.remove(&root);
+                                    ReclaimWorkItem::ObjectPayload(root)
+                                })
+                            })
+                        })
+                        .or_else(|| worker_node.wait_for_reclaim_work(&worker_stop))
+                    else {
+                        break;
+                    };
                     match work {
                         ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
-                            let result = runtime.try_reclaim_object_payload_for(
-                                &bucket,
-                                &key,
-                                generation_id,
-                            );
-                            if matches!(
-                                result,
-                                Ok(false)
-                                    | Err(ServerError::OperationAborted | ServerError::SlowDown)
-                            ) {
-                                std::thread::sleep(RECLAIM_DEFERRED_RETRY_SLEEP);
+                            let root = (bucket, key, generation_id);
+                            if deferred_object_payload_reclaim_roots.contains(&root) {
+                                continue;
+                            }
+                            let (bucket, key, generation_id) = root;
+                            let pg_id = worker_node.object_payload_reclaim_pg_id(&bucket, &key);
+                            let is_pg_cooled = if let Some(retry_after) =
+                                object_payload_reclaim_pg_retry_after.get(&pg_id)
+                            {
+                                let now = Instant::now();
+                                *retry_after > now
+                            } else {
+                                false
+                            };
+                            if is_pg_cooled {
+                                defer_object_payload_reclaim(
+                                    &mut deferred_object_payload_reclaim,
+                                    &mut deferred_object_payload_reclaim_roots,
+                                    (bucket, key, generation_id),
+                                );
+                            } else {
+                                let result = runtime.try_reclaim_object_payload_for(
+                                    &bucket,
+                                    &key,
+                                    generation_id,
+                                );
+                                if matches!(
+                                    result,
+                                    Ok(false)
+                                        | Err(ServerError::OperationAborted | ServerError::SlowDown)
+                                ) {
+                                    object_payload_reclaim_pg_retry_after.insert(
+                                        pg_id,
+                                        Instant::now() + OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN,
+                                    );
+                                    defer_object_payload_reclaim(
+                                        &mut deferred_object_payload_reclaim,
+                                        &mut deferred_object_payload_reclaim_roots,
+                                        (bucket, key, generation_id),
+                                    );
+                                } else {
+                                    object_payload_reclaim_pg_retry_after.remove(&pg_id);
+                                }
                             }
                         }
                         ReclaimWorkItem::BucketDelete(bucket) => {
                             let _ = runtime.try_finalize_bucket_delete_for(&bucket);
+                        }
+                    }
+                    if pending_work.is_none() && !deferred_object_payload_reclaim.is_empty() {
+                        enqueue_durable_reclaim_work_if_due(
+                            &worker_node,
+                            &deferred_object_payload_reclaim_roots,
+                            &mut next_durable_scan_at,
+                        );
+                        if let Some(work) = worker_node.try_take_reclaim_work() {
+                            pending_work = Some(work);
+                        } else if let Some(sleep_for) = earliest_object_payload_reclaim_retry_sleep(
+                            &worker_node,
+                            &deferred_object_payload_reclaim,
+                            &object_payload_reclaim_pg_retry_after,
+                        ) {
+                            std::thread::sleep(sleep_for);
                         }
                     }
                 }

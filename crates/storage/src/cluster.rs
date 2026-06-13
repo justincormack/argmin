@@ -2306,6 +2306,10 @@ impl StorageCluster {
         self.local_map.bucket_pg_for(bucket)
     }
 
+    pub fn object_payload_reclaim_pg_id(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+        self.object_metadata_pg_id(bucket, key)
+    }
+
     fn object_metadata_pg_id(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.local_map.object_pg_for(bucket, key)
     }

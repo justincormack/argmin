@@ -973,19 +973,13 @@ impl LocalClusterRuntimeState {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+    pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
         let mut state = self
             .reclaim_queue
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         Self::pop_reclaim_work(&mut state)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn try_take_reclaim_work_for_test(&self) -> Option<ReclaimWorkItem> {
-        self.try_take_reclaim_work()
     }
 
     pub(crate) fn wait_for_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
@@ -7836,7 +7830,8 @@ mod tests {
         drop(first_map);
 
         let (reopened_map, reopened_cluster) = open_frontend("frontend-reclaim-reopened");
-        let reclaim_scan = reopened_cluster.enqueue_durable_object_payload_reclaim_roots();
+        let reclaim_scan = reopened_cluster
+            .enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new());
         assert_eq!(reclaim_scan.errors, 0);
         assert_eq!(reclaim_scan.queued, 1);
         assert!(matches!(
@@ -34479,7 +34474,7 @@ mod tests {
             crate::StorageCluster::from_local_map(Arc::clone(&reopened_map)).unwrap();
         assert_eq!(
             reopened_cluster
-                .enqueue_durable_object_payload_reclaim_roots()
+                .enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new())
                 .queued,
             1,
             "startup scan should rediscover the durable root without an in-memory hint"
@@ -34539,7 +34534,7 @@ mod tests {
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
 
-        let scan = cluster.enqueue_durable_object_payload_reclaim_roots();
+        let scan = cluster.enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new());
         assert_eq!(
             scan.errors, 1,
             "unavailable PG should be reported in scan stats"
