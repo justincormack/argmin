@@ -116,6 +116,12 @@ static METADATA_COMMAND_BUDGET_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_BACKOFF_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_BACKOFF_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_BACKOFF_US_MAX: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_WORK_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static OBJECT_PAYLOAD_RECLAIM_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static BUCKET_DELETE_FINALIZE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_WORK_QUEUE_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
     OnceLock::new();
 static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
@@ -132,6 +138,14 @@ static METADATA_COMMAND_BUDGET_DIMENSIONS: OnceLock<
 > = OnceLock::new();
 static METADATA_COMMAND_BACKOFF_DIMENSIONS: OnceLock<
     Mutex<Vec<MetadataCommandBackoffDimensionCounter>>,
+> = OnceLock::new();
+static RECLAIM_WORK_QUEUE_ACTION_DIMENSIONS: OnceLock<Mutex<Vec<ReclaimQueueDimensionCounter>>> =
+    OnceLock::new();
+static OBJECT_PAYLOAD_RECLAIM_EVENT_DIMENSIONS: OnceLock<
+    Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>>,
+> = OnceLock::new();
+static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_DIMENSIONS: OnceLock<
+    Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>>,
 > = OnceLock::new();
 static STREAM_UPLOAD_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SESSION_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -197,6 +211,20 @@ pub struct MetadataCommandBackoffDimensionSample {
     pub sleep_us_max: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimQueueDimensionSample {
+    pub work_kind: &'static str,
+    pub action: &'static str,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectPayloadReclaimEventDimensionSample {
+    pub pg_id: u32,
+    pub event: &'static str,
+    pub count: u64,
+}
+
 struct MetadataCommandDimensionCounter {
     pg_id: u32,
     classifier: &'static str,
@@ -221,6 +249,18 @@ struct MetadataCommandBackoffDimensionCounter {
     count: u64,
     sleep_us_total: u64,
     sleep_us_max: u64,
+}
+
+struct ReclaimQueueDimensionCounter {
+    work_kind: &'static str,
+    action: &'static str,
+    count: u64,
+}
+
+struct ObjectPayloadReclaimEventDimensionCounter {
+    pg_id: u32,
+    event: &'static str,
+    count: u64,
 }
 
 impl FlightRecorder {
@@ -343,6 +383,20 @@ fn metadata_command_backoff_dimensions(
     METADATA_COMMAND_BACKOFF_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn reclaim_work_queue_action_dimensions() -> &'static Mutex<Vec<ReclaimQueueDimensionCounter>> {
+    RECLAIM_WORK_QUEUE_ACTION_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn object_payload_reclaim_event_dimensions(
+) -> &'static Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>> {
+    OBJECT_PAYLOAD_RECLAIM_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn object_payload_reclaim_durable_scan_dimensions(
+) -> &'static Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>> {
+    OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn fetch_max_atomic(counter: &AtomicU64, value: u64) {
     let mut current = counter.load(Ordering::Relaxed);
     while value > current {
@@ -455,6 +509,48 @@ fn increment_metadata_command_backoff_dimension(
     }
 }
 
+fn increment_reclaim_queue_dimension(work_kind: &'static str, action: &'static str) {
+    let mut counters = reclaim_work_queue_action_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters
+        .iter_mut()
+        .find(|counter| counter.work_kind == work_kind && counter.action == action)
+    {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(ReclaimQueueDimensionCounter {
+            work_kind,
+            action,
+            count: 1,
+        });
+    }
+}
+
+fn increment_object_payload_reclaim_dimension(
+    counters: &Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>>,
+    pg_id: u32,
+    event: &'static str,
+) {
+    let mut counters = counters.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters
+        .iter_mut()
+        .find(|counter| counter.pg_id == pg_id && counter.event == event)
+    {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(ObjectPayloadReclaimEventDimensionCounter {
+            pg_id,
+            event,
+            count: 1,
+        });
+    }
+}
+
 #[must_use]
 pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDimensionSample> {
     metadata_command_dimension_snapshot(metadata_command_conflict_dimensions())
@@ -509,6 +605,50 @@ pub fn metadata_command_backoff_dimension_snapshot() -> Vec<MetadataCommandBacko
             count: counter.count,
             sleep_us_total: counter.sleep_us_total,
             sleep_us_max: counter.sleep_us_max,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn reclaim_work_queue_action_dimension_snapshot() -> Vec<ReclaimQueueDimensionSample> {
+    reclaim_work_queue_action_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| ReclaimQueueDimensionSample {
+            work_kind: counter.work_kind,
+            action: counter.action,
+            count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn object_payload_reclaim_event_dimension_snapshot(
+) -> Vec<ObjectPayloadReclaimEventDimensionSample> {
+    object_payload_reclaim_event_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| ObjectPayloadReclaimEventDimensionSample {
+            pg_id: counter.pg_id,
+            event: counter.event,
+            count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn object_payload_reclaim_durable_scan_dimension_snapshot(
+) -> Vec<ObjectPayloadReclaimEventDimensionSample> {
+    object_payload_reclaim_durable_scan_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| ObjectPayloadReclaimEventDimensionSample {
+            pg_id: counter.pg_id,
+            event: counter.event,
+            count: counter.count,
         })
         .collect()
 }
@@ -950,6 +1090,21 @@ pub struct MetadataCommandBackoffSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimQueueSummary {
+    pub work_kind: &'static str,
+    pub action: &'static str,
+    pub queue_depth: usize,
+    pub object_payload_depth: usize,
+    pub bucket_delete_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectPayloadReclaimEventSummary {
+    pub pg_id: u32,
+    pub event: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageRpcErrorSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
@@ -1000,6 +1155,12 @@ pub struct MetricsSnapshot {
     pub metadata_command_backoff_total: u64,
     pub metadata_command_backoff_us_total: u64,
     pub metadata_command_backoff_us_max: u64,
+    pub reclaim_work_queue_depth: u64,
+    pub object_payload_reclaim_queue_depth: u64,
+    pub bucket_delete_finalize_queue_depth: u64,
+    pub reclaim_work_queue_action_total: u64,
+    pub object_payload_reclaim_event_total: u64,
+    pub object_payload_reclaim_durable_scan_total: u64,
     pub stream_upload_active_sessions: u64,
     pub stream_upload_session_created_total: u64,
     pub stream_upload_session_aborted_total: u64,
@@ -1099,6 +1260,16 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         metadata_command_backoff_us_total: METADATA_COMMAND_BACKOFF_US_TOTAL
             .load(Ordering::Relaxed),
         metadata_command_backoff_us_max: METADATA_COMMAND_BACKOFF_US_MAX.load(Ordering::Relaxed),
+        reclaim_work_queue_depth: RECLAIM_WORK_QUEUE_DEPTH.load(Ordering::Relaxed),
+        object_payload_reclaim_queue_depth: OBJECT_PAYLOAD_RECLAIM_QUEUE_DEPTH
+            .load(Ordering::Relaxed),
+        bucket_delete_finalize_queue_depth: BUCKET_DELETE_FINALIZE_QUEUE_DEPTH
+            .load(Ordering::Relaxed),
+        reclaim_work_queue_action_total: RECLAIM_WORK_QUEUE_ACTION_TOTAL.load(Ordering::Relaxed),
+        object_payload_reclaim_event_total: OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL
+            .load(Ordering::Relaxed),
+        object_payload_reclaim_durable_scan_total: OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL
+            .load(Ordering::Relaxed),
         stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
             .load(Ordering::Relaxed),
@@ -1860,6 +2031,97 @@ pub fn emit_metadata_command_backoff(
     )
 }
 
+pub fn emit_reclaim_queue_action(target: &'static str, summary: ReclaimQueueSummary) -> bool {
+    RECLAIM_WORK_QUEUE_ACTION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    RECLAIM_WORK_QUEUE_DEPTH.store(summary.queue_depth as u64, Ordering::Relaxed);
+    OBJECT_PAYLOAD_RECLAIM_QUEUE_DEPTH
+        .store(summary.object_payload_depth as u64, Ordering::Relaxed);
+    BUCKET_DELETE_FINALIZE_QUEUE_DEPTH.store(summary.bucket_delete_depth as u64, Ordering::Relaxed);
+    increment_reclaim_queue_dimension(summary.work_kind, summary.action);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = format!(
+        "work_kind={} action={} queue_depth={} object_payload_depth={} bucket_delete_depth={}",
+        summary.work_kind,
+        summary.action,
+        summary.queue_depth,
+        summary.object_payload_depth,
+        summary.bucket_delete_depth
+    );
+    record_flight_event(&context, target, "reclaim_queue_action", detail);
+    event_in_context(
+        &context,
+        target,
+        "reclaim_queue_action",
+        Some(format_args!(
+            "work_kind={} action={} queue_depth={} object_payload_depth={} bucket_delete_depth={}",
+            summary.work_kind,
+            summary.action,
+            summary.queue_depth,
+            summary.object_payload_depth,
+            summary.bucket_delete_depth
+        )),
+    )
+}
+
+pub fn emit_object_payload_reclaim_event(
+    target: &'static str,
+    summary: ObjectPayloadReclaimEventSummary,
+) -> bool {
+    OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    increment_object_payload_reclaim_dimension(
+        object_payload_reclaim_event_dimensions(),
+        summary.pg_id,
+        summary.event,
+    );
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = format!("pg_id={} event={}", summary.pg_id, summary.event);
+    record_flight_event(&context, target, "object_payload_reclaim_event", detail);
+    event_in_context(
+        &context,
+        target,
+        "object_payload_reclaim_event",
+        Some(format_args!(
+            "pg_id={} event={}",
+            summary.pg_id, summary.event
+        )),
+    )
+}
+
+pub fn emit_object_payload_reclaim_durable_scan(
+    target: &'static str,
+    summary: ObjectPayloadReclaimEventSummary,
+) -> bool {
+    OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL.fetch_add(1, Ordering::Relaxed);
+    increment_object_payload_reclaim_dimension(
+        object_payload_reclaim_durable_scan_dimensions(),
+        summary.pg_id,
+        summary.event,
+    );
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = format!("pg_id={} outcome={}", summary.pg_id, summary.event);
+    record_flight_event(
+        &context,
+        target,
+        "object_payload_reclaim_durable_scan",
+        detail,
+    );
+    event_in_context(
+        &context,
+        target,
+        "object_payload_reclaim_durable_scan",
+        Some(format_args!(
+            "pg_id={} outcome={}",
+            summary.pg_id, summary.event
+        )),
+    )
+}
+
 pub fn emit_storage_rpc_error(target: &'static str, summary: StorageRpcErrorSummary<'_>) -> bool {
     STORAGE_RPC_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(context) = current_context() else {
@@ -2514,6 +2776,30 @@ mod tests {
                 sleep_us: 12_345,
             },
         );
+        emit_reclaim_queue_action(
+            "storage",
+            ReclaimQueueSummary {
+                work_kind: "object_payload",
+                action: "enqueue",
+                queue_depth: 3,
+                object_payload_depth: 2,
+                bucket_delete_depth: 1,
+            },
+        );
+        emit_object_payload_reclaim_event(
+            "storage",
+            ObjectPayloadReclaimEventSummary {
+                pg_id: 11,
+                event: "deferred_pending_command",
+            },
+        );
+        emit_object_payload_reclaim_durable_scan(
+            "storage",
+            ObjectPayloadReclaimEventSummary {
+                pg_id: 11,
+                event: "queued",
+            },
+        );
         emit_storage_rpc_error(
             "storage",
             StorageRpcErrorSummary {
@@ -2741,6 +3027,34 @@ mod tests {
                 && sample.count >= 1
                 && sample.sleep_us_total >= 12_345
                 && sample.sleep_us_max >= 12_345));
+        assert_eq!(after.reclaim_work_queue_depth, 3);
+        assert_eq!(after.object_payload_reclaim_queue_depth, 2);
+        assert_eq!(after.bucket_delete_finalize_queue_depth, 1);
+        assert_eq!(
+            after.reclaim_work_queue_action_total,
+            before.reclaim_work_queue_action_total + 1
+        );
+        assert_eq!(
+            after.object_payload_reclaim_event_total,
+            before.object_payload_reclaim_event_total + 1
+        );
+        assert_eq!(
+            after.object_payload_reclaim_durable_scan_total,
+            before.object_payload_reclaim_durable_scan_total + 1
+        );
+        assert!(reclaim_work_queue_action_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.work_kind == "object_payload"
+                && sample.action == "enqueue"
+                && sample.count >= 1));
+        assert!(object_payload_reclaim_event_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == 11
+                && sample.event == "deferred_pending_command"
+                && sample.count >= 1));
+        assert!(object_payload_reclaim_durable_scan_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == 11 && sample.event == "queued" && sample.count >= 1));
         assert_eq!(
             after.storage_rpc_error_total,
             before.storage_rpc_error_total + 1

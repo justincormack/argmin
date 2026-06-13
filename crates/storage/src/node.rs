@@ -1446,7 +1446,7 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) {
+    ) -> bool {
         let root = (bucket.clone(), key.clone(), generation_id);
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1454,12 +1454,17 @@ impl SharedStorageNode {
             state
                 .work_queue
                 .push_back(ReclaimWorkItem::ObjectPayload(root));
+            Self::emit_reclaim_queue_action(&state, "object_payload", "enqueue");
             cv.notify_one();
+            true
+        } else {
+            Self::emit_reclaim_queue_action(&state, "object_payload", "deduplicate");
+            false
         }
     }
 
     /// Queue a bucket for deferred final deletion once reclaim is drained.
-    pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
+    pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = bucket.clone();
@@ -1467,7 +1472,12 @@ impl SharedStorageNode {
             state
                 .work_queue
                 .push_back(ReclaimWorkItem::BucketDelete(bucket));
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "enqueue");
             cv.notify_one();
+            true
+        } else {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "deduplicate");
+            false
         }
     }
 
@@ -1510,12 +1520,31 @@ impl SharedStorageNode {
         match &work {
             ReclaimWorkItem::ObjectPayload(root) => {
                 state.queued_objects.remove(root);
+                Self::emit_reclaim_queue_action(state, "object_payload", "dequeue");
             }
             ReclaimWorkItem::BucketDelete(bucket) => {
                 state.queued_bucket_deletes.remove(bucket);
+                Self::emit_reclaim_queue_action(state, "bucket_delete", "dequeue");
             }
         }
         Some(work)
+    }
+
+    fn emit_reclaim_queue_action(
+        state: &ReclaimQueueState,
+        work_kind: &'static str,
+        action: &'static str,
+    ) {
+        let _ = observability::emit_reclaim_queue_action(
+            TRACE_TARGET,
+            observability::ReclaimQueueSummary {
+                work_kind,
+                action,
+                queue_depth: state.work_queue.len(),
+                object_payload_depth: state.queued_objects.len(),
+                bucket_delete_depth: state.queued_bucket_deletes.len(),
+            },
+        );
     }
 }
 

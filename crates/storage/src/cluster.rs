@@ -771,7 +771,14 @@ impl ReleasedObjectPayloadLease {
     }
 
     pub fn enqueue_object_payload_reclaim(&self) {
-        self.runtime_state.enqueue_object_payload_reclaim(
+        if let Some(cluster) = self.cluster.upgrade() {
+            cluster.enqueue_object_payload_reclaim(&self.bucket, &self.key, self.generation_id);
+            return;
+        }
+
+        // The cluster handle can be gone after shutdown; keep the existing
+        // conservative retry behavior for any worker still draining the queue.
+        let _ = self.runtime_state.enqueue_object_payload_reclaim(
             &self.bucket,
             &self.key,
             self.generation_id,

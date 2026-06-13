@@ -399,6 +399,12 @@ print_slowdown_summary() {
         local metadata_backoff
         local metadata_backoff_us
         local metadata_backoff_us_max
+        local reclaim_queue_depth
+        local object_payload_reclaim_queue_depth
+        local bucket_delete_finalize_queue_depth
+        local reclaim_queue_action
+        local object_payload_reclaim_event
+        local object_payload_reclaim_durable_scan
         slow_down="$(latest_metric_sample_value "$metrics_log" slow_down_response_total)"
         admission_timeout="$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)"
         admission_wait="$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)"
@@ -420,6 +426,12 @@ print_slowdown_summary() {
         metadata_backoff="$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_total)"
         metadata_backoff_us="$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_us_total)"
         metadata_backoff_us_max="$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_us_max)"
+        reclaim_queue_depth="$(latest_metric_sample_value "$metrics_log" reclaim_work_queue_depth)"
+        object_payload_reclaim_queue_depth="$(latest_metric_sample_value "$metrics_log" object_payload_reclaim_queue_depth)"
+        bucket_delete_finalize_queue_depth="$(latest_metric_sample_value "$metrics_log" bucket_delete_finalize_queue_depth)"
+        reclaim_queue_action="$(latest_metric_sample_value "$metrics_log" reclaim_work_queue_action_total)"
+        object_payload_reclaim_event="$(latest_metric_sample_value "$metrics_log" object_payload_reclaim_event_total)"
+        object_payload_reclaim_durable_scan="$(latest_metric_sample_value "$metrics_log" object_payload_reclaim_durable_scan_total)"
         if ((storage_rpc_admission_total > 0)); then
             storage_rpc_admission_wait_percent="$(awk -v waited="$storage_rpc_admission_wait" -v total="$storage_rpc_admission_total" 'BEGIN { printf "%.2f", (waited * 100.0) / total }')"
         else
@@ -428,6 +440,7 @@ print_slowdown_summary() {
         echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
         echo "metadata_recovery leader_total=$metadata_recovery_leader wait_total=$metadata_recovery_wait wait_us_total=$metadata_recovery_wait_us wait_us_max=$metadata_recovery_wait_us_max timeout_total=$metadata_recovery_timeout outcome_total=$metadata_recovery_outcome" >&2
         echo "metadata_budget exhausted_total=$metadata_budget_exhausted backoff_total=$metadata_backoff backoff_us_total=$metadata_backoff_us backoff_us_max=$metadata_backoff_us_max" >&2
+        echo "reclaim queue_depth=$reclaim_queue_depth object_payload_queue_depth=$object_payload_reclaim_queue_depth bucket_delete_queue_depth=$bucket_delete_finalize_queue_depth queue_action_total=$reclaim_queue_action object_payload_event_total=$object_payload_reclaim_event durable_scan_total=$object_payload_reclaim_durable_scan" >&2
         echo "metadata_recovery_top admission" >&2
         latest_metric_family_top "$metrics_log" metadata_command_recovery_admission_by_pg_command_total 10 >&2 || true
         echo "metadata_recovery_top outcome" >&2
@@ -442,6 +455,12 @@ print_slowdown_summary() {
         latest_metric_family_top "$metrics_log" metadata_command_backoff_by_pg_context_total 10 >&2 || true
         echo "metadata_backoff_top sleep_us" >&2
         latest_metric_family_top "$metrics_log" metadata_command_backoff_by_pg_context_sleep_us_total 10 >&2 || true
+        echo "reclaim_queue_top action" >&2
+        latest_metric_family_top "$metrics_log" reclaim_work_queue_action_by_kind_total 10 >&2 || true
+        echo "object_payload_reclaim_top event" >&2
+        latest_metric_family_top "$metrics_log" object_payload_reclaim_event_by_pg_total 10 >&2 || true
+        echo "object_payload_reclaim_top durable_scan" >&2
+        latest_metric_family_top "$metrics_log" object_payload_reclaim_durable_scan_by_pg_total 10 >&2 || true
     else
         echo "metrics unavailable" >&2
     fi

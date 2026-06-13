@@ -1096,6 +1096,12 @@ fn local_debug_metrics_body() -> String {
             "metadata_command_backoff_total {}\n",
             "metadata_command_backoff_us_total {}\n",
             "metadata_command_backoff_us_max {}\n",
+            "reclaim_work_queue_depth {}\n",
+            "object_payload_reclaim_queue_depth {}\n",
+            "bucket_delete_finalize_queue_depth {}\n",
+            "reclaim_work_queue_action_total {}\n",
+            "object_payload_reclaim_event_total {}\n",
+            "object_payload_reclaim_durable_scan_total {}\n",
             "stream_upload_active_sessions {}\n",
             "stream_upload_session_created_total {}\n",
             "stream_upload_session_aborted_total {}\n",
@@ -1138,6 +1144,12 @@ fn local_debug_metrics_body() -> String {
         snapshot.metadata_command_backoff_total,
         snapshot.metadata_command_backoff_us_total,
         snapshot.metadata_command_backoff_us_max,
+        snapshot.reclaim_work_queue_depth,
+        snapshot.object_payload_reclaim_queue_depth,
+        snapshot.bucket_delete_finalize_queue_depth,
+        snapshot.reclaim_work_queue_action_total,
+        snapshot.object_payload_reclaim_event_total,
+        snapshot.object_payload_reclaim_durable_scan_total,
         snapshot.stream_upload_active_sessions,
         snapshot.stream_upload_session_created_total,
         snapshot.stream_upload_session_aborted_total,
@@ -1220,6 +1232,31 @@ fn local_debug_metrics_body() -> String {
             body,
             "metadata_command_backoff_by_pg_context_sleep_us_max{{pg_id=\"{}\",operation=\"{}\",context=\"{}\"}} {}",
             pg_id, operation, context, sample.sleep_us_max
+        );
+    }
+    for sample in observability::reclaim_work_queue_action_dimension_snapshot() {
+        let work_kind = debug_metric_label_value(sample.work_kind);
+        let action = debug_metric_label_value(sample.action);
+        let _ = writeln!(
+            body,
+            "reclaim_work_queue_action_by_kind_total{{kind=\"{}\",action=\"{}\"}} {}",
+            work_kind, action, sample.count
+        );
+    }
+    for sample in observability::object_payload_reclaim_event_dimension_snapshot() {
+        let event = debug_metric_label_value(sample.event);
+        let _ = writeln!(
+            body,
+            "object_payload_reclaim_event_by_pg_total{{pg_id=\"{}\",event=\"{}\"}} {}",
+            sample.pg_id, event, sample.count
+        );
+    }
+    for sample in observability::object_payload_reclaim_durable_scan_dimension_snapshot() {
+        let outcome = debug_metric_label_value(sample.event);
+        let _ = writeln!(
+            body,
+            "object_payload_reclaim_durable_scan_by_pg_total{{pg_id=\"{}\",outcome=\"{}\"}} {}",
+            sample.pg_id, outcome, sample.count
         );
     }
     body

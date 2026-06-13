@@ -6733,16 +6733,26 @@ impl super::StorageCluster {
         if self.operation_epoch() != self.cluster_epoch() {
             return;
         }
-        self.local_map
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let queued = self
+            .local_map
             .runtime_state()
             .enqueue_object_payload_reclaim(bucket, key, generation_id);
+        let _ = observability::emit_object_payload_reclaim_event(
+            super::TRACE_TARGET,
+            observability::ObjectPayloadReclaimEventSummary {
+                pg_id: pg_id.get(),
+                event: if queued { "queued" } else { "deduplicated" },
+            },
+        );
     }
 
     pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
         if self.operation_epoch() != self.cluster_epoch() {
             return;
         }
-        self.local_map
+        let _ = self
+            .local_map
             .runtime_state()
             .enqueue_bucket_delete_finalize(bucket);
     }
@@ -6789,12 +6799,23 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let emit_outcome = |outcome: &'static str| {
+            let _ = observability::emit_object_payload_reclaim_event(
+                super::TRACE_TARGET,
+                observability::ObjectPayloadReclaimEventSummary {
+                    pg_id: pg_id.get(),
+                    event: outcome,
+                },
+            );
+        };
+        emit_outcome("started");
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         if self
             .local_map
             .object_payload_lease_count(bucket, key, generation_id)
             != 0
         {
+            emit_outcome("deferred_lease");
             return Ok(false);
         }
 
@@ -6815,9 +6836,11 @@ impl super::StorageCluster {
                             key,
                             generation_id,
                         );
+                        emit_outcome("completed_existing_pending");
                         return Ok(true);
                     }
                     super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                        emit_outcome("error");
                         return Err(super::conflicting_pending_object_metadata_command(
                             "retryable partial pending payload reclaim command",
                         ));
@@ -6826,6 +6849,7 @@ impl super::StorageCluster {
                 }
             }
             self.emit_pending_slot_action_for_command(pg_id, &command, "reclaim_defer");
+            emit_outcome("deferred_pending_command");
             return Ok(false);
         }
 
@@ -6835,6 +6859,7 @@ impl super::StorageCluster {
                 .object_payload_lease_count(bucket, key, generation_id)
                 != 0
             {
+                emit_outcome("deferred_lease");
                 return Ok(false);
             }
 
@@ -6844,6 +6869,7 @@ impl super::StorageCluster {
         };
 
         let Some(reclaim) = reclaim else {
+            emit_outcome("missing_root");
             return Ok(false);
         };
 
@@ -6885,6 +6911,7 @@ impl super::StorageCluster {
             )
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let Some(claim) = claim else {
+            emit_outcome("deferred_claim_busy");
             return Ok(false);
         };
 
@@ -6899,6 +6926,7 @@ impl super::StorageCluster {
             .try_begin_object_payload_reclaim(bucket, key, generation_id)
         {
             release_reclaim_claim()?;
+            emit_outcome("deferred_active");
             return Ok(false);
         }
 
@@ -7018,6 +7046,11 @@ impl super::StorageCluster {
             }
             result => result,
         };
+        match &result {
+            Ok(true) => emit_outcome("completed"),
+            Ok(false) => emit_outcome("deferred"),
+            Err(_) => emit_outcome("error"),
+        }
         let keep_reclaim_fence = result.is_err() && payload_delete_started;
         self.local_map.finish_object_payload_reclaim(
             bucket,
@@ -7037,32 +7070,44 @@ impl super::StorageCluster {
 
         let mut scan = DurableObjectPayloadReclaimScan::default();
         for pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(pg_id);
+            let emit_scan = |outcome: &'static str| {
+                let _ = observability::emit_object_payload_reclaim_durable_scan(
+                    super::TRACE_TARGET,
+                    observability::ObjectPayloadReclaimEventSummary {
+                        pg_id: pg_id.get(),
+                        event: outcome,
+                    },
+                );
+            };
             let node = match self
                 .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
             {
                 Ok(node) => node,
                 Err(error) => {
                     scan.errors += 1;
+                    emit_scan("error");
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "object_reclaim_durable_scan_pg_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
                     continue;
                 }
             };
             let root = match node
                 .object_mutation_metadata_client()
-                .get_payload_reclaim_root(PgId::new(pg_id))
+                .get_payload_reclaim_root(pg_id)
             {
                 Ok(root) => root,
                 Err(error) => {
                     scan.errors += 1;
+                    emit_scan("error");
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "object_reclaim_durable_scan_pg_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
+                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
                     continue;
                 }
@@ -7070,14 +7115,17 @@ impl super::StorageCluster {
             let Some(root) = root else {
                 continue;
             };
-            if self.object_metadata_pg_id(&root.bucket, &root.key) != pg_id {
+            if self.object_metadata_pg_id(&root.bucket, &root.key) != pg_id.get() {
                 scan.errors += 1;
+                emit_scan("wrong_pg");
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "object_reclaim_durable_scan_wrong_pg_root",
                     Some(format_args!(
                         "pg_id={} root_bucket={} root_key={}",
-                        pg_id, root.bucket, root.key
+                        pg_id.get(),
+                        root.bucket,
+                        root.key
                     )),
                 );
                 continue;
@@ -7088,9 +7136,11 @@ impl super::StorageCluster {
                 root.generation_id,
             ) != 0
             {
+                emit_scan("leased");
                 continue;
             }
             self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
+            emit_scan("queued");
             scan.queued += 1;
         }
         scan

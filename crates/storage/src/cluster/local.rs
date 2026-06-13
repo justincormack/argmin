@@ -939,7 +939,7 @@ impl LocalClusterRuntimeState {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) {
+    ) -> bool {
         let root = (bucket.clone(), key.clone(), generation_id);
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -947,11 +947,16 @@ impl LocalClusterRuntimeState {
             state
                 .work_queue
                 .push_back(ReclaimWorkItem::ObjectPayload(root));
+            Self::emit_reclaim_queue_action(&state, "object_payload", "enqueue");
             cv.notify_one();
+            true
+        } else {
+            Self::emit_reclaim_queue_action(&state, "object_payload", "deduplicate");
+            false
         }
     }
 
-    pub(crate) fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
+    pub(crate) fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = bucket.clone();
@@ -959,7 +964,12 @@ impl LocalClusterRuntimeState {
             state
                 .work_queue
                 .push_back(ReclaimWorkItem::BucketDelete(bucket));
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "enqueue");
             cv.notify_one();
+            true
+        } else {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "deduplicate");
+            false
         }
     }
 
@@ -1005,12 +1015,31 @@ impl LocalClusterRuntimeState {
         match &work {
             ReclaimWorkItem::ObjectPayload(root) => {
                 state.queued_objects.remove(root);
+                Self::emit_reclaim_queue_action(state, "object_payload", "dequeue");
             }
             ReclaimWorkItem::BucketDelete(bucket) => {
                 state.queued_bucket_deletes.remove(bucket);
+                Self::emit_reclaim_queue_action(state, "bucket_delete", "dequeue");
             }
         }
         Some(work)
+    }
+
+    fn emit_reclaim_queue_action(
+        state: &LocalReclaimQueueState,
+        work_kind: &'static str,
+        action: &'static str,
+    ) {
+        let _ = observability::emit_reclaim_queue_action(
+            super::TRACE_TARGET,
+            observability::ReclaimQueueSummary {
+                work_kind,
+                action,
+                queue_depth: state.work_queue.len(),
+                object_payload_depth: state.queued_objects.len(),
+                bucket_delete_depth: state.queued_bucket_deletes.len(),
+            },
+        );
     }
 }
 
@@ -34120,7 +34149,18 @@ mod tests {
             released.payload_reclaim_exists().unwrap(),
             "released lease must find reclaim metadata through the routed object PG primary"
         );
+        let queued_event_count = || {
+            observability::object_payload_reclaim_event_dimension_snapshot()
+                .iter()
+                .find(|sample| sample.pg_id == object_pg && sample.event == "queued")
+                .map_or(0, |sample| sample.count)
+        };
+        let queued_events_before_release_requeue = queued_event_count();
         released.enqueue_object_payload_reclaim();
+        assert!(
+            queued_event_count() >= queued_events_before_release_requeue + 1,
+            "lease-release requeue should emit the per-PG object payload reclaim queued event"
+        );
         assert!(matches!(
             cluster.try_take_reclaim_work(),
             Some(crate::ReclaimWorkItem::ObjectPayload((
