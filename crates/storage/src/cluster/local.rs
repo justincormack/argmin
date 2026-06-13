@@ -13,6 +13,7 @@ use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
+use crate::node::{ReclaimQueueInsert, OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG};
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
@@ -857,6 +858,8 @@ type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
 struct LocalReclaimQueueState {
     work_queue: VecDeque<ReclaimWorkItem>,
     queued_objects: HashSet<LocalReclaimRoot>,
+    outstanding_objects: HashMap<LocalReclaimRoot, u32>,
+    object_payload_outstanding_by_pg: HashMap<u32, usize>,
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
@@ -867,6 +870,8 @@ impl LocalClusterRuntimeState {
                 Mutex::new(LocalReclaimQueueState {
                     work_queue: VecDeque::new(),
                     queued_objects: HashSet::new(),
+                    outstanding_objects: HashMap::new(),
+                    object_payload_outstanding_by_pg: HashMap::new(),
                     queued_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
@@ -939,21 +944,70 @@ impl LocalClusterRuntimeState {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> bool {
+        pg_id: u32,
+    ) -> ReclaimQueueInsert {
+        self.enqueue_object_payload_reclaim_for_pg(bucket, key, generation_id, pg_id)
+    }
+
+    pub(crate) fn enqueue_object_payload_reclaim_for_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        pg_id: u32,
+    ) -> ReclaimQueueInsert {
         let root = (bucket.clone(), key.clone(), generation_id);
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if state.queued_objects.insert(root.clone()) {
-            state
-                .work_queue
-                .push_back(ReclaimWorkItem::ObjectPayload(root));
-            Self::emit_reclaim_queue_action(&state, "object_payload", "enqueue");
-            cv.notify_one();
-            true
-        } else {
+        if state.outstanding_objects.contains_key(&root) {
             Self::emit_reclaim_queue_action(&state, "object_payload", "deduplicate");
-            false
+            return ReclaimQueueInsert::Deduplicated;
         }
+        let outstanding = state
+            .object_payload_outstanding_by_pg
+            .get(&pg_id)
+            .copied()
+            .unwrap_or(0);
+        if outstanding >= OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG {
+            Self::emit_reclaim_queue_action(&state, "object_payload", "pg_capacity_deferred");
+            return ReclaimQueueInsert::PgCapacityDeferred;
+        }
+        state.queued_objects.insert(root.clone());
+        state.outstanding_objects.insert(root.clone(), pg_id);
+        state
+            .object_payload_outstanding_by_pg
+            .insert(pg_id, outstanding + 1);
+        state
+            .work_queue
+            .push_back(ReclaimWorkItem::ObjectPayload(root));
+        Self::emit_reclaim_queue_action(&state, "object_payload", "enqueue");
+        cv.notify_one();
+        ReclaimQueueInsert::Queued
+    }
+
+    pub(crate) fn finish_object_payload_reclaim_work(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(pg_id) = state.outstanding_objects.remove(&root) else {
+            return;
+        };
+        state.queued_objects.remove(&root);
+        if let Some(outstanding) = state.object_payload_outstanding_by_pg.get_mut(&pg_id) {
+            *outstanding = outstanding.saturating_sub(1);
+            if *outstanding == 0 {
+                state.object_payload_outstanding_by_pg.remove(&pg_id);
+            }
+        }
+        Self::emit_reclaim_queue_action(&state, "object_payload", "finish");
     }
 
     pub(crate) fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) -> bool {
@@ -1031,6 +1085,7 @@ impl LocalClusterRuntimeState {
                 action,
                 queue_depth: state.work_queue.len(),
                 object_payload_depth: state.queued_objects.len(),
+                object_payload_outstanding_depth: state.outstanding_objects.len(),
                 bucket_delete_depth: state.queued_bucket_deletes.len(),
             },
         );
@@ -3581,6 +3636,58 @@ mod tests {
     }
 
     #[test]
+    fn object_payload_reclaim_capacity_counts_dequeued_work_until_finished() {
+        let runtime_state = LocalClusterRuntimeState::new();
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key_a = ObjectKey::try_from("a".to_string()).unwrap();
+        let key_b = ObjectKey::try_from("b".to_string()).unwrap();
+        let key_c = ObjectKey::try_from("c".to_string()).unwrap();
+        let generation_a = GenerationId::new(1).unwrap();
+        let generation_b = GenerationId::new(2).unwrap();
+        let generation_c = GenerationId::new(3).unwrap();
+
+        assert_eq!(
+            runtime_state.enqueue_object_payload_reclaim(&bucket, &key_a, generation_a, 0),
+            ReclaimQueueInsert::Queued
+        );
+        assert_eq!(
+            runtime_state.enqueue_object_payload_reclaim(&bucket, &key_b, generation_b, 0),
+            ReclaimQueueInsert::Queued
+        );
+        assert_eq!(
+            runtime_state.enqueue_object_payload_reclaim(&bucket, &key_c, generation_c, 0),
+            ReclaimQueueInsert::PgCapacityDeferred
+        );
+
+        assert_eq!(
+            runtime_state.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::ObjectPayload((
+                bucket.clone(),
+                key_a.clone(),
+                generation_a
+            )))
+        );
+        assert_eq!(
+            runtime_state.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::ObjectPayload((
+                bucket.clone(),
+                key_b.clone(),
+                generation_b
+            )))
+        );
+        assert_eq!(
+            runtime_state.enqueue_object_payload_reclaim(&bucket, &key_c, generation_c, 0),
+            ReclaimQueueInsert::PgCapacityDeferred
+        );
+
+        runtime_state.finish_object_payload_reclaim_work(&bucket, &key_a, generation_a);
+        assert_eq!(
+            runtime_state.enqueue_object_payload_reclaim(&bucket, &key_c, generation_c, 0),
+            ReclaimQueueInsert::Queued
+        );
+    }
+
+    #[test]
     fn metadata_command_recovery_single_flight_waits_for_matching_command() {
         let runtime_state = Arc::new(LocalClusterRuntimeState::new());
         let pg_id = PgId::new(1);
@@ -5559,7 +5666,11 @@ mod tests {
     }
 
     fn drain_trace_reclaim_work(cluster: &crate::StorageCluster) {
-        while cluster.try_take_reclaim_work().is_some() {}
+        while let Some(work) = cluster.try_take_reclaim_work() {
+            if let crate::ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) = work {
+                cluster.finish_object_payload_reclaim_work(&bucket, &key, generation_id);
+            }
+        }
     }
 
     fn assert_stale_metadata_operation_error(
@@ -5811,16 +5922,28 @@ mod tests {
                     cluster.enqueue_object_payload_reclaim(&bucket, &key, generation_id);
                     let work = cluster.try_take_reclaim_work();
                     let expected = matches!(
-                        work,
+                        &work,
                         Some(crate::ReclaimWorkItem::ObjectPayload((
                             queued_bucket,
                             queued_key,
                             queued_generation_id
-                        ))) if queued_bucket == bucket
-                            && queued_key == key
-                            && queued_generation_id == generation_id
+                        ))) if queued_bucket == &bucket
+                            && queued_key == &key
+                            && *queued_generation_id == generation_id
                     );
                     prop_assert!(expected, "unexpected reclaim work item");
+                    if let Some(crate::ReclaimWorkItem::ObjectPayload((
+                        queued_bucket,
+                        queued_key,
+                        queued_generation_id,
+                    ))) = work
+                    {
+                        cluster.finish_object_payload_reclaim_work(
+                            &queued_bucket,
+                            &queued_key,
+                            queued_generation_id,
+                        );
+                    }
                     drain_trace_reclaim_work(&cluster);
                 }
                 LocalClusterTraceOp::QueueStale(seed) => {
@@ -34144,35 +34267,32 @@ mod tests {
             released.payload_reclaim_exists().unwrap(),
             "released lease must find reclaim metadata through the routed object PG primary"
         );
-        let queued_event_count = || {
+        let object_payload_reclaim_event_count = |event: &'static str| {
             observability::object_payload_reclaim_event_dimension_snapshot()
                 .iter()
-                .find(|sample| sample.pg_id == object_pg && sample.event == "queued")
+                .find(|sample| sample.pg_id == object_pg && sample.event == event)
                 .map_or(0, |sample| sample.count)
         };
-        let queued_events_before_release_requeue = queued_event_count();
+        let deduplicated_events_before_release_requeue =
+            object_payload_reclaim_event_count("deduplicated");
         released.enqueue_object_payload_reclaim();
         assert!(
-            queued_event_count() >= queued_events_before_release_requeue + 1,
-            "lease-release requeue should emit the per-PG object payload reclaim queued event"
+            object_payload_reclaim_event_count("deduplicated")
+                >= deduplicated_events_before_release_requeue + 1,
+            "lease-release requeue should deduplicate against the worker's deferred reclaim root"
         );
-        assert!(matches!(
-            cluster.try_take_reclaim_work(),
-            Some(crate::ReclaimWorkItem::ObjectPayload((
-                queued_bucket,
-                queued_key,
-                queued_generation_id
-            ))) if queued_bucket == bucket
-                && queued_key == key
-                && queued_generation_id == committed.generation_id
-        ));
+        assert!(
+            cluster.try_take_reclaim_work().is_none(),
+            "the deferred root remains owned by the worker until terminal completion"
+        );
 
         assert!(
             cluster
                 .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
                 .unwrap(),
-            "lease release requeue should make the deferred reclaim retryable"
+            "lease release should make the worker's deferred reclaim retryable"
         );
+        cluster.finish_object_payload_reclaim_work(&bucket, &key, committed.generation_id);
         assert!(!cluster
             .payload_reclaim_exists(&bucket, &key, committed.generation_id)
             .unwrap());
@@ -34540,8 +34660,8 @@ mod tests {
             "unavailable PG should be reported in scan stats"
         );
         assert_eq!(
-            scan.queued, 1,
-            "scan should continue and enqueue the later healthy PG root"
+            scan.queued, 0,
+            "healthy PG root was already outstanding from the original delete enqueue"
         );
         assert!(matches!(
             cluster.try_take_reclaim_work(),

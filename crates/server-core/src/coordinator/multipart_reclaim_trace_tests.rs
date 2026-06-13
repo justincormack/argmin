@@ -222,6 +222,7 @@ struct ReclaimTraceModel {
     metadata_exists: bool,
     lease_held: bool,
     queue: Vec<ReclaimHint>,
+    deferred_object_reclaim: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +230,7 @@ struct ReclaimKindTraceModel {
     reclaim_kind: Option<TraceReclaimKind>,
     lease_held: bool,
     queue: Vec<ReclaimHint>,
+    deferred_object_reclaim: bool,
 }
 
 impl ReclaimTraceModel {
@@ -237,6 +239,7 @@ impl ReclaimTraceModel {
             metadata_exists: false,
             lease_held: false,
             queue: Vec::new(),
+            deferred_object_reclaim: false,
         }
     }
 
@@ -257,12 +260,16 @@ impl ReclaimTraceModel {
         match self.queue.first() {
             Some(ReclaimHint::Object) => ops.push(WorkerObjectStep),
             Some(ReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None if self.deferred_object_reclaim => ops.push(WorkerObjectStep),
             None => ops.push(ExpectNoWork),
         }
         ops
     }
 
     fn enqueue_hint(&mut self, hint: ReclaimHint) {
+        if hint == ReclaimHint::Object && self.deferred_object_reclaim {
+            return;
+        }
         if !self.queue.contains(&hint) {
             self.queue.push(hint);
         }
@@ -287,10 +294,17 @@ impl ReclaimTraceModel {
                 self.enqueue_hint(ReclaimHint::Object);
             }
             WorkerObjectStep => {
-                assert_eq!(self.queue.remove(0), ReclaimHint::Object);
+                if self.queue.first() == Some(&ReclaimHint::Object) {
+                    self.queue.remove(0);
+                } else {
+                    assert!(self.deferred_object_reclaim);
+                    self.deferred_object_reclaim = false;
+                }
                 if self.metadata_exists && !self.lease_held {
                     self.metadata_exists = false;
                     self.enqueue_hint(ReclaimHint::BucketDelete);
+                } else if self.metadata_exists && self.lease_held {
+                    self.deferred_object_reclaim = true;
                 }
             }
             WorkerBucketDeleteStep => {
@@ -307,6 +321,7 @@ impl ReclaimKindTraceModel {
             reclaim_kind: None,
             lease_held: false,
             queue: Vec::new(),
+            deferred_object_reclaim: false,
         }
     }
 
@@ -328,12 +343,16 @@ impl ReclaimKindTraceModel {
         match self.queue.first() {
             Some(ReclaimHint::Object) => ops.push(WorkerObjectStep),
             Some(ReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None if self.deferred_object_reclaim => ops.push(WorkerObjectStep),
             None => ops.push(ExpectNoWork),
         }
         ops
     }
 
     fn enqueue_hint(&mut self, hint: ReclaimHint) {
+        if hint == ReclaimHint::Object && self.deferred_object_reclaim {
+            return;
+        }
         if !self.queue.contains(&hint) {
             self.queue.push(hint);
         }
@@ -353,10 +372,17 @@ impl ReclaimKindTraceModel {
             }
             EnqueueObjectReclaim => self.enqueue_hint(ReclaimHint::Object),
             WorkerObjectStep => {
-                assert_eq!(self.queue.remove(0), ReclaimHint::Object);
+                if self.queue.first() == Some(&ReclaimHint::Object) {
+                    self.queue.remove(0);
+                } else {
+                    assert!(self.deferred_object_reclaim);
+                    self.deferred_object_reclaim = false;
+                }
                 if self.reclaim_kind.is_some() && !self.lease_held {
                     self.reclaim_kind = None;
                     self.enqueue_hint(ReclaimHint::BucketDelete);
+                } else if self.reclaim_kind.is_some() && self.lease_held {
+                    self.deferred_object_reclaim = true;
                 }
             }
             WorkerBucketDeleteStep => {
@@ -496,6 +522,7 @@ struct TwoGenerationReclaimTraceModel {
     old_lease_held: bool,
     new_lease_held: bool,
     queue: Vec<GenerationReclaimHint>,
+    deferred: Vec<TraceGeneration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +534,7 @@ struct TwoKeyReclaimTraceModel {
     key_a_lease_held: bool,
     key_b_lease_held: bool,
     queue: Vec<KeyReclaimHint>,
+    deferred: Vec<TraceKey>,
 }
 
 impl TwoGenerationReclaimTraceModel {
@@ -519,6 +547,7 @@ impl TwoGenerationReclaimTraceModel {
             old_lease_held: false,
             new_lease_held: false,
             queue: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -553,15 +582,27 @@ impl TwoGenerationReclaimTraceModel {
         match self.queue.first() {
             Some(GenerationReclaimHint::Object(_)) => ops.push(WorkerObjectStep),
             Some(GenerationReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None if !self.deferred.is_empty() => ops.push(WorkerObjectStep),
             None => ops.push(ExpectNoWork),
         }
         ops
     }
 
     fn enqueue_generation(&mut self, generation: TraceGeneration) {
+        if self.deferred.contains(&generation) {
+            return;
+        }
         let hint = GenerationReclaimHint::Object(generation);
         if !self.queue.contains(&hint) {
             self.queue.push(hint);
+        }
+    }
+
+    fn next_object_generation(&self) -> Option<TraceGeneration> {
+        match self.queue.first() {
+            Some(GenerationReclaimHint::Object(generation)) => Some(*generation),
+            Some(GenerationReclaimHint::BucketDelete) => None,
+            None => self.deferred.first().copied(),
         }
     }
 
@@ -608,8 +649,17 @@ impl TwoGenerationReclaimTraceModel {
             EnqueueOldReclaim => self.enqueue_generation(TraceGeneration::Old),
             EnqueueNewReclaim => self.enqueue_generation(TraceGeneration::New),
             WorkerObjectStep => {
-                let GenerationReclaimHint::Object(generation) = self.queue.remove(0) else {
-                    unreachable!("model only schedules worker-object-step for object hints")
+                let generation = match self.queue.first() {
+                    Some(GenerationReclaimHint::Object(_)) => {
+                        let GenerationReclaimHint::Object(generation) = self.queue.remove(0) else {
+                            unreachable!("checked object hint")
+                        };
+                        generation
+                    }
+                    None => self.deferred.remove(0),
+                    Some(GenerationReclaimHint::BucketDelete) => {
+                        unreachable!("model only schedules worker-object-step for object hints")
+                    }
                 };
                 match generation {
                     TraceGeneration::Old if self.old_metadata_exists && !self.old_lease_held => {
@@ -619,6 +669,16 @@ impl TwoGenerationReclaimTraceModel {
                     TraceGeneration::New if self.new_metadata_exists && !self.new_lease_held => {
                         self.new_metadata_exists = false;
                         self.enqueue_bucket_delete();
+                    }
+                    TraceGeneration::Old if self.old_metadata_exists && self.old_lease_held => {
+                        if !self.deferred.contains(&generation) {
+                            self.deferred.push(generation);
+                        }
+                    }
+                    TraceGeneration::New if self.new_metadata_exists && self.new_lease_held => {
+                        if !self.deferred.contains(&generation) {
+                            self.deferred.push(generation);
+                        }
                     }
                     _ => {}
                 }
@@ -663,6 +723,7 @@ impl TwoKeyReclaimTraceModel {
             key_a_lease_held: false,
             key_b_lease_held: false,
             queue: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -697,15 +758,27 @@ impl TwoKeyReclaimTraceModel {
         match self.queue.first() {
             Some(KeyReclaimHint::Object(_)) => ops.push(WorkerObjectStep),
             Some(KeyReclaimHint::BucketDelete) => ops.push(WorkerBucketDeleteStep),
+            None if !self.deferred.is_empty() => ops.push(WorkerObjectStep),
             None => ops.push(ExpectNoWork),
         }
         ops
     }
 
     fn enqueue_key(&mut self, key: TraceKey) {
+        if self.deferred.contains(&key) {
+            return;
+        }
         let hint = KeyReclaimHint::Object(key);
         if !self.queue.contains(&hint) {
             self.queue.push(hint);
+        }
+    }
+
+    fn next_object_key(&self) -> Option<TraceKey> {
+        match self.queue.first() {
+            Some(KeyReclaimHint::Object(key)) => Some(*key),
+            Some(KeyReclaimHint::BucketDelete) => None,
+            None => self.deferred.first().copied(),
         }
     }
 
@@ -752,8 +825,17 @@ impl TwoKeyReclaimTraceModel {
             EnqueueKeyAReclaim => self.enqueue_key(TraceKey::A),
             EnqueueKeyBReclaim => self.enqueue_key(TraceKey::B),
             WorkerObjectStep => {
-                let KeyReclaimHint::Object(key) = self.queue.remove(0) else {
-                    unreachable!("model only schedules worker-object-step for object hints")
+                let key = match self.queue.first() {
+                    Some(KeyReclaimHint::Object(_)) => {
+                        let KeyReclaimHint::Object(key) = self.queue.remove(0) else {
+                            unreachable!("checked object hint")
+                        };
+                        key
+                    }
+                    None => self.deferred.remove(0),
+                    Some(KeyReclaimHint::BucketDelete) => {
+                        unreachable!("model only schedules worker-object-step for object hints")
+                    }
                 };
                 match key {
                     TraceKey::A if self.key_a_metadata_exists && !self.key_a_lease_held => {
@@ -763,6 +845,16 @@ impl TwoKeyReclaimTraceModel {
                     TraceKey::B if self.key_b_metadata_exists && !self.key_b_lease_held => {
                         self.key_b_metadata_exists = false;
                         self.enqueue_bucket_delete();
+                    }
+                    TraceKey::A if self.key_a_metadata_exists && self.key_a_lease_held => {
+                        if !self.deferred.contains(&key) {
+                            self.deferred.push(key);
+                        }
+                    }
+                    TraceKey::B if self.key_b_metadata_exists && self.key_b_lease_held => {
+                        if !self.deferred.contains(&key) {
+                            self.deferred.push(key);
+                        }
                     }
                     _ => {}
                 }
@@ -840,11 +932,13 @@ fn two_key_reclaim_trace_strategy() -> BoxedStrategy<Vec<TwoKeyReclaimTraceOp>> 
 struct ReclaimTraceHarness {
     runtime: ReadRuntime,
     lease: Option<PayloadLease>,
+    deferred_object_reclaim: bool,
 }
 
 struct ReclaimKindTraceHarness {
     runtime: ReadRuntime,
     lease: Option<PayloadLease>,
+    deferred_object_reclaim: bool,
 }
 
 impl ReclaimTraceHarness {
@@ -852,6 +946,7 @@ impl ReclaimTraceHarness {
         Self {
             runtime,
             lease: None,
+            deferred_object_reclaim: false,
         }
     }
 
@@ -879,35 +974,16 @@ impl ReclaimTraceHarness {
                 );
             }
             WorkerObjectStep => {
-                let work = self.take_next_work()?;
-                match work {
-                    Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
-                        if bucket == trusted_bucket_name(TRACE_BUCKET)
-                            && key == trusted_object_key(TRACE_KEY)
-                            && generation_id == trace_generation_id() => {}
-                    Some(ReclaimWorkItem::BucketDelete(_)) => {
-                        return Err(TestCaseError::fail(
-                            "expected object reclaim work item, got bucket delete",
-                        ))
-                    }
-                    None => {
-                        return Err(TestCaseError::fail(
-                            "expected object reclaim work item, got none",
-                        ))
-                    }
-                    Some(ReclaimWorkItem::ObjectPayload(_)) => {
-                        return Err(TestCaseError::fail(
-                            "expected object reclaim work item for the trace generation",
-                        ))
-                    }
-                }
-                self.runtime
+                self.expect_trace_object_work()?;
+                let completed = self
+                    .runtime
                     .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id())
                     .map_err(|err| {
                         TestCaseError::fail(format!(
                             "try_reclaim_object_payload failed unexpectedly: {err:?}"
                         ))
                     })?;
+                self.finish_or_defer_trace_object_work(completed);
             }
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
@@ -932,6 +1008,11 @@ impl ReclaimTraceHarness {
                 }
             }
             ExpectNoWork => {
+                if self.deferred_object_reclaim {
+                    return Err(TestCaseError::fail(
+                        "expected no reclaim work but local deferred object reclaim is pending",
+                    ));
+                }
                 let work = self.take_next_work()?;
                 if work.is_some() {
                     return Err(TestCaseError::fail("expected no queued reclaim work"));
@@ -983,6 +1064,43 @@ impl ReclaimTraceHarness {
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
         Ok(self.runtime.storage_node.try_take_reclaim_work())
     }
+
+    fn expect_trace_object_work(&mut self) -> TestCaseResult {
+        match self.take_next_work()? {
+            Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+                if bucket == trusted_bucket_name(TRACE_BUCKET)
+                    && key == trusted_object_key(TRACE_KEY)
+                    && generation_id == trace_generation_id() =>
+            {
+                Ok(())
+            }
+            Some(ReclaimWorkItem::BucketDelete(_)) => Err(TestCaseError::fail(
+                "expected object reclaim work item, got bucket delete",
+            )),
+            Some(ReclaimWorkItem::ObjectPayload(_)) => Err(TestCaseError::fail(
+                "expected object reclaim work item for the trace generation",
+            )),
+            None if self.deferred_object_reclaim => Ok(()),
+            None => Err(TestCaseError::fail(
+                "expected object reclaim work item, got none",
+            )),
+        }
+    }
+
+    fn finish_or_defer_trace_object_work(&mut self, completed: bool) {
+        if completed {
+            self.runtime
+                .storage_node
+                .finish_object_payload_reclaim_work(
+                    &trusted_bucket_name(TRACE_BUCKET),
+                    &trusted_object_key(TRACE_KEY),
+                    trace_generation_id(),
+                );
+            self.deferred_object_reclaim = false;
+        } else {
+            self.deferred_object_reclaim = true;
+        }
+    }
 }
 
 impl ReclaimKindTraceHarness {
@@ -990,6 +1108,7 @@ impl ReclaimKindTraceHarness {
         Self {
             runtime,
             lease: None,
+            deferred_object_reclaim: false,
         }
     }
 
@@ -1014,35 +1133,16 @@ impl ReclaimKindTraceHarness {
                 );
             }
             WorkerObjectStep => {
-                let work = self.take_next_work()?;
-                match work {
-                    Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
-                        if bucket == trusted_bucket_name(TRACE_BUCKET)
-                            && key == trusted_object_key(TRACE_KEY)
-                            && generation_id == trace_generation_id() => {}
-                    Some(ReclaimWorkItem::BucketDelete(_)) => {
-                        return Err(TestCaseError::fail(
-                            "expected object reclaim work item, got bucket delete",
-                        ))
-                    }
-                    None => {
-                        return Err(TestCaseError::fail(
-                            "expected object reclaim work item, got none",
-                        ))
-                    }
-                    Some(ReclaimWorkItem::ObjectPayload(_)) => {
-                        return Err(TestCaseError::fail(
-                            "expected object reclaim work item for the trace generation",
-                        ))
-                    }
-                }
-                self.runtime
+                self.expect_trace_object_work()?;
+                let completed = self
+                    .runtime
                     .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id())
                     .map_err(|err| {
                         TestCaseError::fail(format!(
                             "try_reclaim_object_payload failed unexpectedly: {err:?}"
                         ))
                     })?;
+                self.finish_or_defer_trace_object_work(completed);
             }
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
@@ -1067,6 +1167,11 @@ impl ReclaimKindTraceHarness {
                 }
             }
             ExpectNoWork => {
+                if self.deferred_object_reclaim {
+                    return Err(TestCaseError::fail(
+                        "expected no reclaim work but local deferred object reclaim is pending",
+                    ));
+                }
                 if self.take_next_work()?.is_some() {
                     return Err(TestCaseError::fail("expected no queued reclaim work"));
                 }
@@ -1137,18 +1242,57 @@ impl ReclaimKindTraceHarness {
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
         Ok(self.runtime.storage_node.try_take_reclaim_work())
     }
+
+    fn expect_trace_object_work(&mut self) -> TestCaseResult {
+        match self.take_next_work()? {
+            Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+                if bucket == trusted_bucket_name(TRACE_BUCKET)
+                    && key == trusted_object_key(TRACE_KEY)
+                    && generation_id == trace_generation_id() =>
+            {
+                Ok(())
+            }
+            Some(ReclaimWorkItem::BucketDelete(_)) => Err(TestCaseError::fail(
+                "expected object reclaim work item, got bucket delete",
+            )),
+            Some(ReclaimWorkItem::ObjectPayload(_)) => Err(TestCaseError::fail(
+                "expected object reclaim work item for the trace generation",
+            )),
+            None if self.deferred_object_reclaim => Ok(()),
+            None => Err(TestCaseError::fail(
+                "expected object reclaim work item, got none",
+            )),
+        }
+    }
+
+    fn finish_or_defer_trace_object_work(&mut self, completed: bool) {
+        if completed {
+            self.runtime
+                .storage_node
+                .finish_object_payload_reclaim_work(
+                    &trusted_bucket_name(TRACE_BUCKET),
+                    &trusted_object_key(TRACE_KEY),
+                    trace_generation_id(),
+                );
+            self.deferred_object_reclaim = false;
+        } else {
+            self.deferred_object_reclaim = true;
+        }
+    }
 }
 
 struct TwoGenerationReclaimTraceHarness {
     runtime: ReadRuntime,
     old_lease: Option<PayloadLease>,
     new_lease: Option<PayloadLease>,
+    deferred_object_reclaim: Vec<TraceGeneration>,
 }
 
 struct TwoKeyReclaimTraceHarness {
     runtime: ReadRuntime,
     key_a_lease: Option<PayloadLease>,
     key_b_lease: Option<PayloadLease>,
+    deferred_object_reclaim: Vec<TraceKey>,
 }
 
 impl TwoGenerationReclaimTraceHarness {
@@ -1157,6 +1301,7 @@ impl TwoGenerationReclaimTraceHarness {
             runtime,
             old_lease: None,
             new_lease: None,
+            deferred_object_reclaim: Vec::new(),
         }
     }
 
@@ -1237,20 +1382,21 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn execute_worker_object_step(&mut self, expected: TraceGeneration) -> TestCaseResult {
-        let work = self.take_next_work()?;
-        let actual = self.expected_generation_from_queue_step(work)?;
+        let actual = self.take_object_generation_work()?;
         prop_assert_eq!(
             actual,
             expected,
             "worker dequeued object reclaim generation out of FIFO order"
         );
-        self.runtime
+        let completed = self
+            .runtime
             .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, expected.generation_id())
             .map_err(|err| {
                 TestCaseError::fail(format!(
                     "try_reclaim_object_payload failed unexpectedly: {err:?}"
                 ))
             })?;
+        self.finish_or_defer_generation_work(expected, completed);
         Ok(())
     }
 
@@ -1309,6 +1455,35 @@ impl TwoGenerationReclaimTraceHarness {
         }
     }
 
+    fn take_object_generation_work(&mut self) -> Result<TraceGeneration, TestCaseError> {
+        match self.take_next_work()? {
+            Some(work) => self.expected_generation_from_queue_step(Some(work)),
+            None => {
+                if self.deferred_object_reclaim.is_empty() {
+                    Err(TestCaseError::fail(
+                        "expected object reclaim work item, got none",
+                    ))
+                } else {
+                    Ok(self.deferred_object_reclaim.remove(0))
+                }
+            }
+        }
+    }
+
+    fn finish_or_defer_generation_work(&mut self, generation: TraceGeneration, completed: bool) {
+        if completed {
+            self.runtime
+                .storage_node
+                .finish_object_payload_reclaim_work(
+                    &trusted_bucket_name(TRACE_BUCKET),
+                    &trusted_object_key(TRACE_KEY),
+                    generation.generation_id(),
+                );
+        } else if !self.deferred_object_reclaim.contains(&generation) {
+            self.deferred_object_reclaim.push(generation);
+        }
+    }
+
     fn metadata_exists(&self, generation: TraceGeneration) -> bool {
         self.runtime
             .storage_node
@@ -1346,6 +1521,7 @@ impl TwoKeyReclaimTraceHarness {
             runtime,
             key_a_lease: None,
             key_b_lease: None,
+            deferred_object_reclaim: Vec::new(),
         }
     }
 
@@ -1426,20 +1602,21 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn execute_worker_object_step(&mut self, expected: TraceKey) -> TestCaseResult {
-        let work = self.take_next_work()?;
-        let actual = self.expected_key_from_queue_step(work)?;
+        let actual = self.take_object_key_work()?;
         prop_assert_eq!(
             actual,
             expected,
             "worker dequeued object reclaim key out of bucket-root order"
         );
-        self.runtime
+        let completed = self
+            .runtime
             .try_reclaim_object_payload(TRACE_BUCKET, expected.key(), trace_generation_id())
             .map_err(|err| {
                 TestCaseError::fail(format!(
                     "try_reclaim_object_payload failed unexpectedly: {err:?}"
                 ))
             })?;
+        self.finish_or_defer_key_work(expected, completed);
         Ok(())
     }
 
@@ -1495,6 +1672,35 @@ impl TwoKeyReclaimTraceHarness {
             None => Err(TestCaseError::fail(
                 "expected object reclaim work item, got none",
             )),
+        }
+    }
+
+    fn take_object_key_work(&mut self) -> Result<TraceKey, TestCaseError> {
+        match self.take_next_work()? {
+            Some(work) => self.expected_key_from_queue_step(Some(work)),
+            None => {
+                if self.deferred_object_reclaim.is_empty() {
+                    Err(TestCaseError::fail(
+                        "expected object reclaim work item, got none",
+                    ))
+                } else {
+                    Ok(self.deferred_object_reclaim.remove(0))
+                }
+            }
+        }
+    }
+
+    fn finish_or_defer_key_work(&mut self, key: TraceKey, completed: bool) {
+        if completed {
+            self.runtime
+                .storage_node
+                .finish_object_payload_reclaim_work(
+                    &trusted_bucket_name(TRACE_BUCKET),
+                    &trusted_object_key(key.key()),
+                    trace_generation_id(),
+                );
+        } else if !self.deferred_object_reclaim.contains(&key) {
+            self.deferred_object_reclaim.push(key);
         }
     }
 
@@ -1721,8 +1927,7 @@ proptest! {
                 render_two_generation_reclaim_trace(&ops[..=index]),
             );
             if matches!(op, TwoGenerationReclaimTraceOp::WorkerObjectStep) {
-                let Some(GenerationReclaimHint::Object(expected)) = model.queue.first().copied()
-                else {
+                let Some(expected) = model.next_object_generation() else {
                     panic!("legal worker step must have queued object work")
                 };
                 harness.execute_worker_object_step(expected)?;
@@ -1749,7 +1954,7 @@ proptest! {
                 render_two_key_reclaim_trace(&ops[..=index]),
             );
             if matches!(op, TwoKeyReclaimTraceOp::WorkerObjectStep) {
-                let Some(KeyReclaimHint::Object(expected)) = model.queue.first().copied() else {
+                let Some(expected) = model.next_object_key() else {
                     panic!("legal worker step must have queued object work")
                 };
                 harness.execute_worker_object_step(expected)?;

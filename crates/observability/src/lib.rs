@@ -118,6 +118,7 @@ static METADATA_COMMAND_BACKOFF_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_BACKOFF_US_MAX: AtomicU64 = AtomicU64::new(0);
 static RECLAIM_WORK_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static OBJECT_PAYLOAD_RECLAIM_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static OBJECT_PAYLOAD_RECLAIM_OUTSTANDING_DEPTH: AtomicU64 = AtomicU64::new(0);
 static BUCKET_DELETE_FINALIZE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RECLAIM_WORK_QUEUE_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1095,6 +1096,7 @@ pub struct ReclaimQueueSummary {
     pub action: &'static str,
     pub queue_depth: usize,
     pub object_payload_depth: usize,
+    pub object_payload_outstanding_depth: usize,
     pub bucket_delete_depth: usize,
 }
 
@@ -1157,6 +1159,7 @@ pub struct MetricsSnapshot {
     pub metadata_command_backoff_us_max: u64,
     pub reclaim_work_queue_depth: u64,
     pub object_payload_reclaim_queue_depth: u64,
+    pub object_payload_reclaim_outstanding_depth: u64,
     pub bucket_delete_finalize_queue_depth: u64,
     pub reclaim_work_queue_action_total: u64,
     pub object_payload_reclaim_event_total: u64,
@@ -1262,6 +1265,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         metadata_command_backoff_us_max: METADATA_COMMAND_BACKOFF_US_MAX.load(Ordering::Relaxed),
         reclaim_work_queue_depth: RECLAIM_WORK_QUEUE_DEPTH.load(Ordering::Relaxed),
         object_payload_reclaim_queue_depth: OBJECT_PAYLOAD_RECLAIM_QUEUE_DEPTH
+            .load(Ordering::Relaxed),
+        object_payload_reclaim_outstanding_depth: OBJECT_PAYLOAD_RECLAIM_OUTSTANDING_DEPTH
             .load(Ordering::Relaxed),
         bucket_delete_finalize_queue_depth: BUCKET_DELETE_FINALIZE_QUEUE_DEPTH
             .load(Ordering::Relaxed),
@@ -2036,17 +2041,22 @@ pub fn emit_reclaim_queue_action(target: &'static str, summary: ReclaimQueueSumm
     RECLAIM_WORK_QUEUE_DEPTH.store(summary.queue_depth as u64, Ordering::Relaxed);
     OBJECT_PAYLOAD_RECLAIM_QUEUE_DEPTH
         .store(summary.object_payload_depth as u64, Ordering::Relaxed);
+    OBJECT_PAYLOAD_RECLAIM_OUTSTANDING_DEPTH.store(
+        summary.object_payload_outstanding_depth as u64,
+        Ordering::Relaxed,
+    );
     BUCKET_DELETE_FINALIZE_QUEUE_DEPTH.store(summary.bucket_delete_depth as u64, Ordering::Relaxed);
     increment_reclaim_queue_dimension(summary.work_kind, summary.action);
     let Some(context) = current_context() else {
         return false;
     };
     let detail = format!(
-        "work_kind={} action={} queue_depth={} object_payload_depth={} bucket_delete_depth={}",
+        "work_kind={} action={} queue_depth={} object_payload_depth={} object_payload_outstanding_depth={} bucket_delete_depth={}",
         summary.work_kind,
         summary.action,
         summary.queue_depth,
         summary.object_payload_depth,
+        summary.object_payload_outstanding_depth,
         summary.bucket_delete_depth
     );
     record_flight_event(&context, target, "reclaim_queue_action", detail);
@@ -2055,11 +2065,12 @@ pub fn emit_reclaim_queue_action(target: &'static str, summary: ReclaimQueueSumm
         target,
         "reclaim_queue_action",
         Some(format_args!(
-            "work_kind={} action={} queue_depth={} object_payload_depth={} bucket_delete_depth={}",
+            "work_kind={} action={} queue_depth={} object_payload_depth={} object_payload_outstanding_depth={} bucket_delete_depth={}",
             summary.work_kind,
             summary.action,
             summary.queue_depth,
             summary.object_payload_depth,
+            summary.object_payload_outstanding_depth,
             summary.bucket_delete_depth
         )),
     )
@@ -2783,6 +2794,7 @@ mod tests {
                 action: "enqueue",
                 queue_depth: 3,
                 object_payload_depth: 2,
+                object_payload_outstanding_depth: 2,
                 bucket_delete_depth: 1,
             },
         );
@@ -3029,6 +3041,7 @@ mod tests {
                 && sample.sleep_us_max >= 12_345));
         assert_eq!(after.reclaim_work_queue_depth, 3);
         assert_eq!(after.object_payload_reclaim_queue_depth, 2);
+        assert_eq!(after.object_payload_reclaim_outstanding_depth, 2);
         assert_eq!(after.bucket_delete_finalize_queue_depth, 1);
         assert_eq!(
             after.reclaim_work_queue_action_total,

@@ -22,6 +22,7 @@ use crate::metadata_command::{
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation,
 };
+use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
     BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
     BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
@@ -6636,6 +6637,7 @@ impl super::StorageCluster {
             bucket.clone(),
             key.clone(),
             generation_id,
+            self.object_metadata_pg_id(bucket, key),
         ))
     }
 
@@ -6660,6 +6662,7 @@ impl super::StorageCluster {
             bucket.clone(),
             key.clone(),
             generation_id,
+            self.object_metadata_pg_id(bucket, key),
         ))
     }
 
@@ -6730,21 +6733,49 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) {
+        let _ = self.enqueue_object_payload_reclaim_for_pg(bucket, key, generation_id);
+    }
+
+    fn enqueue_object_payload_reclaim_for_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Option<ReclaimQueueInsert> {
         if self.operation_epoch() != self.cluster_epoch() {
-            return;
+            return None;
         }
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let queued = self
+        let outcome = self
             .local_map
             .runtime_state()
-            .enqueue_object_payload_reclaim(bucket, key, generation_id);
+            .enqueue_object_payload_reclaim(bucket, key, generation_id, pg_id.get());
         let _ = observability::emit_object_payload_reclaim_event(
             super::TRACE_TARGET,
             observability::ObjectPayloadReclaimEventSummary {
                 pg_id: pg_id.get(),
-                event: if queued { "queued" } else { "deduplicated" },
+                event: match outcome {
+                    ReclaimQueueInsert::Queued => "queued",
+                    ReclaimQueueInsert::Deduplicated => "deduplicated",
+                    ReclaimQueueInsert::PgCapacityDeferred => "pg_capacity_deferred",
+                },
             },
         );
+        Some(outcome)
+    }
+
+    pub fn finish_object_payload_reclaim_work(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return;
+        }
+        self.local_map
+            .runtime_state()
+            .finish_object_payload_reclaim_work(bucket, key, generation_id);
     }
 
     pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
@@ -7171,9 +7202,21 @@ impl super::StorageCluster {
                 emit_scan("leased");
                 continue;
             }
-            self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
-            emit_scan("queued");
-            scan.queued += 1;
+            match self.enqueue_object_payload_reclaim_for_pg(
+                &root.bucket,
+                &root.key,
+                root.generation_id,
+            ) {
+                Some(ReclaimQueueInsert::Queued) => {
+                    emit_scan("queued");
+                    scan.queued += 1;
+                }
+                Some(ReclaimQueueInsert::Deduplicated) => emit_scan("deduplicated"),
+                Some(ReclaimQueueInsert::PgCapacityDeferred) => {
+                    emit_scan("pg_capacity_deferred");
+                }
+                None => {}
+            }
         }
         scan
     }

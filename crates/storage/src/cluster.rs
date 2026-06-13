@@ -684,6 +684,7 @@ pub struct ObjectPayloadLease {
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
+    pg_id: u32,
     released: bool,
 }
 
@@ -695,6 +696,7 @@ impl ObjectPayloadLease {
         bucket: BucketName,
         key: ObjectKey,
         generation_id: GenerationId,
+        pg_id: u32,
     ) -> Self {
         Self {
             cluster,
@@ -703,6 +705,7 @@ impl ObjectPayloadLease {
             bucket,
             key,
             generation_id,
+            pg_id,
             released: false,
         }
     }
@@ -721,6 +724,7 @@ impl ObjectPayloadLease {
             bucket: self.bucket.clone(),
             key: self.key.clone(),
             generation_id: self.generation_id,
+            pg_id: self.pg_id,
             remaining,
         }
     }
@@ -758,6 +762,7 @@ pub struct ReleasedObjectPayloadLease {
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
+    pg_id: u32,
     remaining: usize,
 }
 
@@ -789,6 +794,7 @@ impl ReleasedObjectPayloadLease {
             &self.bucket,
             &self.key,
             self.generation_id,
+            self.pg_id,
         );
     }
 }

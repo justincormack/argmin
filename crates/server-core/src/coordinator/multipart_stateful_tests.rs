@@ -1750,26 +1750,20 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
 
     drop(lease);
 
-    match runtime.storage_node.wait_for_reclaim_work(&stop) {
-        Some(ReclaimWorkItem::ObjectPayload((bucket, key, queued_generation_id))) => {
-            assert_eq!(bucket, "bucket");
-            assert_eq!(key, "key");
-            assert_eq!(
-                queued_generation_id, generation_id,
-                "{invariant}: retried reclaim item targeted the wrong generation"
-            );
-        }
-        Some(ReclaimWorkItem::BucketDelete(bucket)) => {
-            panic!(
-                "{invariant}: expected retried object reclaim work, got bucket delete for {bucket}"
-            )
-        }
-        None => panic!("{invariant}: expected retried reclaim work after dropping the final lease"),
-    }
-
-    runtime
+    assert!(
+        runtime.storage_node.try_take_reclaim_work().is_none(),
+        "{invariant}: lease drop should deduplicate against the worker's deferred reclaim root"
+    );
+    let completed = runtime
         .try_reclaim_object_payload("bucket", "key", generation_id)
         .unwrap();
+    assert!(
+        completed,
+        "{invariant}: deferred reclaim should complete after the final lease drop"
+    );
+    runtime
+        .storage_node
+        .finish_object_payload_reclaim_work(&bucket, &key, generation_id);
     assert!(
         !runtime
             .storage_node

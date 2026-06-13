@@ -229,6 +229,11 @@ impl ReclaimSweeper {
                                         (bucket, key, generation_id),
                                     );
                                 } else {
+                                    worker_node.finish_object_payload_reclaim_work(
+                                        &bucket,
+                                        &key,
+                                        generation_id,
+                                    );
                                     object_payload_reclaim_pg_retry_after.remove(&pg_id);
                                 }
                             }

@@ -13,3 +13,5 @@ cc e8fe817379ad86995b463eae3167eeeb6a44531dcdd179234dbf7409e85ff9cb # shrinks to
 cc 1b65e18d4d45d7bce1a495934cb1d2ddf2f73a4555a154d2324acf8a659530a1 # shrinks to ops = []
 cc 0ffd1b60dfe3de3f2d25f79eebf185bf5f3f30dd750df5fba4d8ec51b4f964e7 # shrinks to ops = []
 cc 3f24dc18046c73a303f23f23f74b9316c388547042fbde535c00c9484669087f # shrinks to ops = []
+cc 32b9f9e3da56a0a60b5e72f63ab7a8314383f6d53bb46221f947cffd6df42d5d # shrinks to ops = [SeedKeyAMetadata, AcquireKeyALease, EnqueueKeyAReclaim, WorkerObjectStep, ReleaseKeyALease, WorkerObjectStep]
+cc 98d41206c296d15e2fa0a8a1ea366ac8173d198857f0fc4b1f7fb34c1b0d26ab # shrinks to ops = [AcquireOldLease, SeedOldMetadata, EnqueueOldReclaim, WorkerObjectStep, ReleaseOldLease, WorkerObjectStep]

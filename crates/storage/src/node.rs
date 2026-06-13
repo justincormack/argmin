@@ -55,6 +55,7 @@ const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 #[cfg(any(test, feature = "test-hooks"))]
 const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
+pub(crate) const OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG: usize = 2;
 mod bucket_ops;
 mod multipart_ops;
 mod object_metadata_ops;
@@ -371,6 +372,13 @@ struct ObjectPayloadLeaseState {
 pub enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
     BucketDelete(BucketName),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimQueueInsert {
+    Queued,
+    Deduplicated,
+    PgCapacityDeferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1447,6 +1455,24 @@ impl SharedStorageNode {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> bool {
+        matches!(
+            self.enqueue_object_payload_reclaim_for_pg(
+                bucket,
+                key,
+                generation_id,
+                self.pg_topology.object_pg_for(bucket, key)
+            ),
+            ReclaimQueueInsert::Queued
+        )
+    }
+
+    pub(crate) fn enqueue_object_payload_reclaim_for_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        _pg_id: u32,
+    ) -> ReclaimQueueInsert {
         let root = (bucket.clone(), key.clone(), generation_id);
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1456,10 +1482,10 @@ impl SharedStorageNode {
                 .push_back(ReclaimWorkItem::ObjectPayload(root));
             Self::emit_reclaim_queue_action(&state, "object_payload", "enqueue");
             cv.notify_one();
-            true
+            ReclaimQueueInsert::Queued
         } else {
             Self::emit_reclaim_queue_action(&state, "object_payload", "deduplicate");
-            false
+            ReclaimQueueInsert::Deduplicated
         }
     }
 
@@ -1542,6 +1568,7 @@ impl SharedStorageNode {
                 action,
                 queue_depth: state.work_queue.len(),
                 object_payload_depth: state.queued_objects.len(),
+                object_payload_outstanding_depth: 0,
                 bucket_delete_depth: state.queued_bucket_deletes.len(),
             },
         );
