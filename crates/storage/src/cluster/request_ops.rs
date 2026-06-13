@@ -6809,6 +6809,18 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
+        Ok(matches!(
+            self.reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)?,
+            super::ObjectPayloadReclaimAttempt::Completed
+        ))
+    }
+
+    pub fn reclaim_object_payload_if_unleased_with_outcome(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let emit_outcome = |outcome: &'static str| {
             let _ = observability::emit_object_payload_reclaim_event(
@@ -6827,7 +6839,7 @@ impl super::StorageCluster {
             != 0
         {
             emit_outcome("deferred_lease");
-            return Ok(false);
+            return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         }
 
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -6848,7 +6860,7 @@ impl super::StorageCluster {
                             generation_id,
                         );
                         emit_outcome("completed_existing_pending");
-                        return Ok(true);
+                        return Ok(super::ObjectPayloadReclaimAttempt::Completed);
                     }
                     super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                         emit_outcome("error");
@@ -6861,7 +6873,7 @@ impl super::StorageCluster {
             }
             self.emit_pending_slot_action_for_command(pg_id, &command, "reclaim_defer");
             emit_outcome("deferred_pending_command");
-            return Ok(false);
+            return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         }
 
         let reclaim = {
@@ -6871,7 +6883,7 @@ impl super::StorageCluster {
                 != 0
             {
                 emit_outcome("deferred_lease");
-                return Ok(false);
+                return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
             }
 
             mutation_client
@@ -6881,7 +6893,7 @@ impl super::StorageCluster {
 
         let Some(reclaim) = reclaim else {
             emit_outcome("missing_root");
-            return Ok(false);
+            return Ok(super::ObjectPayloadReclaimAttempt::MissingRoot);
         };
 
         let bucket_incarnation_generation = {
@@ -6923,7 +6935,7 @@ impl super::StorageCluster {
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let Some(claim) = claim else {
             emit_outcome("deferred_claim_busy");
-            return Ok(false);
+            return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         };
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
@@ -6938,12 +6950,12 @@ impl super::StorageCluster {
         {
             release_reclaim_claim()?;
             emit_outcome("deferred_active");
-            return Ok(false);
+            return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         }
 
         let mut payload_delete_started = false;
         let mut command_owns_reclaim_claim = false;
-        let result = (|| -> Result<bool, ObjectPgActionError> {
+        let result = (|| -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
             match &reclaim {
                 ObjectPayloadReclaimCommand::Segments(reclaim) => {
                     for segment in &reclaim.segments {
@@ -7001,7 +7013,9 @@ impl super::StorageCluster {
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )? {
-                            super::PendingMetadataCommandOutcome::Applied => return Ok(true),
+                            super::PendingMetadataCommandOutcome::Applied => {
+                                return Ok(super::ObjectPayloadReclaimAttempt::Completed);
+                            }
                             super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                                 return Err(super::conflicting_pending_object_metadata_command(
                                     "retryable partial pending payload reclaim command",
@@ -7047,7 +7061,7 @@ impl super::StorageCluster {
                 }
                 command_owns_reclaim_claim = true;
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-                return Ok(true);
+                return Ok(super::ObjectPayloadReclaimAttempt::Completed);
             }
         })();
         let result = match result {
@@ -7058,8 +7072,9 @@ impl super::StorageCluster {
             result => result,
         };
         match &result {
-            Ok(true) => emit_outcome("completed"),
-            Ok(false) => emit_outcome("deferred"),
+            Ok(super::ObjectPayloadReclaimAttempt::Completed) => emit_outcome("completed"),
+            Ok(super::ObjectPayloadReclaimAttempt::Deferred) => emit_outcome("deferred"),
+            Ok(super::ObjectPayloadReclaimAttempt::MissingRoot) => emit_outcome("missing_root"),
             Err(_) => emit_outcome("error"),
         }
         let keep_reclaim_fence = result.is_err() && payload_delete_started;

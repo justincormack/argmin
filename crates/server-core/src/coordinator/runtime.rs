@@ -209,14 +209,14 @@ impl ReclaimSweeper {
                                     (bucket, key, generation_id),
                                 );
                             } else {
-                                let result = runtime.try_reclaim_object_payload_for(
+                                let result = runtime.try_reclaim_object_payload_for_with_outcome(
                                     &bucket,
                                     &key,
                                     generation_id,
                                 );
                                 if matches!(
                                     result,
-                                    Ok(false)
+                                    Ok(storage::cluster::ObjectPayloadReclaimAttempt::Deferred)
                                         | Err(ServerError::OperationAborted | ServerError::SlowDown)
                                 ) {
                                     object_payload_reclaim_pg_retry_after.insert(
@@ -1313,6 +1313,7 @@ impl ReadRuntime {
         .expect("current storage cluster should acquire payload lease")
     }
 
+    #[cfg(test)]
     pub(super) fn try_reclaim_object_payload_for(
         &self,
         bucket: &BucketName,
@@ -1321,6 +1322,17 @@ impl ReadRuntime {
     ) -> Result<bool, ServerError> {
         self.storage_node
             .reclaim_object_payload_if_unleased(bucket, key, generation_id)
+            .map_err(Coordinator::map_object_pg_action_error)
+    }
+
+    fn try_reclaim_object_payload_for_with_outcome(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<storage::cluster::ObjectPayloadReclaimAttempt, ServerError> {
+        self.storage_node
+            .reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
             .map_err(Coordinator::map_object_pg_action_error)
     }
 
