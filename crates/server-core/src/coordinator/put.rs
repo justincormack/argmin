@@ -625,7 +625,7 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.abort_stream_put_for(bucket, key, session_id)
+        self.abort_stream_put_for_cleanup(bucket, key, session_id)
     }
 
     pub fn heartbeat_stream_put_session(

@@ -45,7 +45,11 @@ const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
 const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
-const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = 60_000;
+// HTTP streaming PutObject heartbeats active sessions every 10s. Keep the
+// durable create reservation only slightly longer than that so abandoned
+// sessions stop blocking DeleteBucket well before common 30s client attempt
+// timeouts, while still allowing one delayed heartbeat under contention.
+const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
