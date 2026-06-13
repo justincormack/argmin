@@ -73,21 +73,23 @@ fn assert_uniform(data: &[u8], expected_len: usize) {
 }
 
 #[derive(Debug)]
-struct AtomicReadAttemptError {
+struct AtomicAttemptError {
     context: &'static str,
     message: String,
 }
 
-impl AtomicReadAttemptError {
+impl AtomicAttemptError {
     fn new(context: &'static str, message: String) -> Self {
         Self { context, message }
     }
 
-    fn is_transport_or_timeout(&self) -> bool {
+    fn is_external_retryable(&self) -> bool {
         self.message.contains("TimeoutError")
             || self.message.contains("DispatchFailure")
             || self.message.contains("IncompleteMessage")
             || self.message.contains("ConnectorError")
+            || self.message.contains("OperationAborted")
+            || self.message.contains("SlowDown")
     }
 }
 
@@ -96,19 +98,27 @@ fn external_test_mode() -> bool {
 }
 
 async fn atomic_read_case(size: usize) {
+    retry_atomic_case(|| atomic_read_attempt(size)).await;
+}
+
+async fn retry_atomic_case<F, Fut>(mut attempt_fn: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), AtomicAttemptError>>,
+{
     let max_attempts = if external_test_mode() { 3 } else { 1 };
     let mut last_error = None;
 
     for attempt in 1..=max_attempts {
-        match atomic_read_attempt(size).await {
+        match attempt_fn().await {
             Ok(()) => return,
             Err(err)
                 if attempt < max_attempts
                     && external_test_mode()
-                    && err.is_transport_or_timeout() =>
+                    && err.is_external_retryable() =>
             {
                 eprintln!(
-                    "retrying atomic read case after {} transport error on attempt {attempt}/{max_attempts}: {}",
+                    "retrying atomic case after {} retryable error on attempt {attempt}/{max_attempts}: {}",
                     err.context, err.message
                 );
                 last_error = Some(err);
@@ -129,7 +139,7 @@ async fn atomic_read_case(size: usize) {
     );
 }
 
-async fn atomic_read_attempt(size: usize) -> Result<(), AtomicReadAttemptError> {
+async fn atomic_read_attempt(size: usize) -> Result<(), AtomicAttemptError> {
     let client = CTX.client();
     let bucket = setup_bucket().await;
     let key = "atomic-read";
@@ -144,7 +154,7 @@ async fn atomic_read_attempt(size: usize) -> Result<(), AtomicReadAttemptError> 
                 .send()
         })
         .await
-        .map_err(|err| AtomicReadAttemptError::new("initial put", format!("{err:?}")))?;
+        .map_err(|err| AtomicAttemptError::new("initial put", format!("{err:?}")))?;
 
         let bucket2 = bucket.clone();
         let write_task = tokio::spawn(async move {
@@ -166,17 +176,17 @@ async fn atomic_read_attempt(size: usize) -> Result<(), AtomicReadAttemptError> 
 
         let (write_result, read_result) = tokio::join!(write_task, read_task);
         write_result
-            .map_err(|err| AtomicReadAttemptError::new("concurrent put task", err.to_string()))?
-            .map_err(|err| AtomicReadAttemptError::new("concurrent put", err))?;
+            .map_err(|err| AtomicAttemptError::new("concurrent put task", err.to_string()))?
+            .map_err(|err| AtomicAttemptError::new("concurrent put", err))?;
         let body = read_result
-            .map_err(|err| AtomicReadAttemptError::new("concurrent get task", err.to_string()))?
-            .map_err(|err| AtomicReadAttemptError::new("concurrent get", err))?;
+            .map_err(|err| AtomicAttemptError::new("concurrent get task", err.to_string()))?
+            .map_err(|err| AtomicAttemptError::new("concurrent get", err))?;
 
         assert_uniform(&body, size);
 
         let final_body = get_body_result(&bucket, key)
             .await
-            .map_err(|err| AtomicReadAttemptError::new("final get", err))?;
+            .map_err(|err| AtomicAttemptError::new("final get", err))?;
         assert_uniform(&final_body, size);
         assert_eq!(final_body[0], b'B');
 
@@ -189,65 +199,128 @@ async fn atomic_read_attempt(size: usize) -> Result<(), AtomicReadAttemptError> 
 }
 
 async fn atomic_write_case(size: usize) {
+    retry_atomic_case(|| atomic_write_attempt(size)).await;
+}
+
+async fn atomic_write_attempt(size: usize) -> Result<(), AtomicAttemptError> {
     let client = CTX.client();
     let bucket = setup_bucket().await;
     let key = "atomic-write";
 
-    put_object_retrying_operation_aborted(client, &bucket, key, make_body(b'A', size)).await;
-    let body = get_body(&bucket, key).await;
-    assert_uniform(&body, size);
-    assert_eq!(body[0], b'A');
+    let result = async {
+        retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'A', size)))
+                .send()
+        })
+        .await
+        .map_err(|err| AtomicAttemptError::new("first put", format!("{err:?}")))?;
 
-    put_object_retrying_operation_aborted(client, &bucket, key, make_body(b'B', size)).await;
-    let body = get_body(&bucket, key).await;
-    assert_uniform(&body, size);
-    assert_eq!(body[0], b'B');
+        let body = get_body_result(&bucket, key)
+            .await
+            .map_err(|err| AtomicAttemptError::new("first get", err))?;
+        assert_uniform(&body, size);
+        assert_eq!(body[0], b'A');
+
+        retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'B', size)))
+                .send()
+        })
+        .await
+        .map_err(|err| AtomicAttemptError::new("second put", format!("{err:?}")))?;
+
+        let body = get_body_result(&bucket, key)
+            .await
+            .map_err(|err| AtomicAttemptError::new("second get", err))?;
+        assert_uniform(&body, size);
+        assert_eq!(body[0], b'B');
+
+        Ok(())
+    }
+    .await;
 
     cleanup(&bucket, &[key]).await;
+    result
 }
 
 async fn atomic_dual_write_case(size: usize) {
+    retry_atomic_case(|| atomic_dual_write_attempt(size)).await;
+}
+
+async fn atomic_dual_write_attempt(size: usize) -> Result<(), AtomicAttemptError> {
     let client = CTX.client();
     let bucket = setup_bucket().await;
     let key = "atomic-dual-write";
 
-    put_object_retrying_operation_aborted(client, &bucket, key, make_body(b'X', size)).await;
+    let result = async {
+        retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'X', size)))
+                .send()
+        })
+        .await
+        .map_err(|err| AtomicAttemptError::new("initial put", format!("{err:?}")))?;
 
-    let bucket2 = bucket.clone();
-    let write_a = tokio::spawn(async move {
-        put_object_retrying_operation_aborted(
-            CTX.client(),
-            &bucket2,
-            "atomic-dual-write",
-            make_body(b'A', size),
-        )
-        .await;
-    });
+        let bucket2 = bucket.clone();
+        let write_a = tokio::spawn(async move {
+            retrying_operation_aborted_result(|| {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket2)
+                    .key("atomic-dual-write")
+                    .body(ByteStream::from(make_body(b'A', size)))
+                    .send()
+            })
+            .await
+            .map_err(|err| format!("{err:?}"))
+        });
 
-    let bucket3 = bucket.clone();
-    let write_b = tokio::spawn(async move {
-        put_object_retrying_operation_aborted(
-            CTX.client(),
-            &bucket3,
-            "atomic-dual-write",
-            make_body(b'B', size),
-        )
-        .await;
-    });
+        let bucket3 = bucket.clone();
+        let write_b = tokio::spawn(async move {
+            retrying_operation_aborted_result(|| {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket3)
+                    .key("atomic-dual-write")
+                    .body(ByteStream::from(make_body(b'B', size)))
+                    .send()
+            })
+            .await
+            .map_err(|err| format!("{err:?}"))
+        });
 
-    let (a, b) = tokio::join!(write_a, write_b);
-    a.unwrap();
-    b.unwrap();
+        let (a, b) = tokio::join!(write_a, write_b);
+        a.map_err(|err| AtomicAttemptError::new("concurrent put A task", err.to_string()))?
+            .map_err(|err| AtomicAttemptError::new("concurrent put A", err))?;
+        b.map_err(|err| AtomicAttemptError::new("concurrent put B task", err.to_string()))?
+            .map_err(|err| AtomicAttemptError::new("concurrent put B", err))?;
 
-    let body = get_body(&bucket, key).await;
-    assert_uniform(&body, size);
-    assert!(
-        body[0] == b'A' || body[0] == b'B',
-        "expected all 'A' or all 'B', got 0x{:02x}",
-        body[0],
-    );
+        let body = get_body_result(&bucket, key)
+            .await
+            .map_err(|err| AtomicAttemptError::new("final get", err))?;
+        assert_uniform(&body, size);
+        assert!(
+            body[0] == b'A' || body[0] == b'B',
+            "expected all 'A' or all 'B', got 0x{:02x}",
+            body[0],
+        );
+
+        Ok(())
+    }
+    .await;
 
     cleanup(&bucket, &[key]).await;
+    result
 }
 
 macro_rules! atomic_size_test {
