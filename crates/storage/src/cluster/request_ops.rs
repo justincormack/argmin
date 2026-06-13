@@ -42,6 +42,7 @@ const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS: u64 = 10_000;
 const COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
+const BUCKET_DELETE_DRAIN_LEASE_MILLIS: u64 = BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS + 5_000;
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
 const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
@@ -2224,6 +2225,25 @@ impl super::StorageCluster {
             }
             Err(other) => return Err(other),
         }
+        if let Some(expired) = node
+            .bucket_write_reservation_client()
+            .clear_expired_durable_bucket_write_drain(
+                pg_id,
+                bucket,
+                crate::clock::current_time_millis(),
+            )?
+        {
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_write_expired_drain_rollback",
+                Some(format_args!(
+                    "bucket={:?} pg_id={} drain_id={}",
+                    bucket,
+                    pg_id.get(),
+                    expired.drain_id
+                )),
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
         Ok(())
     }
@@ -2253,6 +2273,11 @@ impl super::StorageCluster {
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
             let drain_id = self.next_bucket_write_drain_id()?;
             let owner_token = self.bucket_write_owner_token();
+            let now = crate::clock::current_time_millis();
+            // DeleteBucket begin work is bounded. Give a live caller a small
+            // grace window, but make an abandoned Active-bucket drain
+            // recoverable by later write-snapshot waiters and delete retries.
+            let lease_deadline = now.saturating_add(BUCKET_DELETE_DRAIN_LEASE_MILLIS);
             match node
                 .bucket_write_reservation_client()
                 .begin_durable_bucket_write_drain(
@@ -2261,8 +2286,8 @@ impl super::StorageCluster {
                     &drain_id,
                     &owner_token,
                     self.operation_epoch(),
-                    crate::clock::current_time_millis(),
-                    None,
+                    now,
+                    Some(lease_deadline),
                 ) {
                 Ok(record) => {
                     return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
@@ -2343,6 +2368,37 @@ impl super::StorageCluster {
                 | MetadataError::BucketNotFound { .. },
             )) => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    fn heartbeat_durable_bucket_delete_drain(
+        &self,
+        drain: &super::DurableBucketWriteDrain,
+    ) -> Result<super::DurableBucketWriteDrain, BucketWriteDrainError> {
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(drain.pg_id))?;
+        let lease_deadline =
+            crate::clock::current_time_millis().saturating_add(BUCKET_DELETE_DRAIN_LEASE_MILLIS);
+        match node
+            .bucket_write_reservation_client()
+            .heartbeat_durable_bucket_write_drain(
+                PgId::new(drain.pg_id),
+                &drain.record,
+                lease_deadline,
+            ) {
+            Ok(record) => Ok(super::DurableBucketWriteDrain {
+                pg_id: drain.pg_id,
+                record,
+            }),
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteDrainConflict { .. }
+                | MetadataError::BucketWriteDrainNotFound { .. },
+            )) => Err(StoreError::MetadataCommandContention {
+                context: "stale bucket delete drain before mark deleting",
+            }
+            .into()),
+            Err(error) => Err(bucket_snapshot_error_to_bucket_write_drain_error(error)),
         }
     }
 
@@ -2696,7 +2752,7 @@ impl super::StorageCluster {
         if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
             return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
         }
-        let durable_drain =
+        let mut durable_drain =
             match self.begin_durable_bucket_delete_drain_with_budget(bucket, Some(started))? {
                 super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
                 super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
@@ -2749,6 +2805,8 @@ impl super::StorageCluster {
                                 ),
                             ));
                         }
+                        durable_drain =
+                            self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
                         (command, false)
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
@@ -2859,6 +2917,7 @@ impl super::StorageCluster {
                 if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
+                durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
                 #[cfg(test)]
                 maybe_run_before_bucket_delete_command_id_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
@@ -2898,6 +2957,7 @@ impl super::StorageCluster {
                 }
                 (command, true)
             };
+            durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
             let outcome = self
                 .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
                     pg_id,

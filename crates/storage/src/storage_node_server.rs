@@ -35,8 +35,8 @@ use crate::storage_rpc::{
     decode_bucket_metadata_control_pending_match_request, decode_bucket_pg_request,
     decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
     decode_bucket_subresource_get_request, decode_bucket_write_drain_begin_request,
-    decode_bucket_write_drain_clear_expired_request, decode_bucket_write_drain_record_request,
-    decode_bucket_write_reservation_acquire_request,
+    decode_bucket_write_drain_clear_expired_request, decode_bucket_write_drain_heartbeat_request,
+    decode_bucket_write_drain_record_request, decode_bucket_write_reservation_acquire_request,
     decode_bucket_write_reservation_heartbeat_request,
     decode_bucket_write_reservation_proof_request, decode_bucket_write_reservation_record_request,
     decode_complete_multipart_command_build_request,
@@ -868,6 +868,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketWriteDrainClearExpired => {
                 match decode_bucket_write_drain_clear_expired_request(&frame.payload) {
                     Ok(request) => self.bucket_write_drain_clear_expired_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketWriteDrainHeartbeat => {
+                match decode_bucket_write_drain_heartbeat_request(&frame.payload) {
+                    Ok(request) => self.bucket_write_drain_heartbeat_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -2225,6 +2234,43 @@ impl StorageNodeConnectionHandler {
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_write_drain_heartbeat_response(
+        &self,
+        request: crate::storage_rpc::StorageRpcBucketWriteDrainHeartbeatRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.record.bucket,
+            "bucket write drain heartbeat",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
+            &local_client,
+            request.pg_id,
+            &request.record,
+            request.lease_deadline,
+        ) {
+            Ok(record) => {
+                let payload = encode_bucket_write_drain_optional_record_response(
+                    &StorageRpcBucketWriteDrainOptionalRecordResponse {
+                        record: Some(record),
+                    },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(
+                &bucket_write_drain_heartbeat_error_response(error),
+            ),
         }
     }
 
@@ -7268,6 +7314,26 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),
         },
+    }
+}
+
+fn bucket_write_drain_heartbeat_error_response(
+    error: BucketSnapshotLoadError,
+) -> StorageRpcErrorResponse {
+    match error {
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDrainConflict { drain_id }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::BucketWriteDrainConflict,
+                message: drain_id,
+            }
+        }
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDrainNotFound { drain_id }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::BucketWriteDrainNotFound,
+                message: drain_id,
+            }
+        }
+        error => bucket_snapshot_error_response(error),
     }
 }
 

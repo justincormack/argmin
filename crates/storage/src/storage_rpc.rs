@@ -318,6 +318,8 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         + STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN;
+const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_HEARTBEAT_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATIONS_LIST_PAYLOAD_LEN: usize =
@@ -540,6 +542,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectStreamUploadsPgList = 120,
     MetadataCommandPgLockAcquire = 121,
     MetadataCommandPgLockRelease = 122,
+    BucketWriteDrainHeartbeat = 124,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,6 +561,8 @@ pub(crate) enum StorageRpcErrorCode {
     ResourceExhausted = 11,
     ReclaimClaimNotFound = 12,
     ShardDeleteInProgress = 13,
+    BucketWriteDrainConflict = 14,
+    BucketWriteDrainNotFound = 15,
 }
 
 impl StorageRpcErrorCode {
@@ -576,6 +581,8 @@ impl StorageRpcErrorCode {
             11 => Ok(Self::ResourceExhausted),
             12 => Ok(Self::ReclaimClaimNotFound),
             13 => Ok(Self::ShardDeleteInProgress),
+            14 => Ok(Self::BucketWriteDrainConflict),
+            15 => Ok(Self::BucketWriteDrainNotFound),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -696,6 +703,7 @@ impl StorageRpcMessageKind {
             Self::BucketWriteDrainBegin => "bucket write drain begin",
             Self::BucketWriteDrainClear => "bucket write drain clear",
             Self::BucketWriteDrainClearExpired => "bucket write drain clear expired",
+            Self::BucketWriteDrainHeartbeat => "bucket write drain heartbeat",
             Self::BucketWriteDrainExists => "bucket write drain exists",
             Self::BucketWriteReservationsList => "bucket write reservations list",
             Self::BucketDeleteFinalized => "bucket delete finalized",
@@ -855,6 +863,7 @@ impl StorageRpcMessageKind {
             120 => Ok(Self::ObjectStreamUploadsPgList),
             121 => Ok(Self::MetadataCommandPgLockAcquire),
             122 => Ok(Self::MetadataCommandPgLockRelease),
+            124 => Ok(Self::BucketWriteDrainHeartbeat),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1036,6 +1045,15 @@ pub(crate) struct StorageRpcBucketWriteDrainRecordRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) record: BucketWriteDrainRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketWriteDrainHeartbeatRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) record: BucketWriteDrainRecord,
+    pub(crate) lease_deadline: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3112,6 +3130,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketWriteDrainClear => {
             STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketWriteDrainHeartbeat => {
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_HEARTBEAT_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketWriteDrainClearExpired => {
             STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN
@@ -9155,6 +9176,49 @@ pub(crate) fn decode_bucket_write_drain_record_request(
         cluster_epoch,
         pg_id,
         record,
+    })
+}
+
+pub(crate) fn encode_bucket_write_drain_heartbeat_request(
+    request: &StorageRpcBucketWriteDrainHeartbeatRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.cluster_epoch != request.record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match drain epoch",
+        ));
+    }
+    validate_bucket_write_drain_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_write_drain_record(&mut out, &request.record);
+    put_u64(&mut out, request.lease_deadline);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_write_drain_heartbeat_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketWriteDrainHeartbeatRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let record = decoder.read_bucket_write_drain_record()?;
+    let lease_deadline = decoder.read_u64()?;
+    decoder.finish()?;
+    if cluster_epoch != record.cluster_epoch {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "request route epoch must match drain epoch",
+        ));
+    }
+    validate_bucket_write_drain_record(&record)?;
+    Ok(StorageRpcBucketWriteDrainHeartbeatRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        record,
+        lease_deadline,
     })
 }
 

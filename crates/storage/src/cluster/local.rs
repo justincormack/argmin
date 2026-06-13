@@ -8834,6 +8834,31 @@ mod tests {
                 .is_empty()
         );
 
+        let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+            super::super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                panic!("active bucket should acquire a delete drain")
+            }
+        };
+        let mut stale_drain = drain.record.clone();
+        stale_drain.owner_token = "stale-delete-owner".to_string();
+        let err = map
+            .node(node_id)
+            .unwrap()
+            .bucket_write_reservation_client()
+            .heartbeat_durable_bucket_write_drain(PgId::new(drain.pg_id), &stale_drain, 200)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteDrainConflict { .. }
+                )
+            ),
+            "Unix heartbeat should preserve stale drain identity as typed metadata contention, got {err:?}"
+        );
+        cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
+
         let snapshot_result: Result<(), MetadataError> = cluster
             .with_bucket_write_snapshot_for_command(
                 &bucket,
@@ -20123,6 +20148,65 @@ mod tests {
                 .is_empty()
         );
         let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+    }
+
+    #[test]
+    fn cluster_bucket_write_snapshot_clears_expired_active_delete_drain() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "expired-active-delete-drain-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        {
+            let primary_pg = map
+                .node(NodeId::new(1))
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            let now = crate::clock::current_time_millis();
+            crate::PgMetadataStore::begin_durable_bucket_write_drain(
+                &*primary_pg,
+                &bucket,
+                "expired-active-delete-drain",
+                "abandoned-delete-owner",
+                crate::ClusterEpoch::INITIAL,
+                now.saturating_sub(10),
+                Some(now.saturating_sub(1)),
+            )
+            .unwrap();
+        }
+
+        cluster
+            .with_bucket_write_snapshot(&bucket, Default::default(), |snapshot| {
+                assert_eq!(snapshot.bucket.name, bucket);
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        let primary_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_drain(&*primary_pg, &bucket)
+                .unwrap()
+                .is_none(),
+            "expired active delete drain should not keep later write snapshots blocked"
+        );
     }
 
     #[test]
@@ -37539,6 +37623,14 @@ mod tests {
                 .bucket_execution_generation
         };
 
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+            ),
+            "bucket delete owner should return retryable contention after draining an old bucket command, got {err:?}"
+        );
         cluster.begin_bucket_delete(&bucket).unwrap();
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),
@@ -38288,6 +38380,14 @@ mod tests {
                 insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
             }));
 
+        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+            ),
+            "bucket delete owner should return retryable contention after a winning pending slot advances the bucket generation, got {err:?}"
+        );
         cluster.begin_bucket_delete(&bucket).unwrap();
 
         assert!(

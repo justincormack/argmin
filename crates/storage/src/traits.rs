@@ -201,6 +201,20 @@ pub(crate) trait PgMetadataStore {
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, MetadataError>;
 
+    /// Renew an active durable bucket write drain by exact identity.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+        lease_deadline: u64,
+        now: u64,
+    ) -> Result<BucketWriteDrainRecord, MetadataError>;
+
     /// Set bucket versioning state.
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.

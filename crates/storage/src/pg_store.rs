@@ -12077,6 +12077,140 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        name: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        bucket_execution_generation: u64,
+        lease_deadline: u64,
+        now: u64,
+    ) -> Result<BucketWriteDrainRecord, MetadataError> {
+        let generation =
+            i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
+                context: "heartbeat durable bucket write drain generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+            context: "heartbeat durable bucket write drain lease deadline",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let now = i64::try_from(now).map_err(|source| MetadataError::Db {
+            context: "heartbeat durable bucket write drain now",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| MetadataError::Db {
+                context: "heartbeat durable bucket write drain (begin txn)",
+                source,
+            })?;
+        let result = (|| {
+            let Some(record) = (match self.conn.query_row(
+                "SELECT bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
+                        state, created_at, lease_deadline \
+                 FROM bucket_write_drains \
+                 WHERE bucket_name = ?1",
+                params![name.as_str()],
+                bucket_write_drain_from_row,
+            ) {
+                Ok(record) => Some(record),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(source) => {
+                    return Err(MetadataError::Db {
+                        context: "heartbeat durable bucket write drain (load drain)",
+                        source,
+                    });
+                }
+            }) else {
+                return Err(MetadataError::BucketWriteDrainNotFound {
+                    drain_id: drain_id.to_string(),
+                });
+            };
+            if record.drain_id != drain_id
+                || record.owner_token != owner_token
+                || record.cluster_epoch != cluster_epoch
+                || record.bucket_execution_generation != bucket_execution_generation
+            {
+                return Err(MetadataError::BucketWriteDrainConflict {
+                    drain_id: drain_id.to_string(),
+                });
+            }
+            let Some(current_deadline) = record.lease_deadline else {
+                return Err(MetadataError::BucketWriteDrainConflict {
+                    drain_id: drain_id.to_string(),
+                });
+            };
+            if i64::try_from(current_deadline).map_err(|source| MetadataError::Db {
+                context: "heartbeat durable bucket write drain current lease deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })? <= now
+            {
+                return Err(MetadataError::BucketWriteDrainConflict {
+                    drain_id: drain_id.to_string(),
+                });
+            }
+            let bucket = self.head_bucket_record_raw(name)?;
+            if bucket.state != BucketState::Active
+                || bucket.bucket_execution_generation != bucket_execution_generation
+            {
+                return Err(MetadataError::BucketWriteDrainConflict {
+                    drain_id: drain_id.to_string(),
+                });
+            }
+            let updated = self
+                .conn
+                .execute(
+                    "UPDATE bucket_write_drains \
+                     SET lease_deadline = ?6 \
+                     WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
+                       AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
+                       AND lease_deadline IS NOT NULL AND lease_deadline > ?7",
+                    params![
+                        name.as_str(),
+                        drain_id,
+                        owner_token,
+                        cluster_epoch.get(),
+                        generation,
+                        lease_deadline,
+                        now,
+                    ],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "heartbeat durable bucket write drain (update drain)",
+                    source,
+                })?;
+            if updated == 0 {
+                return Err(MetadataError::BucketWriteDrainNotFound {
+                    drain_id: drain_id.to_string(),
+                });
+            }
+            self.durable_bucket_write_drain(name)?.ok_or_else(|| {
+                MetadataError::BucketWriteDrainNotFound {
+                    drain_id: drain_id.to_string(),
+                }
+            })
+        })();
+        match result {
+            Ok(record) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map(|()| record)
+                .map_err(|source| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    MetadataError::Db {
+                        context: "heartbeat durable bucket write drain (commit txn)",
+                        source,
+                    }
+                }),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(test)]
     fn put_bucket_versioning(
         &self,
@@ -18182,6 +18316,98 @@ mod tests {
                 .is_none(),
             "Deleting buckets must not be lifecycle-claimable"
         );
+    }
+
+    #[test]
+    fn bucket_write_drain_heartbeat_fences_stale_delete_owner() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 12).unwrap();
+        let bucket = trusted_bucket_name("delete-drain-heartbeat-bucket");
+        let expired_bucket = trusted_bucket_name("expired-delete-drain-heartbeat-bucket");
+        create_probe_bucket_direct(&store, &bucket);
+        create_probe_bucket_direct(&store, &expired_bucket);
+
+        let record = store
+            .begin_durable_bucket_write_drain(
+                &bucket,
+                "delete-drain",
+                "delete-owner",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(100),
+            )
+            .unwrap();
+        let renewed = store
+            .heartbeat_durable_bucket_write_drain(
+                &bucket,
+                "delete-drain",
+                "delete-owner",
+                ClusterEpoch::INITIAL,
+                record.bucket_execution_generation,
+                200,
+                50,
+            )
+            .unwrap();
+        assert_eq!(renewed.lease_deadline, Some(200));
+
+        let wrong_owner = store
+            .heartbeat_durable_bucket_write_drain(
+                &bucket,
+                "delete-drain",
+                "other-owner",
+                ClusterEpoch::INITIAL,
+                record.bucket_execution_generation,
+                300,
+                60,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            wrong_owner,
+            MetadataError::BucketWriteDrainConflict { .. }
+        ));
+
+        let expired = store
+            .begin_durable_bucket_write_drain(
+                &expired_bucket,
+                "expired-delete-drain",
+                "delete-owner",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+            )
+            .unwrap();
+        let expired_heartbeat = store
+            .heartbeat_durable_bucket_write_drain(
+                &expired_bucket,
+                "expired-delete-drain",
+                "delete-owner",
+                ClusterEpoch::INITIAL,
+                expired.bucket_execution_generation,
+                200,
+                20,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            expired_heartbeat,
+            MetadataError::BucketWriteDrainConflict { .. }
+        ));
+
+        store.mark_bucket_deleting(&bucket).unwrap();
+        let inactive_bucket = store
+            .heartbeat_durable_bucket_write_drain(
+                &bucket,
+                "delete-drain",
+                "delete-owner",
+                ClusterEpoch::INITIAL,
+                record.bucket_execution_generation,
+                400,
+                70,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            inactive_bucket,
+            MetadataError::BucketWriteDrainConflict { .. }
+        ));
     }
 
     #[test]

@@ -78,8 +78,8 @@ use crate::storage_rpc::{
     encode_bucket_metadata_control_pending_match_request, encode_bucket_pg_request,
     encode_bucket_request, encode_bucket_snapshot_pair_request, encode_bucket_snapshot_request,
     encode_bucket_subresource_get_request, encode_bucket_write_drain_begin_request,
-    encode_bucket_write_drain_clear_expired_request, encode_bucket_write_drain_record_request,
-    encode_bucket_write_reservation_acquire_request,
+    encode_bucket_write_drain_clear_expired_request, encode_bucket_write_drain_heartbeat_request,
+    encode_bucket_write_drain_record_request, encode_bucket_write_reservation_acquire_request,
     encode_bucket_write_reservation_heartbeat_request,
     encode_bucket_write_reservation_proof_request, encode_bucket_write_reservation_record_request,
     encode_complete_multipart_command_build_request,
@@ -131,8 +131,8 @@ use crate::storage_rpc::{
     StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotRequest,
     StorageRpcBucketSubresourceGetRequest, StorageRpcBucketWriteDrainBeginOutcome,
     StorageRpcBucketWriteDrainBeginRequest, StorageRpcBucketWriteDrainClearExpiredRequest,
-    StorageRpcBucketWriteDrainRecordRequest, StorageRpcBucketWriteReservationAcquireOutcome,
-    StorageRpcBucketWriteReservationAcquireRequest,
+    StorageRpcBucketWriteDrainHeartbeatRequest, StorageRpcBucketWriteDrainRecordRequest,
+    StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcBucketWriteReservationProofRequest,
     StorageRpcBucketWriteReservationRecordRequest, StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
@@ -1222,6 +1222,13 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
+
     fn durable_bucket_write_reservations(
         &self,
         pg_id: PgId,
@@ -2140,6 +2147,13 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
+
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
 
     fn durable_bucket_write_reservations(
         &self,
@@ -4710,6 +4724,7 @@ fn storage_rpc_admission_class(kind: StorageRpcMessageKind) -> UnixStorageNodeRp
         | StorageRpcMessageKind::BucketWriteDrainBegin
         | StorageRpcMessageKind::BucketWriteDrainClear
         | StorageRpcMessageKind::BucketWriteDrainClearExpired
+        | StorageRpcMessageKind::BucketWriteDrainHeartbeat
         | StorageRpcMessageKind::BucketDeleteFinalized
         | StorageRpcMessageKind::BucketDeleteFinalizeRoots
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire
@@ -6820,6 +6835,20 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::heartbeat_durable_bucket_write_drain(
+            self,
+            pg_id,
+            record,
+            lease_deadline,
+        )
+    }
+
     fn durable_bucket_write_reservations(
         &self,
         pg_id: PgId,
@@ -8807,6 +8836,79 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             }
         }
         Ok(response.record)
+    }
+
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteDrainHeartbeatRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: record.clone(),
+            lease_deadline,
+        };
+        let payload = encode_bucket_write_drain_heartbeat_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode bucket write drain heartbeat request",
+                error.to_string(),
+            ))
+        })?;
+        let kind = StorageRpcMessageKind::BucketWriteDrainHeartbeat;
+        let response = self
+            .rpc_request_result(kind, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.code == StorageRpcErrorCode::BucketWriteDrainConflict => {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketWriteDrainConflict {
+                        drain_id: error.message,
+                    },
+                ));
+            }
+            Err(error) if error.code == StorageRpcErrorCode::BucketWriteDrainNotFound => {
+                return Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketWriteDrainNotFound {
+                        drain_id: error.message,
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.rpc_response_error(kind, error),
+                ));
+            }
+        };
+        let response =
+            decode_bucket_write_drain_optional_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket write drain heartbeat response",
+                    error.to_string(),
+                ))
+            })?;
+        let Some(renewed) = response.record else {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket write drain heartbeat response",
+                "heartbeat response returned no drain record".to_string(),
+            )));
+        };
+        if renewed.bucket != record.bucket
+            || renewed.drain_id != record.drain_id
+            || renewed.owner_token != record.owner_token
+            || renewed.cluster_epoch != record.cluster_epoch
+            || renewed.bucket_execution_generation != record.bucket_execution_generation
+            || renewed.lease_deadline != Some(lease_deadline)
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket write drain heartbeat response",
+                "heartbeat response identity does not match request".to_string(),
+            )));
+        }
+        Ok(renewed)
     }
 
     fn durable_bucket_write_reservations(
@@ -13800,6 +13902,25 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::clear_expired_durable_bucket_write_drain(
             &*pg, bucket, now,
+        )?)
+    }
+
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::heartbeat_durable_bucket_write_drain(
+            &*pg,
+            &record.bucket,
+            &record.drain_id,
+            &record.owner_token,
+            record.cluster_epoch,
+            record.bucket_execution_generation,
+            lease_deadline,
+            crate::clock::current_time_millis(),
         )?)
     }
 
