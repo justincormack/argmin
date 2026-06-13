@@ -2697,6 +2697,26 @@ impl super::StorageCluster {
     }
 
     pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        self.begin_bucket_delete_inner(bucket, None)
+    }
+
+    pub fn begin_bucket_delete_if_current(
+        &self,
+        bucket: &BucketName,
+        bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
+    ) -> Result<(), BucketWriteDrainError> {
+        self.begin_bucket_delete_inner(
+            bucket,
+            Some((bucket_execution_generation, bucket_incarnation_generation)),
+        )
+    }
+
+    fn begin_bucket_delete_inner(
+        &self,
+        bucket: &BucketName,
+        expected_bucket_identity: Option<(u64, u64)>,
+    ) -> Result<(), BucketWriteDrainError> {
         let started = std::time::Instant::now();
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node_store = self
@@ -2712,6 +2732,16 @@ impl super::StorageCluster {
                 .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            if let Some((expected_execution, expected_incarnation)) = expected_bucket_identity {
+                if current.bucket_execution_generation != expected_execution
+                    || current.bucket_incarnation_generation != expected_incarnation
+                {
+                    return Err(StoreError::MetadataCommandContention {
+                        context: "stale delete bucket authorization",
+                    }
+                    .into());
+                }
+            }
             if current.state == BucketState::Deleting {
                 if let Some(command) = self
                     .pending_metadata_command_for_bucket(pg_id, bucket)

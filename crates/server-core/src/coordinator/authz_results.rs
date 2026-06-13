@@ -185,6 +185,8 @@ pub(super) struct AuthorizedHeadBucket {
 #[derive(Debug)]
 pub(super) struct AuthorizedDeleteBucket {
     pub(super) name: BucketName,
+    pub(super) bucket_execution_generation: u64,
+    pub(super) bucket_incarnation_generation: u64,
 }
 
 #[derive(Debug)]

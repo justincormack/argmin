@@ -365,13 +365,21 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
+        let AuthorizedDeleteBucket {
+            name,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        } = self.authorize_delete_bucket(req)?;
         let _ = observability::event(
             TRACE_TARGET,
             "bucket_delete_authorized",
             Some(format_args!("bucket={:?}", name)),
         );
-        if let Err(err) = self.storage_node.begin_bucket_delete(&name) {
+        if let Err(err) = self.storage_node.begin_bucket_delete_if_current(
+            &name,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        ) {
             let _ = observability::event(
                 TRACE_TARGET,
                 "bucket_delete_begin_failed",

@@ -90,12 +90,12 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
-        match self.authorize_loaded_bucket_write_action_for(
+        let bucket = match self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::DeleteBucket,
             Self::requester_can_bucket_owner_account_admin,
         ) {
-            Ok(_) => {}
+            Ok(bucket) => bucket,
             Err(ServerError::OperationAborted) => return Err(ServerError::OperationAborted),
             Err(ServerError::BucketNotFound { name }) => {
                 if let Some(authorized) = self.authorize_delete_bucket_from_raw_snapshot(req)? {
@@ -104,9 +104,11 @@ impl Coordinator {
                 return Err(ServerError::BucketNotFound { name });
             }
             Err(error) => return Err(error),
-        }
+        };
         Ok(AuthorizedDeleteBucket {
-            name: req.name_typed().clone(),
+            name: bucket.bucket().name.clone(),
+            bucket_execution_generation: bucket.bucket_execution_generation(),
+            bucket_incarnation_generation: bucket.bucket_incarnation_generation(),
         })
     }
 
@@ -155,7 +157,9 @@ impl Coordinator {
         }
 
         Ok(Some(AuthorizedDeleteBucket {
-            name: req.name_typed().clone(),
+            name: bucket.bucket().name.clone(),
+            bucket_execution_generation: bucket.bucket_execution_generation(),
+            bucket_incarnation_generation: bucket.bucket_incarnation_generation(),
         }))
     }
 

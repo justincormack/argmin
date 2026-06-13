@@ -130,6 +130,8 @@ impl<T> LoadedBucketValue<T> {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct LoadedBucketHandle {
     bucket: BucketSummary,
+    bucket_execution_generation: u64,
+    bucket_incarnation_generation: u64,
     request: BucketHandleRequest,
     policy: LoadedBucketValue<String>,
     tags: LoadedBucketValue<String>,
@@ -140,6 +142,8 @@ pub(super) struct LoadedBucketHandle {
 impl LoadedBucketHandle {
     pub(super) fn new(
         bucket: BucketSummary,
+        bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
         request: BucketHandleRequest,
         policy: LoadedBucketValue<String>,
         tags: LoadedBucketValue<String>,
@@ -148,6 +152,8 @@ impl LoadedBucketHandle {
     ) -> Self {
         Self {
             bucket,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
             request,
             policy,
             tags,
@@ -158,6 +164,14 @@ impl LoadedBucketHandle {
 
     pub(super) const fn bucket(&self) -> &BucketSummary {
         &self.bucket
+    }
+
+    pub(super) const fn bucket_execution_generation(&self) -> u64 {
+        self.bucket_execution_generation
+    }
+
+    pub(super) const fn bucket_incarnation_generation(&self) -> u64 {
+        self.bucket_incarnation_generation
     }
 
     pub(super) const fn request(&self) -> BucketHandleRequest {
@@ -359,6 +373,8 @@ impl<'a> BucketHandleLoader<'a> {
         expected_bucket_owner: Option<&str>,
         request: BucketHandleRequest,
     ) -> Result<LoadedBucketHandle, ServerError> {
+        let bucket_execution_generation = snapshot.bucket.bucket_execution_generation;
+        let bucket_incarnation_generation = snapshot.bucket.bucket_incarnation_generation;
         let bucket = Coordinator::validate_expected_bucket_owner(
             Coordinator::bucket_summary(snapshot.bucket),
             expected_bucket_owner,
@@ -367,6 +383,8 @@ impl<'a> BucketHandleLoader<'a> {
 
         Ok(LoadedBucketHandle::new(
             bucket,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
             request,
             Self::from_storage_subresource(snapshot.policy),
             Self::from_storage_subresource(snapshot.tags),

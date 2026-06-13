@@ -4343,6 +4343,64 @@ fn delete_bucket_authorizes_idempotent_retry_while_deleting() {
 }
 
 #[test]
+fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-stale-auth-recreate";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("attacker-owner", bucket, false)
+        .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    let stale_authorized = coord
+        .authorize_delete_bucket(&bucket_request_with_expected_owner(
+            bucket,
+            test_helpers::requester("attacker-owner"),
+            None,
+        ))
+        .expect("idempotent retry should authorize against the deleting bucket incarnation");
+
+    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
+    coord
+        .create_bucket_for_owner("victim-owner", bucket, false)
+        .unwrap();
+    let recreated = storage_cluster.head_bucket_info(&bucket_name).unwrap();
+    assert_eq!(recreated.owner_principal, "victim-owner");
+    assert_eq!(recreated.state, storage::BucketState::Active);
+    assert_ne!(
+        recreated.bucket_incarnation_generation, stale_authorized.bucket_incarnation_generation,
+        "recreated bucket must be a distinct incarnation"
+    );
+
+    let err = storage_cluster
+        .begin_bucket_delete_if_current(
+            &stale_authorized.name,
+            stale_authorized.bucket_execution_generation,
+            stale_authorized.bucket_incarnation_generation,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            storage::BucketWriteDrainError::Store(
+                storage::StoreError::MetadataCommandContention { .. }
+            )
+        ),
+        "stale authorization should return retryable contention, got {err:?}"
+    );
+
+    let still_active = storage_cluster.head_bucket_info(&bucket_name).unwrap();
+    assert_eq!(still_active.owner_principal, "victim-owner");
+    assert_eq!(still_active.state, storage::BucketState::Active);
+    assert_eq!(
+        still_active.bucket_incarnation_generation,
+        recreated.bucket_incarnation_generation
+    );
+}
+
+#[test]
 fn delete_bucket_does_not_wait_for_bucket_lock() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-no-lock";

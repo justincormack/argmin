@@ -1535,8 +1535,12 @@ impl Coordinator {
                 if let (Some(policy), Some(tags)) = (cached_policy, cached_tags) {
                     #[cfg(test)]
                     maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
+                    let bucket_execution_generation = info.bucket_execution_generation;
+                    let bucket_incarnation_generation = info.bucket_incarnation_generation;
                     return Ok(LoadedBucketHandle::new(
                         Self::bucket_summary_for_boe_modern_fast_path(bucket_info),
+                        bucket_execution_generation,
+                        bucket_incarnation_generation,
                         request,
                         policy,
                         tags,
