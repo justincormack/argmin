@@ -1,0 +1,188 @@
+DeleteBucket retry can delete a recreated bucket
+Link: https://chatgpt.com/codex/cloud/security/findings/d16a3c6f3d248191b23f6b154940b172?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 8c99921
+Author: justin@specialbusservice.com
+Created: 13/06/2026, 20:30:00
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Resolution
+Fixed by commit `80196a4ead0b323530e962f7847687d280cbcabb`
+(`Bind DeleteBucket authorization to bucket identity`).
+
+The fix makes `AuthorizedDeleteBucket` carry the bucket execution generation
+and bucket incarnation generation that were authorized, including the
+raw-snapshot idempotent retry path for buckets already in `Deleting` state.
+`Coordinator::delete_bucket` now calls
+`StorageCluster::begin_bucket_delete_if_current`, and storage revalidates that
+the current bucket row still has the authorized execution/incarnation identity
+before installing or observing a delete drain. If the bucket name has been
+deleted and recreated between authorization and use, storage returns retryable
+metadata contention instead of acting on the new bucket.
+
+Regression coverage was added in
+`delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket`: it
+authorizes against an old deleting bucket, finalizes that old incarnation,
+recreates the same bucket name as another owner, then verifies the stale
+authorization cannot begin delete on the recreated bucket and that the victim
+bucket remains `Active`.
+
+Validation run for the fix:
+
+```
+cargo fmt
+cargo nextest run -p server-core delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket delete_bucket_authorizes_idempotent_retry_while_deleting
+cargo check -p storage
+cargo check -p server-core
+```
+
+# Summary
+Introduced a security-relevant authorization TOCTOU in the new idempotent DeleteBucket retry handling. The intended functional fix is to allow retries while the bucket is already Deleting, but the authorized result does not bind to the deleting bucket incarnation and the storage operation later acts on the current name-only bucket state.
+The commit adds a fallback for DeleteBucket authorization when the normal write-snapshot path reports BucketNotFound. The fallback loads a raw snapshot for buckets in BucketState::Deleting, authorizes the requester against that old bucket metadata, and returns AuthorizedDeleteBucket containing only the bucket name. The subsequent delete path calls begin_bucket_delete with just that name. begin_bucket_delete then reloads whatever bucket currently has that name and, if it is active, starts a new delete drain/mark-delete flow without checking that the owner, policy, expected owner, or bucket_incarnation_generation matches the snapshot that was authorized. This creates a TOCTOU across bucket incarnations: an old bucket owner can retry DeleteBucket while their old bucket is deleting; if the old row is finalized and a victim account recreates the bucket name before begin_bucket_delete executes, the stale authorization may delete the victim's newly-created empty bucket.
+
+# Validation
+## Rubric
+- [x] Confirm the new DeleteBucket retry path can authorize from a raw snapshot for a bucket already in `Deleting` state after normal write-snapshot authorization reports `BucketNotFound`.
+- [x] Confirm the authorization result is not bound to bucket owner, expected owner, execution generation, or `bucket_incarnation_generation`, and carries only the bucket name.
+- [x] Confirm the later delete operation consumes only the name and storage reloads the current bucket by name instead of validating the authorized snapshot identity.
+- [x] Dynamically reproduce the race by authorizing against an old deleting bucket, finalizing it, recreating the same name as another owner, and using the stale authorization to mark the recreated bucket deleting.
+- [x] Attempt required dynamic validation tooling: direct behavioral PoC under debug build succeeded; valgrind attempted but unavailable; LLDB debugger trace captured the stale-use call into `begin_bucket_delete`.
+## Report
+Validated the suspected authorization TOCTOU with a targeted Rust unit-test PoC and debugger trace. Key code evidence: `crates/server-core/src/coordinator/authz/bucket.rs:93-105` falls back to raw-snapshot authorization on `BucketNotFound`; `bucket.rs:120-159` authorizes only if the old snapshot is `BucketState::Deleting` but returns `AuthorizedDeleteBucket { name }`; `crates/server-core/src/coordinator/authz_results.rs:186-188` confirms the authorization result contains only `BucketName`; `crates/server-core/src/coordinator/bucket.rs:368-374` passes only that name to storage; `crates/storage/src/cluster/request_ops.rs:2639-2655` reloads the current bucket by name with `head_bucket_raw`, and `request_ops.rs:2695-2705`/`2875-2881` proceeds to acquire/mark delete for the current name without checking the authorized incarnation. I added PoC test `poc_delete_bucket_stale_raw_authorization_deletes_recreated_bucket` at `crates/server-core/src/coordinator/core_tests.rs:10410-10466`. It: creates an attacker-owned bucket, marks it `Deleting`, calls `coord.authorize_delete_bucket` to obtain stale name-only authorization from the old raw snapshot, finalizes old metadata, recreates the same bucket name as `victim-owner`, then calls `storage_cluster.begin_bucket_delete(&stale_authorized_name)`. The assertions prove the victim bucket was active before stale use and then became `BucketState::Deleting` while retaining the victim incarnation generation. Command output: `cargo test -p server-core poc_delete_bucket_stale_raw_authorization_deletes_recreated_bucket -- --nocapture` => `test ... ok` with `1 passed`. Valgrind was attempted but is not installed. LLDB was used non-interactively; a breakpoint at `request_ops.rs:2639` with the first hit ignored stopped at the stale use site, with backtrace frame #1 at `core_tests.rs:10456`, the line calling `begin_bucket_delete(&stale_authorized_name)`, then continuing yielded the passing test. No memory crash is expected because this is a logic/authorization bug, not memory corruption.
+
+# Evidence
+crates/server-core/src/coordinator/authz/bucket.rs (L120 to 159)
+  Note: The raw snapshot is accepted only if the old bucket state is Deleting, but after authorizing it returns only the bucket name, not the authorized bucket incarnation/generation or owner.
+```
+        let snapshot = match self.storage_node.load_bucket_delete_authorization_snapshot(
+            req.name_typed(),
+            request.resolve_to_storage_request(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(None),
+        };
+        if snapshot.bucket.state != BucketState::Deleting {
+            return Ok(None);
+        }
+
+        // DeleteBucket itself installs or observes the bucket write drain. Once
+        // the drain has marked the bucket Deleting, normal bucket snapshots hide
+        // it as not found, but an idempotent retry must still be able to reach
+        // begin_bucket_delete where AlreadyDeleting is handled. Do not use this
+        // raw-snapshot path for active buckets: OperationAborted from normal
+        // write-snapshot authorization can also mean unrelated metadata command
+        // contention, and there is no later auth revalidation after this method
+        // returns only the bucket name.
+        let bucket = self
+            .bucket_handle_loader()
+            .load_bucket_handle_from_snapshot(snapshot, req.expected_bucket_owner(), request)?;
+        let default_allowed =
+            Self::requester_can_bucket_owner_account_admin(req.requester(), bucket.bucket());
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+            req.requester(),
+            bucket.bucket(),
+            Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+            auth::PolicyAction::DeleteBucket,
+            bucket_policy.as_deref(),
+            default_allowed,
+        )?;
+        if !allowed {
+            return Err(ServerError::AccessDenied);
+        }
+
+        Ok(Some(AuthorizedDeleteBucket {
+            name: req.name_typed().clone(),
+        }))
+```
+
+crates/server-core/src/coordinator/authz/bucket.rs (L93 to 105)
+  Note: The new fallback enters raw-snapshot authorization when the normal write-snapshot authorization sees BucketNotFound, which is the deleting-bucket case.
+```
+        match self.authorize_loaded_bucket_write_action_for(
+            req,
+            auth::PolicyAction::DeleteBucket,
+            Self::requester_can_bucket_owner_account_admin,
+        ) {
+            Ok(_) => {}
+            Err(ServerError::OperationAborted) => return Err(ServerError::OperationAborted),
+            Err(ServerError::BucketNotFound { name }) => {
+                if let Some(authorized) = self.authorize_delete_bucket_from_raw_snapshot(req)? {
+                    return Ok(authorized);
+                }
+                return Err(ServerError::BucketNotFound { name });
+            }
+```
+
+crates/server-core/src/coordinator/bucket.rs (L368 to 380)
+  Note: DeleteBucket consumes only AuthorizedDeleteBucket.name and calls begin_bucket_delete by name, so no authorized snapshot identity is revalidated at use time.
+```
+        let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_authorized",
+            Some(format_args!("bucket={:?}", name)),
+        );
+        if let Err(err) = self.storage_node.begin_bucket_delete(&name) {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "bucket_delete_begin_failed",
+                Some(format_args!("bucket={:?} error={:?}", name, err)),
+            );
+            return Err(Self::map_bucket_write_drain_error(err));
+```
+
+crates/storage/src/cluster/request_ops.rs (L2639 to 2655)
+  Note: begin_bucket_delete reloads the current raw bucket by name and treats a currently active bucket as the target; it does not accept or verify an expected authorized incarnation.
+```
+    pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let started = std::time::Instant::now();
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_start",
+            Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+        );
+        {
+            let current = node_store
+                .bucket_metadata_client()
+                .head_bucket_raw(pg_id, bucket)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            if current.state == BucketState::Deleting {
+```
+
+crates/storage/src/cluster/request_ops.rs (L2695 to 2705)
+  Note: If the current bucket is not already deleting, the function proceeds to acquire a new delete drain for the name, so a recreated active bucket can be acted on after stale authorization.
+```
+        let durable_drain =
+            match self.begin_durable_bucket_delete_drain_with_budget(bucket, Some(started))? {
+                super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+                super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_done",
+                        Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                    );
+                    return Ok(());
+                }
+```
+
+crates/storage/src/cluster/request_ops.rs (L2875 to 2881)
+  Note: The delete flow builds a mark-deleting command for the current bucket name and only handles AlreadyDeleting; it does not compare against the authorized raw snapshot's generation.
+```
+                let command = match node_store
+                    .bucket_metadata_client()
+                    .build_mark_bucket_deleting_command(pg_id, bucket, command_id)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                {
+                    MarkBucketDeletingCommandBuild::AlreadyDeleting => return Ok(()),
+                    MarkBucketDeletingCommandBuild::Command(command) => *command,
+```
