@@ -145,6 +145,7 @@ pub(crate) struct ErrorDiagnostic {
     pub error_code: &'static str,
     pub cause_label: &'static str,
     pub cause_chain: String,
+    pub server_detail: Option<String>,
 }
 
 pub struct CreateMultipartUploadResponseContext<'a> {
@@ -741,6 +742,7 @@ impl S3Response {
             error_code: err.s3_error_code(),
             cause_label: err.diagnostic_cause_label(),
             cause_chain: err.diagnostic_cause_chain(),
+            server_detail: err.server_storage_rpc_detail(),
         });
         self
     }

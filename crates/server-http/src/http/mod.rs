@@ -662,6 +662,7 @@ impl ResponseBodyTrace {
             error_code: err.s3_error_code(),
             cause_label: err.diagnostic_cause_label(),
             cause_chain: err.diagnostic_cause_chain(),
+            server_detail: err.server_storage_rpc_detail(),
         };
         self.emit_error_diagnostic(&diagnostic);
     }
@@ -689,6 +690,14 @@ impl ResponseBodyTrace {
                 diagnostic.cause_label,
                 &diagnostic.cause_chain,
             );
+            if let Some(server_detail) = diagnostic.server_detail.as_deref() {
+                let _ = observability::emit_http_500_server_detail(
+                    &self.meta.context,
+                    TRACE_TARGET,
+                    summary,
+                    server_detail,
+                );
+            }
         }
     }
 }
@@ -4664,10 +4673,14 @@ pub fn s3_response_to_hyper(
             .error_diagnostic
             .as_ref()
             .map(|diagnostic| {
-                format!(
+                let mut suffix = format!(
                     " cause_label={} cause_chain={}",
                     diagnostic.cause_label, diagnostic.cause_chain
-                )
+                );
+                if let Some(server_detail) = diagnostic.server_detail.as_deref() {
+                    suffix.push_str(&format!(" server_detail={server_detail:?}"));
+                }
+                suffix
             })
             .unwrap_or_default();
         if let Some(diagnostic) = resp.error_diagnostic.as_ref() {
@@ -4696,6 +4709,14 @@ pub fn s3_response_to_hyper(
                 diagnostic.cause_label,
                 &diagnostic.cause_chain,
             );
+            if let Some(server_detail) = diagnostic.server_detail.as_deref() {
+                let _ = observability::emit_http_500_server_detail(
+                    &trace_meta.context,
+                    TRACE_TARGET,
+                    summary,
+                    server_detail,
+                );
+            }
         }
         if panic_on_500 || abort_on_500 {
             observability::dump_flight_recorder_to_stderr(if abort_on_500 {

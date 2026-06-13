@@ -1462,6 +1462,42 @@ pub fn emit_http_500_cause_chain(
     )
 }
 
+pub fn emit_http_500_server_detail(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestSummary<'_>,
+    server_detail: &str,
+) -> bool {
+    record_flight_event(
+        context,
+        target,
+        "request_500_server_detail",
+        request_flight_detail(
+            summary,
+            format_args!("server_detail={}", escaped(server_detail)),
+        ),
+    );
+    event_in_context(
+        context,
+        target,
+        "request_500_server_detail",
+        Some(format_args!(
+            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} server_detail={}",
+            summary.status_code,
+            summary.method,
+            summary.path,
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.streaming,
+            summary.body_len,
+            summary.bytes_sent,
+            summary.lifetime_us,
+            escaped(server_detail)
+        )),
+    )
+}
+
 pub fn emit_slow_request(
     context: &TraceContext,
     target: &'static str,

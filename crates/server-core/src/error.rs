@@ -350,6 +350,18 @@ impl ServerError {
         }
     }
 
+    /// Server-side diagnostic detail for storage RPC failures.
+    ///
+    /// Unlike the stable cause labels, this may include the storage RPC
+    /// operation and message. It is intended for local/server logs only, not
+    /// response bodies or customer-visible errors.
+    pub fn server_storage_rpc_detail(&self) -> Option<String> {
+        match self {
+            Self::Store(error) => store_error_storage_rpc_detail(error),
+            _ => None,
+        }
+    }
+
     /// Map to S3 error code string.
     pub fn s3_error_code(&self) -> &'static str {
         match self {
@@ -602,6 +614,44 @@ fn store_error_diagnostic_cause_chain(error: &StoreError) -> String {
     }
 }
 
+fn store_error_storage_rpc_detail(error: &StoreError) -> Option<String> {
+    match error {
+        StoreError::ShardStore {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            source,
+        } => store_error_storage_rpc_detail(source).map(|detail| {
+            format!(
+                "shard_store node_id={node_id} pg_id={pg_id} cluster_epoch={} source=({detail})",
+                cluster_epoch.get()
+            )
+        }),
+        StoreError::StorageRpc {
+            node_id,
+            operation,
+            message,
+        } => Some(format!(
+            "storage_rpc node_id={node_id} operation={operation:?} message={message:?}"
+        )),
+        StoreError::StorageRpcResourceExhausted {
+            node_id,
+            operation,
+            message,
+        } => Some(format!(
+            "storage_rpc_resource_exhausted node_id={node_id} operation={operation:?} message={message:?}"
+        )),
+        StoreError::StorageRpcShardDeleteInProgress {
+            node_id,
+            operation,
+            message,
+        } => Some(format!(
+            "storage_rpc_shard_delete_in_progress node_id={node_id} operation={operation:?} message={message:?}"
+        )),
+        _ => None,
+    }
+}
+
 fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str {
     match error {
         MetadataError::BucketWriteDraining => "bucket_write_draining",
@@ -767,6 +817,13 @@ mod tests {
             shard_overload.diagnostic_cause_chain(),
             "server_error>store_error>shard_store>storage_rpc_resource_exhausted"
         );
+        let server_detail = shard_overload
+            .server_storage_rpc_detail()
+            .expect("storage RPC detail should be available server-side");
+        assert!(server_detail.contains("shard_store node_id=1 pg_id=2"));
+        assert!(server_detail.contains("storage_rpc_resource_exhausted"));
+        assert!(server_detail.contains("operation=\"ReadHandlesAcquire\""));
+        assert!(server_detail.contains("message=\"limit exceeded\""));
         let converted_overload = ServerError::from(StoreError::ShardStore {
             node_id: 1,
             pg_id: 2,
