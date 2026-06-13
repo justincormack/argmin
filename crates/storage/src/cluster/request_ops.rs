@@ -1273,7 +1273,7 @@ impl super::StorageCluster {
         )
     }
 
-    fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+    pub(super) fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
@@ -1481,7 +1481,11 @@ impl super::StorageCluster {
         }
 
         let _ = self
-            .drain_pending_metadata_command_with_recovery_gate(pg_id, command)
+            .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+                pg_id,
+                command,
+                work_budget,
+            )
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         Ok(())
     }
@@ -2406,6 +2410,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         delete_started: std::time::Instant,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
         let started = std::time::Instant::now();
         loop {
@@ -2449,6 +2454,7 @@ impl super::StorageCluster {
             self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                 bucket,
                 Some(delete_started),
+                work_budget,
             )?;
             crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2570,6 +2576,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         started: Option<std::time::Instant>,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
         for raw_pg_id in self.metadata_pg_ids() {
             self.check_bucket_delete_begin_work_budget(
@@ -2577,9 +2584,10 @@ impl super::StorageCluster {
                 started,
                 "bucket delete exact-bucket drain budget exhausted",
             )?;
-            self.drain_pending_object_metadata_commands_for_exact_bucket(
+            self.drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
                 PgId::new(raw_pg_id),
                 bucket,
+                work_budget,
             )
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
@@ -2797,6 +2805,12 @@ impl super::StorageCluster {
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
         let mut metadata_contention_retries = 0usize;
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("bucket_delete_begin")
+        .for_pg(pg_id);
         let result = (|| loop {
             self.check_bucket_delete_begin_work_budget(
                 bucket,
@@ -2807,7 +2821,12 @@ impl super::StorageCluster {
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
                 if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        &mut work_budget,
+                    )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
                     super::sleep_after_metadata_contention_retry_for(
@@ -2841,8 +2860,11 @@ impl super::StorageCluster {
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
                         let _ = self
-                            .drain_bucket_pg_pending_metadata_command(
-                                pg_id, bucket, &command, false,
+                            .drain_bucket_pg_pending_metadata_command_with_work_budget(
+                                pg_id,
+                                &command,
+                                false,
+                                &mut work_budget,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         super::sleep_after_metadata_contention_retry_for(
@@ -2861,8 +2883,11 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
                     | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         let _ = self
-                            .drain_bucket_pg_pending_metadata_command(
-                                pg_id, bucket, &command, false,
+                            .drain_bucket_pg_pending_metadata_command_with_work_budget(
+                                pg_id,
+                                &command,
+                                false,
+                                &mut work_budget,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         super::sleep_after_metadata_contention_retry_for(
@@ -2891,6 +2916,7 @@ impl super::StorageCluster {
                         self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                             bucket,
                             Some(started),
+                            &mut work_budget,
                         )?;
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
@@ -2905,6 +2931,7 @@ impl super::StorageCluster {
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                     bucket,
                     Some(started),
+                    &mut work_budget,
                 )?;
                 if self
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
@@ -2922,15 +2949,21 @@ impl super::StorageCluster {
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
-                self.wait_for_durable_bucket_write_reservations_empty(bucket, started)?;
+                self.wait_for_durable_bucket_write_reservations_empty(
+                    bucket,
+                    started,
+                    &mut work_budget,
+                )?;
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                     bucket,
                     Some(started),
+                    &mut work_budget,
                 )?;
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                     bucket,
                     Some(started),
+                    &mut work_budget,
                 )?;
                 if self
                     .pending_metadata_command_for_bucket(pg_id, bucket)?
@@ -2974,7 +3007,12 @@ impl super::StorageCluster {
                     MarkBucketDeletingCommandBuild::Command(command) => *command,
                 };
                 if !self
-                    .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
+                    .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        &mut work_budget,
+                    )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
                     super::sleep_after_metadata_contention_retry_for(
@@ -2989,10 +3027,11 @@ impl super::StorageCluster {
             };
             durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
             let outcome = self
-                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
                     &command,
                     clear_pending_on_zero_apply,
+                    &mut work_budget,
                 )
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             match outcome {

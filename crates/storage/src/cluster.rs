@@ -3364,7 +3364,32 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.drain_pending_metadata_command_with_recovery_gate_inner(pg_id, command, None)
+    }
+
+    fn drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.drain_pending_metadata_command_with_recovery_gate_inner(
+            pg_id,
+            command,
+            Some(work_budget),
+        )
+    }
+
+    fn drain_pending_metadata_command_with_recovery_gate_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        mut work_budget: Option<&mut RequestWorkBudget>,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         loop {
+            if let Some(work_budget) = work_budget.as_deref_mut() {
+                work_budget.check("pending command recovery gate budget exhausted")?;
+            }
             let recovery = self
                 .local_map
                 .runtime_state()
@@ -3417,7 +3442,15 @@ impl StorageCluster {
                     ));
                 }
             };
-            let outcome = self.finish_pending_metadata_command_recovery(pg_id, command)?;
+            let outcome = match work_budget.as_deref_mut() {
+                Some(work_budget) => self
+                    .finish_pending_metadata_command_recovery_with_work_budget(
+                        pg_id,
+                        command,
+                        work_budget,
+                    )?,
+                None => self.finish_pending_metadata_command_recovery(pg_id, command)?,
+            };
             self.emit_metadata_command_recovery_outcome_for_command(
                 pg_id,
                 command,
@@ -3454,13 +3487,41 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.finish_pending_metadata_command_recovery_inner(pg_id, command, None)
+    }
+
+    fn finish_pending_metadata_command_recovery_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.finish_pending_metadata_command_recovery_inner(pg_id, command, Some(work_budget))
+    }
+
+    fn finish_pending_metadata_command_recovery_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: Option<&mut RequestWorkBudget>,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
         if Self::metadata_command_is_bucket_pg_command(command) {
-            let outcome = self
-                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-                    pg_id, command, false,
-                )
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            let outcome = match work_budget {
+                Some(work_budget) => self
+                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                        pg_id,
+                        command,
+                        false,
+                        work_budget,
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                None => self
+                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                        pg_id, command, false,
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+            };
             return Ok(match outcome {
                 request_ops::FinishPendingMetadataCommandResult::Applied => {
                     PendingMetadataCommandOutcome::Applied
@@ -3473,7 +3534,7 @@ impl StorageCluster {
                 }
             });
         }
-        self.finish_object_pg_pending_slot_inner(pg_id, command, true)
+        self.finish_object_pg_pending_slot_inner(pg_id, command, true, work_budget)
     }
 
     fn metadata_command_recovery_applied_collectable_object_command(
@@ -3489,7 +3550,7 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.finish_object_pg_pending_slot_inner(pg_id, command, false)
+        self.finish_object_pg_pending_slot_inner(pg_id, command, false, None)
     }
 
     fn finish_object_pg_pending_slot_inner(
@@ -3497,9 +3558,13 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         abandon_zero_apply_stale_reservation: bool,
+        mut work_budget: Option<&mut RequestWorkBudget>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         let mut command = command.clone();
         loop {
+            if let Some(work_budget) = work_budget.as_deref_mut() {
+                work_budget.check("object metadata pending command apply budget exhausted")?;
+            }
             let command_bucket = command.bucket_name();
             if self
                 .metadata_command_has_abandoned_log_on_acting_set(&command)
@@ -3861,12 +3926,44 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<(), ObjectPgActionError> {
+        self.drain_pending_object_metadata_commands_for_exact_bucket_inner(pg_id, bucket, None)
+    }
+
+    fn drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        self.drain_pending_object_metadata_commands_for_exact_bucket_inner(
+            pg_id,
+            bucket,
+            Some(work_budget),
+        )
+    }
+
+    fn drain_pending_object_metadata_commands_for_exact_bucket_inner(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        mut work_budget: Option<&mut RequestWorkBudget>,
+    ) -> Result<(), ObjectPgActionError> {
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            if let Some(work_budget) = work_budget.as_deref_mut() {
+                work_budget.check("exact bucket object command drain budget exhausted")?;
+            }
             if command.bucket_name() != bucket {
                 return Ok(());
             }
-            let outcome =
-                self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+            let outcome = match work_budget.as_deref_mut() {
+                Some(work_budget) => self
+                    .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+                        pg_id,
+                        &command,
+                        work_budget,
+                    )?,
+                None => self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?,
+            };
             match outcome {
                 PendingMetadataCommandOutcome::Applied
                 | PendingMetadataCommandOutcome::Abandoned => {}

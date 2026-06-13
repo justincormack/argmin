@@ -252,6 +252,9 @@ async fn cleanup_multipart_bucket(bucket: &str, keys: &[&str]) {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
+                if raw.contains("NoSuchBucket") {
+                    return;
+                }
                 if raw.contains("BucketNotEmpty") || raw.contains("OperationAborted") {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
@@ -285,6 +288,9 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
                 Ok(_) => return,
                 Err(err) => {
                     let raw = format!("{err:?}");
+                    if raw.contains("NoSuchBucket") {
+                        return;
+                    }
                     if raw.contains("BucketNotEmpty") || raw.contains("OperationAborted") {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         continue;
