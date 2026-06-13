@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{err_status, unique_bucket, SendRetryingOperationAborted, CTX};
+use s3_tests::{
+    err_status, put_object_retrying_operation_aborted, unique_bucket, SendRetryingOperationAborted,
+    CTX,
+};
 
 const ONE_MIB: usize = 1024 * 1024;
 const FOUR_MIB: usize = 4 * ONE_MIB;
@@ -463,21 +466,14 @@ fn test_atomic_multipart_upload_write() {
         let key = "foo";
 
         // Put a pre-existing object
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        put_object_retrying_operation_aborted(client, &bucket, key, b"bar".to_vec()).await;
 
         // Start a multipart upload to the same key
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("start atomic multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -499,7 +495,7 @@ fn test_atomic_multipart_upload_write() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort atomic multipart upload")
             .await
             .unwrap();
 
