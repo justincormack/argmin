@@ -757,8 +757,48 @@ impl StorageNodeConnectionHandler {
                 self.config.node_id,
                 frame.request_id,
             ));
+            let started = std::time::Instant::now();
+            let trace_rpc_lifecycle = trace_storage_rpc_lifecycle(frame.kind);
+            if trace_rpc_lifecycle {
+                let _ = observability::emit_flight_event(
+                    "storage_rpc_server",
+                    "storage_rpc_server_frame_received",
+                    format!(
+                        "node_id={} rpc_request_id={} kind={}",
+                        self.config.node_id.as_u32(),
+                        frame.request_id,
+                        frame.kind.operation_name()
+                    ),
+                );
+            }
             let response = self.dispatch_frame(&mut session, &frame)?;
+            if trace_rpc_lifecycle {
+                let _ = observability::emit_flight_event(
+                    "storage_rpc_server",
+                    "storage_rpc_server_dispatch_done",
+                    format!(
+                        "node_id={} rpc_request_id={} kind={} elapsed_us={}",
+                        self.config.node_id.as_u32(),
+                        frame.request_id,
+                        frame.kind.operation_name(),
+                        started.elapsed().as_micros()
+                    ),
+                );
+            }
             write_storage_rpc_frame_to(stream, &response).map_err(rpc_stream_error)?;
+            if trace_rpc_lifecycle {
+                let _ = observability::emit_flight_event(
+                    "storage_rpc_server",
+                    "storage_rpc_server_response_written",
+                    format!(
+                        "node_id={} rpc_request_id={} kind={} elapsed_us={}",
+                        self.config.node_id.as_u32(),
+                        frame.request_id,
+                        frame.kind.operation_name(),
+                        started.elapsed().as_micros()
+                    ),
+                );
+            }
         }
     }
 
@@ -6904,6 +6944,17 @@ impl StorageNodeConnectionHandler {
             message: format!("{kind:?} is not implemented by this storage-node server slice"),
         })
     }
+}
+
+fn trace_storage_rpc_lifecycle(kind: StorageRpcMessageKind) -> bool {
+    matches!(
+        kind,
+        StorageRpcMessageKind::MetadataCommandPendingEnvelope
+            | StorageRpcMessageKind::MetadataCommandPendingSlotInsert
+            | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
+            | StorageRpcMessageKind::MetadataCommandPendingSlotReplace
+            | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
+    )
 }
 
 #[derive(Debug, Default)]

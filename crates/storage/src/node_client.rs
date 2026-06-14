@@ -4466,22 +4466,128 @@ impl UnixStorageNodeClient {
         _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
-                context: "connect storage-node RPC socket",
-                source,
-            })?;
+        let started = Instant::now();
+        let trace_rpc_lifecycle = trace_storage_rpc_lifecycle(kind);
+        if trace_rpc_lifecycle {
+            let _ = observability::emit_flight_event(
+                "storage_rpc_client",
+                "storage_rpc_client_start",
+                format!(
+                    "node_id={} rpc_request_id={} kind={}",
+                    self.node_id.as_u32(),
+                    request_id,
+                    kind.operation_name()
+                ),
+            );
+        }
+        let mut stream = match UnixStream::connect(&self.socket_path) {
+            Ok(stream) => {
+                if trace_rpc_lifecycle {
+                    let _ = observability::emit_flight_event(
+                        "storage_rpc_client",
+                        "storage_rpc_client_connected",
+                        format!(
+                            "node_id={} rpc_request_id={} kind={} elapsed_us={}",
+                            self.node_id.as_u32(),
+                            request_id,
+                            kind.operation_name(),
+                            started.elapsed().as_micros()
+                        ),
+                    );
+                }
+                stream
+            }
+            Err(source) => {
+                if trace_rpc_lifecycle {
+                    let _ = observability::emit_flight_event(
+                        "storage_rpc_client",
+                        "storage_rpc_client_connect_failed",
+                        format!(
+                            "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                            self.node_id.as_u32(),
+                            request_id,
+                            kind.operation_name(),
+                            started.elapsed().as_micros(),
+                            source
+                        ),
+                    );
+                }
+                return Err(StoreError::Io {
+                    context: "connect storage-node RPC socket",
+                    source,
+                });
+            }
+        };
         let request = StorageRpcFrame {
             request_id,
             kind,
             payload,
         };
-        write_storage_rpc_frame_to(&mut stream, &request).map_err(|error| {
-            self.rpc_payload_error("write storage RPC request", error.to_string())
-        })?;
-        let response = read_storage_rpc_frame_from(&mut stream).map_err(|error| {
-            self.rpc_payload_error("read storage RPC response", error.to_string())
-        })?;
+        if let Err(error) = write_storage_rpc_frame_to(&mut stream, &request) {
+            if trace_rpc_lifecycle {
+                let _ = observability::emit_flight_event(
+                    "storage_rpc_client",
+                    "storage_rpc_client_write_failed",
+                    format!(
+                        "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                        self.node_id.as_u32(),
+                        request_id,
+                        kind.operation_name(),
+                        started.elapsed().as_micros(),
+                        error
+                    ),
+                );
+            }
+            return Err(self.rpc_payload_error("write storage RPC request", error.to_string()));
+        }
+        if trace_rpc_lifecycle {
+            let _ = observability::emit_flight_event(
+                "storage_rpc_client",
+                "storage_rpc_client_request_written",
+                format!(
+                    "node_id={} rpc_request_id={} kind={} elapsed_us={}",
+                    self.node_id.as_u32(),
+                    request_id,
+                    kind.operation_name(),
+                    started.elapsed().as_micros()
+                ),
+            );
+        }
+        let response = match read_storage_rpc_frame_from(&mut stream) {
+            Ok(response) => {
+                if trace_rpc_lifecycle {
+                    let _ = observability::emit_flight_event(
+                        "storage_rpc_client",
+                        "storage_rpc_client_response_read",
+                        format!(
+                            "node_id={} rpc_request_id={} kind={} elapsed_us={}",
+                            self.node_id.as_u32(),
+                            request_id,
+                            kind.operation_name(),
+                            started.elapsed().as_micros()
+                        ),
+                    );
+                }
+                response
+            }
+            Err(error) => {
+                if trace_rpc_lifecycle {
+                    let _ = observability::emit_flight_event(
+                        "storage_rpc_client",
+                        "storage_rpc_client_read_failed",
+                        format!(
+                            "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                            self.node_id.as_u32(),
+                            request_id,
+                            kind.operation_name(),
+                            started.elapsed().as_micros(),
+                            error
+                        ),
+                    );
+                }
+                return Err(self.rpc_payload_error("read storage RPC response", error.to_string()));
+            }
+        };
         if response.request_id != request_id || response.kind != kind {
             return Err(self.rpc_payload_error(
                 "validate storage RPC response",
@@ -4596,6 +4702,17 @@ impl UnixStorageNodeClient {
             message,
         }
     }
+}
+
+fn trace_storage_rpc_lifecycle(kind: StorageRpcMessageKind) -> bool {
+    matches!(
+        kind,
+        StorageRpcMessageKind::MetadataCommandPendingEnvelope
+            | StorageRpcMessageKind::MetadataCommandPendingSlotInsert
+            | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
+            | StorageRpcMessageKind::MetadataCommandPendingSlotReplace
+            | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
+    )
 }
 
 fn storage_rpc_admission_class(kind: StorageRpcMessageKind) -> UnixStorageNodeRpcAdmissionClass {
