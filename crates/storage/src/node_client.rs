@@ -2761,6 +2761,7 @@ pub(crate) struct UnixStorageNodeClient {
 struct UnixStorageNodeRpcAdmission {
     limit: usize,
     non_reserved_limit: usize,
+    completion_limit: usize,
     read_limit: usize,
     list_limit: usize,
     start_write_limit: usize,
@@ -2905,9 +2906,11 @@ impl UnixStorageNodeRpcAdmission {
         let shared_limit = limit.saturating_sub(reserved_control).max(1).min(limit);
         let list_limit = (shared_limit / 2).max(1).min(shared_limit);
         let start_write_floor = (limit / 8).clamp(1, 4).min(shared_limit);
+        let completion_limit = limit.saturating_sub(start_write_floor).max(1);
         Self {
             limit,
             non_reserved_limit: shared_limit,
+            completion_limit,
             read_limit: shared_limit,
             list_limit,
             start_write_limit: shared_limit,
@@ -2990,8 +2993,10 @@ impl UnixStorageNodeRpcAdmission {
             return false;
         }
         match class {
-            UnixStorageNodeRpcAdmissionClass::Control
-            | UnixStorageNodeRpcAdmissionClass::Completion => true,
+            UnixStorageNodeRpcAdmissionClass::Control => true,
+            UnixStorageNodeRpcAdmissionClass::Completion => {
+                active.completion < self.completion_limit
+            }
             UnixStorageNodeRpcAdmissionClass::Progress => {
                 active.non_reserved() < self.non_reserved_limit
             }
@@ -23092,6 +23097,40 @@ mod tests {
         drop(held_start);
         drop(held_progress_b);
         drop(held_progress_a);
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_completion_cannot_exhaust_start_write_floor() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            32,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let mut completions = Vec::new();
+        for _ in 0..28 {
+            let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+                UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+                UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                    panic!("completion admission unexpectedly timed out before its cap")
+                }
+            };
+            completions.push(completion);
+        }
+
+        assert!(matches!(
+            admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+
+        let start_write = match admission.acquire(UnixStorageNodeRpcAdmissionClass::StartWrite) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("completion saturation should preserve the start-write floor")
+            }
+        };
+
+        drop(start_write);
+        drop(completions);
     }
 
     #[test]
