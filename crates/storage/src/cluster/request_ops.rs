@@ -2572,6 +2572,33 @@ impl super::StorageCluster {
         crate::error::MetadataError::BucketNotEmpty.into()
     }
 
+    fn emit_bucket_delete_begin_loop_step(
+        bucket: &BucketName,
+        pg_id: PgId,
+        started: std::time::Instant,
+        step: &'static str,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" {detail}")
+        };
+        let _ = observability::emit_flight_event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_loop_step",
+            format!(
+                "bucket={:?} pg_id={} step={} elapsed_us={}{}",
+                bucket,
+                pg_id.get(),
+                step,
+                started.elapsed().as_micros(),
+                suffix
+            ),
+        );
+    }
+
     fn drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
         &self,
         bucket: &BucketName,
@@ -2977,15 +3004,44 @@ impl super::StorageCluster {
         )
         .for_operation("bucket_delete_begin")
         .for_pg(pg_id);
+        let mut loop_iteration = 0u64;
         let result = (|| loop {
+            loop_iteration += 1;
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "iteration_start",
+                format!("iteration={loop_iteration}"),
+            );
             self.check_bucket_delete_begin_work_budget(
                 bucket,
                 Some(started),
                 "bucket delete begin metadata convergence budget exhausted",
             )?;
-            let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                self.pending_metadata_command_for_bucket(pg_id, bucket)?
-            {
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "pending_command_lookup_start",
+                format!("iteration={loop_iteration}"),
+            );
+            let pending_command = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "pending_command_lookup_done",
+                format!(
+                    "iteration={} has_pending={} command_kind={}",
+                    loop_iteration,
+                    pending_command.is_some(),
+                    pending_command
+                        .as_ref()
+                        .map_or("none", |command| command.payload().kind_name())
+                ),
+            );
+            let (command, clear_pending_on_zero_apply) = if let Some(command) = pending_command {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
                         pg_id,
@@ -3007,6 +3063,13 @@ impl super::StorageCluster {
                     MetadataCommandPayload::MarkBucketDeleting(mark)
                         if mark.bucket_name() == bucket =>
                     {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "mark_matches_current_start",
+                            format!("iteration={loop_iteration}"),
+                        );
                         if !node_store
                             .bucket_metadata_client()
                             .pending_mark_bucket_deleting_command_matches_current(
@@ -3020,11 +3083,39 @@ impl super::StorageCluster {
                                 ),
                             ));
                         }
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "mark_matches_current_done",
+                            format!("iteration={loop_iteration}"),
+                        );
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "heartbeat_before_existing_mark_start",
+                            format!("iteration={loop_iteration}"),
+                        );
                         durable_drain =
                             self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "heartbeat_before_existing_mark_done",
+                            format!("iteration={loop_iteration}"),
+                        );
                         (command, false)
                     }
                     MetadataCommandPayload::MarkBucketDeleting(_) => {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_other_mark_deleting_start",
+                            format!("iteration={loop_iteration}"),
+                        );
                         let _ = self
                             .drain_bucket_pg_pending_metadata_command_with_work_budget(
                                 pg_id,
@@ -3033,6 +3124,13 @@ impl super::StorageCluster {
                                 &mut work_budget,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_other_mark_deleting_done",
+                            format!("iteration={loop_iteration}"),
+                        );
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
                             Some(pg_id),
@@ -3048,6 +3146,17 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::PutBucketSubresource(_)
                     | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
                     | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_bucket_pg_command_start",
+                            format!(
+                                "iteration={} command_kind={}",
+                                loop_iteration,
+                                command.payload().kind_name()
+                            ),
+                        );
                         let _ = self
                             .drain_bucket_pg_pending_metadata_command_with_work_budget(
                                 pg_id,
@@ -3056,6 +3165,17 @@ impl super::StorageCluster {
                                 &mut work_budget,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_bucket_pg_command_done",
+                            format!(
+                                "iteration={} command_kind={}",
+                                loop_iteration,
+                                command.payload().kind_name()
+                            ),
+                        );
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
                             Some(pg_id),
@@ -3079,11 +3199,33 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::CreateMultipartUpload(_)
                     | MetadataCommandPayload::AbortMultipartUpload(_)
                     | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_exact_bucket_object_commands_start",
+                            format!(
+                                "iteration={} command_kind={}",
+                                loop_iteration,
+                                command.payload().kind_name()
+                            ),
+                        );
                         self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                             bucket,
                             Some(started),
                             &mut work_budget,
                         )?;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_exact_bucket_object_commands_done",
+                            format!(
+                                "iteration={} command_kind={}",
+                                loop_iteration,
+                                command.payload().kind_name()
+                            ),
+                        );
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
                             Some(pg_id),
@@ -3094,15 +3236,55 @@ impl super::StorageCluster {
                     }
                 }
             } else {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "drain_exact_bucket_object_commands_start",
+                    format!(
+                        "iteration={} command_kind=none pass=initial",
+                        loop_iteration
+                    ),
+                );
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                     bucket,
                     Some(started),
                     &mut work_budget,
                 )?;
-                if self
-                    .pending_metadata_command_for_bucket(pg_id, bucket)?
-                    .is_some()
-                {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "drain_exact_bucket_object_commands_done",
+                    format!(
+                        "iteration={} command_kind=none pass=initial",
+                        loop_iteration
+                    ),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "pending_command_recheck_start",
+                    format!("iteration={} pass=after_object_drain", loop_iteration),
+                );
+                let pending_after_object_drain =
+                    self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "pending_command_recheck_done",
+                    format!(
+                        "iteration={} pass=after_object_drain has_pending={} command_kind={}",
+                        loop_iteration,
+                        pending_after_object_drain.is_some(),
+                        pending_after_object_drain
+                            .as_ref()
+                            .map_or("none", |command| command.payload().kind_name())
+                    ),
+                );
+                if pending_after_object_drain.is_some() {
                     super::sleep_after_metadata_contention_retry_for(
                         "bucket_delete_begin",
                         Some(pg_id),
@@ -3111,30 +3293,146 @@ impl super::StorageCluster {
                     );
                     continue;
                 }
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "active_stream_recheck_start",
+                    format!("iteration={loop_iteration}"),
+                );
                 if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "active_stream_recheck_done",
+                    format!("iteration={loop_iteration}"),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "abort_abandoned_stream_uploads_start",
+                    format!("iteration={} pass=before_reservation_wait", loop_iteration),
+                );
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "abort_abandoned_stream_uploads_done",
+                    format!("iteration={} pass=before_reservation_wait", loop_iteration),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "wait_reservations_empty_start",
+                    format!("iteration={loop_iteration}"),
+                );
                 self.wait_for_durable_bucket_write_reservations_empty(
                     bucket,
                     started,
                     &mut work_budget,
                 )?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "wait_reservations_empty_done",
+                    format!("iteration={loop_iteration}"),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "drain_exact_bucket_object_commands_start",
+                    format!(
+                        "iteration={} command_kind=none pass=after_reservation_wait",
+                        loop_iteration
+                    ),
+                );
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                     bucket,
                     Some(started),
                     &mut work_budget,
                 )?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "drain_exact_bucket_object_commands_done",
+                    format!(
+                        "iteration={} command_kind=none pass=after_reservation_wait",
+                        loop_iteration
+                    ),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "abort_abandoned_stream_uploads_start",
+                    format!("iteration={} pass=before_visibility_check", loop_iteration),
+                );
                 self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "abort_abandoned_stream_uploads_done",
+                    format!("iteration={} pass=before_visibility_check", loop_iteration),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "drain_exact_bucket_object_commands_start",
+                    format!(
+                        "iteration={} command_kind=none pass=before_visibility_check",
+                        loop_iteration
+                    ),
+                );
                 self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                     bucket,
                     Some(started),
                     &mut work_budget,
                 )?;
-                if self
-                    .pending_metadata_command_for_bucket(pg_id, bucket)?
-                    .is_some()
-                {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "drain_exact_bucket_object_commands_done",
+                    format!(
+                        "iteration={} command_kind=none pass=before_visibility_check",
+                        loop_iteration
+                    ),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "pending_command_recheck_start",
+                    format!("iteration={} pass=before_visibility_check", loop_iteration),
+                );
+                let pending_before_visibility_check =
+                    self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "pending_command_recheck_done",
+                    format!(
+                        "iteration={} pass=before_visibility_check has_pending={} command_kind={}",
+                        loop_iteration,
+                        pending_before_visibility_check.is_some(),
+                        pending_before_visibility_check
+                            .as_ref()
+                            .map_or("none", |command| command.payload().kind_name())
+                    ),
+                );
+                if pending_before_visibility_check.is_some() {
                     super::sleep_after_metadata_contention_retry_for(
                         "bucket_delete_begin",
                         Some(pg_id),
@@ -3143,16 +3441,60 @@ impl super::StorageCluster {
                     );
                     continue;
                 }
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "visibility_check_start",
+                    format!("iteration={loop_iteration}"),
+                );
                 if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
                 }
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "visibility_check_done",
+                    format!("iteration={loop_iteration}"),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "heartbeat_before_build_mark_start",
+                    format!("iteration={loop_iteration}"),
+                );
                 durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "heartbeat_before_build_mark_done",
+                    format!("iteration={loop_iteration}"),
+                );
                 #[cfg(test)]
                 maybe_run_before_bucket_delete_command_id_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "next_command_id_start",
+                    format!("iteration={loop_iteration}"),
+                );
                 let command_id = match self.next_metadata_command_id(pg_id) {
-                    Ok(command_id) => command_id,
+                    Ok(command_id) => {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "next_command_id_done",
+                            format!("iteration={loop_iteration} command_id={command_id:?}"),
+                        );
+                        command_id
+                    }
                     Err(StoreError::MetadataCommandLogConflict { .. }) => {
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
@@ -3164,6 +3506,13 @@ impl super::StorageCluster {
                     }
                     Err(error) => return Err(BucketWriteDrainError::from(error)),
                 };
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "build_mark_deleting_start",
+                    format!("iteration={loop_iteration} command_id={command_id:?}"),
+                );
                 let command = match node_store
                     .bucket_metadata_client()
                     .build_mark_bucket_deleting_command(pg_id, bucket, command_id)
@@ -3172,6 +3521,20 @@ impl super::StorageCluster {
                     MarkBucketDeletingCommandBuild::AlreadyDeleting => return Ok(()),
                     MarkBucketDeletingCommandBuild::Command(command) => *command,
                 };
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "build_mark_deleting_done",
+                    format!("iteration={loop_iteration} command_id={command_id:?}"),
+                );
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "pending_install_start",
+                    format!("iteration={loop_iteration} command_id={command_id:?}"),
+                );
                 if !self
                     .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
                         pg_id,
@@ -3189,9 +3552,50 @@ impl super::StorageCluster {
                     );
                     continue;
                 }
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "pending_install_done",
+                    format!("iteration={loop_iteration} command_id={command_id:?}"),
+                );
                 (command, true)
             };
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "heartbeat_before_apply_start",
+                format!(
+                    "iteration={} command_kind={}",
+                    loop_iteration,
+                    command.payload().kind_name()
+                ),
+            );
             durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "heartbeat_before_apply_done",
+                format!(
+                    "iteration={} command_kind={}",
+                    loop_iteration,
+                    command.payload().kind_name()
+                ),
+            );
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "apply_mark_deleting_start",
+                format!(
+                    "iteration={} command_kind={} clear_pending_on_zero_apply={}",
+                    loop_iteration,
+                    command.payload().kind_name(),
+                    clear_pending_on_zero_apply
+                ),
+            );
             let outcome = self
                 .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
@@ -3200,6 +3604,13 @@ impl super::StorageCluster {
                     &mut work_budget,
                 )
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                pg_id,
+                started,
+                "apply_mark_deleting_done",
+                format!("iteration={} outcome={outcome:?}", loop_iteration),
+            );
             match outcome {
                 FinishPendingMetadataCommandResult::Applied => {}
                 FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
