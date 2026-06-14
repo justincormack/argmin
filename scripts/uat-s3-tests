@@ -304,7 +304,9 @@ wait_for_process() {
     local pid="$1"
     local log_path="$2"
     local name="$3"
-    if ! kill -0 "$pid" 2>/dev/null; then
+    local state
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -z "$state" || "$state" == Z* ]]; then
         cat "$log_path" >&2 || true
         die "$name exited before becoming ready"
     fi
@@ -650,11 +652,13 @@ esac
 for _ in {1..200}; do
     wait_for_process "$frontend_pid" "$frontend_log" "frontend"
     if curl -k -sS "$readiness_url" >/dev/null 2>&1; then
+        wait_for_process "$frontend_pid" "$frontend_log" "frontend"
         break
     fi
     sleep 0.1
 done
 
+wait_for_process "$frontend_pid" "$frontend_log" "frontend"
 if ! curl -k -sS "$readiness_url" >/dev/null 2>&1; then
     cat "$frontend_log" >&2 || true
     die "argmin-s3 did not become ready at $endpoint"
