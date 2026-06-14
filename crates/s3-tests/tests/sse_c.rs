@@ -103,6 +103,73 @@ macro_rules! with_sse_c_copy_headers {
     }};
 }
 
+async fn put_sse_c_object_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    key_b64: &str,
+    key_md5_b64: &str,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    let key_b64 = key_b64.to_owned();
+    let key_md5_b64 = key_md5_b64.to_owned();
+    s3_tests::retrying_operation_aborted("put SSE-C object", || {
+        let body = body.clone();
+        let key_b64 = key_b64.clone();
+        let key_md5_b64 = key_md5_b64.clone();
+        async move {
+            with_sse_c_headers!(
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body)),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+        }
+    })
+    .await
+}
+
+async fn put_sse_c_object_with_sha256_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    key_b64: &str,
+    key_md5_b64: &str,
+    checksum_sha256: &str,
+) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
+    let key_b64 = key_b64.to_owned();
+    let key_md5_b64 = key_md5_b64.to_owned();
+    let checksum_sha256 = checksum_sha256.to_owned();
+    s3_tests::retrying_operation_aborted("put SSE-C object with checksum", || {
+        let body = body.clone();
+        let key_b64 = key_b64.clone();
+        let key_md5_b64 = key_md5_b64.clone();
+        let checksum_sha256 = checksum_sha256.clone();
+        async move {
+            with_sse_c_headers!(
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body))
+                    .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                    .checksum_sha256(checksum_sha256),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+        }
+    })
+    .await
+}
+
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
     let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
@@ -354,18 +421,15 @@ async fn setup_sse_c_object(bucket: &str, key: &str, body: Vec<u8>) -> (String, 
 
     let customer_key = test_sse_c_key();
     let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
-    with_sse_c_headers!(
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(body.clone())),
-        key_b64,
-        key_md5_b64
+    put_sse_c_object_retrying_operation_aborted(
+        client,
+        bucket,
+        key,
+        body.clone(),
+        &key_b64,
+        &key_md5_b64,
     )
-    .send()
-    .await
-    .unwrap();
+    .await;
 
     (key_b64, key_md5_b64, body)
 }
@@ -382,18 +446,15 @@ async fn assert_sse_c_put_get_head_round_trip_size(size: usize, seed: u8, label:
     let (key_b64, key_md5_b64) = sse_c_header_values(&key);
     let body = patterned_bytes(size, seed);
 
-    with_sse_c_headers!(
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(&object_key)
-            .body(ByteStream::from(body.clone())),
-        key_b64,
-        key_md5_b64
+    put_sse_c_object_retrying_operation_aborted(
+        client,
+        &bucket,
+        &object_key,
+        body.clone(),
+        &key_b64,
+        &key_md5_b64,
     )
-    .send()
-    .await
-    .unwrap();
+    .await;
 
     let head = with_sse_c_headers!(
         client.head_object().bucket(&bucket).key(&object_key),
@@ -570,18 +631,15 @@ fn test_sse_c_put_get_head_round_trip() {
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
         let body = b"hello sse-c".to_vec();
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from(body.clone())),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            body.clone(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let head = with_sse_c_headers!(
             client.head_object().bucket(&bucket).key("obj"),
@@ -858,7 +916,7 @@ fn test_sse_c_range_get_on_versioned_object_returns_requested_version() {
                     .status(BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable SSE-C range versioning")
             .await
             .unwrap();
 
@@ -867,32 +925,26 @@ fn test_sse_c_range_get_on_versioned_object_returns_requested_version() {
         let first = patterned_bytes(96, 0x81);
         let second = patterned_bytes(96, 0x91);
 
-        let put_v1 = with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from(first.clone())),
-            key_b64,
-            key_md5_b64
+        let put_v1 = put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            first.clone(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
         let v1 = put_v1.version_id().unwrap().to_string();
 
-        let put_v2 = with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from(second)),
-            key_b64,
-            key_md5_b64
+        let put_v2 = put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            second,
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
         let v2 = put_v2.version_id().unwrap().to_string();
 
         let resp = with_sse_c_headers!(
@@ -1016,18 +1068,15 @@ fn test_sse_c_get_requires_headers() {
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from_static(b"secret")),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            b"secret".to_vec(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let result = client
             .get_object()
@@ -1055,18 +1104,15 @@ fn test_sse_c_head_requires_headers() {
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from_static(b"secret")),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            b"secret".to_vec(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let result = client
             .head_object()
@@ -1241,18 +1287,15 @@ fn test_sse_c_get_rejects_wrong_key() {
         let wrong_key = [42u8; 32];
         let (wrong_key_b64, wrong_key_md5_b64) = sse_c_header_values(&wrong_key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from_static(b"secret")),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            b"secret".to_vec(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let result = with_sse_c_headers!(
             client.get_object().bucket(&bucket).key("obj"),
@@ -1282,20 +1325,16 @@ fn test_sse_c_head_checksum_mode_uses_customer_key() {
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
         let checksum_sha256 = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from(vec![b'A'; 1024]))
-                .checksum_algorithm(ChecksumAlgorithm::Sha256)
-                .checksum_sha256(checksum_sha256),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_with_sha256_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            vec![b'A'; 1024],
+            &key_b64,
+            &key_md5_b64,
+            checksum_sha256,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let head = with_sse_c_headers!(
             client
@@ -1731,18 +1770,15 @@ fn test_sse_c_non_multipart_get_part() {
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
         let body = b"body".to_vec();
 
-        let put = with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from(body.clone())),
-            key_b64,
-            key_md5_b64
+        let put = put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "obj",
+            body.clone(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
         let etag = put.e_tag().unwrap().to_string();
 
         let get = with_sse_c_headers!(
@@ -2253,18 +2289,15 @@ fn test_sse_c_copy_object_round_trip() {
         let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
         let body = b"hello sse-c copy".to_vec();
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("src")
-                .body(ByteStream::from(body.clone())),
-            src_key_b64,
-            src_key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "src",
+            body.clone(),
+            &src_key_b64,
+            &src_key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         with_sse_c_copy_headers!(
             client
@@ -2334,18 +2367,15 @@ fn test_sse_c_copy_object_requires_source_headers() {
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("src")
-                .body(ByteStream::from_static(b"secret-copy")),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "src",
+            b"secret-copy".to_vec(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let result = client
             .copy_object()
@@ -2381,18 +2411,15 @@ fn test_sse_c_copy_object_invalid_source_key_md5_argument_name_matches_aws() {
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("src")
-                .body(ByteStream::from_static(b"secret-copy")),
-            key_b64,
-            key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "src",
+            b"secret-copy".to_vec(),
+            &key_b64,
+            &key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let url = format!("{}/{}/dst", CTX.endpoint(), bucket);
         let copy_source = format!("{}/src", bucket);
@@ -2439,18 +2466,15 @@ fn test_sse_c_upload_part_copy_round_trip() {
         let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
         let body = b"hello multipart copy sse-c".to_vec();
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("src")
-                .body(ByteStream::from(body.clone())),
-            src_key_b64,
-            src_key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "src",
+            body.clone(),
+            &src_key_b64,
+            &src_key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let create = with_sse_c_headers!(
             client.create_multipart_upload().bucket(&bucket).key("dst"),
@@ -2563,18 +2587,15 @@ fn test_sse_c_upload_part_copy_requires_source_headers() {
         let dst_key = [9u8; 32];
         let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("src")
-                .body(ByteStream::from_static(b"secret-copy-part")),
-            src_key_b64,
-            src_key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "src",
+            b"secret-copy-part".to_vec(),
+            &src_key_b64,
+            &src_key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let create = with_sse_c_headers!(
             client.create_multipart_upload().bucket(&bucket).key("dst"),
@@ -2643,18 +2664,15 @@ fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
         let wrong_dst_key = [11u8; 32];
         let (wrong_dst_key_b64, wrong_dst_key_md5_b64) = sse_c_header_values(&wrong_dst_key);
 
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("src")
-                .body(ByteStream::from_static(b"secret-copy-part")),
-            src_key_b64,
-            src_key_md5_b64
+        put_sse_c_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "src",
+            b"secret-copy-part".to_vec(),
+            &src_key_b64,
+            &src_key_md5_b64,
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
 
         let create = with_sse_c_headers!(
             client.create_multipart_upload().bucket(&bucket).key("dst"),
