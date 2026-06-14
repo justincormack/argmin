@@ -6,7 +6,8 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{
-    delete_bucket_retrying_operation_aborted, err_status, put_object_retrying_operation_aborted,
+    delete_bucket_retrying_operation_aborted, err_status,
+    get_object_body_retrying_operation_aborted, put_object_retrying_operation_aborted,
     retrying_operation_aborted_result, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
@@ -539,14 +540,14 @@ fn test_atomic_multipart_upload_write() {
         let upload_id = create.upload_id().unwrap();
 
         // Original object is still readable during in-progress MPU
-        let get = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let body = get.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            None,
+            "get object during atomic multipart test",
+        )
+        .await;
         assert_eq!(&body[..], b"bar");
 
         // Abort the multipart upload
@@ -560,14 +561,14 @@ fn test_atomic_multipart_upload_write() {
             .unwrap();
 
         // Original object still intact after abort
-        let get = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let body = get.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            None,
+            "get object during atomic multipart test",
+        )
+        .await;
         assert_eq!(&body[..], b"bar");
 
         cleanup(&bucket, &[key]).await;

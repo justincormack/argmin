@@ -252,6 +252,42 @@ where
     }
 }
 
+pub async fn get_object_body_retrying_operation_aborted(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    context: &str,
+) -> Vec<u8> {
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+
+    loop {
+        let mut request = client.get_object().bucket(bucket).key(key);
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id);
+        }
+
+        match request.send().await {
+            Ok(response) => match response.body.collect().await {
+                Ok(body) => return body.into_bytes().to_vec(),
+                Err(_error) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                Err(error) => panic!("{context}: {error:?}"),
+            },
+            Err(error)
+                if is_retryable_operation_contention(&error)
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+}
+
 pub type RetrySendFuture<T, E> =
     Pin<Box<dyn Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>> + Send>>;
 

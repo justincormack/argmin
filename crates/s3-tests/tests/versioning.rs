@@ -6,7 +6,8 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
-    err_status, send_signed_request, unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
+    err_status, get_object_body_retrying_operation_aborted, send_signed_request, unique_bucket,
+    RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -353,16 +354,14 @@ async fn create_multiple_versions(
 
 /// Verify that GET with a specific versionId returns expected content.
 async fn check_obj_content(bucket: &str, key: &str, version_id: &str, expected: &str) {
-    let resp = CTX
-        .client()
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .version_id(version_id)
-        .send_retrying_operation_aborted("S3 operation during versioning test")
-        .await
-        .unwrap();
-    let body = resp.body.collect().await.unwrap().into_bytes();
+    let body = get_object_body_retrying_operation_aborted(
+        CTX.client(),
+        bucket,
+        key,
+        Some(version_id),
+        "get object body during versioning test",
+    )
+    .await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
         expected,
@@ -608,14 +607,14 @@ fn test_versioning_obj_create_read_remove_head() {
         delete_object_version_retrying_operation_aborted(client, &bucket, key, &removed_vid).await;
 
         // GET should now return the previous version
-        let resp = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
             contents.last().unwrap()
@@ -839,27 +838,27 @@ fn test_versioning_obj_plain_null_version_overwrite() {
         let version_id = resp.version_id().unwrap().to_string();
 
         // GET returns new version
-        let resp = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(&body[..], b"zzz");
 
         // Delete the new version → old null version becomes current
         delete_object_version_retrying_operation_aborted(client, &bucket, key, &version_id).await;
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(&body[..], b"fooz");
 
         // Delete the null version
@@ -1000,14 +999,14 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
         // Put while suspended overwrites null
         put_object_retrying_operation_aborted(client, &bucket, key, b"zzz".to_vec()).await;
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(&body[..], b"zzz");
 
         // Should only have 1 version (the null)
@@ -1088,24 +1087,24 @@ fn test_versioning_obj_suspended_copy() {
             .unwrap();
 
         // Verify copies
-        let resp = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key2)
-            .send_retrying_operation_aborted("get object during versioning suspended copy")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key2,
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(&body[..], b"null content");
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket2)
-            .key(key1)
-            .send_retrying_operation_aborted("get object during versioning suspended copy")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket2,
+            key1,
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(&body[..], b"null content");
 
         // Cleanup
@@ -1625,14 +1624,14 @@ fn test_versioning_copy_obj_version() {
             )
             .await;
 
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&new_key)
-                .send_retrying_operation_aborted("S3 operation during versioning test")
-                .await
-                .unwrap();
-            let body = resp.body.collect().await.unwrap().into_bytes();
+            let body = get_object_body_retrying_operation_aborted(
+                client,
+                &bucket,
+                &new_key,
+                None,
+                "get object body during versioning test",
+            )
+            .await;
             assert_eq!(std::str::from_utf8(&body).unwrap(), contents[i]);
             copy_keys.push(new_key);
         }
@@ -1651,14 +1650,14 @@ fn test_versioning_copy_obj_version() {
             )
             .await;
 
-            let resp = client
-                .get_object()
-                .bucket(&bucket2)
-                .key(&new_key)
-                .send_retrying_operation_aborted("S3 operation during versioning test")
-                .await
-                .unwrap();
-            let body = resp.body.collect().await.unwrap().into_bytes();
+            let body = get_object_body_retrying_operation_aborted(
+                client,
+                &bucket2,
+                &new_key,
+                None,
+                "get object body during versioning test",
+            )
+            .await;
             assert_eq!(std::str::from_utf8(&body).unwrap(), contents[i]);
         }
 
@@ -1671,14 +1670,14 @@ fn test_versioning_copy_obj_version() {
         )
         .await;
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket2)
-            .key("new_key")
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-            .unwrap();
-        let body = resp.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket2,
+            "new_key",
+            None,
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(std::str::from_utf8(&body).unwrap(), contents[num - 1]);
 
         // Cleanup
@@ -2258,15 +2257,14 @@ fn test_versioning_obj_create_overwrite_multipart() {
         assert_eq!(get.content_length(), Some(5 * 1024 * 1024));
 
         // Old version still has original content
-        let get_old = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&v1)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-            .unwrap();
-        let body = get_old.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            Some(&v1),
+            "get object body during versioning test",
+        )
+        .await;
         assert_eq!(&body[..], b"original");
 
         cleanup_versioned(&bucket, key, &[v1, v2]).await;
