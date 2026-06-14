@@ -634,8 +634,10 @@ struct StorageNodeMetadataCommandLockContext {
 
 #[derive(Clone, Copy, Debug)]
 struct StorageNodeMetadataCommandLockHolder {
-    context: Option<StorageNodeMetadataCommandLockContext>,
+    acquired_context: Option<StorageNodeMetadataCommandLockContext>,
+    current_context: Option<StorageNodeMetadataCommandLockContext>,
     acquired_at: Instant,
+    current_started_at: Option<Instant>,
 }
 
 impl StorageNodeMetadataCommandLocks {
@@ -708,14 +710,24 @@ impl StorageNodeMetadataCommandLocks {
         held.insert(
             pg_id,
             StorageNodeMetadataCommandLockHolder {
-                context,
+                acquired_context: context,
+                current_context: context,
                 acquired_at: Instant::now(),
+                current_started_at: Some(Instant::now()),
             },
         );
         StorageNodeMetadataCommandGuard {
             locks: self.clone(),
             pg_id,
             released: false,
+        }
+    }
+
+    fn update_context(&self, pg_id: PgId, context: Option<StorageNodeMetadataCommandLockContext>) {
+        let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(holder) = held.get_mut(&pg_id) {
+            holder.current_context = context;
+            holder.current_started_at = context.map(|_| Instant::now());
         }
     }
 
@@ -741,17 +753,26 @@ fn emit_metadata_command_lock_wait_diagnostic(
         .map(|context| context.kind.operation_name())
         .unwrap_or("unknown");
     let holder_request_id = holder
-        .context
+        .acquired_context
         .map(|context| context.request_id.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let holder_kind = holder
-        .context
+        .acquired_context
         .map(|context| context.kind.operation_name())
         .unwrap_or("unknown");
     let held_us = holder.acquired_at.elapsed().as_micros();
+    let (holder_current_request_id, holder_current_kind, holder_current_elapsed_us) =
+        match (holder.current_context, holder.current_started_at) {
+            (Some(context), Some(started_at)) => (
+                context.request_id.to_string(),
+                context.kind.operation_name(),
+                started_at.elapsed().as_micros().to_string(),
+            ),
+            _ => ("none".to_string(), "none", "none".to_string()),
+        };
     let waited_us = waited.as_micros();
     let detail = format!(
-        "node_id={} pg_id={} waiter_request_id={} waiter_kind=\"{}\" waited_us={} holder_request_id={} holder_kind=\"{}\" holder_held_us={}",
+        "node_id={} pg_id={} waiter_request_id={} waiter_kind=\"{}\" waited_us={} holder_request_id={} holder_kind=\"{}\" holder_held_us={} holder_current_request_id={} holder_current_kind=\"{}\" holder_current_elapsed_us={}",
         node_id.as_u32(),
         pg_id.get(),
         waiter_request_id,
@@ -759,7 +780,10 @@ fn emit_metadata_command_lock_wait_diagnostic(
         waited_us,
         holder_request_id,
         holder_kind,
-        held_us
+        held_us,
+        holder_current_request_id,
+        holder_current_kind,
+        holder_current_elapsed_us
     );
     let _ = observability::emit_flight_event(
         "storage",
@@ -862,7 +886,18 @@ impl StorageNodeConnectionHandler {
                     ),
                 );
             }
-            let response = self.dispatch_frame(&mut session, &frame)?;
+            session.set_current_rpc_context(frame.request_id, frame.kind);
+            session.update_metadata_command_lock_context(
+                &self.metadata_command_locks,
+                session.current_rpc_context(),
+            );
+            let response = match self.dispatch_frame(&mut session, &frame) {
+                Ok(response) => response,
+                Err(error) => {
+                    session.clear_metadata_command_lock_context(&self.metadata_command_locks);
+                    return Err(error);
+                }
+            };
             if trace_rpc_lifecycle {
                 let _ = observability::emit_flight_event(
                     "storage_rpc_server",
@@ -876,7 +911,11 @@ impl StorageNodeConnectionHandler {
                     ),
                 );
             }
-            write_storage_rpc_frame_to(stream, &response).map_err(rpc_stream_error)?;
+            if let Err(error) = write_storage_rpc_frame_to(stream, &response) {
+                session.clear_metadata_command_lock_context(&self.metadata_command_locks);
+                return Err(rpc_stream_error(error));
+            }
+            session.clear_metadata_command_lock_context(&self.metadata_command_locks);
             if trace_rpc_lifecycle {
                 let _ = observability::emit_flight_event(
                     "storage_rpc_server",
@@ -898,7 +937,6 @@ impl StorageNodeConnectionHandler {
         session: &mut StorageNodeSession<'_>,
         frame: &StorageRpcFrame,
     ) -> Result<StorageRpcFrame, StorageNodeServerError> {
-        session.set_current_rpc_context(frame.request_id, frame.kind);
         let payload = match frame.kind {
             StorageRpcMessageKind::Health => {
                 if frame.payload.is_empty() {
@@ -7327,6 +7365,20 @@ impl<'a> StorageNodeSession<'a> {
         self.metadata_command_guards.contains_key(&pg_id)
     }
 
+    fn update_metadata_command_lock_context(
+        &self,
+        locks: &StorageNodeMetadataCommandLocks,
+        context: Option<StorageNodeMetadataCommandLockContext>,
+    ) {
+        for &pg_id in self.metadata_command_guards.keys() {
+            locks.update_context(pg_id, context);
+        }
+    }
+
+    fn clear_metadata_command_lock_context(&self, locks: &StorageNodeMetadataCommandLocks) {
+        self.update_metadata_command_lock_context(locks, None);
+    }
+
     fn acquire_metadata_command_pg_lock(
         &mut self,
         locks: &StorageNodeMetadataCommandLocks,
@@ -7924,6 +7976,13 @@ mod tests {
                 kind: StorageRpcMessageKind::MetadataCommandPgLockAcquire,
             }),
         );
+        locks.update_context(
+            pg_id,
+            Some(StorageNodeMetadataCommandLockContext {
+                request_id: 43,
+                kind: StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            }),
+        );
         let (wait_tx, wait_rx) = mpsc::channel();
         locks.set_before_wait_hook(Arc::new(move |actual_pg_id| {
             assert_eq!(actual_pg_id, pg_id);
@@ -7979,6 +8038,20 @@ mod tests {
             .detail
             .contains("holder_kind=\"metadata command PG lock acquire\""));
         assert!(record.detail.contains("holder_held_us="));
+        assert!(record.detail.contains("holder_current_request_id=43"));
+        assert!(record
+            .detail
+            .contains("holder_current_kind=\"metadata command apply and record\""));
+        assert!(record.detail.contains("holder_current_elapsed_us="));
+        locks.update_context(pg_id, None);
+        {
+            let held = locks.state.held.lock().unwrap_or_else(|e| e.into_inner());
+            let holder = held
+                .get(&pg_id)
+                .expect("holder should still be present before release");
+            assert!(holder.current_context.is_none());
+            assert!(holder.current_started_at.is_none());
+        }
 
         drop(first);
         waiter
