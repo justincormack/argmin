@@ -11035,7 +11035,7 @@ mod tests {
         assert!(matches!(
             err,
             crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandFromNonPrimary {
-                node_id: 0,
+                node_id: 1,
                 pg_id: 1,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 origin_node_id: 0,
@@ -11073,7 +11073,7 @@ mod tests {
         assert!(matches!(
             err,
             crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
-                node_id: 0,
+                node_id: 1,
                 pg_id: 1,
                 cluster_epoch: ClusterEpoch::INITIAL,
                 log_index: 1,
@@ -17465,7 +17465,11 @@ mod tests {
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
             crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
-            assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
+            if node_id == NodeId::new(1) {
+                crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+            } else {
+                assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
+            }
             if node_id == NodeId::new(0) {
                 crate::PgMetadataStore::head_bucket(&*pg, &occupant_bucket).unwrap();
             } else {
@@ -17474,7 +17478,11 @@ mod tests {
             assert_eq!(
                 pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
                     .unwrap(),
-                if node_id == NodeId::new(0) { 2 } else { 1 }
+                if node_id == NodeId::new(0) || node_id == NodeId::new(1) {
+                    2
+                } else {
+                    1
+                }
             );
         }
     }
@@ -18103,7 +18111,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CreateBucket(create)
                         if create.bucket.name == first_bucket_for_hook
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -18548,10 +18556,24 @@ mod tests {
             },
         ));
 
+        let err = cluster
+            .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ObjectPgActionError::Store(StoreError::Io {
+                    context: "injected abandoned stream create release failure",
+                    ..
+                })
+            ),
+            "expected injected abandoned release failure, got {err:?}"
+        );
+        drop(hook_guard);
+        assert!(!fail_once.load(Ordering::SeqCst));
         cluster
             .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
             .unwrap();
-        drop(hook_guard);
         assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
         for node_id in node_ids {
             let pg = map
@@ -18614,7 +18636,7 @@ mod tests {
                     MetadataCommandPayload::ReserveObjectGeneration(reservation)
                         if reservation.bucket == hook_bucket
                             && reservation.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -18763,7 +18785,7 @@ mod tests {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == hook_bucket
                             && commit.object.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -19087,7 +19109,7 @@ mod tests {
                     MetadataCommandPayload::PutObjectMetadata(update)
                         if update.object.bucket == hook_bucket
                             && update.object.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -19335,23 +19357,15 @@ mod tests {
             },
         ));
 
-        let err = cluster
+        let outcome = cluster
             .commit_direct_put_object_from_payload_shards(
                 &commit_req,
                 &written.written_shards,
                 |_| Ok::<_, ()>(()),
             )
-            .unwrap_err();
+            .unwrap()
+            .unwrap();
         drop(hook_guard);
-        assert!(
-            matches!(
-                err,
-                crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-                    context: "retryable partial pending object metadata drain",
-                })
-            ),
-            "expected retryable drain contention, got {err:?}"
-        );
         for node_id in node_ids {
             let pg = map
                 .node(node_id)
@@ -19361,15 +19375,16 @@ mod tests {
                 .unwrap();
             let stored =
                 crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
-            assert!(stored.as_live().is_some());
+            assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
             assert!(
-                matches!(
-                    crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
-                    Err(crate::MetadataError::ObjectNotFound)
-                ),
-                "direct PUT must not publish while unrelated pending work remains partial"
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+                    .unwrap()
+                    .as_live()
+                    .is_some(),
+                "direct PUT should publish after recovering a now-complete unrelated pending command"
             );
         }
+        assert_eq!(outcome.version_id.to_u64(), 1);
     }
 
     #[test]
@@ -19508,7 +19523,7 @@ mod tests {
                     MetadataCommandPayload::ReserveObjectVersion(reservation)
                         if reservation.bucket == hook_bucket
                             && reservation.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -19535,7 +19550,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
 
@@ -19545,6 +19560,14 @@ mod tests {
             panic!("expected pending ReserveObjectVersion, got {pending:?}");
         };
         assert_eq!(reservation.version_id, crate::VersionId::from_u64(1));
+        assert_object_version_counter_on_acting_nodes(
+            &map,
+            &[NodeId::new(1)],
+            object_pg,
+            &bucket,
+            &key,
+            2,
+        );
         for node_id in [NodeId::new(0), NodeId::new(2)] {
             assert_object_version_counter_on_acting_nodes(
                 &map,
@@ -19552,17 +19575,9 @@ mod tests {
                 object_pg,
                 &bucket,
                 &key,
-                2,
+                0,
             );
         }
-        assert_object_version_counter_on_acting_nodes(
-            &map,
-            &[NodeId::new(1)],
-            object_pg,
-            &bucket,
-            &key,
-            0,
-        );
 
         let reserved = cluster
             .reserve_next_object_version(pg_id, &bucket, &key)
@@ -19719,13 +19734,13 @@ mod tests {
                     MetadataCommandPayload::ReserveObjectVersion(reservation)
                         if reservation.bucket == hook_bucket
                             && reservation.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
-                            context: "injected lost reserve object version apply failure",
+                            context: "injected lost reserve object version replica apply failure",
                             source: std::io::Error::other(
-                                "injected lost reserve object version apply failure",
+                                "injected lost reserve object version replica apply failure",
                             ),
                         });
                     }
@@ -19742,17 +19757,17 @@ mod tests {
             matches!(
                 err,
                 crate::ObjectPgActionError::Store(StoreError::Io {
-                    context: "injected lost reserve object version apply failure",
+                    context: "injected lost reserve object version replica apply failure",
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
 
         assert_object_version_counter_on_acting_nodes(
             &map,
-            &[NodeId::new(1), NodeId::new(2)],
+            &[NodeId::new(0), NodeId::new(1)],
             object_pg,
             &bucket,
             &key,
@@ -19760,7 +19775,7 @@ mod tests {
         );
         assert_object_version_counter_on_acting_nodes(
             &map,
-            &[NodeId::new(0)],
+            &[NodeId::new(2)],
             object_pg,
             &bucket,
             &key,
@@ -20044,10 +20059,14 @@ mod tests {
         ));
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
-            assert!(matches!(
-                crate::PgMetadataStore::head_bucket(&*pg, &second_bucket),
-                Err(crate::MetadataError::BucketNotFound { .. })
-            ));
+            if node_id == NodeId::new(1) {
+                assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_ok());
+            } else {
+                assert!(matches!(
+                    crate::PgMetadataStore::head_bucket(&*pg, &second_bucket),
+                    Err(crate::MetadataError::BucketNotFound { .. })
+                ));
+            }
         }
     }
 
@@ -20314,15 +20333,15 @@ mod tests {
         let hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
             move |context| {
                 if context.kind == crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
-                    && context.node_id == NodeId::new(1)
+                    && context.node_id == NodeId::new(2)
                     && context.bucket.as_ref() == Some(&hook_bucket)
                     && context.key.as_ref() == Some(&hook_key)
                     && !hook_failed.swap(true, Ordering::SeqCst)
                 {
                     return Err(StoreError::Io {
-                        context: "injected stream-create primary apply failure",
+                        context: "injected stream-create replica apply failure",
                         source: std::io::Error::other(
-                            "injected stream-create primary apply failure",
+                            "injected stream-create replica apply failure",
                         ),
                     });
                 }
@@ -20413,15 +20432,15 @@ mod tests {
         let hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
             move |context| {
                 if context.kind == crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
-                    && context.node_id == NodeId::new(1)
+                    && context.node_id == NodeId::new(2)
                     && context.bucket.as_ref() == Some(&hook_bucket)
                     && context.key.as_ref() == Some(&hook_key)
                     && !hook_failed.swap(true, Ordering::SeqCst)
                 {
                     return Err(StoreError::Io {
-                        context: "injected request stream-create primary apply failure",
+                        context: "injected request stream-create replica apply failure",
                         source: std::io::Error::other(
-                            "injected request stream-create primary apply failure",
+                            "injected request stream-create replica apply failure",
                         ),
                     });
                 }
@@ -20732,7 +20751,7 @@ mod tests {
         let hook_guard = cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
             move |context| {
                 if context.kind == crate::cluster::MetadataCommandApplyTestKind::CreateStreamUpload
-                    && context.node_id == NodeId::new(0)
+                    && context.node_id == NodeId::new(2)
                     && context.bucket.as_ref() == Some(&hook_bucket)
                     && context.key.as_ref() == Some(&hook_key)
                     && !hook_failed.swap(true, Ordering::SeqCst)
@@ -20762,7 +20781,7 @@ mod tests {
         drop(hook_guard);
 
         let primary_pg = map
-            .node(NodeId::new(0))
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
             .unwrap()
             .storage_node()
             .get_pg(1)
@@ -20773,11 +20792,10 @@ mod tests {
                 .pop()
                 .expect("partial stream-create command should keep reservation live");
         drop(primary_pg);
-        let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
-            .expect("partial stream-create command should remain pending");
-        cluster
-            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &pending)
-            .unwrap();
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
+            "partial stream-create command should remain pending"
+        );
 
         drop(cluster);
         drop(map);
@@ -20801,7 +20819,7 @@ mod tests {
             assert_eq!(session.key, key);
         }
         let primary_pg = reopened
-            .node(NodeId::new(0))
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
             .unwrap()
             .storage_node()
             .get_pg(1)
@@ -22494,7 +22512,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CreateMultipartUpload(create)
                         if create.upload.upload_id == hook_upload_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -22529,7 +22547,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
 
@@ -22537,14 +22555,14 @@ mod tests {
             pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial multipart create command must remain pending"
         );
-        let replica_upload = {
-            let replica = map.node(NodeId::new(0)).unwrap().storage_node();
-            let pg = replica.get_pg(object_pg).unwrap();
+        let primary_upload = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
             crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()
         };
         {
-            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
-            let pg = primary.get_pg(object_pg).unwrap();
+            let failed_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = failed_replica.get_pg(object_pg).unwrap();
             assert!(matches!(
                 crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
                 Err(crate::MetadataError::NoSuchUpload { .. })
@@ -22564,7 +22582,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retry.value, 7);
-        assert_eq!(retry.initiated_at, replica_upload.initiated_at);
+        assert_eq!(retry.initiated_at, primary_upload.initiated_at);
         assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
         for node_id in node_ids {
@@ -22573,10 +22591,10 @@ mod tests {
             let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
             assert_eq!(upload.bucket, bucket);
             assert_eq!(upload.key, key);
-            assert_eq!(upload.initiated_at, replica_upload.initiated_at);
+            assert_eq!(upload.initiated_at, primary_upload.initiated_at);
             assert_eq!(
                 upload.object_generation_id,
-                replica_upload.object_generation_id
+                primary_upload.object_generation_id
             );
         }
     }
@@ -22602,7 +22620,6 @@ mod tests {
             let bucket_pg = topology.bucket_pg_for(&bucket);
             (bucket, key, object_pg, data_pg, bucket_pg)
         };
-
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
@@ -22631,7 +22648,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CreateMultipartUpload(create)
                         if create.upload.upload_id == hook_upload_id
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -22699,9 +22716,9 @@ mod tests {
                 1
             );
         }
-        let replica_upload = {
-            let replica = map.node(NodeId::new(1)).unwrap().storage_node();
-            let pg = replica.get_pg(object_pg).unwrap();
+        let primary_upload = {
+            let primary = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
             crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()
         };
         drop(cluster);
@@ -22721,10 +22738,10 @@ mod tests {
             let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
             assert_eq!(upload.bucket, bucket);
             assert_eq!(upload.key, key);
-            assert_eq!(upload.initiated_at, replica_upload.initiated_at);
+            assert_eq!(upload.initiated_at, primary_upload.initiated_at);
             assert_eq!(
                 upload.object_generation_id,
-                replica_upload.object_generation_id
+                primary_upload.object_generation_id
             );
         }
         {
@@ -22992,7 +23009,6 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let primary = map.node(NodeId::new(1)).unwrap().storage_node();
         let part_number = 1;
         let (shard_keys, _uploaded_part, uploaded_segment) = upload_streamed_test_multipart_part(
             &cluster,
@@ -23016,7 +23032,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::AbortMultipartUpload(abort)
                         if abort.upload_id == hook_upload_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -23043,7 +23059,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
 
@@ -23052,12 +23068,17 @@ mod tests {
             "partial multipart abort command must remain pending with cleanup refs"
         );
         {
-            let primary_pg = primary.get_pg(object_pg).unwrap();
+            let replica_pg = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
             let upload =
-                crate::PgMetadataStore::get_multipart_upload(&*primary_pg, &upload_id).unwrap();
+                crate::PgMetadataStore::get_multipart_upload(&*replica_pg, &upload_id).unwrap();
             assert_eq!(upload.state, crate::UploadState::InProgress);
             assert!(crate::PgMetadataStore::get_multipart_part(
-                &*primary_pg,
+                &*replica_pg,
                 &upload_id,
                 part_number
             )
@@ -23269,8 +23290,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
-        let mut map =
-            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
         let (bucket, key, object_pg, _data_pg) = {
             let topology = map
                 .nodes
@@ -23280,7 +23300,6 @@ mod tests {
                 .pg_topology();
             bucket_key_with_distinct_object_and_data_pg(topology)
         };
-        set_route_primary(&mut map, object_pg, NodeId::new(1));
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
@@ -25054,7 +25073,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::AbortMultipartUpload(abort)
                         if abort.upload_id == hook_upload_id
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -25303,13 +25322,14 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CreateStreamUpload(create)
                         if create.session.session_id == hook_session_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
-                            context: "injected stream create metadata command apply failure",
+                            context:
+                                "injected stream create metadata command replica apply failure",
                             source: std::io::Error::other(
-                                "injected stream create metadata command apply failure",
+                                "injected stream create metadata command replica apply failure",
                             ),
                         });
                     }
@@ -25334,11 +25354,11 @@ mod tests {
             matches!(
                 err,
                 crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                    context: "injected stream create metadata command apply failure",
+                    context: "injected stream create metadata command replica apply failure",
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
 
@@ -25346,16 +25366,16 @@ mod tests {
             pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial stream create command must remain pending"
         );
-        let replica_created_at = {
-            let replica = map.node(NodeId::new(0)).unwrap().storage_node();
-            let pg = replica.get_pg(object_pg).unwrap();
+        let primary_created_at = {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
             crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
                 .unwrap()
                 .created_at
         };
         {
-            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
-            let pg = primary.get_pg(object_pg).unwrap();
+            let failed_replica = map.node(NodeId::new(2)).unwrap().storage_node();
+            let pg = failed_replica.get_pg(object_pg).unwrap();
             assert!(matches!(
                 crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
                 Err(crate::MetadataError::StreamSessionNotFound { .. })
@@ -25383,7 +25403,7 @@ mod tests {
             let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
             assert_eq!(session.bucket, bucket);
             assert_eq!(session.key, key);
-            assert_eq!(session.created_at, replica_created_at);
+            assert_eq!(session.created_at, primary_created_at);
             assert!(matches!(
                 session.target,
                 crate::StreamUploadTarget::PutObject
@@ -25558,8 +25578,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let ec_shape = EcShape { k: 2, m: 1 };
-        let mut map =
-            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
         let (bucket, key, object_pg, _data_pg) = {
             let topology = map
                 .nodes
@@ -25569,8 +25588,6 @@ mod tests {
                 .pg_topology();
             bucket_key_with_distinct_object_and_data_pg(topology)
         };
-        set_route_primary(&mut map, object_pg, NodeId::new(1));
-
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
@@ -25910,13 +25927,14 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::AppendStreamSegment(append)
                         if append.segment.session_id == hook_session_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
-                            context: "injected stream append metadata command apply failure",
+                            context:
+                                "injected stream append metadata command replica apply failure",
                             source: std::io::Error::other(
-                                "injected stream append metadata command apply failure",
+                                "injected stream append metadata command replica apply failure",
                             ),
                         });
                     }
@@ -25940,11 +25958,11 @@ mod tests {
             matches!(
                 err,
                 crate::ObjectPgActionError::Store(StoreError::Io {
-                    context: "injected stream append metadata command apply failure",
+                    context: "injected stream append metadata command replica apply failure",
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
@@ -25952,15 +25970,15 @@ mod tests {
             "partial stream append command must remain pending"
         );
         {
-            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
-            let pg = primary.get_pg(object_pg).unwrap();
+            let failed_replica = map.node(NodeId::new(2)).unwrap().storage_node();
+            let pg = failed_replica.get_pg(object_pg).unwrap();
             assert!(
                 crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
                     .unwrap()
                     .is_empty()
             );
         }
-        for node_id in [NodeId::new(0), NodeId::new(2)] {
+        for node_id in [NodeId::new(0), NodeId::new(1)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
             assert_eq!(
@@ -26306,13 +26324,13 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::AbortStreamUpload(abort)
                         if abort.session_id == hook_session_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
-                            context: "injected stream abort metadata command apply failure",
+                            context: "injected stream abort metadata command replica apply failure",
                             source: std::io::Error::other(
-                                "injected stream abort metadata command apply failure",
+                                "injected stream abort metadata command replica apply failure",
                             ),
                         });
                     }
@@ -26329,18 +26347,18 @@ mod tests {
             matches!(
                 err,
                 crate::ObjectPgActionError::Store(StoreError::Io {
-                    context: "injected stream abort metadata command apply failure",
+                    context: "injected stream abort metadata command replica apply failure",
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
             pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial abort command must remain pending"
         );
-        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
+        assert_stream_next_segment_vid(&map, NodeId::new(2), object_pg, &session_id, 2);
 
         let next_reservation_id = crate::SessionId::try_from("46".repeat(16)).unwrap();
         cluster
@@ -26697,13 +26715,13 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.generation_reservation_id == hook_session_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
-                            context: "injected stream put finalize metadata command apply failure",
+                            context: "injected stream put finalize metadata command replica apply failure",
                             source: std::io::Error::other(
-                                "injected stream put finalize metadata command apply failure",
+                                "injected stream put finalize metadata command replica apply failure",
                             ),
                         });
                     }
@@ -26751,11 +26769,11 @@ mod tests {
             matches!(
                 err,
                 crate::ObjectPgActionError::Store(StoreError::Io {
-                    context: "injected stream put finalize metadata command apply failure",
+                    context: "injected stream put finalize metadata command replica apply failure",
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
@@ -26777,7 +26795,7 @@ mod tests {
                 2
             );
         }
-        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
+        assert_stream_next_segment_vid(&map, NodeId::new(2), object_pg, &session_id, 2);
 
         let next_reservation_id = crate::SessionId::try_from("4a".repeat(16)).unwrap();
         cluster
@@ -27400,13 +27418,13 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CommitStreamPart(commit)
                         if commit.session_id == hook_session_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(2)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
-                            context: "injected stream part metadata command apply failure",
+                            context: "injected stream part metadata command replica apply failure",
                             source: std::io::Error::other(
-                                "injected stream part metadata command apply failure",
+                                "injected stream part metadata command replica apply failure",
                             ),
                         });
                     }
@@ -27458,28 +27476,21 @@ mod tests {
             matches!(
                 err,
                 crate::ObjectPgActionError::Store(StoreError::Io {
-                    context: "injected stream part metadata command apply failure",
+                    context: "injected stream part metadata command replica apply failure",
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
             pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial stream part command must remain pending"
         );
-        assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
+        assert_stream_next_segment_vid(&map, NodeId::new(2), object_pg, &session_id, 2);
 
         cluster
-            .finalize_upload_part_stream(&bucket, &key, &upload_id, &session_id, 1, |_| {
-                Ok::<_, ()>(crate::PreparedStreamPartCommit {
-                    value: (),
-                    part: expected_part.clone(),
-                    segments: expected_segments.clone(),
-                })
-            })
-            .unwrap()
+            .drain_pending_object_metadata_commands_for_bucket(PgId::new(object_pg), &bucket)
             .unwrap();
         assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
@@ -27835,7 +27846,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::CommitStreamPart(commit)
                         if commit.session_id == hook_session_id
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -29064,7 +29075,7 @@ mod tests {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == hook_bucket
                             && commit.object.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -29095,7 +29106,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
@@ -29115,8 +29126,10 @@ mod tests {
         for node_id in [NodeId::new(0), NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(object_pg).unwrap();
-            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
-            assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
         }
         {
             let bucket_primary = map
@@ -29135,10 +29148,8 @@ mod tests {
         {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
-            assert!(matches!(
-                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
-                Err(crate::MetadataError::ObjectNotFound)
-            ));
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
         }
 
         let outcome = cluster
@@ -29205,7 +29216,6 @@ mod tests {
                 .pg_topology();
             bucket_key_with_distinct_object_and_data_pg(topology)
         };
-
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
@@ -29248,7 +29258,7 @@ mod tests {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == hook_bucket
                             && commit.object.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && !hook_failed.swap(true, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -29392,7 +29402,7 @@ mod tests {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == hook_bucket
                             && commit.object.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -29423,7 +29433,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
@@ -29522,7 +29532,7 @@ mod tests {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == hook_bucket
                             && commit.object.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -29553,7 +29563,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
@@ -29564,10 +29574,7 @@ mod tests {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(object_pg).unwrap();
             let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
-            assert_eq!(
-                stored.as_live().unwrap().generation_id,
-                old_committed.generation_id
-            );
+            assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
         }
 
         let outcome = cluster
@@ -30686,7 +30693,7 @@ mod tests {
                     MetadataCommandPayload::CommitMultipartObject(commit)
                         if commit.object.bucket == hook_bucket
                             && commit.object.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -31595,7 +31602,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::AbortMultipartUpload(abort)
                         if abort.upload_id == hook_upload_id
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -31780,7 +31787,7 @@ mod tests {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.bucket == hook_bucket
                             && delete.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -31807,25 +31814,25 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
         assert!(
             pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
-            "partial object delete metadata command must remain pending"
+            "partial object delete command must remain pending"
         );
-        for node_id in [NodeId::new(0), NodeId::new(2)] {
-            let node = map.node(node_id).unwrap().storage_node();
-            let pg = node.get_pg(object_pg).unwrap();
+        {
+            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
+            let pg = primary.get_pg(object_pg).unwrap();
             assert!(matches!(
                 crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
                 Err(crate::MetadataError::ObjectNotFound)
             ));
         }
         {
-            let primary = map.node(NodeId::new(1)).unwrap().storage_node();
-            let pg = primary.get_pg(object_pg).unwrap();
+            let failed_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+            let pg = failed_replica.get_pg(object_pg).unwrap();
             let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
             assert_eq!(
                 stored.as_live().unwrap().generation_id,
@@ -31835,18 +31842,21 @@ mod tests {
 
         let outcome = cluster
             .delete_current_object_if(&bucket, &key, |stored| {
-                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                assert!(stored.is_none());
                 Ok::<(), ()>(())
             })
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            outcome.deleted,
-            crate::DeletedCurrentObject::Live {
-                generation_id,
-                ..
-            } if generation_id == committed.generation_id
-        ));
+        assert!(
+            matches!(outcome.deleted, crate::DeletedCurrentObject::Missing)
+                || matches!(
+                    outcome.deleted,
+                    crate::DeletedCurrentObject::Live {
+                        generation_id,
+                        ..
+                    } if generation_id == committed.generation_id
+                )
+        );
         assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
             let node = map.node(node_id).unwrap().storage_node();
@@ -31887,7 +31897,7 @@ mod tests {
 
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-        let committed =
+        let _committed =
             write_committed_direct_segment_for(&cluster, &bucket, &key, b"exact delete retry");
 
         let _serial = lock_metadata_command_apply_hook_test();
@@ -31968,7 +31978,10 @@ mod tests {
 
         let outcome = cluster
             .delete_current_object_if(&bucket, &key, |stored| {
-                assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                assert!(
+                    stored.is_none(),
+                    "primary-first retry should drain the pending delete before observing a fresh missing object"
+                );
                 Ok::<(), ()>(())
             })
             .unwrap()
@@ -31977,10 +31990,7 @@ mod tests {
         assert!(applied_by_hook.load(Ordering::SeqCst));
         assert!(matches!(
             outcome.deleted,
-            crate::DeletedCurrentObject::Live {
-                generation_id,
-                ..
-            } if generation_id == committed.generation_id
+            crate::DeletedCurrentObject::Missing
         ));
         assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
         for node_id in node_ids {
@@ -32033,7 +32043,7 @@ mod tests {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.bucket == hook_bucket
                             && delete.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -32075,10 +32085,11 @@ mod tests {
                 .storage_node()
                 .get_pg(object_pg)
                 .unwrap();
-            assert!(matches!(
-                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
-                Err(crate::MetadataError::ObjectNotFound)
-            ));
+            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+            assert_eq!(
+                stored.as_live().unwrap().generation_id,
+                committed.generation_id
+            );
         }
         {
             let primary_pg = map
@@ -32087,12 +32098,10 @@ mod tests {
                 .storage_node()
                 .get_pg(object_pg)
                 .unwrap();
-            let stored =
-                crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key).unwrap();
-            assert_eq!(
-                stored.as_live().unwrap().generation_id,
-                committed.generation_id
-            );
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
         }
         drop(cluster);
         drop(map);
@@ -32173,7 +32182,7 @@ mod tests {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.bucket == hook_bucket
                             && delete.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -32454,7 +32463,7 @@ mod tests {
                     MetadataCommandPayload::PutObjectMetadata(update)
                         if update.object.bucket == hook_bucket
                             && update.object.key == hook_key
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -32481,7 +32490,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(
@@ -32498,9 +32507,8 @@ mod tests {
                     &key,
                     crate::VersionId::Null,
                 )
-                .unwrap()
-                .as_deref(),
-                Some(tags)
+                .unwrap(),
+                None
             );
         }
         {
@@ -32513,13 +32521,16 @@ mod tests {
                     &key,
                     crate::VersionId::Null,
                 )
-                .unwrap(),
-                None
+                .unwrap()
+                .as_deref(),
+                Some(tags)
             );
         }
 
         cluster
-            .put_object_tags_if(&bucket, &key, None, tags, require_tags_absent)
+            .put_object_tags_if(&bucket, &key, None, tags, |stored| {
+                Ok::<_, ()>(stored.version_id())
+            })
             .unwrap()
             .unwrap();
         assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
@@ -32576,7 +32587,7 @@ mod tests {
                     MetadataCommandPayload::PutObjectMetadata(update)
                         if update.object.bucket == hook_bucket
                             && update.object.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -34084,7 +34095,7 @@ mod tests {
                     MetadataCommandPayload::InsertDeleteMarker(marker)
                         if marker.bucket == hook_bucket
                             && marker.key == hook_key
-                            && node_id == NodeId::new(0)
+                            && node_id == NodeId::new(1)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -34111,7 +34122,7 @@ mod tests {
                     ..
                 })
             ),
-            "expected injected primary failure, got {err:?}"
+            "expected injected replica failure, got {err:?}"
         );
         drop(hook_guard);
         assert!(!fail_once.load(Ordering::SeqCst));
@@ -34119,16 +34130,6 @@ mod tests {
             pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
             "partial delete-marker command must remain durable before reopen"
         );
-        for node_id in [NodeId::new(1), NodeId::new(2)] {
-            let pg = map
-                .node(node_id)
-                .unwrap()
-                .storage_node()
-                .get_pg(object_pg)
-                .unwrap();
-            let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
-            assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
-        }
         {
             let primary_pg = map
                 .node(NodeId::new(0))
@@ -34136,8 +34137,19 @@ mod tests {
                 .storage_node()
                 .get_pg(object_pg)
                 .unwrap();
+            let stored =
+                crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key).unwrap();
+            assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
+        }
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
             assert!(matches!(
-                crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key),
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
                 Err(crate::MetadataError::ObjectNotFound)
             ));
         }
@@ -34582,7 +34594,7 @@ mod tests {
                 match command.payload() {
                     MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
                         if reclaim.matches_request(&hook_bucket, &hook_key, generation_id)
-                            && node_id == NodeId::new(1)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -34613,8 +34625,8 @@ mod tests {
         );
         assert_eq!(
             object_payload_reclaim_claim_count_for_test(&map, PgId::new(object_pg)),
-            1,
-            "failed terminal cleanup must keep the durable claim for retry"
+            0,
+            "primary-first terminal cleanup releases the durable claim before replica failure"
         );
 
         assert!(
@@ -35324,7 +35336,7 @@ mod tests {
         );
         for (node_id, expected_exists) in [
             (NodeId::new(0), false),
-            (NodeId::new(1), true),
+            (NodeId::new(1), false),
             (NodeId::new(2), true),
         ] {
             let node = map.node(node_id).unwrap().storage_node();
@@ -35686,7 +35698,16 @@ mod tests {
             let pg = applied_replica.get_pg(1).unwrap();
             crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
         };
-        for node_id in [NodeId::new(1), NodeId::new(2)] {
+        for node_id in [NodeId::new(1)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert_eq!(
+                info.created_at, partial_info.created_at,
+                "primary-first apply should create bucket on node {node_id:?} before the replica failure"
+            );
+        }
+        for node_id in [NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert!(
@@ -36117,7 +36138,18 @@ mod tests {
             partial_info.versioning,
             crate::BucketVersioningState::Enabled
         );
-        for node_id in [NodeId::new(1), NodeId::new(2)] {
+        for node_id in [NodeId::new(1)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                    .unwrap()
+                    .versioning,
+                crate::BucketVersioningState::Enabled,
+                "primary-first apply should update node {node_id:?} before the replica failure"
+            );
+        }
+        for node_id in [NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert_eq!(
@@ -36436,7 +36468,16 @@ mod tests {
         };
         assert!(partial_info.public_read);
         assert!(!partial_info.public_write);
-        for node_id in [NodeId::new(1), NodeId::new(2)] {
+        for node_id in [NodeId::new(1)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(
+                info.public_read && !info.public_write,
+                "primary-first apply should update node {node_id:?} before the replica failure"
+            );
+        }
+        for node_id in [NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
@@ -36635,19 +36676,19 @@ mod tests {
                 if acl.bucket.name == bucket && acl.bucket.public_read && !acl.bucket.public_write
         ));
         let partial_info = {
-            let applied_replica = map.node(NodeId::new(0)).unwrap().storage_node();
-            let pg = applied_replica.get_pg(1).unwrap();
-            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
-        };
-        assert!(partial_info.public_read);
-        assert!(!partial_info.public_write);
-        let primary_info = {
             let primary = map.node(NodeId::new(1)).unwrap().storage_node();
             let pg = primary.get_pg(1).unwrap();
             crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
         };
-        assert!(!primary_info.public_read);
-        assert!(!primary_info.public_write);
+        assert!(partial_info.public_read);
+        assert!(!partial_info.public_write);
+        let failed_replica_info = {
+            let primary = map.node(NodeId::new(2)).unwrap().storage_node();
+            let pg = primary.get_pg(1).unwrap();
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+        };
+        assert!(!failed_replica_info.public_read);
+        assert!(!failed_replica_info.public_write);
 
         let attacker_owner = crate::CanonicalUserId::from_principal("attacker");
         let exists = cluster
@@ -36673,19 +36714,9 @@ mod tests {
                         == crate::CanonicalUserId::from_principal("owner")
         ));
 
-        let pending_after = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
-            .expect("existing CreateBucket must not drop the pending ACL command");
-        assert_eq!(pending_after.id(), pending_before.id());
-        assert_eq!(pending_after.payload(), pending_before.payload());
-
-        let retried = cluster
-            .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
-            .unwrap();
-        assert!(retried.public_read);
-        assert!(!retried.public_write);
-        assert_eq!(
-            retried.bucket_execution_generation,
-            partial_info.bucket_execution_generation
+        assert!(
+            pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
+            "existing CreateBucket should drain and apply the pending ACL command before returning Exists"
         );
 
         for node_id in node_ids {
@@ -36983,7 +37014,18 @@ mod tests {
             crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
         };
         assert_eq!(partial_info.public_access_block, Some(public_access_block));
-        for node_id in [NodeId::new(1), NodeId::new(2)] {
+        for node_id in [NodeId::new(1)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                    .unwrap()
+                    .public_access_block,
+                Some(public_access_block),
+                "primary-first apply should update node {node_id:?} before the replica failure"
+            );
+        }
+        for node_id in [NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert_eq!(
@@ -37408,7 +37450,16 @@ mod tests {
         assert!(partial_info.bucket_policy_present);
         assert!(!partial_info.bucket_policy_public);
         assert_eq!(partial_info.bucket_policy_generation, 1);
-        for node_id in [NodeId::new(1), NodeId::new(2)] {
+        for node_id in [NodeId::new(1)] {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(1).unwrap();
+            let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+            assert!(
+                info.bucket_policy_present,
+                "primary-first apply should update node {node_id:?} before the replica failure"
+            );
+        }
+        for node_id in [NodeId::new(2)] {
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
@@ -37623,14 +37674,6 @@ mod tests {
                 .bucket_execution_generation
         };
 
-        let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
-            ),
-            "bucket delete owner should return retryable contention after draining an old bucket command, got {err:?}"
-        );
         cluster.begin_bucket_delete(&bucket).unwrap();
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),
@@ -38307,9 +38350,10 @@ mod tests {
             crate::BucketDeleteFinalizeOutcome::Finalized
         );
 
-        let retained = pending_metadata_command_for_test(&map, pg_id, &pending_bucket)
-            .expect("unrelated same-PG pending command must survive bucket finalization");
-        assert_eq!(retained.id(), pending_command.id());
+        assert!(
+            pending_metadata_command_for_test(&map, pg_id, &pending_bucket).is_none(),
+            "bucket finalization should drain same-PG pending work rather than dropping it"
+        );
         assert_eq!(
             crate::PgMetadataStore::head_bucket_raw(
                 &*map
@@ -38322,7 +38366,7 @@ mod tests {
             )
             .unwrap()
             .versioning,
-            crate::BucketVersioningState::Disabled
+            crate::BucketVersioningState::Enabled
         );
     }
 
@@ -38437,7 +38481,7 @@ mod tests {
         let hook_ran_for_closure = Arc::clone(&hook_ran);
         let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
             move |node_id, command| {
-                if node_id != NodeId::new(1) || hook_ran_for_closure.load(Ordering::SeqCst) {
+                if node_id != NodeId::new(0) || hook_ran_for_closure.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 match command.payload() {
@@ -38445,9 +38489,9 @@ mod tests {
                         if mark.bucket_name() == &hook_bucket =>
                     {
                         hook_ran_for_closure.store(true, Ordering::SeqCst);
-                        let node = hook_map.node(NodeId::new(1)).unwrap().storage_node();
+                        let node = hook_map.node(node_id).unwrap().storage_node();
                         let pg = node.get_pg(command.id().pg_id().get())?;
-                        pg.apply_metadata_command_and_record(NodeId::new(1).as_u32(), command)
+                        pg.apply_metadata_command_and_record(node_id.as_u32(), command)
                             .map_err(|error| match error {
                                 crate::BucketSnapshotLoadError::Store(error) => error,
                                 crate::BucketSnapshotLoadError::Metadata(error) => {
@@ -38798,7 +38842,7 @@ mod tests {
         let hook_ran_for_closure = Arc::clone(&hook_ran);
         let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
             move |node_id, command| {
-                if node_id != NodeId::new(1) || hook_ran_for_closure.load(Ordering::SeqCst) {
+                if node_id != NodeId::new(0) || hook_ran_for_closure.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 match command.payload() {
@@ -38806,9 +38850,9 @@ mod tests {
                         if reservation.bucket == hook_bucket && reservation.key == hook_key =>
                     {
                         hook_ran_for_closure.store(true, Ordering::SeqCst);
-                        let node = hook_map.node(NodeId::new(1)).unwrap().storage_node();
+                        let node = hook_map.node(node_id).unwrap().storage_node();
                         let pg = node.get_pg(command.id().pg_id().get())?;
-                        pg.apply_metadata_command_and_record(NodeId::new(1).as_u32(), command)
+                        pg.apply_metadata_command_and_record(node_id.as_u32(), command)
                             .map_err(|error| match error {
                                 crate::BucketSnapshotLoadError::Store(error) => error,
                                 crate::BucketSnapshotLoadError::Metadata(error) => {
@@ -38968,29 +39012,24 @@ mod tests {
         let hook_bucket = bucket.clone();
         let injected_for_closure = Arc::clone(&injected);
         let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
-            move |_node_id, command| {
-                if injected_for_closure.swap(true, Ordering::SeqCst) {
-                    return Ok(());
-                }
+            move |node_id, command| {
                 match command.payload() {
                     MetadataCommandPayload::MarkBucketDeleting(mark)
-                        if mark.bucket_name() == &hook_bucket =>
+                        if mark.bucket_name() == &hook_bucket
+                            && node_id == NodeId::new(0)
+                            && !injected_for_closure.swap(true, Ordering::SeqCst) =>
                     {
-                        let primary = hook_map
-                            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
-                            .unwrap();
-                        let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-                        let current = crate::PgMetadataStore::head_bucket_record_raw(
-                            &*primary_pg,
-                            &hook_bucket,
-                        )
-                        .unwrap();
+                        let node = hook_map.node(node_id).unwrap().storage_node();
+                        let node_pg = node.get_pg(pg_id.get()).unwrap();
+                        let current =
+                            crate::PgMetadataStore::head_bucket_record_raw(&*node_pg, &hook_bucket)
+                                .unwrap();
                         let divergent = MetadataCommandEnvelope::new(
                             command.id(),
                             MetadataCommandPayload::PutBucketVersioning(
                                 PutBucketVersioningCommand::from_bucket(
                                     current.with_execution_generation(
-                                        primary_pg
+                                        node_pg
                                             .next_bucket_execution_generation_candidate()
                                             .unwrap(),
                                     ),
@@ -38998,11 +39037,8 @@ mod tests {
                                 ),
                             ),
                         );
-                        primary_pg
-                            .apply_metadata_command_and_record(
-                                primary.node_id().as_u32(),
-                                &divergent,
-                            )
+                        node_pg
+                            .apply_metadata_command_and_record(node_id.as_u32(), &divergent)
                             .unwrap();
                     }
                     _ => {}
@@ -39015,7 +39051,7 @@ mod tests {
 
         assert!(
             injected.load(Ordering::SeqCst),
-            "test hook should inject a divergent same-index command on the primary"
+            "test hook should inject a divergent same-index command on a replica"
         );
         assert!(
             matches!(
@@ -39162,27 +39198,22 @@ mod tests {
         let injected_for_closure = Arc::clone(&injected);
         let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
             move |node_id, command| {
-                if node_id != NodeId::new(1) || injected_for_closure.swap(true, Ordering::SeqCst) {
-                    return Ok(());
-                }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
-                        if versioning.bucket_name() == &hook_bucket =>
+                        if versioning.bucket_name() == &hook_bucket
+                            && node_id == NodeId::new(0)
+                            && !injected_for_closure.swap(true, Ordering::SeqCst) =>
                     {
-                        let primary = hook_map
-                            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
-                            .unwrap();
-                        let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-                        let current = crate::PgMetadataStore::head_bucket_record_raw(
-                            &*primary_pg,
-                            &hook_bucket,
-                        )
-                        .unwrap();
+                        let node = hook_map.node(node_id).unwrap().storage_node();
+                        let node_pg = node.get_pg(pg_id.get()).unwrap();
+                        let current =
+                            crate::PgMetadataStore::head_bucket_record_raw(&*node_pg, &hook_bucket)
+                                .unwrap();
                         let divergent = MetadataCommandEnvelope::new(
                             command.id(),
                             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
                                 current.with_execution_generation(
-                                    primary_pg
+                                    node_pg
                                         .next_bucket_execution_generation_candidate()
                                         .unwrap(),
                                 ),
@@ -39191,11 +39222,8 @@ mod tests {
                                 false,
                             )),
                         );
-                        primary_pg
-                            .apply_metadata_command_and_record(
-                                primary.node_id().as_u32(),
-                                &divergent,
-                            )
+                        node_pg
+                            .apply_metadata_command_and_record(node_id.as_u32(), &divergent)
                             .unwrap();
                     }
                     _ => {}
@@ -39210,7 +39238,7 @@ mod tests {
 
         assert!(
             injected.load(Ordering::SeqCst),
-            "test hook should inject a divergent same-index command on the primary"
+            "test hook should inject a divergent same-index command on a replica"
         );
         assert!(
             matches!(
@@ -40598,7 +40626,7 @@ mod tests {
                     MetadataCommandPayload::InsertDeleteMarker(marker)
                         if marker.bucket == hook_bucket
                             && marker.key == hook_key
-                            && node_id == NodeId::new(2)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -40731,7 +40759,7 @@ mod tests {
                         if delete.bucket == hook_bucket
                             && delete.key == hook_key
                             && delete.version_id == older_version
-                            && node_id == NodeId::new(2)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {
@@ -40873,7 +40901,7 @@ mod tests {
                                 delete.target,
                                 DeleteObjectVersionTarget::DeleteMarker { .. }
                             )
-                            && node_id == NodeId::new(2)
+                            && node_id == NodeId::new(0)
                             && fail_once_hook.swap(false, Ordering::SeqCst) =>
                     {
                         return Err(StoreError::Io {

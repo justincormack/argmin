@@ -1200,7 +1200,7 @@ impl StorageCluster {
         let mut nodes = self
             .local_map
             .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
-        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        nodes.sort_by_key(|node| node.node_id() != primary_node_id);
         let Some(conflict_index) = nodes
             .iter()
             .position(|node| node.node_id().as_u32() == *conflict_node_id)
@@ -1547,111 +1547,92 @@ impl StorageCluster {
             "reissue_attempt",
             Some(command.payload().kind_name()),
         );
-        let primary_critical_section = primary
-            .metadata_command_client()
-            .open_metadata_command_critical_section(pg_id, self.operation_epoch())?;
-        let primary_metadata_client = primary_critical_section.as_ref();
-        let primary_max_log_index = primary_metadata_client
-            .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
-        let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(
-            pg_id,
-            Some((primary.node_id(), primary_metadata_client)),
-        )?;
-        if let Some(current) = primary_metadata_client
-            .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
-        {
-            if current != *command {
-                return self
-                    .matching_reissued_pending_command_if_safe(
-                        pg_id,
-                        primary.node_id(),
-                        primary_metadata_client,
-                        primary_max_log_index,
-                        acting_set_max_log_index,
-                        command,
-                        current,
-                    )
-                    .map_err(BucketSnapshotLoadError::from);
-            }
-        } else {
-            return Ok(None);
+        let primary_metadata_client = primary.metadata_command_client();
+        let acting_set_max_log_index =
+            self.max_metadata_command_log_index_on_acting_set(pg_id, None)?;
+
+        enum ReissueReplaceOutcome {
+            Replaced(MetadataCommandEnvelope),
+            Reload {
+                current: MetadataCommandEnvelope,
+                primary_max_log_index: u64,
+            },
+            Missing,
         }
-        if acting_set_max_log_index > primary_max_log_index {
-            if let Some(current) = primary_metadata_client
-                .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
-            {
-                if current != *command {
-                    return self
-                        .matching_reissued_pending_command_if_safe(
-                            pg_id,
-                            primary.node_id(),
-                            primary_metadata_client,
-                            primary_max_log_index,
-                            acting_set_max_log_index,
-                            command,
-                            current,
-                        )
-                        .map_err(BucketSnapshotLoadError::from);
-                }
-                return self
-                    .matching_reissued_pending_command_if_safe(
-                        pg_id,
-                        primary.node_id(),
-                        primary_metadata_client,
-                        primary_max_log_index,
-                        acting_set_max_log_index,
-                        command,
-                        current,
-                    )
-                    .map_err(BucketSnapshotLoadError::from);
-            } else {
-                return Ok(None);
-            }
-        }
-        let next_log_index = primary_max_log_index
-            .max(command.id().log_index().get())
-            .checked_add(1)
-            .and_then(MetadataCommandLogIndex::new)
-            .ok_or(StoreError::MetadataCommandLogConflict {
-                node_id: primary.node_id().as_u32(),
-                pg_id: pg_id.get(),
-                cluster_epoch: self.operation_epoch(),
-                log_index: u64::MAX,
-            })?;
-        let replacement = MetadataCommandEnvelope::new(
-            MetadataCommandId::new(self.operation_epoch(), pg_id, next_log_index),
-            command.payload().clone(),
-        );
-        if !primary_metadata_client.replace_pending_metadata_command_slot_for_reissue(
-            pg_id,
-            command,
-            &replacement,
-            Some(&bucket),
-        )? {
-            let current = primary_metadata_client
-                .pending_metadata_command_envelope(pg_id, self.operation_epoch())?;
-            let primary_max_log_index = primary_metadata_client
+
+        let replace_outcome = {
+            let primary_critical_section = primary_metadata_client
+                .open_metadata_command_critical_section(pg_id, self.operation_epoch())?;
+            let primary_max_log_index = primary_critical_section
                 .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
-            let Some(current) = current else {
+            let Some(current) = primary_critical_section
+                .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+            else {
                 return Ok(None);
             };
-            let acting_set_max_log_index = self.max_metadata_command_log_index_on_acting_set(
-                pg_id,
-                Some((primary.node_id(), primary_metadata_client)),
-            )?;
-            return self
-                .matching_reissued_pending_command_if_safe(
+            if current != *command || acting_set_max_log_index > primary_max_log_index {
+                ReissueReplaceOutcome::Reload {
+                    current,
+                    primary_max_log_index,
+                }
+            } else {
+                let next_log_index = primary_max_log_index
+                    .max(command.id().log_index().get())
+                    .checked_add(1)
+                    .and_then(MetadataCommandLogIndex::new)
+                    .ok_or(StoreError::MetadataCommandLogConflict {
+                        node_id: primary.node_id().as_u32(),
+                        pg_id: pg_id.get(),
+                        cluster_epoch: self.operation_epoch(),
+                        log_index: u64::MAX,
+                    })?;
+                let replacement = MetadataCommandEnvelope::new(
+                    MetadataCommandId::new(self.operation_epoch(), pg_id, next_log_index),
+                    command.payload().clone(),
+                );
+                if primary_critical_section.replace_pending_metadata_command_slot_for_reissue(
+                    pg_id,
+                    command,
+                    &replacement,
+                    Some(&bucket),
+                )? {
+                    ReissueReplaceOutcome::Replaced(replacement)
+                } else {
+                    let current = primary_critical_section
+                        .pending_metadata_command_envelope(pg_id, self.operation_epoch())?;
+                    let primary_max_log_index = primary_critical_section
+                        .max_metadata_command_log_index(pg_id, self.operation_epoch())?;
+                    match current {
+                        Some(current) => ReissueReplaceOutcome::Reload {
+                            current,
+                            primary_max_log_index,
+                        },
+                        None => ReissueReplaceOutcome::Missing,
+                    }
+                }
+            }
+        };
+        match replace_outcome {
+            ReissueReplaceOutcome::Replaced(replacement) => Ok(Some(replacement)),
+            ReissueReplaceOutcome::Missing => Ok(None),
+            ReissueReplaceOutcome::Reload {
+                current,
+                primary_max_log_index,
+            } => {
+                let acting_set_max_log_index =
+                    self.max_metadata_command_log_index_on_acting_set(pg_id, None)?;
+                self.matching_reissued_pending_command_if_safe(
                     pg_id,
                     primary.node_id(),
-                    primary_metadata_client,
+                    primary_metadata_client.as_ref(),
                     primary_max_log_index,
                     acting_set_max_log_index,
                     command,
                     current,
                 )
-                .map_err(BucketSnapshotLoadError::from);
+                .map_err(BucketSnapshotLoadError::from)
+            }
         }
-        Ok(Some(replacement))
     }
 
     #[cfg(test)]

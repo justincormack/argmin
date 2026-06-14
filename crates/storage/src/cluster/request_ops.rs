@@ -877,21 +877,6 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        {
-            match primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(PgId::new(pg_id), &bucket)
-            {
-                Ok(info) => {
-                    return Ok(BucketCreateAttemptOutcome::Exists(info));
-                }
-                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
-                    ..
-                })) => {}
-                Err(other) => return Err(other),
-            }
-        }
-
         let pg_id = PgId::new(pg_id);
         loop {
             let (command, clear_pending_on_zero_apply) = match self
@@ -916,6 +901,18 @@ impl super::StorageCluster {
                     }
                 }
                 None => {
+                    match primary_store
+                        .bucket_metadata_client()
+                        .head_bucket_raw(pg_id, &bucket)
+                    {
+                        Ok(info) => {
+                            return Ok(BucketCreateAttemptOutcome::Exists(info));
+                        }
+                        Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                            ..
+                        })) => {}
+                        Err(other) => return Err(other),
+                    }
                     let Some(command_id) =
                         self.next_bucket_metadata_command_id_or_drain(pg_id, &bucket)?
                     else {
@@ -999,15 +996,10 @@ impl super::StorageCluster {
             .expect("validated metadata PG command route must exist")
             .primary_node_id();
         if origin_node_id != primary_node_id {
-            let rejecting_node_id = nodes
-                .iter()
-                .min_by_key(|node| node.node_id() == primary_node_id)
-                .map(|node| node.node_id())
-                .unwrap_or(primary_node_id);
             return Err(MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 source: StoreError::MetadataCommandFromNonPrimary {
-                    node_id: rejecting_node_id.as_u32(),
+                    node_id: primary_node_id.as_u32(),
                     pg_id: pg_id.get(),
                     cluster_epoch: command.id().cluster_epoch(),
                     origin_node_id: origin_node_id.as_u32(),
@@ -1016,47 +1008,68 @@ impl super::StorageCluster {
                 .into(),
             });
         }
-        let primary_node = self
-            .local_map
-            .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id)
-            .map_err(|source| MetadataCommandApplyFailure {
-                applied_nodes: 0,
-                source: source.into(),
-            })?;
-        let primary_critical_section = primary_node
-            .metadata_command_client()
-            .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
-            .map_err(|source| MetadataCommandApplyFailure {
-                applied_nodes: 0,
-                source: BucketSnapshotLoadError::Store(source),
-            })?;
-        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        nodes.sort_by_key(|node| node.node_id() != primary_node_id);
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
-            let metadata_client = if node.node_id() == primary_node_id {
-                primary_critical_section.as_ref()
-            } else {
-                node.metadata_command_client().as_ref()
-            };
-            let acceptance = if node.node_id() == primary_node_id {
-                metadata_client
+            if node.node_id() == primary_node_id {
+                let primary_critical_section = node
+                    .metadata_command_client()
+                    .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: BucketSnapshotLoadError::Store(source),
+                    })?;
+                let metadata_client = primary_critical_section.as_ref();
+                let acceptance = metadata_client
                     .metadata_command_acceptance(pg_id, command)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         source: BucketSnapshotLoadError::Store(source),
-                    })?
-            } else {
-                self.local_map
-                    .validate_metadata_command_for_replica(
-                        origin_node_id,
-                        node.node_id(),
-                        pg_id,
-                        command,
-                    )
+                    })?;
+                if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                    metadata_client
+                        .apply_metadata_command_and_record(pg_id, command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source,
+                        })?;
+                    continue;
+                }
+                self.validate_metadata_command_bucket_write_reservation(command)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
-                        source: source.into(),
-                    })?
-            };
+                        source,
+                    })?;
+                maybe_run_before_metadata_command_apply_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    node.node_id(),
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+                metadata_client
+                    .apply_metadata_command_and_record(pg_id, command)
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    })?;
+                continue;
+            }
+
+            let metadata_client = node.metadata_command_client();
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_for_replica(
+                    origin_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 metadata_client
                     .apply_metadata_command_and_record(pg_id, command)
@@ -1108,20 +1121,6 @@ impl super::StorageCluster {
                 source: source.into(),
             })?
             .node_id();
-        let primary_node = self
-            .local_map
-            .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id)
-            .map_err(|source| MetadataCommandApplyFailure {
-                applied_nodes: 0,
-                source: source.into(),
-            })?;
-        let primary_critical_section = primary_node
-            .metadata_command_client()
-            .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
-            .map_err(|source| MetadataCommandApplyFailure {
-                applied_nodes: 0,
-                source: BucketSnapshotLoadError::Store(source),
-            })?;
         let mut nodes = self
             .local_map
             .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
@@ -1129,33 +1128,47 @@ impl super::StorageCluster {
                 applied_nodes: 0,
                 source: source.into(),
             })?;
-        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
+        nodes.sort_by_key(|node| node.node_id() != primary_node_id);
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             let metadata_client = if node.node_id() == primary_node_id {
-                primary_critical_section.as_ref()
-            } else {
-                node.metadata_command_client().as_ref()
-            };
-            let acceptance = if node.node_id() == primary_node_id {
-                metadata_client
+                let primary_critical_section = node
+                    .metadata_command_client()
+                    .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: BucketSnapshotLoadError::Store(source),
+                    })?;
+                let metadata_client = primary_critical_section.as_ref();
+                let acceptance = metadata_client
                     .metadata_command_abandon_acceptance(pg_id, command)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         source: BucketSnapshotLoadError::Store(source),
-                    })?
+                    })?;
+                if acceptance != MetadataCommandAcceptance::AlreadyApplied {
+                    metadata_client
+                        .record_metadata_command_abandoned(pg_id, command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source: source.into(),
+                        })?;
+                }
+                continue;
             } else {
-                self.local_map
-                    .validate_metadata_command_abandon_for_replica(
-                        primary_node_id,
-                        node.node_id(),
-                        pg_id,
-                        command,
-                    )
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source: source.into(),
-                    })?
+                node.metadata_command_client().as_ref()
             };
+            let acceptance = self
+                .local_map
+                .validate_metadata_command_abandon_for_replica(
+                    primary_node_id,
+                    node.node_id(),
+                    pg_id,
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 continue;
             }
@@ -3229,11 +3242,26 @@ impl super::StorageCluster {
                                 command.payload().kind_name()
                             ),
                         );
-                        self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
-                            bucket,
-                            Some(started),
-                            &mut work_budget,
-                        )?;
+                        match self
+                            .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                                bucket,
+                                Some(started),
+                                &mut work_budget,
+                            ) {
+                            Ok(()) => {}
+                            Err(BucketWriteDrainError::Store(
+                                StoreError::MetadataCommandContention { .. },
+                            )) => {
+                                super::sleep_after_metadata_contention_retry_for(
+                                    "bucket_delete_begin",
+                                    Some(pg_id),
+                                    "bucket delete drain exact bucket object commands contention",
+                                    &mut metadata_contention_retries,
+                                );
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
                             pg_id,
@@ -3265,11 +3293,26 @@ impl super::StorageCluster {
                         loop_iteration
                     ),
                 );
-                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
-                    bucket,
-                    Some(started),
-                    &mut work_budget,
-                )?;
+                match self
+                    .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                        bucket,
+                        Some(started),
+                        &mut work_budget,
+                    ) {
+                    Ok(()) => {}
+                    Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                        ..
+                    })) => {
+                        super::sleep_after_metadata_contention_retry_for(
+                            "bucket_delete_begin",
+                            Some(pg_id),
+                            "bucket delete initial exact bucket object drain contention",
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -3373,11 +3416,26 @@ impl super::StorageCluster {
                         loop_iteration
                     ),
                 );
-                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
-                    bucket,
-                    Some(started),
-                    &mut work_budget,
-                )?;
+                match self
+                    .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                        bucket,
+                        Some(started),
+                        &mut work_budget,
+                    ) {
+                    Ok(()) => {}
+                    Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                        ..
+                    })) => {
+                        super::sleep_after_metadata_contention_retry_for(
+                            "bucket_delete_begin",
+                            Some(pg_id),
+                            "bucket delete exact bucket object drain after reservation wait contention",
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -3413,11 +3471,26 @@ impl super::StorageCluster {
                         loop_iteration
                     ),
                 );
-                self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
-                    bucket,
-                    Some(started),
-                    &mut work_budget,
-                )?;
+                match self
+                    .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                        bucket,
+                        Some(started),
+                        &mut work_budget,
+                    ) {
+                    Ok(()) => {}
+                    Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                        ..
+                    })) => {
+                        super::sleep_after_metadata_contention_retry_for(
+                            "bucket_delete_begin",
+                            Some(pg_id),
+                            "bucket delete exact bucket object drain before visibility check contention",
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -4134,6 +4207,25 @@ impl super::StorageCluster {
             let mut upload_id_marker = None;
             loop {
                 work_budget.check("completed multipart cleanup listing budget exhausted")?;
+                if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    match self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        work_budget,
+                    ) {
+                        Ok(()) => {
+                            upload_id_marker = None;
+                            continue;
+                        }
+                        Err(BucketSnapshotLoadError::Store(
+                            StoreError::MetadataCommandContention { .. },
+                        )) => continue,
+                        Err(error) => {
+                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
+                        }
+                    }
+                }
                 let page = node
                     .object_mutation_metadata_client()
                     .list_completed_multipart_upload_records_for_bucket_page(
@@ -4880,6 +4972,27 @@ impl super::StorageCluster {
             let mut upload_id_marker = None;
             loop {
                 work_budget.check("completed multipart cleanup listing budget exhausted")?;
+                if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    match self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        work_budget,
+                    ) {
+                        Ok(()) => {
+                            upload_id_marker = None;
+                            continue;
+                        }
+                        Err(BucketSnapshotLoadError::Store(
+                            StoreError::MetadataCommandContention { .. },
+                        )) => continue,
+                        Err(error) => {
+                            return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                                error,
+                            ));
+                        }
+                    }
+                }
                 let page = node
                     .object_mutation_metadata_client()
                     .list_completed_multipart_upload_records_for_bucket_page(
