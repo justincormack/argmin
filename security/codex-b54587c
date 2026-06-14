@@ -1,0 +1,173 @@
+Durable reclaim scans can be starved by queued work
+Link: https://chatgpt.com/codex/cloud/security/findings/5c4dbccfd744819182e66f8632305bb7?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: b54587c
+Author: justin@specialbusservice.com
+Created: 13/06/2026, 14:55:33
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Fixed in commit `b9ba8144` (`Scan durable reclaim roots while queue is busy`).
+
+The finding was valid: the reclaim worker could repeatedly consume
+already-queued in-memory work through `try_take_reclaim_work()` and avoid the
+`wait_for_reclaim_work()` path that performs durable reclaim discovery. Metrics
+or work-created/work-finished backpressure would make the pressure visible, but
+would not by itself guarantee that durable roots lost from the in-memory queue
+are rediscovered.
+
+The fix makes the reclaim worker run the existing rate-limited durable scan at
+the start of every worker loop, before selecting queued work. The scan still
+excludes locally deferred object-payload roots, preserving the cooldown/dedupe
+invariant and avoiding the duplicate-growth issue fixed earlier. As a result,
+busy in-memory reclaim traffic can delay durable rediscovery by at most the
+configured scan interval, rather than starving it until the queue becomes empty.
+
+Validation run for the fix:
+
+```
+cargo fmt
+cargo nextest run -p server-core final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists
+cargo nextest run -p storage durable_reclaim_scan_recovers_lost_local_queue_after_reopen durable_reclaim_scan_continues_after_unavailable_pg object_payload_reclaim_capacity_counts_dequeued_work_until_finished
+git diff --check
+```
+
+# Summary
+Introduced: the commit changed the reclaim worker from always using wait_for_reclaim_work, which performs durable scans, to preferentially using try_take_reclaim_work, which only pops the in-memory queue and does not perform durable discovery.
+Before this commit, every reclaim-worker iteration called wait_for_reclaim_work, which first scanned durable metadata roots for object-payload reclaim and bucket-delete finalization before returning queued work. The new loop first drains pending_work and try_take_reclaim_work, and only falls back to wait_for_reclaim_work when the in-memory queue is empty. The periodic durable scan helper is only invoked on the deferred-work path. As a result, if an authenticated client keeps generating reclaim queue entries faster than the worker fully drains them, persisted durable reclaim roots that are not already in memory may not be rediscovered or finalized. This can delay or prevent cleanup of stale payloads and bucket deletion finalizers, leading to disk-space exhaustion or operational denial of service.
+
+# Validation
+## Rubric
+- [x] Confirm the current ReclaimSweeper loop can consume pending/in-memory work before calling wait_for_reclaim_work.
+- [x] Confirm durable object-payload and bucket-delete discovery occurs in wait_for_reclaim_work/enqueue_durable_reclaim_work, not in try_take_reclaim_work.
+- [x] Confirm durable reclaim roots can exist without an in-memory queue entry after reopen/lost local queue.
+- [x] Demonstrate dynamically that repeated in-memory work drained through try_take_reclaim_work leaves a persisted reclaim root undiscovered.
+- [x] Demonstrate that switching to wait_for_reclaim_work discovers that same persisted root, proving the starvation condition depends on the new worker path.
+## Report
+Validated the finding as a logic/availability bug, not a crash bug. Key code evidence: in the new worker loop, crates/server-core/src/coordinator/runtime.rs:166-185 takes pending_work, then worker_node.try_take_reclaim_work(), and only calls worker_node.wait_for_reclaim_work() if the in-memory queue is empty and the deferred-object path did not produce work. The periodic durable scan helper is only called on the deferred-object path at runtime.rs:240-247. Storage confirms the split: crates/storage/src/cluster/request_ops.rs:6760-6764 try_take_reclaim_work only delegates to runtime_state().try_take_reclaim_work(), while request_ops.rs:6782-6787 wait_for_reclaim_work calls enqueue_durable_reclaim_work() on each loop. The local queue implementation at crates/storage/src/cluster/local.rs:976-982 only pops an in-memory queue item. The parent commit used wait_for_reclaim_work every iteration (git show HEAD^ showed runtime.rs:105: while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop)), so the current commit introduced the bypass.
+
+Dynamic PoC: I added a targeted unit test, poc_busy_in_memory_queue_bypasses_durable_reclaim_scan_until_wait_path, in crates/storage/src/cluster/local.rs. It creates a real durable object-payload reclaim root, reopens the cluster so that root is not in memory, then repeatedly enqueues unrelated in-memory reclaim work and drains it via try_take_reclaim_work. The test asserts each post-drain try_take_reclaim_work returns None while payload_reclaim_exists for the lost root remains true, demonstrating that the busy in-memory path does not discover durable roots. It then calls wait_for_reclaim_work and asserts the lost durable root is immediately returned. Command output: `cargo test -p storage poc_busy_in_memory_queue_bypasses_durable_reclaim_scan_until_wait_path --features test-hooks -- --nocapture` => `test ... ok; 1 passed`.
+
+Debugger evidence: lldb breakpoint at request_ops.rs:6760 hit from the PoC at local.rs:34547 during the busy-queue try_take path; a separate lldb breakpoint at request_ops.rs:6782 hit from local.rs:34566 only when the PoC explicitly called wait_for_reclaim_work, after which the test passed. This traces the two distinct paths.
+
+Crash/Valgrind/ASan attempts: no crash is expected because this is starvation/cleanup-liveness logic. A direct compiled test run completed successfully and served as the reproducer. valgrind was unavailable in the container (`valgrind-not-found`). ASan via `RUSTFLAGS='-Z sanitizer=address'` failed because the installed Rust toolchain is stable and rejects -Z sanitizer options.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L166 to 185)
+  Note: The worker now drains pending_work and try_take_reclaim_work before falling back to wait_for_reclaim_work; try_take_reclaim_work does not perform durable reclaim scans.
+```
+                    let Some(work) = pending_work
+                        .take()
+                        .or_else(|| worker_node.try_take_reclaim_work())
+                        .or_else(|| {
+                            if deferred_object_payload_reclaim.is_empty() {
+                                return None;
+                            }
+                            enqueue_durable_reclaim_work_if_due(
+                                &worker_node,
+                                &deferred_object_payload_reclaim_roots,
+                                &mut next_durable_scan_at,
+                            );
+                            worker_node.try_take_reclaim_work().or_else(|| {
+                                deferred_object_payload_reclaim.pop_front().map(|root| {
+                                    deferred_object_payload_reclaim_roots.remove(&root);
+                                    ReclaimWorkItem::ObjectPayload(root)
+                                })
+                            })
+                        })
+                        .or_else(|| worker_node.wait_for_reclaim_work(&worker_stop))
+```
+
+crates/server-core/src/coordinator/runtime.rs (L240 to 245)
+  Note: The new periodic durable scan helper is only called when deferred_object_payload_reclaim is non-empty, leaving the normal busy-queue path without periodic durable discovery.
+```
+                    if pending_work.is_none() && !deferred_object_payload_reclaim.is_empty() {
+                        enqueue_durable_reclaim_work_if_due(
+                            &worker_node,
+                            &deferred_object_payload_reclaim_roots,
+                            &mut next_durable_scan_at,
+                        );
+```
+
+crates/storage/src/cluster/request_ops.rs (L6760 to 6765)
+  Note: try_take_reclaim_work only pops in-memory work and performs no durable object-payload or bucket-delete scan.
+```
+    pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return None;
+        }
+        self.local_map.runtime_state().try_take_reclaim_work()
+    }
+```
+
+crates/storage/src/cluster/request_ops.rs (L6782 to 6787)
+  Note: Durable reclaim work is discovered by wait_for_reclaim_work via enqueue_durable_reclaim_work, but the new worker loop can bypass this function while the in-memory queue remains non-empty.
+```
+    pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return None;
+        }
+        while !stop.load(Ordering::SeqCst) {
+            self.enqueue_durable_reclaim_work();
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The original medium rating is supported. Static evidence and prior executable PoC evidence confirm the logic bug: the production ReclaimSweeper can drain in-memory work via try_take_reclaim_work without performing durable discovery, while wait_for_reclaim_work is the path that enqueues durable reclaim work. Reachability is realistic through normal PUT overwrite, DELETE object, and DELETE bucket S3 operations, but strong authz generally limits attackers to authenticated writers or intentionally public-write buckets. The consequence is availability degradation and possible disk exhaustion, not auth bypass, sensitive data disclosure, data integrity compromise, or RCE. Default localhost binding and max connection/in-flight controls further argue against high/critical, while the potential for service-wide storage exhaustion keeps it security-relevant rather than ignore/low.
+## Likelihood
+high - The attack is reachable through normal S3 HTTP operations and does not require admin privileges once write/delete access exists, but it requires sustained churn, durable roots absent from the in-memory queue, and an exposed service. The repository default is loopback and there are request admission controls, so exploitation is plausible but not broadly unauthenticated by default. | Remote network vector
+## Impact
+medium - Successful exploitation can delay or prevent cleanup of stale object payloads and bucket deletion finalizers, causing disk growth and potential service-level denial of service. It does not provide confidentiality loss, integrity bypass, privilege escalation, or code execution, and an attacker already needs write/delete capability or a public-write bucket.
+## Assumptions
+- The S3 frontend is deployed in a role that starts the reclaim worker, which is true for legacy-local, combined, and frontend roles shown in the repository.
+- The attacker has valid S3 write/delete permission on at least one bucket, or the operator has intentionally configured a public-write bucket.
+- Persisted durable reclaim roots can exist without corresponding in-memory queue entries, for example after process restart/reopen or lost transient queue state, as demonstrated by the prior validation test.
+- No external IaC or runtime deployment manifest was present in the checkout, so public internet exposure cannot be proven from repository artifacts.
+- S3 HTTP frontend reachable by the attacker
+- valid SigV4 credentials with object write/delete ability, or an intentionally public-write bucket
+- durable reclaim roots not already represented in the in-memory reclaim queue
+- sustained generation of new reclaim work faster than the worker reaches its wait path
+## Path
+S3 writer/public-write client
+  -> HTTP auth/dispatch
+  -> PUT overwrite / DELETE object / DELETE bucket
+  -> in-memory reclaim queue remains busy
+  -> ReclaimSweeper uses try_take_reclaim_work before wait_for_reclaim_work
+  -> durable scan not reached
+  -> stale payload/finalizer cleanup delayed; disk exhaustion risk
+## Path evidence
+- `crates/server-core/src/coordinator/runtime.rs:166-185` - The reclaim worker takes pending work and try_take_reclaim_work before falling back to wait_for_reclaim_work, creating a busy-queue path that can avoid durable scanning.
+- `crates/server-core/src/coordinator/runtime.rs:240-248` - The periodic durable scan helper is only invoked when deferred_object_payload_reclaim is non-empty, not as an unconditional periodic scan while ordinary in-memory work is being drained.
+- `crates/storage/src/cluster/request_ops.rs:6760-6765` - try_take_reclaim_work only delegates to runtime_state().try_take_reclaim_work and does not enqueue or scan durable reclaim roots.
+- `crates/storage/src/cluster/request_ops.rs:6782-6788` - wait_for_reclaim_work performs enqueue_durable_reclaim_work on each loop, confirming durable discovery is tied to the path that can be bypassed while the queue remains busy.
+- `crates/storage/src/cluster/local.rs:976-982` - The local try_take_reclaim_work implementation only pops an in-memory queue item.
+- `crates/server-core/src/coordinator/put.rs:275-280` - Authorized object overwrite can enqueue stale-generation object payload reclaim work.
+- `crates/server-core/src/coordinator/delete.rs:80-84` - Authorized object delete can enqueue object payload reclaim work.
+- `crates/server-core/src/coordinator/bucket.rs:387-389` - Authorized bucket deletion enqueues bucket-delete finalization work.
+- `crates/server-http/src/http/mod.rs:3085-3113` - HTTP frontend authenticates requests with SigV4 credentials and represents missing auth as anonymous, which is later constrained by ACL/policy authorization.
+- `crates/server-core/src/coordinator/authz.rs:440-455` - Object writes require owner/admin, ACL write permission, or effective public-write authorization.
+- `crates/argmin-s3/src/config.rs:94-115` - Service configuration is environment-driven; default listen address is 127.0.0.1:9000, with configured credentials and connection limits.
+- `crates/argmin-s3/src/main.rs:358-383` - argmin-s3 binds a TCP listener at the configured listen address and applies a max in-flight request limit.
+- `crates/server-core/src/coordinator/infra.rs:446-449` - The production Coordinator starts the ReclaimSweeper when background reclaim workers are enabled.
+## Narrative
+The finding is a real in-scope availability vulnerability. The production argmin-s3 server starts the ReclaimSweeper in normal frontend modes, and object overwrites, object deletes, and bucket deletes enqueue reclaim work. In the introduced loop, ReclaimSweeper first consumes pending_work and worker_node.try_take_reclaim_work, and only calls worker_node.wait_for_reclaim_work if those paths return no work. However, try_take_reclaim_work only pops the in-memory queue, while wait_for_reclaim_work calls enqueue_durable_reclaim_work, which discovers persisted object-payload and bucket-delete roots. A client with write/delete permission can therefore keep the in-memory queue non-empty and postpone rediscovery of durable cleanup work. The impact is availability-only: delayed cleanup can consume disk and leave bucket deletion finalizers pending, but it does not bypass authentication, read private data, modify unauthorized objects, or execute code. Medium severity is appropriate given authenticated/public-write preconditions, default localhost listen address, and connection/in-flight controls, balanced against a plausible service-level disk-exhaustion outcome.
+## Controls
+- SigV4 authentication via authenticate_request
+- Bucket/object ACL and bucket policy authorization
+- Default listen address is loopback 127.0.0.1:9000
+- Optional TLS if ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are set
+- max_connections and max_inflight_requests admission controls
+- HTTP header/body idle timeouts and bounded control-plane body sizes
+- No repository IaC proving public ingress or load balancer exposure
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were found, so actual public exposure cannot be proven from repository artifacts.
+- Static review cannot quantify the rate of reclaim work required to starve durable scans in a production workload.
+- The prior validation PoC was a unit/integration-level reproducer rather than a full end-to-end HTTP exploit, although the enqueuing operations are reachable through normal HTTP S3 APIs.
+- Operational mitigations such as external reverse-proxy rate limits, filesystem quotas, monitoring, or deployment-specific network controls are not visible in the repository.
