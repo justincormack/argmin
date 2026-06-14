@@ -7361,6 +7361,12 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
                 message: claim_id,
             }
         }
+        BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimConflict { claim_id }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::ReclaimClaimConflict,
+                message: claim_id,
+            }
+        }
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),

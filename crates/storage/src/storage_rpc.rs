@@ -563,6 +563,7 @@ pub(crate) enum StorageRpcErrorCode {
     ShardDeleteInProgress = 13,
     BucketWriteDrainConflict = 14,
     BucketWriteDrainNotFound = 15,
+    ReclaimClaimConflict = 16,
 }
 
 impl StorageRpcErrorCode {
@@ -583,6 +584,7 @@ impl StorageRpcErrorCode {
             13 => Ok(Self::ShardDeleteInProgress),
             14 => Ok(Self::BucketWriteDrainConflict),
             15 => Ok(Self::BucketWriteDrainNotFound),
+            16 => Ok(Self::ReclaimClaimConflict),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),

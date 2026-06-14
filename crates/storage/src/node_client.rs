@@ -4695,6 +4695,40 @@ impl UnixStorageNodeClient {
         }
     }
 
+    fn bucket_snapshot_rpc_response_error(
+        &self,
+        kind: StorageRpcMessageKind,
+        error: StorageRpcErrorResponse,
+    ) -> BucketSnapshotLoadError {
+        match error.code {
+            StorageRpcErrorCode::ReclaimClaimNotFound => {
+                BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimNotFound {
+                    claim_id: error.message,
+                })
+            }
+            StorageRpcErrorCode::ReclaimClaimConflict => {
+                BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimConflict {
+                    claim_id: error.message,
+                })
+            }
+            _ => BucketSnapshotLoadError::Store(self.rpc_response_error(kind, error)),
+        }
+    }
+
+    fn rpc_request_bucket_snapshot(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, BucketSnapshotLoadError> {
+        match self
+            .rpc_request_result(kind, payload)
+            .map_err(BucketSnapshotLoadError::Store)?
+        {
+            Ok(response) => Ok(response),
+            Err(error) => Err(self.bucket_snapshot_rpc_response_error(kind, error)),
+        }
+    }
+
     fn rpc_payload_error(&self, operation: &'static str, message: String) -> StoreError {
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
@@ -9163,12 +9197,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire,
+            payload,
+        )?;
         let response = decode_bucket_delete_finalize_claim_optional_record_response(&response)
             .map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
@@ -9214,24 +9246,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 ))
             })?;
         let kind = StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease;
-        let response = self
-            .rpc_request_result(kind, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) if error.code == StorageRpcErrorCode::ReclaimClaimNotFound => {
-                return Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::ReclaimClaimNotFound {
-                        claim_id: error.message,
-                    },
-                ));
-            }
-            Err(error) => {
-                return Err(BucketSnapshotLoadError::Store(
-                    self.rpc_response_error(kind, error),
-                ));
-            }
-        };
+        let response = self.rpc_request_bucket_snapshot(kind, payload)?;
         self.validate_empty_bucket_write_reservation_response(
             "decode bucket delete finalize claim release response",
             &response,
@@ -9332,9 +9347,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 error.to_string(),
             ))
         })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimAcquire, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::LifecycleSweepClaimAcquire,
+            payload,
+        )?;
         let response =
             decode_lifecycle_sweep_claim_optional_record_response(&response).map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
@@ -9385,9 +9401,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimHeartbeat, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::LifecycleSweepClaimHeartbeat,
+            payload,
+        )?;
         let response =
             decode_lifecycle_sweep_claim_record_response(&response).map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
@@ -9428,9 +9445,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 error.to_string(),
             ))
         })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimError, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::LifecycleSweepClaimError,
+            payload,
+        )?;
         let response =
             decode_lifecycle_sweep_claim_record_response(&response).map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
@@ -9466,9 +9484,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 error.to_string(),
             ))
         })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::LifecycleSweepClaimRelease, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::LifecycleSweepClaimRelease,
+            payload,
+        )?;
         self.validate_empty_bucket_write_reservation_response(
             "decode lifecycle sweep claim release response",
             &response,
@@ -10720,12 +10739,10 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire,
+            payload,
+        )?;
         let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
             .map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
@@ -10773,12 +10790,10 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease,
+            payload,
+        )?;
         self.validate_empty_bucket_write_reservation_response(
             "decode object payload reclaim claim release response",
             &response,
@@ -17804,7 +17819,7 @@ mod tests {
         };
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..11)
+        let server_threads: Vec<_> = (0..13)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -17898,10 +17913,35 @@ mod tests {
         .expect("finalize claim should acquire");
         assert_eq!(claim.bucket, finalize_bucket);
         assert_eq!(claim.claim_id, "finalize-claim-rpc-1");
-        BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+        let replacement_claim =
+            BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
+                &client,
+                PgId::new(0),
+                &finalize_bucket,
+                finalize_bucket_incarnation_generation,
+                "finalize-claim-rpc-2",
+                "finalize-claim-owner-rpc-2",
+                ClusterEpoch::new(1).unwrap(),
+                81,
+                Some(100),
+                81,
+            )
+            .unwrap()
+            .expect("expired finalizer claim should be stealable");
+        let stale_release = BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
             &client,
             PgId::new(0),
             &claim,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            stale_release,
+            BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimConflict { .. })
+        ));
+        BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+            &client,
+            PgId::new(0),
+            &replacement_claim,
         )
         .unwrap();
 

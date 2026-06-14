@@ -3862,6 +3862,15 @@ impl super::StorageCluster {
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             Ok(())
         };
+        let stale_finalizer_claim_release = |error: &BucketWriteDrainError| {
+            matches!(
+                error,
+                BucketWriteDrainError::Metadata(
+                    MetadataError::ReclaimClaimNotFound { .. }
+                        | MetadataError::ReclaimClaimConflict { .. }
+                )
+            )
+        };
 
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS),
@@ -3886,14 +3895,28 @@ impl super::StorageCluster {
                     crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
                     Ok(outcome)
                 }
+                Err(BucketWriteDrainError::Metadata(MetadataError::ReclaimClaimConflict {
+                    ..
+                })) => {
+                    crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
+                    Ok(outcome)
+                }
                 Err(error) => Err(error),
             },
             Ok(outcome) => {
-                release_finalizer_claim()?;
+                if let Err(error) = release_finalizer_claim() {
+                    if !stale_finalizer_claim_release(&error) {
+                        return Err(error);
+                    }
+                }
                 Ok(outcome)
             }
             Err(error) => {
-                release_finalizer_claim()?;
+                if let Err(release_error) = release_finalizer_claim() {
+                    if !stale_finalizer_claim_release(&release_error) {
+                        return Err(release_error);
+                    }
+                }
                 Err(error)
             }
         }
