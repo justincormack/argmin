@@ -3942,19 +3942,93 @@ impl StorageCluster {
         )
     }
 
+    fn emit_exact_bucket_object_drain_step(
+        bucket: &BucketName,
+        pg_id: PgId,
+        step: &'static str,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" {detail}")
+        };
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_exact_object_drain_step",
+            format!(
+                "bucket={:?} object_pg_id={} step={}{}",
+                bucket,
+                pg_id.get(),
+                step,
+                suffix
+            ),
+        );
+    }
+
     fn drain_pending_object_metadata_commands_for_exact_bucket_inner(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         mut work_budget: Option<&mut RequestWorkBudget>,
     ) -> Result<(), ObjectPgActionError> {
-        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+        let mut drain_iteration = 0u64;
+        loop {
+            drain_iteration += 1;
+            Self::emit_exact_bucket_object_drain_step(
+                bucket,
+                pg_id,
+                "pending_lookup_start",
+                format!("iteration={drain_iteration}"),
+            );
+            let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+                Self::emit_exact_bucket_object_drain_step(
+                    bucket,
+                    pg_id,
+                    "pending_lookup_done",
+                    format!("iteration={drain_iteration} has_pending=false"),
+                );
+                break;
+            };
+            Self::emit_exact_bucket_object_drain_step(
+                bucket,
+                pg_id,
+                "pending_lookup_done",
+                format!(
+                    "iteration={} has_pending=true command_kind={} command_bucket={:?}",
+                    drain_iteration,
+                    command.payload().kind_name(),
+                    command.bucket_name()
+                ),
+            );
             if let Some(work_budget) = work_budget.as_deref_mut() {
                 work_budget.check("exact bucket object command drain budget exhausted")?;
             }
             if command.bucket_name() != bucket {
+                Self::emit_exact_bucket_object_drain_step(
+                    bucket,
+                    pg_id,
+                    "stop_foreign_bucket",
+                    format!(
+                        "iteration={} command_kind={} command_bucket={:?}",
+                        drain_iteration,
+                        command.payload().kind_name(),
+                        command.bucket_name()
+                    ),
+                );
                 return Ok(());
             }
+            Self::emit_exact_bucket_object_drain_step(
+                bucket,
+                pg_id,
+                "apply_start",
+                format!(
+                    "iteration={} command_kind={}",
+                    drain_iteration,
+                    command.payload().kind_name()
+                ),
+            );
             let outcome = match work_budget.as_deref_mut() {
                 Some(work_budget) => self
                     .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
@@ -3964,6 +4038,12 @@ impl StorageCluster {
                     )?,
                 None => self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?,
             };
+            Self::emit_exact_bucket_object_drain_step(
+                bucket,
+                pg_id,
+                "apply_done",
+                format!("iteration={} outcome={outcome:?}", drain_iteration),
+            );
             match outcome {
                 PendingMetadataCommandOutcome::Applied
                 | PendingMetadataCommandOutcome::Abandoned => {}

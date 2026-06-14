@@ -2606,18 +2606,37 @@ impl super::StorageCluster {
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
         for raw_pg_id in self.metadata_pg_ids() {
+            let object_pg_id = PgId::new(raw_pg_id);
             self.check_bucket_delete_begin_work_budget(
                 bucket,
                 started,
                 "bucket delete exact-bucket drain budget exhausted",
             )?;
+            if let Some(started) = started {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    self.bucket_metadata_pg_id(bucket).into(),
+                    started,
+                    "drain_exact_bucket_object_pg_start",
+                    format!("object_pg_id={}", object_pg_id.get()),
+                );
+            }
             self.drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
-                PgId::new(raw_pg_id),
+                object_pg_id,
                 bucket,
                 work_budget,
             )
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            if let Some(started) = started {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    self.bucket_metadata_pg_id(bucket).into(),
+                    started,
+                    "drain_exact_bucket_object_pg_done",
+                    format!("object_pg_id={}", object_pg_id.get()),
+                );
+            }
         }
         Ok(())
     }
