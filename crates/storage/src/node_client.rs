@@ -2762,6 +2762,7 @@ struct UnixStorageNodeRpcAdmission {
     limit: usize,
     non_reserved_limit: usize,
     completion_limit: usize,
+    pending_envelope_limit: usize,
     read_limit: usize,
     list_limit: usize,
     start_write_limit: usize,
@@ -2775,6 +2776,7 @@ struct UnixStorageNodeRpcAdmission {
 struct UnixStorageNodeRpcAdmissionPermit {
     admission: Arc<UnixStorageNodeRpcAdmission>,
     class: UnixStorageNodeRpcAdmissionClass,
+    pending_envelope: bool,
     observed_active: bool,
 }
 
@@ -2815,6 +2817,7 @@ impl UnixStorageNodeRpcAdmissionClass {
 struct UnixStorageNodeRpcAdmissionActive {
     total: usize,
     completion: usize,
+    pending_envelope: usize,
     progress: usize,
     start_write: usize,
     read: usize,
@@ -2826,11 +2829,16 @@ impl UnixStorageNodeRpcAdmissionActive {
         self.progress + self.start_write + self.read + self.list
     }
 
-    fn acquire(&mut self, class: UnixStorageNodeRpcAdmissionClass) {
+    fn acquire(&mut self, class: UnixStorageNodeRpcAdmissionClass, pending_envelope: bool) {
         self.total += 1;
         match class {
             UnixStorageNodeRpcAdmissionClass::Control => {}
-            UnixStorageNodeRpcAdmissionClass::Completion => self.completion += 1,
+            UnixStorageNodeRpcAdmissionClass::Completion => {
+                self.completion += 1;
+                if pending_envelope {
+                    self.pending_envelope += 1;
+                }
+            }
             UnixStorageNodeRpcAdmissionClass::Progress => self.progress += 1,
             UnixStorageNodeRpcAdmissionClass::StartWrite => self.start_write += 1,
             UnixStorageNodeRpcAdmissionClass::Read => self.read += 1,
@@ -2838,7 +2846,7 @@ impl UnixStorageNodeRpcAdmissionActive {
         }
     }
 
-    fn release(&mut self, class: UnixStorageNodeRpcAdmissionClass) {
+    fn release(&mut self, class: UnixStorageNodeRpcAdmissionClass, pending_envelope: bool) {
         self.total = self
             .total
             .checked_sub(1)
@@ -2850,6 +2858,11 @@ impl UnixStorageNodeRpcAdmissionActive {
                     .completion
                     .checked_sub(1)
                     .expect("Unix storage-node completion RPC admission release without acquire");
+                if pending_envelope {
+                    self.pending_envelope = self.pending_envelope.checked_sub(1).expect(
+                        "Unix storage-node pending-envelope RPC admission release without acquire",
+                    );
+                }
             }
             UnixStorageNodeRpcAdmissionClass::Progress => {
                 self.progress = self
@@ -2907,10 +2920,12 @@ impl UnixStorageNodeRpcAdmission {
         let list_limit = (shared_limit / 2).max(1).min(shared_limit);
         let start_write_floor = (limit / 8).clamp(1, 4).min(shared_limit);
         let completion_limit = limit.saturating_sub(start_write_floor).max(1);
+        let pending_envelope_limit = (completion_limit / 2).max(1);
         Self {
             limit,
             non_reserved_limit: shared_limit,
             completion_limit,
+            pending_envelope_limit,
             read_limit: shared_limit,
             list_limit,
             start_write_limit: shared_limit,
@@ -2928,20 +2943,41 @@ impl UnixStorageNodeRpcAdmission {
         if active.total >= self.limit {
             return None;
         }
-        active.acquire(UnixStorageNodeRpcAdmissionClass::Control);
+        active.acquire(UnixStorageNodeRpcAdmissionClass::Control, false);
         observability::storage_rpc_admission_class_acquired(
             UnixStorageNodeRpcAdmissionClass::Control.as_str(),
         );
         Some(UnixStorageNodeRpcAdmissionPermit {
             admission: Arc::clone(self),
             class: UnixStorageNodeRpcAdmissionClass::Control,
+            pending_envelope: false,
             observed_active: true,
         })
     }
 
+    #[cfg(test)]
     fn acquire(
         self: &Arc<Self>,
         class: UnixStorageNodeRpcAdmissionClass,
+    ) -> UnixStorageNodeRpcAdmissionAcquire {
+        self.acquire_with_pending_envelope(class, false)
+    }
+
+    fn acquire_with_kind(
+        self: &Arc<Self>,
+        class: UnixStorageNodeRpcAdmissionClass,
+        kind: StorageRpcMessageKind,
+    ) -> UnixStorageNodeRpcAdmissionAcquire {
+        self.acquire_with_pending_envelope(
+            class,
+            kind == StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+        )
+    }
+
+    fn acquire_with_pending_envelope(
+        self: &Arc<Self>,
+        class: UnixStorageNodeRpcAdmissionClass,
+        pending_envelope: bool,
     ) -> UnixStorageNodeRpcAdmissionAcquire {
         let started_at = Instant::now();
         let wait_timeout = self.wait_timeout_for_class(class);
@@ -2949,13 +2985,14 @@ impl UnixStorageNodeRpcAdmission {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         let mut waited = false;
         loop {
-            if self.can_admit(&active, class) {
-                active.acquire(class);
+            if self.can_admit(&active, class, pending_envelope) {
+                active.acquire(class, pending_envelope);
                 observability::storage_rpc_admission_class_acquired(class.as_str());
                 return UnixStorageNodeRpcAdmissionAcquire::Acquired {
                     permit: UnixStorageNodeRpcAdmissionPermit {
                         admission: Arc::clone(self),
                         class,
+                        pending_envelope,
                         observed_active: true,
                     },
                     wait_us: if waited {
@@ -2976,7 +3013,7 @@ impl UnixStorageNodeRpcAdmission {
                 .wait_timeout(active, remaining)
                 .unwrap_or_else(|e| e.into_inner());
             active = next_active;
-            if wait_result.timed_out() && !self.can_admit(&active, class) {
+            if wait_result.timed_out() && !self.can_admit(&active, class, pending_envelope) {
                 return UnixStorageNodeRpcAdmissionAcquire::TimedOut {
                     wait_us: started_at.elapsed().as_micros(),
                 };
@@ -2988,6 +3025,7 @@ impl UnixStorageNodeRpcAdmission {
         &self,
         active: &UnixStorageNodeRpcAdmissionActive,
         class: UnixStorageNodeRpcAdmissionClass,
+        pending_envelope: bool,
     ) -> bool {
         if active.total >= self.limit {
             return false;
@@ -2996,6 +3034,7 @@ impl UnixStorageNodeRpcAdmission {
             UnixStorageNodeRpcAdmissionClass::Control => true,
             UnixStorageNodeRpcAdmissionClass::Completion => {
                 active.completion < self.completion_limit
+                    && (!pending_envelope || active.pending_envelope < self.pending_envelope_limit)
             }
             UnixStorageNodeRpcAdmissionClass::Progress => {
                 active.non_reserved() < self.non_reserved_limit
@@ -3040,7 +3079,7 @@ impl Drop for UnixStorageNodeRpcAdmissionPermit {
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        active.release(self.class);
+        active.release(self.class, self.pending_envelope);
         self.admission.capacity_available.notify_all();
         if self.observed_active {
             observability::storage_rpc_admission_class_released(self.class.as_str());
@@ -4643,7 +4682,7 @@ impl UnixStorageNodeClient {
     ) -> Result<UnixStorageNodeRpcAdmissionPermit, StoreError> {
         observability::emit_storage_rpc_admission_attempt();
         let wait_timeout = self.rpc_admission.wait_timeout_for_class(class);
-        match self.rpc_admission.acquire(class) {
+        match self.rpc_admission.acquire_with_kind(class, kind) {
             UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, wait_us } => {
                 if wait_us > 0 {
                     let _ = observability::emit_storage_rpc_admission_wait(
@@ -23131,6 +23170,49 @@ mod tests {
 
         drop(start_write);
         drop(completions);
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_pending_envelopes_cannot_exhaust_completion() {
+        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+            32,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let mut pending_envelopes = Vec::new();
+        for _ in 0..14 {
+            let pending_envelope = match admission.acquire_with_kind(
+                UnixStorageNodeRpcAdmissionClass::Completion,
+                StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            ) {
+                UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+                UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                    panic!("pending-envelope admission unexpectedly timed out before its cap")
+                }
+            };
+            pending_envelopes.push(pending_envelope);
+        }
+
+        assert!(matches!(
+            admission.acquire_with_kind(
+                UnixStorageNodeRpcAdmissionClass::Completion,
+                StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            ),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+
+        let release = match admission.acquire_with_kind(
+            UnixStorageNodeRpcAdmissionClass::Completion,
+            StorageRpcMessageKind::BucketWriteReservationRelease,
+        ) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("pending-envelope saturation should preserve completion capacity")
+            }
+        };
+
+        drop(release);
+        drop(pending_envelopes);
     }
 
     #[test]
