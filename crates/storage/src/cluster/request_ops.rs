@@ -2727,19 +2727,77 @@ impl super::StorageCluster {
     ) -> Result<(), BucketWriteDrainError> {
         let started = std::time::Instant::now();
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let node_store = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_delete_begin_start",
             Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
         );
+        let node_store = match self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
         {
-            let current = node_store
+            Ok(node_store) => node_store,
+            Err(error) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_failed",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} phase=primary_node elapsed_us={} error={:?}",
+                        bucket,
+                        pg_id.get(),
+                        started.elapsed().as_micros(),
+                        error
+                    )),
+                );
+                return Err(error.into());
+            }
+        };
+        {
+            let raw_snapshot_started = std::time::Instant::now();
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_delete_begin_raw_snapshot_start",
+                Some(format_args!(
+                    "bucket={:?} pg_id={} elapsed_us={}",
+                    bucket,
+                    pg_id.get(),
+                    started.elapsed().as_micros()
+                )),
+            );
+            let current = match node_store
                 .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)
-                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            {
+                Ok(current) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_raw_snapshot_done",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                            bucket,
+                            pg_id.get(),
+                            raw_snapshot_started.elapsed().as_micros(),
+                            started.elapsed().as_micros()
+                        )),
+                    );
+                    current
+                }
+                Err(error) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_raw_snapshot_failed",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} error={:?}",
+                            bucket,
+                            pg_id.get(),
+                            raw_snapshot_started.elapsed().as_micros(),
+                            started.elapsed().as_micros(),
+                            error
+                        )),
+                    );
+                    return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
+                }
+            };
             if let Some((expected_execution, expected_incarnation)) = expected_bucket_identity {
                 if current.bucket_execution_generation != expected_execution
                     || current.bucket_incarnation_generation != expected_incarnation
@@ -2787,19 +2845,127 @@ impl super::StorageCluster {
                 return Ok(());
             }
         }
-        if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
-            return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+        let stream_check_started = std::time::Instant::now();
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_stream_check_start",
+            Some(format_args!(
+                "bucket={:?} pg_id={} elapsed_us={}",
+                bucket,
+                pg_id.get(),
+                started.elapsed().as_micros()
+            )),
+        );
+        match self.active_put_object_stream_upload_source(bucket) {
+            Ok(Some(source)) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_stream_check_not_empty",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} source={:?}",
+                        bucket,
+                        pg_id.get(),
+                        stream_check_started.elapsed().as_micros(),
+                        started.elapsed().as_micros(),
+                        source
+                    )),
+                );
+                return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+            }
+            Ok(None) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_stream_check_done",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                        bucket,
+                        pg_id.get(),
+                        stream_check_started.elapsed().as_micros(),
+                        started.elapsed().as_micros()
+                    )),
+                );
+            }
+            Err(error) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_stream_check_failed",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} error={:?}",
+                        bucket,
+                        pg_id.get(),
+                        stream_check_started.elapsed().as_micros(),
+                        started.elapsed().as_micros(),
+                        error
+                    )),
+                );
+                return Err(error);
+            }
         }
+        let durable_drain_started = std::time::Instant::now();
+        let _ = observability::event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_durable_drain_start",
+            Some(format_args!(
+                "bucket={:?} pg_id={} elapsed_us={}",
+                bucket,
+                pg_id.get(),
+                started.elapsed().as_micros()
+            )),
+        );
         let mut durable_drain =
-            match self.begin_durable_bucket_delete_drain_with_budget(bucket, Some(started))? {
-                super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
-                super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            match self.begin_durable_bucket_delete_drain_with_budget(bucket, Some(started)) {
+                Ok(super::DurableBucketDeleteDrainBegin::Acquired(drain)) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_durable_drain_acquired",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                            bucket,
+                            pg_id.get(),
+                            durable_drain_started.elapsed().as_micros(),
+                            started.elapsed().as_micros()
+                        )),
+                    );
+                    drain
+                }
+                Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_durable_drain_already_deleting",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                            bucket,
+                            pg_id.get(),
+                            durable_drain_started.elapsed().as_micros(),
+                            started.elapsed().as_micros()
+                        )),
+                    );
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_delete_begin_done",
-                        Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} elapsed_us={}",
+                            bucket,
+                            pg_id.get(),
+                            started.elapsed().as_micros()
+                        )),
                     );
                     return Ok(());
+                }
+                Err(error) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_durable_drain_failed",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} error={:?}",
+                            bucket,
+                            pg_id.get(),
+                            durable_drain_started.elapsed().as_micros(),
+                            started.elapsed().as_micros(),
+                            error
+                        )),
+                    );
+                    return Err(error);
                 }
             };
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
@@ -3062,11 +3228,27 @@ impl super::StorageCluster {
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_done",
-                    Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} elapsed_us={}",
+                        bucket,
+                        pg_id.get(),
+                        started.elapsed().as_micros()
+                    )),
                 );
                 Ok(())
             }
             Err(error) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_failed",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} phase=budgeted_loop elapsed_us={} error={:?}",
+                        bucket,
+                        pg_id.get(),
+                        started.elapsed().as_micros(),
+                        error
+                    )),
+                );
                 self.rollback_durable_bucket_delete_drain(&durable_drain)?;
                 Err(error)
             }

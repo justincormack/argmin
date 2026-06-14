@@ -359,21 +359,75 @@ impl Coordinator {
     }
 
     pub fn delete_bucket(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let request_started = std::time::Instant::now();
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket",
             "bucket={:?}",
             req.name
         );
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_request_start",
+            Some(format_args!("bucket={:?}", req.name)),
+        );
+        let authorize_started = std::time::Instant::now();
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_authorize_start",
+            Some(format_args!("bucket={:?}", req.name)),
+        );
         let AuthorizedDeleteBucket {
             name,
             bucket_execution_generation,
             bucket_incarnation_generation,
-        } = self.authorize_delete_bucket(req)?;
+        } = match self.authorize_delete_bucket(req) {
+            Ok(authorized) => {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "bucket_delete_authorize_done",
+                    Some(format_args!(
+                        "bucket={:?} elapsed_us={} total_elapsed_us={}",
+                        authorized.name,
+                        authorize_started.elapsed().as_micros(),
+                        request_started.elapsed().as_micros()
+                    )),
+                );
+                authorized
+            }
+            Err(error) => {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "bucket_delete_authorize_failed",
+                    Some(format_args!(
+                        "bucket={:?} elapsed_us={} total_elapsed_us={} error={:?}",
+                        req.name,
+                        authorize_started.elapsed().as_micros(),
+                        request_started.elapsed().as_micros(),
+                        error
+                    )),
+                );
+                return Err(error);
+            }
+        };
         let _ = observability::event(
             TRACE_TARGET,
             "bucket_delete_authorized",
-            Some(format_args!("bucket={:?}", name)),
+            Some(format_args!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            )),
+        );
+        let begin_started = std::time::Instant::now();
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_delete_begin_call_start",
+            Some(format_args!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            )),
         );
         if let Err(err) = self.storage_node.begin_bucket_delete_if_current(
             &name,
@@ -383,14 +437,34 @@ impl Coordinator {
             let _ = observability::event(
                 TRACE_TARGET,
                 "bucket_delete_begin_failed",
-                Some(format_args!("bucket={:?} error={:?}", name, err)),
+                Some(format_args!(
+                    "bucket={:?} elapsed_us={} total_elapsed_us={} error={:?}",
+                    name,
+                    begin_started.elapsed().as_micros(),
+                    request_started.elapsed().as_micros(),
+                    err
+                )),
             );
             return Err(Self::map_bucket_write_drain_error(err));
         }
         let _ = observability::event(
             TRACE_TARGET,
+            "bucket_delete_begin_call_done",
+            Some(format_args!(
+                "bucket={:?} elapsed_us={} total_elapsed_us={}",
+                name,
+                begin_started.elapsed().as_micros(),
+                request_started.elapsed().as_micros()
+            )),
+        );
+        let _ = observability::event(
+            TRACE_TARGET,
             "bucket_delete_marked",
-            Some(format_args!("bucket={:?}", name)),
+            Some(format_args!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            )),
         );
         self.remove_bucket_fast_path(&name);
         self.read_runtime()
@@ -398,7 +472,11 @@ impl Coordinator {
         let _ = observability::event(
             TRACE_TARGET,
             "bucket_delete_finalize_enqueued",
-            Some(format_args!("bucket={:?}", name)),
+            Some(format_args!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            )),
         );
         Ok(())
     }
