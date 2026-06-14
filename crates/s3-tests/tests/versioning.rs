@@ -1,4 +1,3 @@
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, EncodingType,
@@ -24,36 +23,21 @@ const XML_SPECIAL_KEY: &str = "xml<>&\"key";
 const XML_SPECIAL_KEY_ENCODED: &str = "xml%3C%3E%26%22key";
 const CONCURRENT_VERSION_OPERATION_ATTEMPTS: usize = 20;
 
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
-
 async fn put_object_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
     body: Vec<u8>,
 ) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
+    s3_tests::retrying_operation_aborted("put object during versioning setup", || {
+        client
             .put_object()
             .bucket(bucket)
             .key(key)
             .body(ByteStream::from(body.clone()))
             .send()
-            .await
-        {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("put object during versioning setup: {err:?}"),
-        }
-    }
-    panic!("put object during versioning setup did not complete");
+    })
+    .await
 }
 
 async fn upload_part_retrying_operation_aborted(
@@ -64,8 +48,8 @@ async fn upload_part_retrying_operation_aborted(
     part_number: i32,
     body: Vec<u8>,
 ) -> aws_sdk_s3::operation::upload_part::UploadPartOutput {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
+    s3_tests::retrying_operation_aborted("upload part during versioning setup", || {
+        client
             .upload_part()
             .bucket(bucket)
             .key(key)
@@ -73,19 +57,8 @@ async fn upload_part_retrying_operation_aborted(
             .part_number(part_number)
             .body(ByteStream::from(body.clone()))
             .send()
-            .await
-        {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("upload part during versioning setup: {err:?}"),
-        }
-    }
-    panic!("upload part during versioning setup did not complete");
+    })
+    .await
 }
 
 async fn create_multipart_upload_retrying_operation_aborted(
@@ -93,25 +66,14 @@ async fn create_multipart_upload_retrying_operation_aborted(
     bucket: &str,
     key: &str,
 ) -> aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
+    s3_tests::retrying_operation_aborted("create multipart upload during versioning setup", || {
+        client
             .create_multipart_upload()
             .bucket(bucket)
             .key(key)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-        {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("create multipart upload during versioning setup: {err:?}"),
-        }
-    }
-    panic!("create multipart upload during versioning setup did not complete");
+            .send()
+    })
+    .await
 }
 
 async fn delete_object_retrying_operation_aborted(
@@ -119,25 +81,16 @@ async fn delete_object_retrying_operation_aborted(
     bucket: &str,
     key: &str,
 ) -> String {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client.delete_object().bucket(bucket).key(key).send().await {
-            Ok(output) => {
-                assert!(output.delete_marker().unwrap_or(false));
-                return output
-                    .version_id()
-                    .expect("delete marker version id")
-                    .to_string();
-            }
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("delete object during versioning setup: {err:?}"),
-        }
-    }
-    panic!("delete object during versioning setup did not complete");
+    let output =
+        s3_tests::retrying_operation_aborted("delete object during versioning setup", || {
+            client.delete_object().bucket(bucket).key(key).send()
+        })
+        .await;
+    assert!(output.delete_marker().unwrap_or(false));
+    output
+        .version_id()
+        .expect("delete marker version id")
+        .to_string()
 }
 
 async fn delete_object_version_retrying_operation_aborted(
@@ -146,25 +99,18 @@ async fn delete_object_version_retrying_operation_aborted(
     key: &str,
     version_id: &str,
 ) {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
-            .delete_object()
-            .bucket(bucket)
-            .key(key)
-            .version_id(version_id)
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("delete object version during concurrent version race: {err:?}"),
-        }
-    }
+    s3_tests::retrying_operation_aborted(
+        "delete object version during concurrent version race",
+        || {
+            client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version_id)
+                .send()
+        },
+    )
+    .await;
 }
 
 async fn complete_multipart_upload_retrying_operation_aborted(
@@ -174,31 +120,23 @@ async fn complete_multipart_upload_retrying_operation_aborted(
     upload_id: &str,
     etag: &str,
 ) -> aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
-            .complete_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
-                    .build(),
-            )
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-        {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("complete multipart upload during versioning setup: {err:?}"),
-        }
-    }
-    panic!("complete multipart upload during versioning setup did not complete");
+    s3_tests::retrying_operation_aborted(
+        "complete multipart upload during versioning setup",
+        || {
+            client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                        .build(),
+                )
+                .send()
+        },
+    )
+    .await
 }
 
 async fn copy_object_retrying_operation_aborted(
@@ -207,26 +145,15 @@ async fn copy_object_retrying_operation_aborted(
     key: &str,
     copy_source: String,
 ) -> aws_sdk_s3::operation::copy_object::CopyObjectOutput {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
+    s3_tests::retrying_operation_aborted("copy object during versioning setup", || {
+        client
             .copy_object()
             .bucket(bucket)
             .key(key)
             .copy_source(copy_source.clone())
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-        {
-            Ok(output) => return output,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("copy object during versioning setup: {err:?}"),
-        }
-    }
-    panic!("copy object during versioning setup did not complete");
+            .send()
+    })
+    .await
 }
 
 async fn put_bucket_versioning_retrying_operation_aborted(
@@ -234,8 +161,8 @@ async fn put_bucket_versioning_retrying_operation_aborted(
     bucket: &str,
     status: BucketVersioningStatus,
 ) {
-    for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
-        match client
+    s3_tests::retrying_operation_aborted("put bucket versioning during versioning setup", || {
+        client
             .put_bucket_versioning()
             .bucket(bucket)
             .versioning_configuration(
@@ -243,20 +170,9 @@ async fn put_bucket_versioning_retrying_operation_aborted(
                     .status(status.clone())
                     .build(),
             )
-            .send_retrying_operation_aborted("S3 operation during versioning test")
-            .await
-        {
-            Ok(_) => return,
-            Err(err)
-                if is_operation_aborted(&err)
-                    && attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS =>
-            {
-                sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-            }
-            Err(err) => panic!("put bucket versioning during versioning setup: {err:?}"),
-        }
-    }
-    panic!("put bucket versioning during versioning setup did not complete");
+            .send()
+    })
+    .await;
 }
 
 fn expected_raw_list_key(decoded_key: &str) -> String {
@@ -276,8 +192,9 @@ fn expected_raw_list_key(decoded_key: &str) -> String {
     format!("<Key>{escaped}</Key>")
 }
 
-fn raw_response_is_operation_aborted(response: &RawResponse) -> bool {
-    response.status == 409 && response.body.contains("<Code>OperationAborted</Code>")
+fn raw_response_is_retryable_operation_contention(response: &RawResponse) -> bool {
+    (response.status == 409 && response.body.contains("<Code>OperationAborted</Code>"))
+        || (response.status == 503 && response.body.contains("<Code>SlowDown</Code>"))
 }
 
 fn send_raw_retrying_operation_aborted<F>(description: &str, mut send: F) -> RawResponse
@@ -286,14 +203,14 @@ where
 {
     for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
         let response = send();
-        if !raw_response_is_operation_aborted(&response) {
+        if !raw_response_is_retryable_operation_contention(&response) {
             return response;
         }
         if attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
         }
     }
-    panic!("{description} did not complete without OperationAborted");
+    panic!("{description} did not complete without retryable operation contention");
 }
 
 fn assert_canonical_owner_id(id: &str) {
