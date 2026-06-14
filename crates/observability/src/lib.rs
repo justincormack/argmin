@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread;
-#[cfg(feature = "deep-tracing")]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceContext {
@@ -100,6 +98,18 @@ static STORAGE_RPC_ADMISSION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_ADMISSION_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_ADMISSION_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_CONTROL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_COMPLETION: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_START_WRITE: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_READ: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_ACTIVE_LIST: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_PENDING_ENVELOPE_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_PENDING_ENVELOPE_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_PENDING_ENVELOPE_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_US_MAX: AtomicU64 = AtomicU64::new(0);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -167,6 +177,7 @@ const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const FLIGHT_RECORDER_CAPACITY: usize = 512;
 const FLIGHT_RECORD_MAX_DETAIL_BYTES: usize = 1_024;
 const METADATA_COMMAND_DIMENSION_CAPACITY: usize = 512;
+const STORAGE_RPC_LONG_RUNNING_THRESHOLD: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlightRecord {
@@ -1136,6 +1147,13 @@ pub struct StorageRpcAdmissionSummary<'a> {
     pub timeout_us: Option<u128>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRpcActiveSummary<'a> {
+    pub node_id: u32,
+    pub rpc_kind: &'a str,
+    pub admission_class: &'a str,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub request_start_total: u64,
@@ -1154,6 +1172,18 @@ pub struct MetricsSnapshot {
     pub storage_rpc_admission_wait_total: u64,
     pub storage_rpc_admission_wait_us_total: u64,
     pub storage_rpc_admission_timeout_total: u64,
+    pub storage_rpc_active_total: u64,
+    pub storage_rpc_active_control: u64,
+    pub storage_rpc_active_completion: u64,
+    pub storage_rpc_active_progress: u64,
+    pub storage_rpc_active_start_write: u64,
+    pub storage_rpc_active_read: u64,
+    pub storage_rpc_active_list: u64,
+    pub storage_rpc_pending_envelope_active: u64,
+    pub storage_rpc_pending_envelope_started_total: u64,
+    pub storage_rpc_pending_envelope_completed_total: u64,
+    pub storage_rpc_pending_envelope_long_running_total: u64,
+    pub storage_rpc_pending_envelope_long_running_us_max: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
@@ -1197,12 +1227,52 @@ pub struct StreamUploadActiveSessionGuard {
     active: bool,
 }
 
+pub struct StorageRpcActiveGuard {
+    started_at: Instant,
+    summary: StorageRpcActiveSummary<'static>,
+    active: bool,
+}
+
 impl Drop for InflightRequestsGuard {
     fn drop(&mut self) {
         if self.active {
             INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
             self.active = false;
         }
+    }
+}
+
+impl Drop for StorageRpcActiveGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        STORAGE_RPC_PENDING_ENVELOPE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        STORAGE_RPC_PENDING_ENVELOPE_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let elapsed = self.started_at.elapsed();
+        if elapsed >= STORAGE_RPC_LONG_RUNNING_THRESHOLD {
+            let elapsed_us = saturating_u128_to_u64(elapsed.as_micros());
+            STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_TOTAL.fetch_add(1, Ordering::Relaxed);
+            fetch_max_atomic(
+                &STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_US_MAX,
+                elapsed_us,
+            );
+            if let Some(context) = current_context() {
+                record_flight_event(
+                    &context,
+                    "storage_rpc_client",
+                    "storage_rpc_pending_envelope_long_running",
+                    format!(
+                        "node_id={} rpc_kind={} admission_class={} elapsed_us={}",
+                        self.summary.node_id,
+                        self.summary.rpc_kind,
+                        self.summary.admission_class,
+                        elapsed_us
+                    ),
+                );
+            }
+        }
+        self.active = false;
     }
 }
 
@@ -1227,6 +1297,47 @@ pub fn stream_upload_active_session_guard() -> StreamUploadActiveSessionGuard {
     StreamUploadActiveSessionGuard { active: true }
 }
 
+pub fn storage_rpc_admission_class_acquired(admission_class: &'static str) {
+    STORAGE_RPC_ACTIVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if let Some(counter) = storage_rpc_admission_class_counter(admission_class) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn storage_rpc_admission_class_released(admission_class: &'static str) {
+    STORAGE_RPC_ACTIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+    if let Some(counter) = storage_rpc_admission_class_counter(admission_class) {
+        counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[must_use]
+pub fn storage_rpc_pending_envelope_guard(
+    summary: StorageRpcActiveSummary<'static>,
+) -> StorageRpcActiveGuard {
+    STORAGE_RPC_PENDING_ENVELOPE_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    STORAGE_RPC_PENDING_ENVELOPE_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    StorageRpcActiveGuard {
+        started_at: Instant::now(),
+        summary,
+        active: true,
+    }
+}
+
+fn storage_rpc_admission_class_counter(
+    admission_class: &'static str,
+) -> Option<&'static AtomicU64> {
+    match admission_class {
+        "control" => Some(&STORAGE_RPC_ACTIVE_CONTROL),
+        "completion" => Some(&STORAGE_RPC_ACTIVE_COMPLETION),
+        "progress" => Some(&STORAGE_RPC_ACTIVE_PROGRESS),
+        "start_write" => Some(&STORAGE_RPC_ACTIVE_START_WRITE),
+        "read" => Some(&STORAGE_RPC_ACTIVE_READ),
+        "list" => Some(&STORAGE_RPC_ACTIVE_LIST),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn metrics_snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
@@ -1248,6 +1359,23 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         storage_rpc_admission_timeout_total: STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL
             .load(Ordering::Relaxed),
+        storage_rpc_active_total: STORAGE_RPC_ACTIVE_TOTAL.load(Ordering::Relaxed),
+        storage_rpc_active_control: STORAGE_RPC_ACTIVE_CONTROL.load(Ordering::Relaxed),
+        storage_rpc_active_completion: STORAGE_RPC_ACTIVE_COMPLETION.load(Ordering::Relaxed),
+        storage_rpc_active_progress: STORAGE_RPC_ACTIVE_PROGRESS.load(Ordering::Relaxed),
+        storage_rpc_active_start_write: STORAGE_RPC_ACTIVE_START_WRITE.load(Ordering::Relaxed),
+        storage_rpc_active_read: STORAGE_RPC_ACTIVE_READ.load(Ordering::Relaxed),
+        storage_rpc_active_list: STORAGE_RPC_ACTIVE_LIST.load(Ordering::Relaxed),
+        storage_rpc_pending_envelope_active: STORAGE_RPC_PENDING_ENVELOPE_ACTIVE
+            .load(Ordering::Relaxed),
+        storage_rpc_pending_envelope_started_total: STORAGE_RPC_PENDING_ENVELOPE_STARTED_TOTAL
+            .load(Ordering::Relaxed),
+        storage_rpc_pending_envelope_completed_total: STORAGE_RPC_PENDING_ENVELOPE_COMPLETED_TOTAL
+            .load(Ordering::Relaxed),
+        storage_rpc_pending_envelope_long_running_total:
+            STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_TOTAL.load(Ordering::Relaxed),
+        storage_rpc_pending_envelope_long_running_us_max:
+            STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_US_MAX.load(Ordering::Relaxed),
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),

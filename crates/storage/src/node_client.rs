@@ -2774,6 +2774,7 @@ struct UnixStorageNodeRpcAdmission {
 struct UnixStorageNodeRpcAdmissionPermit {
     admission: Arc<UnixStorageNodeRpcAdmission>,
     class: UnixStorageNodeRpcAdmissionClass,
+    observed_active: bool,
 }
 
 enum UnixStorageNodeRpcAdmissionAcquire {
@@ -2925,9 +2926,13 @@ impl UnixStorageNodeRpcAdmission {
             return None;
         }
         active.acquire(UnixStorageNodeRpcAdmissionClass::Control);
+        observability::storage_rpc_admission_class_acquired(
+            UnixStorageNodeRpcAdmissionClass::Control.as_str(),
+        );
         Some(UnixStorageNodeRpcAdmissionPermit {
             admission: Arc::clone(self),
             class: UnixStorageNodeRpcAdmissionClass::Control,
+            observed_active: true,
         })
     }
 
@@ -2943,10 +2948,12 @@ impl UnixStorageNodeRpcAdmission {
         loop {
             if self.can_admit(&active, class) {
                 active.acquire(class);
+                observability::storage_rpc_admission_class_acquired(class.as_str());
                 return UnixStorageNodeRpcAdmissionAcquire::Acquired {
                     permit: UnixStorageNodeRpcAdmissionPermit {
                         admission: Arc::clone(self),
                         class,
+                        observed_active: true,
                     },
                     wait_us: if waited {
                         started_at.elapsed().as_micros()
@@ -3030,6 +3037,10 @@ impl Drop for UnixStorageNodeRpcAdmissionPermit {
             .unwrap_or_else(|e| e.into_inner());
         active.release(self.class);
         self.admission.capacity_available.notify_all();
+        if self.observed_active {
+            observability::storage_rpc_admission_class_released(self.class.as_str());
+            self.observed_active = false;
+        }
     }
 }
 
@@ -4463,10 +4474,20 @@ impl UnixStorageNodeClient {
         &self,
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
-        _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
+        rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        let _pending_envelope_guard =
+            (kind == StorageRpcMessageKind::MetadataCommandPendingEnvelope).then(|| {
+                observability::storage_rpc_pending_envelope_guard(
+                    observability::StorageRpcActiveSummary {
+                        node_id: self.node_id.as_u32(),
+                        rpc_kind: kind.operation_name(),
+                        admission_class: rpc_permit.class.as_str(),
+                    },
+                )
+            });
         let trace_rpc_lifecycle = trace_storage_rpc_lifecycle(kind);
         if trace_rpc_lifecycle {
             let _ = observability::emit_flight_event(
