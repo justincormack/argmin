@@ -660,10 +660,7 @@ impl StorageNodeMetadataCommandLocks {
         let mut next_diagnostic_at = started_at + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_AFTER;
         let mut waited = false;
         let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            let Some(holder) = held.get(&pg_id).copied() else {
-                break;
-            };
+        while let Some(holder) = held.get(&pg_id).copied() {
             waited = true;
             #[cfg(test)]
             let before_wait_hook = self

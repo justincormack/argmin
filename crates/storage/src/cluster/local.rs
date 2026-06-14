@@ -34374,7 +34374,7 @@ mod tests {
         released.enqueue_object_payload_reclaim();
         assert!(
             object_payload_reclaim_event_count("deduplicated")
-                >= deduplicated_events_before_release_requeue + 1,
+                > deduplicated_events_before_release_requeue,
             "lease-release requeue should deduplicate against the worker's deferred reclaim root"
         );
         assert!(
@@ -35698,7 +35698,8 @@ mod tests {
             let pg = applied_replica.get_pg(1).unwrap();
             crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
         };
-        for node_id in [NodeId::new(1)] {
+        {
+            let node_id = NodeId::new(1);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
@@ -35707,7 +35708,8 @@ mod tests {
                 "primary-first apply should create bucket on node {node_id:?} before the replica failure"
             );
         }
-        for node_id in [NodeId::new(2)] {
+        {
+            let node_id = NodeId::new(2);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert!(
@@ -36138,7 +36140,8 @@ mod tests {
             partial_info.versioning,
             crate::BucketVersioningState::Enabled
         );
-        for node_id in [NodeId::new(1)] {
+        {
+            let node_id = NodeId::new(1);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert_eq!(
@@ -36149,7 +36152,8 @@ mod tests {
                 "primary-first apply should update node {node_id:?} before the replica failure"
             );
         }
-        for node_id in [NodeId::new(2)] {
+        {
+            let node_id = NodeId::new(2);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert_eq!(
@@ -36468,7 +36472,8 @@ mod tests {
         };
         assert!(partial_info.public_read);
         assert!(!partial_info.public_write);
-        for node_id in [NodeId::new(1)] {
+        {
+            let node_id = NodeId::new(1);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
@@ -36477,7 +36482,8 @@ mod tests {
                 "primary-first apply should update node {node_id:?} before the replica failure"
             );
         }
-        for node_id in [NodeId::new(2)] {
+        {
+            let node_id = NodeId::new(2);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
@@ -37014,7 +37020,8 @@ mod tests {
             crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
         };
         assert_eq!(partial_info.public_access_block, Some(public_access_block));
-        for node_id in [NodeId::new(1)] {
+        {
+            let node_id = NodeId::new(1);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert_eq!(
@@ -37025,7 +37032,8 @@ mod tests {
                 "primary-first apply should update node {node_id:?} before the replica failure"
             );
         }
-        for node_id in [NodeId::new(2)] {
+        {
+            let node_id = NodeId::new(2);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             assert_eq!(
@@ -37450,7 +37458,8 @@ mod tests {
         assert!(partial_info.bucket_policy_present);
         assert!(!partial_info.bucket_policy_public);
         assert_eq!(partial_info.bucket_policy_generation, 1);
-        for node_id in [NodeId::new(1)] {
+        {
+            let node_id = NodeId::new(1);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
@@ -37459,7 +37468,8 @@ mod tests {
                 "primary-first apply should update node {node_id:?} before the replica failure"
             );
         }
-        for node_id in [NodeId::new(2)] {
+        {
+            let node_id = NodeId::new(2);
             let node = map.node(node_id).unwrap().storage_node();
             let pg = node.get_pg(1).unwrap();
             let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();

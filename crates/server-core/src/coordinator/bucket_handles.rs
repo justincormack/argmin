@@ -139,26 +139,47 @@ pub(super) struct LoadedBucketHandle {
     cors: LoadedBucketValue<String>,
 }
 
-impl LoadedBucketHandle {
-    pub(super) fn new(
-        bucket: BucketSummary,
-        bucket_execution_generation: u64,
-        bucket_incarnation_generation: u64,
-        request: BucketHandleRequest,
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct LoadedBucketSubresources {
+    policy: LoadedBucketValue<String>,
+    tags: LoadedBucketValue<String>,
+    lifecycle: LoadedBucketValue<String>,
+    cors: LoadedBucketValue<String>,
+}
+
+impl LoadedBucketSubresources {
+    pub(super) const fn new(
         policy: LoadedBucketValue<String>,
         tags: LoadedBucketValue<String>,
         lifecycle: LoadedBucketValue<String>,
         cors: LoadedBucketValue<String>,
     ) -> Self {
         Self {
-            bucket,
-            bucket_execution_generation,
-            bucket_incarnation_generation,
-            request,
             policy,
             tags,
             lifecycle,
             cors,
+        }
+    }
+}
+
+impl LoadedBucketHandle {
+    pub(super) fn new(
+        bucket: BucketSummary,
+        bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
+        request: BucketHandleRequest,
+        subresources: LoadedBucketSubresources,
+    ) -> Self {
+        Self {
+            bucket,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+            request,
+            policy: subresources.policy,
+            tags: subresources.tags,
+            lifecycle: subresources.lifecycle,
+            cors: subresources.cors,
         }
     }
 
@@ -386,10 +407,12 @@ impl<'a> BucketHandleLoader<'a> {
             bucket_execution_generation,
             bucket_incarnation_generation,
             request,
-            Self::from_storage_subresource(snapshot.policy),
-            Self::from_storage_subresource(snapshot.tags),
-            Self::from_storage_subresource(snapshot.lifecycle),
-            Self::from_storage_subresource(snapshot.cors),
+            LoadedBucketSubresources::new(
+                Self::from_storage_subresource(snapshot.policy),
+                Self::from_storage_subresource(snapshot.tags),
+                Self::from_storage_subresource(snapshot.lifecycle),
+                Self::from_storage_subresource(snapshot.cors),
+            ),
         ))
     }
 

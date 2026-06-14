@@ -44,7 +44,8 @@ use super::authz_results::{
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use super::bucket_handles::{
-    BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
+    BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketSubresources,
+    LoadedBucketValue,
 };
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
@@ -1542,10 +1543,12 @@ impl Coordinator {
                         bucket_execution_generation,
                         bucket_incarnation_generation,
                         request,
-                        policy,
-                        tags,
-                        LoadedBucketValue::NotRequested,
-                        LoadedBucketValue::NotRequested,
+                        LoadedBucketSubresources::new(
+                            policy,
+                            tags,
+                            LoadedBucketValue::NotRequested,
+                            LoadedBucketValue::NotRequested,
+                        ),
                     ));
                 }
             }

@@ -670,15 +670,19 @@ impl TwoGenerationReclaimTraceModel {
                         self.new_metadata_exists = false;
                         self.enqueue_bucket_delete();
                     }
-                    TraceGeneration::Old if self.old_metadata_exists && self.old_lease_held => {
-                        if !self.deferred.contains(&generation) {
-                            self.deferred.push(generation);
-                        }
+                    TraceGeneration::Old
+                        if self.old_metadata_exists
+                            && self.old_lease_held
+                            && !self.deferred.contains(&generation) =>
+                    {
+                        self.deferred.push(generation);
                     }
-                    TraceGeneration::New if self.new_metadata_exists && self.new_lease_held => {
-                        if !self.deferred.contains(&generation) {
-                            self.deferred.push(generation);
-                        }
+                    TraceGeneration::New
+                        if self.new_metadata_exists
+                            && self.new_lease_held
+                            && !self.deferred.contains(&generation) =>
+                    {
+                        self.deferred.push(generation);
                     }
                     _ => {}
                 }
@@ -846,15 +850,19 @@ impl TwoKeyReclaimTraceModel {
                         self.key_b_metadata_exists = false;
                         self.enqueue_bucket_delete();
                     }
-                    TraceKey::A if self.key_a_metadata_exists && self.key_a_lease_held => {
-                        if !self.deferred.contains(&key) {
-                            self.deferred.push(key);
-                        }
+                    TraceKey::A
+                        if self.key_a_metadata_exists
+                            && self.key_a_lease_held
+                            && !self.deferred.contains(&key) =>
+                    {
+                        self.deferred.push(key);
                     }
-                    TraceKey::B if self.key_b_metadata_exists && self.key_b_lease_held => {
-                        if !self.deferred.contains(&key) {
-                            self.deferred.push(key);
-                        }
+                    TraceKey::B
+                        if self.key_b_metadata_exists
+                            && self.key_b_lease_held
+                            && !self.deferred.contains(&key) =>
+                    {
+                        self.deferred.push(key);
                     }
                     _ => {}
                 }

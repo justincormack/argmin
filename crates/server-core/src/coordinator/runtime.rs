@@ -52,9 +52,7 @@ fn earliest_object_payload_reclaim_retry_sleep(
     let mut earliest_retry: Option<Instant> = None;
     for (bucket, key, _) in deferred_work {
         let pg_id = storage_node.object_payload_reclaim_pg_id(bucket, key);
-        let Some(retry_after) = retry_after_by_pg.get(&pg_id) else {
-            return None;
-        };
+        let retry_after = retry_after_by_pg.get(&pg_id)?;
         if *retry_after <= now {
             return None;
         }
