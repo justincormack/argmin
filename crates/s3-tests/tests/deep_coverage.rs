@@ -34,7 +34,7 @@ async fn setup_versioned_bucket() -> String {
                 .status(BucketVersioningStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("enable versioning during deep coverage setup")
         .await
         .unwrap();
     bucket
@@ -946,25 +946,15 @@ fn test_large_put_versioned_bucket() {
         let data_v2: Vec<u8> = (0..size).map(|i| ((i + 128) % 251) as u8).collect();
 
         // Write v1.
-        let r1 = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(data_v1.clone()))
-            .send()
-            .await
-            .unwrap();
+        let r1 =
+            s3_tests::put_object_retrying_operation_aborted(client, &bucket, key, data_v1.clone())
+                .await;
         let vid1 = r1.version_id().unwrap().to_string();
 
         // Write v2.
-        let r2 = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(data_v2.clone()))
-            .send()
-            .await
-            .unwrap();
+        let r2 =
+            s3_tests::put_object_retrying_operation_aborted(client, &bucket, key, data_v2.clone())
+                .await;
         let vid2 = r2.version_id().unwrap().to_string();
         assert_ne!(vid1, vid2, "versions should differ");
 
