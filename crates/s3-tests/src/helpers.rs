@@ -209,6 +209,12 @@ fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) 
     err.as_service_error().and_then(ProvideErrorMetadata::code)
 }
 
+fn is_retryable_operation_contention<E: ProvideErrorMetadata>(
+    err: &aws_sdk_s3::error::SdkError<E>,
+) -> bool {
+    matches!(s3_error_code(err), Some("OperationAborted" | "SlowDown"))
+}
+
 pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
@@ -236,7 +242,7 @@ where
         match op().await {
             Ok(output) => return Ok(output),
             Err(err)
-                if s3_error_code(&err) == Some("OperationAborted")
+                if is_retryable_operation_contention(&err)
                     && std::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -266,7 +272,7 @@ pub trait SendRetryingOperationAborted: Clone {
             loop {
                 match self.clone().send_once().await {
                     Err(err)
-                        if s3_error_code(&err) == Some("OperationAborted")
+                        if is_retryable_operation_contention(&err)
                             && std::time::Instant::now() < deadline =>
                     {
                         tokio::time::sleep(RETRY_DELAY).await;
@@ -909,7 +915,7 @@ pub async fn delete_objects_retrying_operation_aborted(
         {
             Ok(resp) => resp,
             Err(err)
-                if s3_error_code(&err) == Some("OperationAborted")
+                if is_retryable_operation_contention(&err)
                     && std::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -922,7 +928,9 @@ pub async fn delete_objects_retrying_operation_aborted(
 
         let mut retry = Vec::new();
         for error in resp.errors() {
-            if error.code() == Some("OperationAborted") && std::time::Instant::now() < deadline {
+            if matches!(error.code(), Some("OperationAborted" | "SlowDown"))
+                && std::time::Instant::now() < deadline
+            {
                 retry.push(matching_delete_object(&all_objects, error));
             } else {
                 errors.push(error.clone());
