@@ -370,26 +370,30 @@ fn test_atomic_conditional_write() {
         let key = "atomic-cond-write";
 
         // Write 'A', capture etag
-        let resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'A', ONE_MIB)))
-            .send()
-            .await
-            .unwrap();
+        let resp = retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'A', ONE_MIB)))
+                .send()
+        })
+        .await
+        .unwrap();
         let etag_a = resp.e_tag().unwrap().to_string();
 
         // Conditional overwrite with if_match(<etag>) — must succeed
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .if_match(&etag_a)
-            .body(ByteStream::from(make_body(b'B', ONE_MIB)))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .if_match(&etag_a)
+                .body(ByteStream::from(make_body(b'B', ONE_MIB)))
+                .send()
+        })
+        .await
+        .unwrap();
 
         let body = get_body(&bucket, key).await;
         assert_uniform(&body, ONE_MIB);
@@ -410,35 +414,41 @@ fn test_atomic_dual_conditional_write() {
         let key = "atomic-dual-cond";
 
         // Write 'A', capture etag
-        let resp = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'A', ONE_MIB)))
-            .send()
-            .await
-            .unwrap();
+        let resp = retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'A', ONE_MIB)))
+                .send()
+        })
+        .await
+        .unwrap();
         let etag_a = resp.e_tag().unwrap().to_string();
 
         // Unconditional overwrite with 'B' (changes the etag)
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'B', ONE_MIB)))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(make_body(b'B', ONE_MIB)))
+                .send()
+        })
+        .await
+        .unwrap();
 
         // Conditional overwrite with stale etag → must fail
-        let result = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .if_match(&etag_a)
-            .body(ByteStream::from(make_body(b'C', ONE_MIB)))
-            .send()
-            .await;
+        let result = retrying_operation_aborted_result(|| {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .if_match(&etag_a)
+                .body(ByteStream::from(make_body(b'C', ONE_MIB)))
+                .send()
+        })
+        .await;
         assert_eq!(err_status(&result), 412);
 
         // Object must still be all 'B'
