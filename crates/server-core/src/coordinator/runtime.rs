@@ -163,6 +163,11 @@ impl ReclaimSweeper {
                 let mut next_durable_scan_at = Instant::now();
                 let mut pending_work = None;
                 while !worker_stop.load(Ordering::SeqCst) {
+                    enqueue_durable_reclaim_work_if_due(
+                        &worker_node,
+                        &deferred_object_payload_reclaim_roots,
+                        &mut next_durable_scan_at,
+                    );
                     let Some(work) = pending_work
                         .take()
                         .or_else(|| worker_node.try_take_reclaim_work())
