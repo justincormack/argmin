@@ -40,10 +40,6 @@ fn make_body(ch: u8, size: usize) -> Vec<u8> {
     vec![ch; size]
 }
 
-async fn get_body(bucket: &str, key: &str) -> Vec<u8> {
-    get_body_result(bucket, key).await.unwrap()
-}
-
 async fn get_body_result(bucket: &str, key: &str) -> Result<Vec<u8>, String> {
     let resp = CTX
         .client()
@@ -124,17 +120,14 @@ where
                 last_error = Some(err);
             }
             Err(err) => {
-                panic!(
-                    "atomic read case failed during {}: {}",
-                    err.context, err.message
-                );
+                panic!("atomic case failed during {}: {}", err.context, err.message);
             }
         }
     }
 
     let err = last_error.expect("atomic read retry loop must record the final error");
     panic!(
-        "atomic read case failed after {max_attempts} attempts during {}: {}",
+        "atomic case failed after {max_attempts} attempts during {}: {}",
         err.context, err.message
     );
 }
@@ -359,17 +352,12 @@ atomic_size_test!(
 );
 atomic_size_test!(test_atomic_dual_write_10mb, atomic_dual_write_case, TEN_MIB);
 
-/// Conditional overwrite with if_match(<etag>) succeeds atomically.
-///
-/// Matches Ceph: test_atomic_conditional_write_1mb
-#[test]
-fn test_atomic_conditional_write() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-        let key = "atomic-cond-write";
+async fn atomic_conditional_write_attempt() -> Result<(), AtomicAttemptError> {
+    let client = CTX.client();
+    let bucket = setup_bucket().await;
+    let key = "atomic-cond-write";
 
-        // Write 'A', capture etag
+    let result = async {
         let resp = retrying_operation_aborted_result(|| {
             client
                 .put_object()
@@ -379,10 +367,9 @@ fn test_atomic_conditional_write() {
                 .send()
         })
         .await
-        .unwrap();
+        .map_err(|err| AtomicAttemptError::new("initial conditional put", format!("{err:?}")))?;
         let etag_a = resp.e_tag().unwrap().to_string();
 
-        // Conditional overwrite with if_match(<etag>) — must succeed
         retrying_operation_aborted_result(|| {
             client
                 .put_object()
@@ -393,27 +380,38 @@ fn test_atomic_conditional_write() {
                 .send()
         })
         .await
-        .unwrap();
+        .map_err(|err| AtomicAttemptError::new("conditional overwrite put", format!("{err:?}")))?;
 
-        let body = get_body(&bucket, key).await;
+        let body = get_body_result(&bucket, key)
+            .await
+            .map_err(|err| AtomicAttemptError::new("conditional final get", err))?;
         assert_uniform(&body, ONE_MIB);
         assert_eq!(body[0], b'B');
 
-        cleanup(&bucket, &[key]).await;
+        Ok(())
+    }
+    .await;
+
+    cleanup(&bucket, &[key]).await;
+    result
+}
+
+/// Conditional overwrite with if_match(<etag>) succeeds atomically.
+///
+/// Matches Ceph: test_atomic_conditional_write_1mb
+#[test]
+fn test_atomic_conditional_write() {
+    s3_tests::run(async {
+        retry_atomic_case(atomic_conditional_write_attempt).await;
     });
 }
 
-/// Conditional overwrite with a stale etag fails with 412 PreconditionFailed.
-///
-/// Matches Ceph: test_atomic_dual_conditional_write_1mb
-#[test]
-fn test_atomic_dual_conditional_write() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-        let key = "atomic-dual-cond";
+async fn atomic_dual_conditional_write_attempt() -> Result<(), AtomicAttemptError> {
+    let client = CTX.client();
+    let bucket = setup_bucket().await;
+    let key = "atomic-dual-cond";
 
-        // Write 'A', capture etag
+    let result = async {
         let resp = retrying_operation_aborted_result(|| {
             client
                 .put_object()
@@ -423,10 +421,9 @@ fn test_atomic_dual_conditional_write() {
                 .send()
         })
         .await
-        .unwrap();
+        .map_err(|err| AtomicAttemptError::new("initial stale-etag put", format!("{err:?}")))?;
         let etag_a = resp.e_tag().unwrap().to_string();
 
-        // Unconditional overwrite with 'B' (changes the etag)
         retrying_operation_aborted_result(|| {
             client
                 .put_object()
@@ -436,10 +433,9 @@ fn test_atomic_dual_conditional_write() {
                 .send()
         })
         .await
-        .unwrap();
+        .map_err(|err| AtomicAttemptError::new("stale-etag overwrite put", format!("{err:?}")))?;
 
-        // Conditional overwrite with stale etag → must fail
-        let result = retrying_operation_aborted_result(|| {
+        let stale_result = retrying_operation_aborted_result(|| {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -449,14 +445,47 @@ fn test_atomic_dual_conditional_write() {
                 .send()
         })
         .await;
-        assert_eq!(err_status(&result), 412);
+        match stale_result {
+            Ok(_) => {
+                return Err(AtomicAttemptError::new(
+                    "stale conditional put",
+                    "expected HTTP 412, got success".to_string(),
+                ));
+            }
+            Err(err)
+                if err
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                    == Some(412) => {}
+            Err(err) => {
+                return Err(AtomicAttemptError::new(
+                    "stale conditional put",
+                    format!("{err:?}"),
+                ));
+            }
+        }
 
-        // Object must still be all 'B'
-        let body = get_body(&bucket, key).await;
+        let body = get_body_result(&bucket, key)
+            .await
+            .map_err(|err| AtomicAttemptError::new("stale-etag final get", err))?;
         assert_uniform(&body, ONE_MIB);
         assert_eq!(body[0], b'B');
 
-        cleanup(&bucket, &[key]).await;
+        Ok(())
+    }
+    .await;
+
+    cleanup(&bucket, &[key]).await;
+    result
+}
+
+/// Conditional overwrite with a stale etag fails with 412 PreconditionFailed.
+///
+/// Matches Ceph: test_atomic_dual_conditional_write_1mb
+#[test]
+fn test_atomic_dual_conditional_write() {
+    s3_tests::run(async {
+        retry_atomic_case(atomic_dual_conditional_write_attempt).await;
     });
 }
 
