@@ -4483,6 +4483,7 @@ impl UnixStorageNodeClient {
                 observability::storage_rpc_pending_envelope_guard(
                     observability::StorageRpcActiveSummary {
                         node_id: self.node_id.as_u32(),
+                        rpc_request_id: request_id,
                         rpc_kind: kind.operation_name(),
                         admission_class: rpc_permit.class.as_str(),
                     },

@@ -389,6 +389,12 @@ print_slowdown_summary() {
         local storage_rpc_admission_wait_us
         local storage_rpc_admission_timeout
         local storage_rpc_admission_wait_percent
+        local storage_rpc_active_total
+        local storage_rpc_active_completion
+        local storage_rpc_pending_envelope_active
+        local storage_rpc_pending_envelope_oldest_active_us
+        local storage_rpc_pending_envelope_oldest_active_node_id
+        local storage_rpc_pending_envelope_oldest_active_request_id
         local metadata_recovery_leader
         local metadata_recovery_wait
         local metadata_recovery_wait_us
@@ -417,6 +423,12 @@ print_slowdown_summary() {
         storage_rpc_admission_wait="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_total)"
         storage_rpc_admission_wait_us="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_us_total)"
         storage_rpc_admission_timeout="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_timeout_total)"
+        storage_rpc_active_total="$(latest_metric_sample_value "$metrics_log" storage_rpc_active_total)"
+        storage_rpc_active_completion="$(latest_metric_sample_value "$metrics_log" storage_rpc_active_completion)"
+        storage_rpc_pending_envelope_active="$(latest_metric_sample_value "$metrics_log" storage_rpc_pending_envelope_active)"
+        storage_rpc_pending_envelope_oldest_active_us="$(latest_metric_sample_value "$metrics_log" storage_rpc_pending_envelope_oldest_active_us)"
+        storage_rpc_pending_envelope_oldest_active_node_id="$(latest_metric_sample_value "$metrics_log" storage_rpc_pending_envelope_oldest_active_node_id)"
+        storage_rpc_pending_envelope_oldest_active_request_id="$(latest_metric_sample_value "$metrics_log" storage_rpc_pending_envelope_oldest_active_request_id)"
         metadata_recovery_leader="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_leader_total)"
         metadata_recovery_wait="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_wait_total)"
         metadata_recovery_wait_us="$(latest_metric_sample_value "$metrics_log" metadata_command_recovery_wait_us_total)"
@@ -440,6 +452,7 @@ print_slowdown_summary() {
             storage_rpc_admission_wait_percent="0.00"
         fi
         echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
+        echo "storage_rpc_active total=$storage_rpc_active_total completion=$storage_rpc_active_completion pending_envelope_active=$storage_rpc_pending_envelope_active pending_envelope_oldest_active_us=$storage_rpc_pending_envelope_oldest_active_us pending_envelope_oldest_active_node_id=$storage_rpc_pending_envelope_oldest_active_node_id pending_envelope_oldest_active_request_id=$storage_rpc_pending_envelope_oldest_active_request_id" >&2
         echo "metadata_recovery leader_total=$metadata_recovery_leader wait_total=$metadata_recovery_wait wait_us_total=$metadata_recovery_wait_us wait_us_max=$metadata_recovery_wait_us_max timeout_total=$metadata_recovery_timeout outcome_total=$metadata_recovery_outcome" >&2
         echo "metadata_budget exhausted_total=$metadata_budget_exhausted backoff_total=$metadata_backoff backoff_us_total=$metadata_backoff_us backoff_us_max=$metadata_backoff_us_max" >&2
         echo "reclaim queue_depth=$reclaim_queue_depth object_payload_queue_depth=$object_payload_reclaim_queue_depth object_payload_outstanding_depth=$object_payload_reclaim_outstanding_depth bucket_delete_queue_depth=$bucket_delete_finalize_queue_depth queue_action_total=$reclaim_queue_action object_payload_event_total=$object_payload_reclaim_event durable_scan_total=$object_payload_reclaim_durable_scan" >&2

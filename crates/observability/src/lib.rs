@@ -110,6 +110,7 @@ static STORAGE_RPC_PENDING_ENVELOPE_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0)
 static STORAGE_RPC_PENDING_ENVELOPE_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_US_MAX: AtomicU64 = AtomicU64::new(0);
+static STORAGE_RPC_PENDING_ENVELOPE_ACTIVE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1150,8 +1151,17 @@ pub struct StorageRpcAdmissionSummary<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageRpcActiveSummary<'a> {
     pub node_id: u32,
+    pub rpc_request_id: u64,
     pub rpc_kind: &'a str,
     pub admission_class: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StorageRpcPendingEnvelopeActiveRecord {
+    sequence: u64,
+    node_id: u32,
+    rpc_request_id: u64,
+    started_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1184,6 +1194,9 @@ pub struct MetricsSnapshot {
     pub storage_rpc_pending_envelope_completed_total: u64,
     pub storage_rpc_pending_envelope_long_running_total: u64,
     pub storage_rpc_pending_envelope_long_running_us_max: u64,
+    pub storage_rpc_pending_envelope_oldest_active_us: u64,
+    pub storage_rpc_pending_envelope_oldest_active_node_id: u64,
+    pub storage_rpc_pending_envelope_oldest_active_request_id: u64,
     pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
@@ -1230,6 +1243,7 @@ pub struct StreamUploadActiveSessionGuard {
 pub struct StorageRpcActiveGuard {
     started_at: Instant,
     summary: StorageRpcActiveSummary<'static>,
+    sequence: u64,
     active: bool,
 }
 
@@ -1249,6 +1263,10 @@ impl Drop for StorageRpcActiveGuard {
         }
         STORAGE_RPC_PENDING_ENVELOPE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
         STORAGE_RPC_PENDING_ENVELOPE_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        storage_rpc_pending_envelope_active_records()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|record| record.sequence != self.sequence);
         let elapsed = self.started_at.elapsed();
         if elapsed >= STORAGE_RPC_LONG_RUNNING_THRESHOLD {
             let elapsed_us = saturating_u128_to_u64(elapsed.as_micros());
@@ -1315,13 +1333,31 @@ pub fn storage_rpc_admission_class_released(admission_class: &'static str) {
 pub fn storage_rpc_pending_envelope_guard(
     summary: StorageRpcActiveSummary<'static>,
 ) -> StorageRpcActiveGuard {
+    let started_at = Instant::now();
+    let sequence = STORAGE_RPC_PENDING_ENVELOPE_ACTIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     STORAGE_RPC_PENDING_ENVELOPE_ACTIVE.fetch_add(1, Ordering::Relaxed);
     STORAGE_RPC_PENDING_ENVELOPE_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    storage_rpc_pending_envelope_active_records()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(StorageRpcPendingEnvelopeActiveRecord {
+            sequence,
+            node_id: summary.node_id,
+            rpc_request_id: summary.rpc_request_id,
+            started_at,
+        });
     StorageRpcActiveGuard {
-        started_at: Instant::now(),
+        started_at,
         summary,
+        sequence,
         active: true,
     }
+}
+
+fn storage_rpc_pending_envelope_active_records(
+) -> &'static Mutex<Vec<StorageRpcPendingEnvelopeActiveRecord>> {
+    static ACTIVE: OnceLock<Mutex<Vec<StorageRpcPendingEnvelopeActiveRecord>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn storage_rpc_admission_class_counter(
@@ -1340,6 +1376,22 @@ fn storage_rpc_admission_class_counter(
 
 #[must_use]
 pub fn metrics_snapshot() -> MetricsSnapshot {
+    let pending_envelope_oldest_active = {
+        let records = storage_rpc_pending_envelope_active_records()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        records
+            .iter()
+            .max_by_key(|record| record.started_at.elapsed())
+            .map(|record| {
+                (
+                    saturating_u128_to_u64(record.started_at.elapsed().as_micros()),
+                    u64::from(record.node_id),
+                    record.rpc_request_id,
+                )
+            })
+            .unwrap_or((0, 0, 0))
+    };
     MetricsSnapshot {
         request_start_total: REQUEST_START_TOTAL.load(Ordering::Relaxed),
         inflight_requests: INFLIGHT_REQUESTS.load(Ordering::Relaxed),
@@ -1376,6 +1428,9 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_TOTAL.load(Ordering::Relaxed),
         storage_rpc_pending_envelope_long_running_us_max:
             STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_US_MAX.load(Ordering::Relaxed),
+        storage_rpc_pending_envelope_oldest_active_us: pending_envelope_oldest_active.0,
+        storage_rpc_pending_envelope_oldest_active_node_id: pending_envelope_oldest_active.1,
+        storage_rpc_pending_envelope_oldest_active_request_id: pending_envelope_oldest_active.2,
         bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),
