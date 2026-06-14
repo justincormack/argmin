@@ -715,6 +715,19 @@ pub fn record_flight_event(
     recorder.push(record);
 }
 
+pub fn emit_flight_event(
+    target: &'static str,
+    event: &'static str,
+    detail: impl Into<String>,
+) -> bool {
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = detail.into();
+    record_flight_event(&context, target, event, detail.clone());
+    event_in_context(&context, target, event, Some(format_args!("{detail}")))
+}
+
 #[must_use]
 pub fn flight_recorder_snapshot() -> Vec<FlightRecord> {
     flight_recorder()
