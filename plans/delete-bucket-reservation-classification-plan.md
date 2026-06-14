@@ -154,3 +154,15 @@ the reservation row alone.
   whether a metadata command is publishable.
 - Do not make `DeleteBucket` wait for finalization, payload reclaim, read leases,
   completed async cleanup, or final row deletion; those remain finalizer work.
+
+## Benchmarking Note
+
+Recent UAT soak runs are intentionally heavy on short-lived buckets and cleanup.
+Those runs produced very large bucket-delete finalizer queue/deduplication
+counts even after object-payload reclaim was bounded per PG. This appears to be
+test-workload amplification rather than a representative production request mix.
+
+Do not tune bucket-delete finalizer scan/dequeue/deduplication policy solely from
+that workload. Revisit per-PG finalizer limits, cooldowns, or scan pacing after
+we have a more realistic workload benchmark that includes longer-lived buckets
+and normal object access patterns.
