@@ -356,6 +356,37 @@ impl StorageNodeProcessConfig {
         }
     }
 
+    pub fn validate_runtime_refresh_from(
+        &self,
+        current: &StorageNodeProcessConfig,
+    ) -> Result<(), StorageNodeServerError> {
+        if self.node_id != current.node_id {
+            return Err(StorageNodeServerError::RuntimeRefreshNodeChanged {
+                current: current.node_id.as_u32(),
+                candidate: self.node_id.as_u32(),
+            });
+        }
+        if self.data_dir != current.data_dir {
+            return Err(StorageNodeServerError::RuntimeRefreshDataDirChanged {
+                current: current.data_dir.clone(),
+                candidate: self.data_dir.clone(),
+            });
+        }
+        if self.default_ec_shape != current.default_ec_shape {
+            return Err(StorageNodeServerError::RuntimeRefreshEcShapeChanged {
+                current: current.default_ec_shape,
+                candidate: self.default_ec_shape,
+            });
+        }
+        if self.socket_path != current.socket_path {
+            return Err(StorageNodeServerError::RuntimeRefreshSocketPathChanged {
+                current: current.socket_path.clone(),
+                candidate: self.socket_path.clone(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn control_plane_heartbeat(
         &self,
         node: &SharedStorageNode,
@@ -589,6 +620,25 @@ pub enum StorageNodeServerError {
         valid_until_ms: u64,
         now_ms: u64,
     },
+    #[error("storage-node runtime refresh changed node id from {current} to {candidate}")]
+    RuntimeRefreshNodeChanged { current: u32, candidate: u32 },
+    #[error(
+        "storage-node runtime refresh changed data directory from {current:?} to {candidate:?}"
+    )]
+    RuntimeRefreshDataDirChanged {
+        current: PathBuf,
+        candidate: PathBuf,
+    },
+    #[error("storage-node runtime refresh changed EC shape from {current:?} to {candidate:?}")]
+    RuntimeRefreshEcShapeChanged {
+        current: EcShape,
+        candidate: EcShape,
+    },
+    #[error("storage-node runtime refresh changed socket path from {current:?} to {candidate:?}")]
+    RuntimeRefreshSocketPathChanged {
+        current: PathBuf,
+        candidate: PathBuf,
+    },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
@@ -791,6 +841,7 @@ impl StorageNodeServer {
             self.config.default_ec_shape,
             &runtime_map,
         )?;
+        next_config.validate_runtime_refresh_from(&self.config)?;
         Ok(StorageNodeControlPlaneRefresh {
             lease,
             runtime_map,
@@ -8279,6 +8330,63 @@ mod tests {
             .unwrap();
 
         assert!(!session.holds_metadata_command_pg_lock(PgId::new(0)));
+    }
+
+    #[test]
+    fn storage_node_runtime_refresh_allows_route_table_changes() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+        let mut candidate = current.clone();
+        candidate.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        candidate.route_map_valid_until_ms = Some(3_000);
+        candidate.pg_ids = vec![0, 1];
+        candidate.pg_routes.push(StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: candidate.cluster_epoch,
+            state: PgState::Peering,
+            primary_node_id: candidate.node_id,
+            acting_set: vec![candidate.node_id],
+        });
+        candidate.pg_routes[0].cluster_epoch = candidate.cluster_epoch;
+
+        candidate.validate_runtime_refresh_from(&current).unwrap();
+    }
+
+    #[test]
+    fn storage_node_runtime_refresh_rejects_process_identity_changes() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+
+        let mut changed_node = current.clone();
+        changed_node.node_id = NodeId::new(8);
+        assert!(matches!(
+            changed_node.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshNodeChanged {
+                current: 7,
+                candidate: 8,
+            })
+        ));
+
+        let mut changed_data = current.clone();
+        changed_data.data_dir = tmp.path().join("other-node");
+        assert!(matches!(
+            changed_data.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshDataDirChanged { .. })
+        ));
+
+        let mut changed_ec = current.clone();
+        changed_ec.default_ec_shape = EcShape { k: 2, m: 1 };
+        assert!(matches!(
+            changed_ec.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshEcShapeChanged { .. })
+        ));
+
+        let mut changed_socket = current.clone();
+        changed_socket.socket_path = tmp.path().join("sock").join("other.sock");
+        assert!(matches!(
+            changed_socket.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshSocketPathChanged { .. })
+        ));
     }
 
     #[test]

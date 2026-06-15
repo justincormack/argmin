@@ -7204,6 +7204,10 @@ Status:
   expired installed map so the node can refresh, but storage RPC serving now
   fails closed with a stale-route response once the installed map's active
   primary lease bound has expired.
+- Tightened storage-node runtime-map refresh candidates so they are explicitly
+  installable over the running process identity. Epochs, validity deadlines, PG
+  sets, and route tables may change, but a refresh cannot silently change the
+  node id, data directory, default EC shape, or bound Unix socket path.
 
 Exit criteria:
 
