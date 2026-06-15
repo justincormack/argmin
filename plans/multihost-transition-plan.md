@@ -7083,8 +7083,8 @@ Status:
   now retain the validated primary node incarnation, and callers can re-check
   authority incarnation, cluster epoch, node incarnation, both the token and
   current node lease deadlines, active PG state, deterministic primary
-  assignment, and current primary PG observation before applying work that
-  started under an earlier view.
+  assignment, current primary PG observation, and the expected operation class
+  before applying work that started under an earlier view.
 
 Exit criteria:
 

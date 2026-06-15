@@ -1189,6 +1189,25 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         authorization: &PgOperationAuthorization,
         now_ms: u64,
     ) -> Result<(), ControlPlaneError> {
+        self.validate_pg_operation_authorization_for(
+            authorization,
+            authorization.operation(),
+            now_ms,
+        )
+    }
+
+    pub fn validate_pg_operation_authorization_for(
+        &self,
+        authorization: &PgOperationAuthorization,
+        operation: PgServiceOperation,
+        now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        if authorization.operation() != operation {
+            return Err(ControlPlaneError::PgOperationAuthorizationMismatch {
+                expected: operation,
+                actual: authorization.operation(),
+            });
+        }
         if authorization.authority_incarnation() != self.snapshot.authority_incarnation {
             return Err(ControlPlaneError::StaleAuthorityIncarnation {
                 authority_incarnation: authorization.authority_incarnation(),
@@ -1383,6 +1402,12 @@ pub enum ControlPlaneError {
     StaleAuthorizationEpoch {
         cluster_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
+    },
+
+    #[error("authorization is for {actual:?}, not expected operation {expected:?}")]
+    PgOperationAuthorizationMismatch {
+        expected: PgServiceOperation,
+        actual: PgServiceOperation,
     },
 
     #[error("node {node_id} is not serving cluster epoch {cluster_epoch}")]
@@ -3482,6 +3507,24 @@ mod tests {
             authority
                 .validate_pg_operation_authorization(&authorization, 3_060)
                 .unwrap();
+            authority
+                .validate_pg_operation_authorization_for(&authorization, operation, 3_060)
+                .unwrap();
+            let wrong_operation = match operation {
+                PgServiceOperation::MetadataWrite => PgServiceOperation::MetadataRead,
+                _ => PgServiceOperation::MetadataWrite,
+            };
+            assert!(matches!(
+                authority.validate_pg_operation_authorization_for(
+                    &authorization,
+                    wrong_operation,
+                    3_060,
+                ),
+                Err(ControlPlaneError::PgOperationAuthorizationMismatch {
+                    expected,
+                    actual,
+                }) if expected == wrong_operation && actual == operation
+            ));
         }
 
         for state in [
