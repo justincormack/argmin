@@ -204,7 +204,8 @@ Current production pending-command publishers:
 Adding a production call site that creates or installs a pending metadata
 command requires updating this table and the boundary check allowlist. Direct
 uses of `try_set_pending_metadata_command_for_bucket`,
-`try_install_pending_metadata_command_for_bucket`, and
+`try_install_pending_metadata_command_for_bucket`,
+`try_install_object_pg_pending_command_with_fresh_id`, and
 `set_pending_metadata_command_for_bucket` are intentionally tracked.
 Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention

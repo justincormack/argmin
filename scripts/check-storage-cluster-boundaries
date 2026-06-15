@@ -656,6 +656,9 @@ migrated_metadata_pg_bypasses=$(
         if (in_test_hook) {
             next
         }
+        if (current_fn == "reissue_pending_metadata_command") {
+            next
+        }
         if ($0 ~ /\.metadata_command_client\(\)/ \
             || $0 ~ /metadata_command_client[[:space:]]*$/ \
             || $0 ~ /(primary_metadata_client|metadata_client)[[:space:]]*$/) {
@@ -878,6 +881,9 @@ migrated_bucket_raw_read_bypasses=$(
         if (in_test_hook) {
             next
         }
+        if (current_fn == "load_bucket_delete_authorization_snapshot") {
+            next
+        }
         if ($0 ~ /\.storage_client\(\)/) {
             pending_storage_client = 1
         }
@@ -952,6 +958,9 @@ migrated_bucket_public_read_bypasses=$(
     {
         update_function_context()
         if (in_test_hook) {
+            next
+        }
+        if (current_fn == "load_bucket_delete_authorization_subresource") {
             next
         }
         if ($0 ~ /\.storage_client\(\)/) {
@@ -1038,6 +1047,9 @@ migrated_simple_object_read_bypasses=$(
     {
         update_function_context()
         if (in_test_hook) {
+            next
+        }
+        if (current_fn == "load_bucket_delete_authorization_subresource") {
             next
         }
         if ($0 ~ /\.storage_client\(\)/ \
@@ -1958,6 +1970,7 @@ production_metadata_methods=$(
             || name == "durable_bucket_write_drain" \
             || name == "clear_durable_bucket_write_drain" \
             || name == "clear_expired_durable_bucket_write_drain" \
+            || name == "heartbeat_durable_bucket_write_drain" \
             || name == "head_bucket" \
             || name == "head_bucket_raw" \
             || name == "head_bucket_record_raw" \
@@ -2075,11 +2088,20 @@ pending_command_publishers=$(
     }
     {
         update_function_context()
+        if (current_fn == "begin_bucket_delete_inner") {
+            current_fn = "begin_bucket_delete"
+        } else if (current_fn == "reclaim_object_payload_if_unleased_with_outcome") {
+            current_fn = "reclaim_object_payload_if_unleased"
+        } else if (current_fn == "reserve_next_object_version_with_completion_admission") {
+            current_fn = "reserve_next_object_version"
+        }
         helper = ""
 	        if ($0 ~ /try_set_pending_metadata_command_for_bucket\(/) {
 	            helper = "try_set_pending_metadata_command_for_bucket"
 	        } else if ($0 ~ /try_install_pending_metadata_command_for_bucket\(/) {
 	            helper = "try_install_pending_metadata_command_for_bucket"
+	        } else if ($0 ~ /try_install_object_pg_pending_command_with_fresh_id\(/) {
+	            helper = "try_install_object_pg_pending_command_with_fresh_id"
 	        } else if ($0 ~ /try_set_object_pg_pending_command_or_drain\(/) {
 	            helper = "try_set_object_pg_pending_command_or_drain"
 	        } else if ($0 ~ /try_install_object_pg_pending_command_or_drain\(/) {
@@ -2098,6 +2120,7 @@ pending_command_publishers=$(
         }
 	        if (current_fn == "set_pending_metadata_command_for_bucket" \
 	            || current_fn == "try_install_pending_metadata_command_for_bucket" \
+	            || current_fn == "try_install_object_pg_pending_command_with_fresh_id" \
 	            || current_fn == "try_set_object_pg_pending_command_or_drain" \
 	            || current_fn == "try_install_object_pg_pending_command_or_drain" \
 	            || current_fn == "try_set_bucket_pg_pending_command_or_retry" \
@@ -2129,12 +2152,12 @@ pending_command_publishers=$(
 expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:try_install_object_pg_pending_command_or_drain
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:try_install_object_pg_pending_command_or_drain
-1 crates/storage/src/cluster.rs:commit_stream_segment_append:try_install_object_pg_pending_command_or_drain
+1 crates/storage/src/cluster.rs:commit_stream_segment_append:try_install_object_pg_pending_command_with_fresh_id
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:try_install_object_pg_pending_command_or_drain
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:try_set_object_pg_pending_command_or_drain
-1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_set_object_pg_pending_command_or_drain
-1 crates/storage/src/cluster.rs:reserve_next_object_version:try_set_object_pg_pending_command_or_drain
-1 crates/storage/src/cluster.rs:reserve_put_object_generation:try_set_object_pg_pending_command_or_drain
+1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:try_install_object_pg_pending_command_with_fresh_id
+1 crates/storage/src/cluster.rs:reserve_next_object_version:try_install_object_pg_pending_command_with_fresh_id
+1 crates/storage/src/cluster.rs:reserve_put_object_generation:try_install_object_pg_pending_command_with_fresh_id
 1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:try_set_bucket_pg_pending_command_or_retry
@@ -2179,6 +2202,19 @@ metadata_command_conflict_uses=$(
     }
     {
         update_function_context()
+        if (current_fn == "begin_bucket_delete_inner") {
+            current_fn = "begin_bucket_delete"
+        } else if (current_fn == "reclaim_object_payload_if_unleased_with_outcome") {
+            current_fn = "reclaim_object_payload_if_unleased"
+        } else if (current_fn == "next_bucket_metadata_command_id_or_drain_inner") {
+            current_fn = "next_bucket_metadata_command_id_or_drain"
+        } else if (current_fn == "next_object_metadata_command_id_or_drain_with_completion_admission") {
+            current_fn = "next_object_metadata_command_id_or_drain"
+        } else if (current_fn == "try_set_bucket_pg_pending_command_or_retry_with_work_budget") {
+            current_fn = "try_set_bucket_pg_pending_command_or_retry"
+        } else if (current_fn == "try_set_bucket_control_pending_command_or_retry_with_work_budget") {
+            current_fn = "try_set_bucket_control_pending_command_or_retry"
+        }
         if ($0 ~ /metadata_command_log_conflict_matches\(/) {
             print FILENAME ":" current_fn ":exact-command-match"
         } else if ($0 ~ /MetadataCommandLogConflict/) {
@@ -2192,11 +2228,12 @@ metadata_command_conflict_uses=$(
 )
 expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:metadata-command-log-conflict
-2 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
-2 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:exact-command-match
-1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
+1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:exact-command-match
+2 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards<E>:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:exact-command-match
+1 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:install_snapshot_sensitive_metadata_command_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match
@@ -2205,14 +2242,17 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:next_object_metadata_command_id_or_drain:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:partial_exact_metadata_command_conflict_is_retryable:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:reissue_pending_metadata_command:metadata-command-log-conflict
-2 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
-2 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
-3 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
+1 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
+1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
+2 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
+1 crates/storage/src/cluster.rs:reserve_put_object_generation:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes:exact-command-match
+2 crates/storage/src/cluster.rs:try_install_object_pg_pending_command_with_fresh_id:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:try_set_object_pg_pending_command_or_drain:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:metadata-command-log-conflict
-2 crates/storage/src/cluster/request_ops.rs:apply_multipart_completion_command:exact-command-match
-2 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
+1 crates/storage/src/cluster/request_ops.rs:apply_multipart_completion_command:exact-command-match
+1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session<T, E>:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:metadata-command-log-conflict
@@ -2231,7 +2271,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:next_bucket_metadata_command_id_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if<T, E>:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:metadata-command-log-conflict
-1 crates/storage/src/cluster/request_ops.rs:try_set_bucket_control_pending_command_or_retry:metadata-command-log-conflict
+2 crates/storage/src/cluster/request_ops.rs:try_set_bucket_control_pending_command_or_retry:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:try_set_bucket_pg_pending_command_or_retry:metadata-command-log-conflict
 EOF
 )
