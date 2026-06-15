@@ -24,15 +24,16 @@ async fn setup_public_object_with_body(body: &'static [u8]) -> (String, String, 
     let client = CTX.client();
     let bucket = s3_tests::create_public_bucket(client).await;
     let key = "range-test";
-    let put = client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .acl(ObjectCannedAcl::PublicRead)
-        .body(ByteStream::from_static(body))
-        .send()
-        .await
-        .unwrap();
+    let put = s3_tests::retrying_operation_aborted("put public range object", || {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from_static(body))
+            .send()
+    })
+    .await;
     (bucket, key.to_string(), put.e_tag().unwrap().to_string())
 }
 
