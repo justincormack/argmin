@@ -7978,6 +7978,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id: NodeId::new(1),
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: tmp.path().join("remote-node-1"),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8170,6 +8171,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id: NodeId::new(1),
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8236,6 +8238,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8307,6 +8310,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8398,6 +8402,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8536,6 +8541,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8667,6 +8673,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -8778,6 +8785,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0, 1],
@@ -8868,6 +8876,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9055,6 +9064,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9148,6 +9158,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9230,6 +9241,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9405,6 +9417,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9560,6 +9573,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir,
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9651,6 +9665,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -9782,6 +9797,7 @@ mod tests {
         let server_config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
             data_dir: remote_data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -10324,6 +10340,7 @@ mod tests {
             server_configs.push(StorageNodeProcessConfig {
                 node_id,
                 cluster_epoch: ClusterEpoch::INITIAL,
+                route_map_valid_until_ms: None,
                 data_dir: tmp.path().join(format!("remote-node-{}", node_id.as_u32())),
                 default_ec_shape: ec_shape,
                 pg_ids: vec![0],
@@ -10451,6 +10468,7 @@ mod tests {
             server_configs.push(StorageNodeProcessConfig {
                 node_id,
                 cluster_epoch: ClusterEpoch::INITIAL,
+                route_map_valid_until_ms: None,
                 data_dir: tmp
                     .path()
                     .join(format!("remote-node-missing-ack-{}", node_id.as_u32())),
@@ -10601,6 +10619,7 @@ mod tests {
             server_configs.push(StorageNodeProcessConfig {
                 node_id,
                 cluster_epoch: ClusterEpoch::INITIAL,
+                route_map_valid_until_ms: None,
                 data_dir: tmp
                     .path()
                     .join(format!("remote-node-wrong-ack-{}", node_id.as_u32())),

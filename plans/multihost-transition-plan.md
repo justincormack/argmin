@@ -7199,6 +7199,11 @@ Status:
   from a `ClusterRuntimeMapSnapshot`, filtering the authority route view to only
   PGs where that node is in the acting set and failing closed if the node is not
   present in the runtime map.
+- Carried the runtime-map validity deadline into storage-node process configs
+  and storage-node serving validation. Heartbeats can still be built from an
+  expired installed map so the node can refresh, but storage RPC serving now
+  fails closed with a stale-route response once the installed map's active
+  primary lease bound has expired.
 
 Exit criteria:
 

@@ -4167,7 +4167,19 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(35), vec![NodeId::new(2)])
             .unwrap();
-        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 34, PgState::Peering, 1_001);
+        heartbeat_with_pg_observation(&mut authority, 2, 34, PgState::Peering, 1_002);
+        authority
+            .complete_pg_peering(
+                PgId::new(34),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                1_003,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 34, PgState::Active, 1_004);
+        let runtime_map = authority.snapshot().runtime_map(1_005).unwrap();
+        let valid_until_ms = runtime_map.valid_until_ms().unwrap();
 
         let node_1_config = crate::storage_node_server::StorageNodeProcessConfig::from_runtime_map(
             NodeId::new(1),
@@ -4179,13 +4191,17 @@ mod tests {
         assert_eq!(node_1_config.node_id, NodeId::new(1));
         assert_eq!(node_1_config.cluster_epoch, runtime_map.cluster_epoch());
         assert_eq!(
+            node_1_config.route_map_valid_until_ms(),
+            Some(valid_until_ms)
+        );
+        assert_eq!(
             node_1_config.socket_path,
             std::path::PathBuf::from("node-1.sock")
         );
         assert_eq!(node_1_config.pg_ids, vec![34]);
         assert_eq!(node_1_config.pg_routes.len(), 1);
         assert_eq!(node_1_config.pg_routes[0].pg_id, 34);
-        assert_eq!(node_1_config.pg_routes[0].state, PgState::Peering);
+        assert_eq!(node_1_config.pg_routes[0].state, PgState::Active);
         assert_eq!(
             node_1_config.pg_routes[0].acting_set,
             vec![NodeId::new(1), NodeId::new(2)]
@@ -4199,6 +4215,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(node_2_config.pg_ids, vec![34, 35]);
+        assert_eq!(
+            node_2_config.route_map_valid_until_ms(),
+            Some(valid_until_ms)
+        );
         assert_eq!(
             node_2_config
                 .pg_routes

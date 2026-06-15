@@ -254,6 +254,7 @@ extern "C" {
 pub struct StorageNodeProcessConfig {
     pub node_id: NodeId,
     pub cluster_epoch: ClusterEpoch,
+    pub route_map_valid_until_ms: Option<u64>,
     pub data_dir: PathBuf,
     pub default_ec_shape: EcShape,
     pub pg_ids: Vec<u32>,
@@ -324,12 +325,35 @@ impl StorageNodeProcessConfig {
         Ok(Self {
             node_id,
             cluster_epoch: runtime_map.cluster_epoch(),
+            route_map_valid_until_ms: runtime_map.valid_until_ms(),
             data_dir: data_dir.into(),
             default_ec_shape,
             pg_ids,
             socket_path: PathBuf::from(node.endpoint()),
             pg_routes,
         })
+    }
+
+    pub fn route_map_valid_until_ms(&self) -> Option<u64> {
+        self.route_map_valid_until_ms
+    }
+
+    pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
+        self.route_map_valid_until_ms
+            .is_none_or(|valid_until_ms| valid_until_ms > now_ms)
+    }
+
+    pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StorageNodeServerError> {
+        match self.route_map_valid_until_ms {
+            Some(valid_until_ms) if valid_until_ms <= now_ms => {
+                Err(StorageNodeServerError::RouteMapExpired {
+                    cluster_epoch: self.cluster_epoch,
+                    valid_until_ms,
+                    now_ms,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn control_plane_heartbeat(
@@ -556,6 +580,14 @@ pub enum StorageNodeServerError {
     RuntimeMapNodeNotFound {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
+    },
+    #[error(
+        "storage-node route map for cluster epoch {cluster_epoch} expired at {valid_until_ms}ms, now {now_ms}ms"
+    )]
+    RouteMapExpired {
+        cluster_epoch: ClusterEpoch,
+        valid_until_ms: u64,
+        now_ms: u64,
     },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
@@ -6950,14 +6982,11 @@ impl StorageNodeConnectionHandler {
         session: &mut StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) =
-            self.validate_primary_pg(request.pg_id, "metadata command critical section")
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_lock_release(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         session.release_metadata_command_pg_lock(request.pg_id);
@@ -7027,6 +7056,18 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
+        let now_ms = crate::clock::current_time_millis();
+        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms {
+            if valid_until_ms <= now_ms {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::StaleShardLocation,
+                    message: format!(
+                        "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
+                        self.config.cluster_epoch.get()
+                    ),
+                });
+            }
+        }
         let raw_pg_id = pg_id.get();
         let Some(route) = self
             .config
@@ -7053,6 +7094,66 @@ impl StorageNodeConnectionHandler {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::InactivePgRoute,
                 message: format!("PG {raw_pg_id} route is {}", route.state),
+            });
+        }
+        if !route.acting_set.contains(&self.config.node_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not in acting set for PG {raw_pg_id}",
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_pg_route_for_metadata_lock_release(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        if cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "request route epoch {} does not match storage-node epoch {}",
+                    cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        let raw_pg_id = pg_id.get();
+        let Some(route) = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id)
+        else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {raw_pg_id} is not configured on this storage node"),
+            });
+        };
+        if route.cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::WrongClusterEpoch,
+                message: format!(
+                    "PG {raw_pg_id} route epoch {} does not match storage-node epoch {}",
+                    route.cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
             });
         }
         if !route.acting_set.contains(&self.config.node_id) {
@@ -8088,6 +8189,7 @@ mod tests {
         StorageNodeProcessConfig {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_valid_until_ms: None,
             data_dir: tmp.path().join("node"),
             default_ec_shape: EcShape { k: 4, m: 2 },
             pg_ids: vec![0],
@@ -8110,6 +8212,73 @@ mod tests {
             primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }
+    }
+
+    #[test]
+    fn storage_node_process_config_preserves_route_map_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_valid_until_ms = Some(1_500);
+
+        assert_eq!(config.route_map_valid_until_ms(), Some(1_500));
+        assert!(config.is_route_map_valid_at(1_499));
+        assert!(matches!(
+            config.require_route_map_valid_at(1_500),
+            Err(StorageNodeServerError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 1_500,
+                now_ms: 1_500,
+            }) if cluster_epoch == config.cluster_epoch
+        ));
+    }
+
+    #[test]
+    fn storage_node_server_rejects_expired_route_map_for_serving_rpc() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_valid_until_ms = Some(1);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let error = server
+            .connection_handler()
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(error.message.contains("route map"));
+        assert!(error.message.contains("expired"));
+    }
+
+    #[test]
+    fn metadata_command_pg_lock_release_allows_expired_route_map_cleanup() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_valid_until_ms = Some(1);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let mut session = StorageNodeSession::new(&server.read_handles);
+        session.acquire_metadata_command_pg_lock(
+            &server.metadata_command_locks,
+            config.node_id,
+            PgId::new(0),
+            None,
+        );
+        assert!(session.holds_metadata_command_pg_lock(PgId::new(0)));
+
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+        };
+        let response = handler
+            .metadata_command_pg_lock_release_response(&mut session, request)
+            .unwrap();
+        decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+
+        assert!(!session.holds_metadata_command_pg_lock(PgId::new(0)));
     }
 
     #[test]

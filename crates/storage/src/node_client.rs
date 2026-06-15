@@ -16334,6 +16334,7 @@ mod tests {
         StorageNodeProcessConfig {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_valid_until_ms: None,
             data_dir: tmp.path().join("node"),
             default_ec_shape: EcShape { k: 4, m: 2 },
             pg_ids: vec![0],
