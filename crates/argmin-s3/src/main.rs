@@ -1,7 +1,12 @@
 mod config;
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 
 use auth::{AccountIdentity, CredentialRecord, CredentialStore, SecretKey};
 use ec::EcConfig;
@@ -11,6 +16,7 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
+use storage::control_plane::{FileControlPlaneStore, SingleAuthorityControlPlane};
 use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
 };
@@ -23,6 +29,13 @@ use tokio_rustls::TlsAcceptor;
 
 use config::{ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig};
 use server_http::http::HttpFrontend;
+
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     CertificateDer::pem_file_iter(path)
@@ -102,6 +115,71 @@ fn build_credential_store(config: &ServerConfig) -> CredentialStore {
     credentials
 }
 
+#[derive(Debug)]
+struct ControlPlaneStateLock {
+    _file: File,
+}
+
+fn acquire_control_plane_state_lock(state_path: &Path) -> Result<ControlPlaneStateLock, String> {
+    let lock_path = control_plane_state_lock_path(state_path)?;
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create control-plane lock directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            format!(
+                "failed to open control-plane state lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+    // SAFETY: flock operates on a valid file descriptor owned by `file`.
+    // The descriptor stays open for the lifetime of `ControlPlaneStateLock`.
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Err(format!(
+                "control-plane state {} is already locked by another manager",
+                state_path.display()
+            ))
+        } else {
+            Err(format!(
+                "failed to lock control-plane state {} using {}: {error}",
+                state_path.display(),
+                lock_path.display()
+            ))
+        };
+    }
+    Ok(ControlPlaneStateLock { _file: file })
+}
+
+fn control_plane_state_lock_path(state_path: &Path) -> Result<PathBuf, String> {
+    let file_name = state_path.file_name().ok_or_else(|| {
+        format!(
+            "ARGMIN_CONTROL_PLANE_STATE_PATH {} is missing a file name",
+            state_path.display()
+        )
+    })?;
+    let mut lock_name = OsString::from(file_name);
+    lock_name.push(".lock");
+    let mut lock_path = state_path.to_path_buf();
+    lock_path.set_file_name(lock_name);
+    Ok(lock_path)
+}
+
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -133,6 +211,7 @@ async fn main() {
     };
 
     match config.process_role {
+        ProcessRole::ControlPlane => run_control_plane_process(&config),
         ProcessRole::StorageNode => run_storage_node_process(&config, &ec_config),
         ProcessRole::Combined => {
             let _storage_node_thread = start_storage_node_process(&config, &ec_config);
@@ -144,6 +223,48 @@ async fn main() {
         ProcessRole::LegacyLocal => {
             run_legacy_local_frontend(config, host_id, ec_config).await;
         }
+    }
+}
+
+fn run_control_plane_process(config: &ServerConfig) -> ! {
+    let state_path = config
+        .control_plane_state_path
+        .as_deref()
+        .expect("control-plane role requires state path");
+    let _state_lock =
+        acquire_control_plane_state_lock(Path::new(state_path)).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+    let store = FileControlPlaneStore::new(state_path);
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
+        eprintln!("failed to open control-plane state {state_path}: {error}");
+        std::process::exit(1);
+    });
+    eprintln!(
+        "argmin-s3 control-plane manager using state {} (lease scan {} ms)",
+        state_path,
+        config.control_plane_lease_scan_interval.as_millis()
+    );
+
+    loop {
+        let now_ms = storage::clock::current_time_millis();
+        match authority.expire_heartbeat_leases(now_ms) {
+            Ok(expiry) if !expiry.expired_nodes().is_empty() => {
+                eprintln!(
+                    "control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
+                    expiry.expired_nodes().len(),
+                    expiry.cluster_epoch(),
+                    expiry.peering_pgs().len()
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("control-plane lease expiry failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        thread::sleep(config.control_plane_lease_scan_interval);
     }
 }
 
@@ -463,6 +584,8 @@ mod tests {
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
             storage_node_rpc_control_admission_wait_timeout:
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+            control_plane_state_path: None,
+            control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
             ec_k: 4,
@@ -483,6 +606,33 @@ mod tests {
             abort_on_500: false,
             local_debug_endpoint: false,
         }
+    }
+
+    #[test]
+    fn control_plane_state_lock_uses_sibling_lock_file() {
+        let state_path = Path::new("/tmp/argmin/control-plane.state");
+
+        assert_eq!(
+            control_plane_state_lock_path(state_path).unwrap(),
+            Path::new("/tmp/argmin/control-plane.state.lock")
+        );
+    }
+
+    #[test]
+    fn control_plane_state_lock_rejects_second_manager_for_same_state() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-lock-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state_path = tmp.join("control-plane.state");
+        let first = acquire_control_plane_state_lock(&state_path).unwrap();
+
+        let error = acquire_control_plane_state_lock(&state_path).unwrap_err();
+
+        assert!(error.contains("already locked"), "{error}");
+        drop(first);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

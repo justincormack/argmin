@@ -7250,6 +7250,14 @@ Status:
   production fencing input for the heartbeat loop; the remaining process wiring
   should call it once during storage-node startup and then pass the returned
   incarnation to the refresh loop.
+- Added the first process boundary for the single-authority manager. The
+  `argmin-s3` binary now has a `control-plane` role that requires
+  `ARGMIN_CONTROL_PLANE_STATE_PATH`, takes a sibling interprocess lock before
+  opening the durable file-backed authority, and runs the heartbeat lease-expiry
+  scan loop as the single owner. Storage nodes must not independently open the
+  same authority state file; the next wiring step is the control-plane transport
+  endpoint that lets storage-node heartbeat loops and frontend runtime-map
+  refresh loops talk to this manager process.
 
 Exit criteria:
 

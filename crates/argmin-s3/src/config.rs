@@ -11,6 +11,7 @@ pub(crate) enum ProcessRole {
     Frontend,
     StorageNode,
     Combined,
+    ControlPlane,
 }
 
 impl ProcessRole {
@@ -67,6 +68,8 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_admission_limit: usize,
     pub(crate) storage_node_rpc_admission_wait_timeout: Duration,
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
+    pub(crate) control_plane_state_path: Option<String>,
+    pub(crate) control_plane_lease_scan_interval: Duration,
     pub(crate) storage_cluster_epoch: u64,
     pub(crate) storage_pg_ids: Vec<u32>,
     pub(crate) ec_k: u8,
@@ -105,6 +108,8 @@ impl ServerConfig {
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` (1024)
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` (250)
     ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
+    ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
+    ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
@@ -256,6 +261,12 @@ impl ServerConfig {
                 })?;
         let storage_node_rpc_control_admission_wait_timeout =
             Duration::from_millis(storage_node_rpc_control_admission_wait_ms);
+        let control_plane_state_path = get("ARGMIN_CONTROL_PLANE_STATE_PATH");
+        let control_plane_lease_scan_ms: u64 = get("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS")
+            .unwrap_or_else(|| "250".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS: {e}"))?;
+        let control_plane_lease_scan_interval = Duration::from_millis(control_plane_lease_scan_ms);
         let stream_read_chunk_size: usize = get("ARGMIN_STREAM_READ_CHUNK_SIZE")
             .unwrap_or_else(|| server_core::coordinator::INTERNAL_SEGMENT_SIZE.to_string())
             .parse()
@@ -357,6 +368,14 @@ impl ServerConfig {
                 "ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS must be > 0".to_string(),
             );
         }
+        if process_role == ProcessRole::ControlPlane && control_plane_state_path.is_none() {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_STATE_PATH is required for control-plane role".to_string(),
+            );
+        }
+        if control_plane_lease_scan_interval.is_zero() {
+            return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
+        }
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
@@ -415,6 +434,8 @@ impl ServerConfig {
             storage_node_rpc_admission_limit,
             storage_node_rpc_admission_wait_timeout,
             storage_node_rpc_control_admission_wait_timeout,
+            control_plane_state_path,
+            control_plane_lease_scan_interval,
             storage_cluster_epoch,
             storage_pg_ids,
             ec_k,
@@ -451,9 +472,10 @@ fn parse_process_role(value: &str) -> Result<ProcessRole, String> {
         "frontend" => Ok(ProcessRole::Frontend),
         "storage-node" => Ok(ProcessRole::StorageNode),
         "combined" => Ok(ProcessRole::Combined),
+        "control-plane" => Ok(ProcessRole::ControlPlane),
         "legacy-local" => Ok(ProcessRole::LegacyLocal),
         _ => Err(
-            "ARGMIN_PROCESS_ROLE must be one of frontend, storage-node, combined, legacy-local"
+            "ARGMIN_PROCESS_ROLE must be one of frontend, storage-node, combined, control-plane, legacy-local"
                 .to_string(),
         ),
     }
@@ -819,6 +841,11 @@ mod tests {
             cfg.storage_node_rpc_control_admission_wait_timeout,
             LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT
         );
+        assert_eq!(cfg.control_plane_state_path, None);
+        assert_eq!(
+            cfg.control_plane_lease_scan_interval,
+            Duration::from_millis(250)
+        );
         assert_eq!(
             cfg.stream_read_chunk_size,
             server_core::coordinator::INTERNAL_SEGMENT_SIZE
@@ -851,6 +878,11 @@ mod tests {
             ("ARGMIN_PG_COUNT", "32"),
             ("ARGMIN_STORAGE_CLUSTER_EPOCH", "7"),
             ("ARGMIN_STORAGE_PG_IDS", "2, 5, 31"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/control-plane.state",
+            ),
+            ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
@@ -864,6 +896,14 @@ mod tests {
         assert_eq!(cfg.pg_count, 32);
         assert_eq!(cfg.storage_cluster_epoch, 7);
         assert_eq!(cfg.storage_pg_ids, vec![2, 5, 31]);
+        assert_eq!(
+            cfg.control_plane_state_path.as_deref(),
+            Some("/tmp/control-plane.state")
+        );
+        assert_eq!(
+            cfg.control_plane_lease_scan_interval,
+            Duration::from_millis(125)
+        );
         assert_eq!(cfg.local_node_count, 12);
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
@@ -929,6 +969,38 @@ mod tests {
         );
         assert_eq!(cfg.storage_cluster_epoch, 1);
         assert_eq!(cfg.storage_pg_ids, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn process_role_control_plane_requires_state_path() {
+        let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "control-plane")]))
+            .unwrap_err();
+
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_STATE_PATH"));
+    }
+
+    #[test]
+    fn process_role_control_plane_does_not_require_frontend_or_storage_secrets() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/argmin-control-plane.state",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::ControlPlane);
+        assert_eq!(
+            cfg.control_plane_state_path.as_deref(),
+            Some("/tmp/argmin-control-plane.state")
+        );
+        assert_eq!(
+            cfg.control_plane_lease_scan_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(cfg.account_id, "");
+        assert_eq!(cfg.storage_node_id, None);
     }
 
     #[test]
@@ -1524,6 +1596,16 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_lease_scan_interval_zero() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS",
+            "0",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0"));
+    }
+
+    #[test]
     fn invalid_storage_node_rpc_admission_limit() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
             "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT",
@@ -1551,6 +1633,16 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS"));
+    }
+
+    #[test]
+    fn invalid_control_plane_lease_scan_interval() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS",
+            "not_a_number",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS"));
     }
 
     #[test]
