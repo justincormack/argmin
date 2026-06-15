@@ -7050,6 +7050,11 @@ Status:
   previous map before exposing the new epoch, old `version=2` state still loads,
   and history is pruned to a fixed recent window for stale-route diagnostics and
   future cross-epoch fault-injection checks.
+- Tightened heartbeat-driven epoch changes so node incarnation changes, endpoint
+  changes, and availability recovery move affected active PGs back to `Peering`
+  before the new epoch is exposed. This prevents a recovered earlier acting-set
+  member from becoming deterministic primary in a later epoch without an
+  explicit peering completion.
 
 Exit criteria:
 

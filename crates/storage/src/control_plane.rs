@@ -816,6 +816,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
 
         let mut epoch_changed = false;
+        let mut affected_node = None;
         let mut next_snapshot = self.snapshot.clone();
         {
             let record = next_snapshot
@@ -825,20 +826,26 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             if heartbeat.node_incarnation > record.node_incarnation {
                 record.node_incarnation = heartbeat.node_incarnation;
                 epoch_changed = true;
+                affected_node = Some(heartbeat.node_id);
             }
             if record.endpoint != heartbeat.endpoint {
                 record.endpoint = heartbeat.endpoint;
                 epoch_changed = true;
+                affected_node = Some(heartbeat.node_id);
             }
             if record.availability != NodeAvailabilityState::Healthy {
                 record.availability = NodeAvailabilityState::Healthy;
                 epoch_changed = true;
+                affected_node = Some(heartbeat.node_id);
             }
             record.last_observed_epoch = Some(heartbeat.observed_epoch);
             record.last_heartbeat_ms = Some(heartbeat.now_ms);
             record.lease_deadline_ms = Some(lease_deadline_ms);
         }
         if epoch_changed {
+            if let Some(node_id) = affected_node {
+                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+            }
             next_snapshot.bump_epoch()?;
         }
         self.commit_snapshot(next_snapshot)?;
@@ -2809,6 +2816,140 @@ mod tests {
             authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(3)]),
             Some(NodeId::new(3))
         );
+    }
+
+    #[test]
+    fn recovered_earlier_primary_forces_active_pg_back_to_peering() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 100).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(13), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                1_000,
+            ))
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                2,
+                authority.snapshot().cluster_epoch(),
+                1_050,
+            ))
+            .unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(13),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                1_060,
+            )
+            .unwrap();
+        for (node_id, now_ms) in [(1, 1_070), (2, 1_080)] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    now_ms,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(13)),
+            Some(NodeId::new(1))
+        );
+
+        let node_one_deadline = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        let expiry = authority
+            .expire_heartbeat_leases(node_one_deadline)
+            .unwrap();
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
+        assert_eq!(expiry.peering_pgs(), &[PgId::new(13)]);
+
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                2,
+                authority.snapshot().cluster_epoch(),
+                node_one_deadline + 1,
+            ))
+            .unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(13),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                node_one_deadline + 2,
+            )
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                2,
+                authority.snapshot().cluster_epoch(),
+                node_one_deadline + 3,
+            ))
+            .unwrap();
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(13)),
+            Some(NodeId::new(2))
+        );
+
+        let recovered = authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                node_one_deadline + 4,
+            ))
+            .unwrap();
+        assert!(!recovered.serving());
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(13)).unwrap().state(),
+            PgState::Peering
+        );
+        assert_eq!(authority.serving_pg_primary(PgId::new(13)), None);
+
+        let caught_up = authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                recovered.cluster_epoch(),
+                node_one_deadline + 5,
+            ))
+            .unwrap();
+        assert!(caught_up.serving());
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(13)).unwrap().state(),
+            PgState::Peering
+        );
+        assert!(matches!(
+            authority.authorize_pg_primary_service(
+                PgId::new(13),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                authority.snapshot().cluster_epoch(),
+                node_one_deadline + 6,
+            ),
+            Err(ControlPlaneError::PgNotActive { pg_id: 13, .. })
+        ));
     }
 
     #[test]
