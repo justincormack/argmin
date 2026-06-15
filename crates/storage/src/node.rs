@@ -18,6 +18,7 @@ use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
+use crate::control_plane::{NodePgHeartbeatObservation, PgMetadataProof};
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
@@ -48,6 +49,7 @@ use crate::types::{
 };
 #[cfg(test)]
 use crate::types::{StreamUploadState, StreamUploadTarget};
+use crate::{PgId, PgState};
 
 const TRACE_TARGET: &str = "storage";
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1141,6 +1143,24 @@ impl SharedStorageNode {
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    pub fn pg_heartbeat_observation(
+        &self,
+        pg_id: PgId,
+        state: PgState,
+    ) -> Result<NodePgHeartbeatObservation, StoreError> {
+        let pg = self.get_pg(pg_id.get())?;
+        let metadata_state = pg.metadata_command_replica_state()?;
+        Ok(NodePgHeartbeatObservation {
+            pg_id,
+            state,
+            metadata_proof: PgMetadataProof::new(
+                metadata_state.applied_log_index,
+                metadata_state.applied_log_hash,
+                metadata_state.state_digest,
+            ),
+        })
+    }
+
     /// Write a shard file durably without taking the per-PG mutex.
     ///
     /// This is used on the write hot path so file IO and fsync do not hold the
@@ -1759,6 +1779,35 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
+    }
+
+    #[test]
+    fn shared_node_pg_heartbeat_observation_uses_metadata_replica_state() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let metadata_state = {
+            let pg = node.get_pg(0).unwrap();
+            pg.metadata_command_replica_state().unwrap()
+        };
+
+        let observation = node
+            .pg_heartbeat_observation(PgId::new(0), PgState::Peering)
+            .unwrap();
+
+        assert_eq!(observation.pg_id, PgId::new(0));
+        assert_eq!(observation.state, PgState::Peering);
+        assert_eq!(
+            observation.metadata_proof.applied_log_index,
+            metadata_state.applied_log_index
+        );
+        assert_eq!(
+            observation.metadata_proof.applied_log_hash,
+            metadata_state.applied_log_hash
+        );
+        assert_eq!(
+            observation.metadata_proof.state_digest,
+            metadata_state.state_digest
+        );
     }
 
     fn create_bucket_for_snapshot_test(node: &SharedStorageNode, name: &str) -> BucketName {

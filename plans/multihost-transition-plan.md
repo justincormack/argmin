@@ -7118,6 +7118,13 @@ Status:
   local cluster route and storage-node process route shapes. This keeps the
   current startup paths static for now, but gives the later dynamic map install
   work a single tested bridge from authority state to runtime routing.
+- Added the first storage-node-to-authority peering-proof bridge. A
+  `SharedStorageNode` can now build a PG heartbeat observation from its durable
+  metadata command replica state, carrying the applied log index, applied hash
+  chain value, and metadata state digest that the control-plane peering checks
+  already compare. Dynamic heartbeat wiring still remains to be added, but the
+  proof source is now the PG's persisted command-log state rather than only a
+  synthetic test placeholder.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary

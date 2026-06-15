@@ -647,12 +647,17 @@ pub struct PgMetadataProof {
 
 impl PgMetadataProof {
     #[must_use]
-    pub const fn empty() -> Self {
+    pub const fn new(applied_log_index: u64, applied_log_hash: u64, state_digest: u64) -> Self {
         Self {
-            applied_log_index: 0,
-            applied_log_hash: 0,
-            state_digest: 0,
+            applied_log_index,
+            applied_log_hash,
+            state_digest,
         }
+    }
+
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self::new(0, 0, 0)
     }
 }
 
