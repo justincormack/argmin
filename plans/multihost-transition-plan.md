@@ -7150,6 +7150,11 @@ Status:
   storage-node clients from absolute runtime endpoints, while preserving the
   authority route-map validity deadline and exposing the same fail-closed
   validity check at the cluster boundary.
+- Added the matching storage-node process config bridge. A storage node can now
+  derive its startup PG set, route table, cluster epoch, and socket endpoint
+  from a `ClusterRuntimeMapSnapshot`, filtering the authority route view to only
+  PGs where that node is in the acting set and failing closed if the node is not
+  present in the runtime map.
 
 Exit criteria:
 

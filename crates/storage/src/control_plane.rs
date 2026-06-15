@@ -3981,6 +3981,93 @@ mod tests {
     }
 
     #[test]
+    fn runtime_map_builds_storage_node_process_config_for_node_routes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(34), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(35), vec![NodeId::new(2)])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+
+        let node_1_config = crate::storage_node_server::StorageNodeProcessConfig::from_runtime_map(
+            NodeId::new(1),
+            tmp.path().join("node-1"),
+            crate::EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        assert_eq!(node_1_config.node_id, NodeId::new(1));
+        assert_eq!(node_1_config.cluster_epoch, runtime_map.cluster_epoch());
+        assert_eq!(
+            node_1_config.socket_path,
+            std::path::PathBuf::from("node-1.sock")
+        );
+        assert_eq!(node_1_config.pg_ids, vec![34]);
+        assert_eq!(node_1_config.pg_routes.len(), 1);
+        assert_eq!(node_1_config.pg_routes[0].pg_id, 34);
+        assert_eq!(node_1_config.pg_routes[0].state, PgState::Peering);
+        assert_eq!(
+            node_1_config.pg_routes[0].acting_set,
+            vec![NodeId::new(1), NodeId::new(2)]
+        );
+
+        let node_2_config = crate::storage_node_server::StorageNodeProcessConfig::from_runtime_map(
+            NodeId::new(2),
+            tmp.path().join("node-2"),
+            crate::EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        assert_eq!(node_2_config.pg_ids, vec![34, 35]);
+        assert_eq!(
+            node_2_config
+                .pg_routes
+                .iter()
+                .map(|route| route.pg_id)
+                .collect::<Vec<_>>(),
+            vec![34, 35]
+        );
+    }
+
+    #[test]
+    fn runtime_map_storage_node_config_rejects_absent_node() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(36), vec![NodeId::new(1)])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+
+        assert!(matches!(
+            crate::storage_node_server::StorageNodeProcessConfig::from_runtime_map(
+                NodeId::new(2),
+                tmp.path().join("node-2"),
+                crate::EcShape { k: 1, m: 0 },
+                &runtime_map,
+            ),
+            Err(crate::storage_node_server::StorageNodeServerError::RuntimeMapNodeNotFound {
+                node_id: 2,
+                cluster_epoch,
+            }) if cluster_epoch == runtime_map.cluster_epoch()
+        ));
+    }
+
+    #[test]
     fn runtime_map_unix_storage_clients_reject_relative_endpoints() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

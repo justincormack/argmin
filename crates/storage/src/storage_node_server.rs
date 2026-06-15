@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::control_plane::PgRouteSnapshot;
+use crate::control_plane::{ClusterRuntimeMapSnapshot, PgRouteSnapshot};
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
@@ -258,6 +258,43 @@ pub struct StorageNodeProcessConfig {
     pub pg_routes: Vec<StorageNodePgRoute>,
 }
 
+impl StorageNodeProcessConfig {
+    pub fn from_runtime_map(
+        node_id: NodeId,
+        data_dir: impl Into<PathBuf>,
+        default_ec_shape: EcShape,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<Self, StorageNodeServerError> {
+        let node = runtime_map
+            .nodes()
+            .iter()
+            .find(|node| node.node_id() == node_id)
+            .ok_or(StorageNodeServerError::RuntimeMapNodeNotFound {
+                node_id: node_id.as_u32(),
+                cluster_epoch: runtime_map.cluster_epoch(),
+            })?;
+        let pg_routes: Vec<StorageNodePgRoute> = runtime_map
+            .pg_routes()
+            .iter()
+            .filter(|route| route.acting_set().contains(&node_id))
+            .map(StorageNodePgRoute::from)
+            .collect();
+        let pg_ids: Vec<u32> = pg_routes.iter().map(|route| route.pg_id).collect();
+        validate_pg_ids(&pg_ids)?;
+        validate_pg_routes(&pg_ids, &pg_routes)?;
+
+        Ok(Self {
+            node_id,
+            cluster_epoch: runtime_map.cluster_epoch(),
+            data_dir: data_dir.into(),
+            default_ec_shape,
+            pg_ids,
+            socket_path: PathBuf::from(node.endpoint()),
+            pg_routes,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageNodePgRoute {
     pub pg_id: u32,
@@ -435,6 +472,11 @@ pub enum StorageNodeServerError {
     InconsistentPgRoute { pg_id: u32 },
     #[error("storage-node PG route {pg_id} primary node {primary_node_id} is not in acting set")]
     RoutePrimaryNotInActingSet { pg_id: u32, primary_node_id: u32 },
+    #[error("storage node {node_id} is absent from runtime map for cluster epoch {cluster_epoch}")]
+    RuntimeMapNodeNotFound {
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
