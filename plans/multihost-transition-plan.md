@@ -7114,6 +7114,10 @@ Status:
   `active_primary`, requires that primary to still have a current heartbeat
   lease and current-epoch `Active` PG observation, and fails closed for `Peering`
   or stale-primary state instead of re-running dynamic primary selection.
+- Added explicit conversion from the durable route snapshot into the existing
+  local cluster route and storage-node process route shapes. This keeps the
+  current startup paths static for now, but gives the later dynamic map install
+  work a single tested bridge from authority state to runtime routing.
 
 Exit criteria:
 

@@ -3407,8 +3407,22 @@ mod tests {
         assert_eq!(route.state(), PgState::Active);
         assert_eq!(
             authority.snapshot().active_pg_routes(2_004).unwrap(),
-            vec![route]
+            vec![route.clone()]
         );
+
+        let local_route = crate::cluster::LocalPgRoute::from(&route);
+        assert_eq!(local_route.cluster_epoch(), route.cluster_epoch());
+        assert_eq!(local_route.pg_id(), route.pg_id());
+        assert_eq!(local_route.primary_node_id(), route.primary_node_id());
+        assert_eq!(local_route.acting_set(), route.acting_set());
+        assert_eq!(local_route.state(), route.state());
+
+        let storage_node_route = crate::storage_node_server::StorageNodePgRoute::from(&route);
+        assert_eq!(storage_node_route.cluster_epoch, route.cluster_epoch());
+        assert_eq!(storage_node_route.pg_id, route.pg_id().get());
+        assert_eq!(storage_node_route.primary_node_id, route.primary_node_id());
+        assert_eq!(storage_node_route.acting_set, route.acting_set());
+        assert_eq!(storage_node_route.state, route.state());
     }
 
     #[test]

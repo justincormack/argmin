@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::control_plane::PgRouteSnapshot;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
@@ -264,6 +265,18 @@ pub struct StorageNodePgRoute {
     pub state: PgState,
     pub primary_node_id: NodeId,
     pub acting_set: Vec<NodeId>,
+}
+
+impl From<&PgRouteSnapshot> for StorageNodePgRoute {
+    fn from(route: &PgRouteSnapshot) -> Self {
+        Self {
+            pg_id: route.pg_id().get(),
+            cluster_epoch: route.cluster_epoch(),
+            state: route.state(),
+            primary_node_id: route.primary_node_id(),
+            acting_set: route.acting_set().to_vec(),
+        }
+    }
 }
 
 fn storage_node_rpc_trace_context(node_id: NodeId, request_id: u64) -> observability::TraceContext {

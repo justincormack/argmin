@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
+use crate::control_plane::PgRouteSnapshot;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::MetadataCommandLogIndex;
@@ -783,6 +784,18 @@ impl LocalPgRoute {
 
     fn contains_node(&self, node_id: NodeId) -> bool {
         self.acting_set.contains(&node_id)
+    }
+}
+
+impl From<&PgRouteSnapshot> for LocalPgRoute {
+    fn from(route: &PgRouteSnapshot) -> Self {
+        Self {
+            cluster_epoch: route.cluster_epoch(),
+            pg_id: route.pg_id(),
+            primary_node_id: route.primary_node_id(),
+            acting_set: Arc::from(route.acting_set()),
+            state: route.state(),
+        }
     }
 }
 
