@@ -6929,6 +6929,59 @@ Status: complete.
 
 Add real distributed behavior after the normal path is already shaped correctly.
 
+Core membership and heartbeat decision:
+
+Phase 11 should introduce one authoritative cluster-map manager for membership,
+heartbeat leases, cluster epoch bumps, and PG state transitions. The first
+implementation may be single-authority and non-HA, but it must sit behind a
+control-plane interface that Phase 12 can replace with a replicated consensus
+implementation. Gossip or peer observations may be useful diagnostics and
+failure hints, but they are not authoritative membership agreement. Even the
+single-authority Phase 11 implementation must persist cluster-map state,
+authority incarnation, and the latest issued cluster epoch before issuing any
+lease or map that depends on them. After restart, it must either resume from the
+durable latest epoch or allocate a strictly higher epoch; epochs and authority
+incarnations must never be reused. This keeps stale frontends and storage nodes
+from a previous authority instance fenced even before Phase 12 adds replicated
+agreement.
+
+Separate durable membership from temporary availability:
+
+- durable membership states: `Joining`, `Active`, `Draining`, `Out`, and
+  `Removed`
+- temporary availability states: `Healthy`, `Suspect`, and `Unavailable`
+- a missed heartbeat should not immediately remove a node from durable
+  placement; it should mark the node temporarily unavailable, bump the cluster
+  epoch, move affected PGs into peering, and let the new epoch choose primaries
+  from the still-available acting-set members
+- permanent `Out` membership changes are the later repair, backfill, and
+  migration trigger
+
+Heartbeat is a lease and fencing mechanism. A storage node heartbeats with its
+stable `node_id`, current boot/incarnation id, advertised endpoint, observed
+cluster epoch, and local PG health/state summary. The control plane replies with
+the current cluster map, cluster epoch, and heartbeat lease deadline. Nodes and
+frontends must stop accepting new mutating work when their control-plane lease or
+map is stale, and every storage RPC / metadata command that can mutate state
+must carry enough epoch and sender-incarnation context for receivers to reject
+stale senders. Lease issuance is valid only after the authority has durably
+recorded the epoch/map/incarnation tuple being leased.
+
+PG primary assignment should be deterministic once the authoritative map is
+known. Given `(cluster_epoch, pg_id, acting_set, temporary availability view)`,
+all nodes must compute the same primary, for example by choosing the first
+available node in the deterministic acting-set order. The hard agreement problem
+is deciding the authoritative map and epoch; the primary selection function
+should remain simple and testable.
+
+Epoch changes fence unsafe service. On membership, availability, or acting-set
+change, the control plane bumps the cluster epoch and affected PGs enter
+`Peering`. The new primary reconstructs authoritative PG state from durable
+command logs and pending-command records across the acting set before marking
+the PG `Active`. Requests that need complete PG truth, especially writes and
+list operations, must fail closed or return typed retryable responses while the
+PG is peering or the sender has only stale epoch information.
+
 Work items:
 
 1. add heartbeat and failure detection to the control plane
