@@ -7118,6 +7118,10 @@ Status:
   local cluster route and storage-node process route shapes. This keeps the
   current startup paths static for now, but gives the later dynamic map install
   work a single tested bridge from authority state to runtime routing.
+- Added a topology-only local cluster constructor that accepts supplied PG
+  routes and validates the route set against the configured epoch, PG set, and
+  local node set before exposing it. This is the fail-closed install boundary
+  the later dynamic control-plane route update path should reuse.
 
 Exit criteria:
 

@@ -587,6 +587,30 @@ pub enum ClusterBuildError {
     #[error("duplicate PG id {pg_id}")]
     DuplicatePgId { pg_id: u32 },
 
+    #[error("duplicate route for PG {pg_id}")]
+    DuplicatePgRoute { pg_id: u32 },
+
+    #[error("route for PG {pg_id} is not present in the configured PG set")]
+    RoutePgNotConfigured { pg_id: u32 },
+
+    #[error("configured PG {pg_id} has no route")]
+    MissingPgRoute { pg_id: u32 },
+
+    #[error(
+        "route for PG {pg_id} has cluster epoch {route_epoch}, expected current cluster epoch {cluster_epoch}"
+    )]
+    RouteClusterEpochMismatch {
+        pg_id: u32,
+        route_epoch: ClusterEpoch,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("route for PG {pg_id} primary node {primary_node_id} is not in its acting set")]
+    RoutePrimaryNotInActingSet { pg_id: u32, primary_node_id: u32 },
+
+    #[error("route for PG {pg_id} acting set references unknown local node {node_id}")]
+    RouteActingSetNodeNotFound { pg_id: u32, node_id: u32 },
+
     #[error("invalid EC shape k={data_shards} m={parity_shards}: {reason}")]
     InvalidEcShape {
         data_shards: u8,

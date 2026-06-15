@@ -1259,6 +1259,73 @@ impl LocalClusterMap {
         })
     }
 
+    pub fn open_frontend_topology_only_with_pg_routes(
+        metadata_primary_node_id: NodeId,
+        node_ids: impl IntoIterator<Item = NodeId>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+        pg_routes: impl IntoIterator<Item = LocalPgRoute>,
+    ) -> Result<Self, ClusterBuildError> {
+        let mut ordered_node_ids = Vec::new();
+        let mut node_id_set = BTreeSet::<NodeId>::new();
+        for node_id in node_ids {
+            if !node_id_set.insert(node_id) {
+                return Err(ClusterBuildError::DuplicateNodeId {
+                    id: node_id.as_u32(),
+                });
+            }
+            ordered_node_ids.push(node_id);
+        }
+        if ordered_node_ids.is_empty() {
+            return Err(ClusterBuildError::EmptyCluster);
+        }
+        if !node_id_set.contains(&metadata_primary_node_id) {
+            return Err(ClusterBuildError::MetadataPrimaryNotFound {
+                id: metadata_primary_node_id.as_u32(),
+            });
+        }
+        let pg_ids = validate_local_pg_ids(pg_ids)?;
+        let placement_map = build_local_placement_map(node_id_set.iter().copied())?;
+        validate_local_payload_placement(&placement_map, default_ec_shape)?;
+
+        let storage_pg_ids: Vec<u32> = pg_ids.iter().map(|pg_id| pg_id.get()).collect();
+        let pg_topology = PgTopology::new(&storage_pg_ids).map_err(|reason| {
+            ClusterBuildError::InvalidLocalPlacement {
+                reason: reason.to_string(),
+            }
+        })?;
+        let pg_routes = build_validated_pg_routes(cluster_epoch, &node_id_set, &pg_ids, pg_routes)?;
+
+        let mut nodes = BTreeMap::new();
+        for node_id in ordered_node_ids {
+            let node_store =
+                LocalNodeStore::topology_only(node_id, &storage_pg_ids, default_ec_shape).map_err(
+                    |source| ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source,
+                    },
+                )?;
+            nodes.insert(node_id, node_store);
+        }
+        let metadata_primary = nodes
+            .get(&metadata_primary_node_id)
+            .expect("validated metadata primary should have been opened");
+
+        Ok(Self {
+            epoch: cluster_epoch,
+            metadata_primary_node_id,
+            pg_ids: storage_pg_ids.into_boxed_slice(),
+            pg_topology,
+            default_ec_shape,
+            pg_routes,
+            placement_map,
+            runtime_state: Arc::new(LocalClusterRuntimeState::new()),
+            process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
+            nodes,
+        })
+    }
+
     fn open_with_configs_inner(
         metadata_primary_node_id: NodeId,
         configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
@@ -2900,6 +2967,56 @@ fn build_static_pg_routes(
             )
         })
         .collect()
+}
+
+fn build_validated_pg_routes(
+    cluster_epoch: ClusterEpoch,
+    node_ids: &BTreeSet<NodeId>,
+    pg_ids: &[PgId],
+    routes: impl IntoIterator<Item = LocalPgRoute>,
+) -> Result<BTreeMap<PgId, LocalPgRoute>, ClusterBuildError> {
+    let configured: BTreeSet<PgId> = pg_ids.iter().copied().collect();
+    let mut pg_routes = BTreeMap::new();
+    for route in routes {
+        let route_pg_id = route.pg_id();
+        if route.cluster_epoch() != cluster_epoch {
+            return Err(ClusterBuildError::RouteClusterEpochMismatch {
+                pg_id: route_pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                cluster_epoch,
+            });
+        }
+        if !configured.contains(&route_pg_id) {
+            return Err(ClusterBuildError::RoutePgNotConfigured {
+                pg_id: route_pg_id.get(),
+            });
+        }
+        if !route.acting_set().contains(&route.primary_node_id()) {
+            return Err(ClusterBuildError::RoutePrimaryNotInActingSet {
+                pg_id: route_pg_id.get(),
+                primary_node_id: route.primary_node_id().as_u32(),
+            });
+        }
+        for &node_id in route.acting_set() {
+            if !node_ids.contains(&node_id) {
+                return Err(ClusterBuildError::RouteActingSetNodeNotFound {
+                    pg_id: route_pg_id.get(),
+                    node_id: node_id.as_u32(),
+                });
+            }
+        }
+        if pg_routes.insert(route_pg_id, route).is_some() {
+            return Err(ClusterBuildError::DuplicatePgRoute {
+                pg_id: route_pg_id.get(),
+            });
+        }
+    }
+    for &pg_id in pg_ids {
+        if !pg_routes.contains_key(&pg_id) {
+            return Err(ClusterBuildError::MissingPgRoute { pg_id: pg_id.get() });
+        }
+    }
+    Ok(pg_routes)
 }
 
 fn validate_metadata_command_replay_state(
@@ -7131,6 +7248,82 @@ mod tests {
                 Err(StoreError::PgNotFound { pg_id: 0 })
             ));
         }
+    }
+
+    #[test]
+    fn opens_frontend_topology_with_supplied_pg_routes() {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let epoch = ClusterEpoch::new(7).unwrap();
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let acting_set = Arc::<[NodeId]>::from(vec![NodeId::new(2), NodeId::new(1)]);
+        let routes = vec![
+            LocalPgRoute::active(epoch, PgId::new(0), NodeId::new(2), Arc::clone(&acting_set)),
+            LocalPgRoute::active(epoch, PgId::new(1), NodeId::new(2), Arc::clone(&acting_set)),
+        ];
+
+        let map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+            NodeId::new(0),
+            node_ids,
+            &[0, 1],
+            ec_shape,
+            epoch,
+            routes,
+        )
+        .unwrap();
+
+        assert_eq!(map.epoch(), epoch);
+        assert_eq!(map.metadata_primary_node_id(), NodeId::new(0));
+        assert_eq!(map.pg_routes().count(), 2);
+        let route = map.pg_route(PgId::new(1)).unwrap();
+        assert_eq!(route.primary_node_id(), NodeId::new(2));
+        assert_eq!(route.acting_set(), &[NodeId::new(2), NodeId::new(1)]);
+        assert_eq!(route.cluster_epoch(), epoch);
+        assert_eq!(route.state(), PgState::Active);
+    }
+
+    #[test]
+    fn supplied_pg_routes_must_match_configured_epoch_and_pg_set() {
+        let node_ids = [NodeId::new(0), NodeId::new(1)];
+        let epoch = ClusterEpoch::new(7).unwrap();
+        let stale_epoch = ClusterEpoch::new(6).unwrap();
+        let ec_shape = EcShape { k: 1, m: 1 };
+        let acting_set = Arc::<[NodeId]>::from(vec![NodeId::new(0), NodeId::new(1)]);
+
+        let stale_route = LocalPgRoute::active(
+            stale_epoch,
+            PgId::new(0),
+            NodeId::new(0),
+            Arc::clone(&acting_set),
+        );
+        assert!(matches!(
+            LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+                NodeId::new(0),
+                node_ids,
+                &[0],
+                ec_shape,
+                epoch,
+                vec![stale_route],
+            ),
+            Err(ClusterBuildError::RouteClusterEpochMismatch {
+                pg_id: 0,
+                route_epoch,
+                cluster_epoch,
+            }) if route_epoch == stale_epoch && cluster_epoch == epoch
+        ));
+
+        let only_route =
+            LocalPgRoute::active(epoch, PgId::new(0), NodeId::new(0), Arc::clone(&acting_set));
+        assert!(matches!(
+            LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+                NodeId::new(0),
+                node_ids,
+                &[0, 1],
+                ec_shape,
+                epoch,
+                vec![only_route],
+            ),
+            Err(ClusterBuildError::MissingPgRoute { pg_id: 1 })
+        ));
     }
 
     struct RecordingPlacedShardClient {
