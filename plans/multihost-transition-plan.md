@@ -7171,6 +7171,9 @@ Status:
   remain unbounded, while control-plane-derived/supplied route maps can retain
   `valid_until_ms` and expose `require_route_map_valid_at(now_ms)` for later
   dynamic install and serving guards.
+- Wired the runtime-map validity bound into metadata PG routing. Expired
+  control-plane-derived maps now fail closed before selecting metadata
+  primaries, acting sets, or accepting replica metadata commands.
 - Added the first direct authority-to-local-runtime install bridge. A frontend
   topology-only `LocalClusterMap` can now be built from a
   `ClusterRuntimeMapSnapshot`, preserving the authority epoch, all exported PG

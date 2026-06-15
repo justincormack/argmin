@@ -1586,6 +1586,10 @@ impl LocalClusterMap {
         }
     }
 
+    fn require_route_map_valid_now(&self) -> Result<(), StoreError> {
+        self.require_route_map_valid_at(crate::clock::current_time_millis())
+    }
+
     pub fn metadata_primary_node_id(&self) -> NodeId {
         self.metadata_primary_node_id
     }
@@ -2572,6 +2576,7 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
+        self.require_route_map_valid_now()?;
 
         let route = self
             .pg_routes
@@ -2622,6 +2627,7 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
+        self.require_route_map_valid_now()?;
 
         let route = self
             .pg_routes
@@ -2691,6 +2697,7 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
+        self.require_route_map_valid_now()?;
 
         let route = self
             .pg_routes
@@ -7471,6 +7478,63 @@ mod tests {
                 valid_until_ms: 1_500,
                 now_ms: 1_500,
             }) if cluster_epoch == epoch
+        ));
+    }
+
+    #[test]
+    fn expired_route_maps_reject_metadata_routing() {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let pg_id = PgId::new(1);
+        let command = create_bucket_metadata_command(pg_id, 1, BucketName::new("bucket").unwrap());
+        map.route_map_valid_until_ms =
+            Some(crate::clock::current_time_millis().saturating_add(60_000));
+
+        map.metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        map.metadata_pg_acting_nodes(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        map.validate_metadata_command_for_replica(NodeId::new(0), NodeId::new(1), pg_id, &command)
+            .unwrap();
+
+        let expired_at = crate::clock::current_time_millis();
+        map.route_map_valid_until_ms = Some(expired_at);
+        let err = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if valid_until_ms == expired_at && now_ms >= expired_at
+        ));
+
+        let err = map
+            .metadata_pg_acting_nodes(ClusterEpoch::INITIAL, pg_id)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if valid_until_ms == expired_at && now_ms >= expired_at
+        ));
+
+        let err = map
+            .validate_metadata_command_for_replica(NodeId::new(0), NodeId::new(1), pg_id, &command)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if valid_until_ms == expired_at && now_ms >= expired_at
         ));
     }
 
