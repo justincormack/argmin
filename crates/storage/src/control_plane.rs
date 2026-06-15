@@ -120,6 +120,7 @@ pub struct NodeControlRecord {
     last_observed_epoch: Option<ClusterEpoch>,
     last_heartbeat_ms: Option<u64>,
     lease_deadline_ms: Option<u64>,
+    pg_observations: BTreeMap<PgId, NodePgObservationRecord>,
 }
 
 impl NodeControlRecord {
@@ -138,6 +139,7 @@ impl NodeControlRecord {
             last_observed_epoch: None,
             last_heartbeat_ms: None,
             lease_deadline_ms: None,
+            pg_observations: BTreeMap::new(),
         }
     }
 
@@ -179,6 +181,14 @@ impl NodeControlRecord {
     #[must_use]
     pub fn lease_deadline_ms(&self) -> Option<u64> {
         self.lease_deadline_ms
+    }
+
+    pub fn pg_observation(&self, pg_id: PgId) -> Option<&NodePgObservationRecord> {
+        self.pg_observations.get(&pg_id)
+    }
+
+    pub fn pg_observations(&self) -> impl Iterator<Item = &NodePgObservationRecord> {
+        self.pg_observations.values()
     }
 
     fn can_serve_primary(&self, cluster_epoch: ClusterEpoch) -> bool {
@@ -255,6 +265,9 @@ impl ClusterControlSnapshot {
 
     fn bump_epoch(&mut self) -> Result<(), ControlPlaneError> {
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
+        for record in self.nodes.values_mut() {
+            record.pg_observations.clear();
+        }
         Ok(())
     }
 
@@ -341,6 +354,42 @@ impl PgControlRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePgObservationRecord {
+    pg_id: PgId,
+    state: PgState,
+    observed_epoch: ClusterEpoch,
+    observed_at_ms: u64,
+}
+
+impl NodePgObservationRecord {
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn state(&self) -> PgState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn observed_epoch(&self) -> ClusterEpoch {
+        self.observed_epoch
+    }
+
+    #[must_use]
+    pub fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePgHeartbeatObservation {
+    pub pg_id: PgId,
+    pub state: PgState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeHeartbeat {
     pub node_id: NodeId,
@@ -349,6 +398,7 @@ pub struct NodeHeartbeat {
     pub observed_epoch: ClusterEpoch,
     pub now_ms: u64,
     pub lease_duration_ms: u64,
+    pub pg_observations: Vec<NodePgHeartbeatObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -866,6 +916,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 snapshot: self.snapshot.clone(),
             });
         }
+        validate_pg_heartbeat_observations(
+            &self.snapshot,
+            heartbeat.node_id,
+            &heartbeat.pg_observations,
+        )?;
 
         let mut epoch_changed = false;
         let mut affected_node = None;
@@ -893,6 +948,18 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.last_observed_epoch = Some(heartbeat.observed_epoch);
             record.last_heartbeat_ms = Some(heartbeat.now_ms);
             record.lease_deadline_ms = Some(lease_deadline_ms);
+            record.pg_observations.clear();
+            for observation in &heartbeat.pg_observations {
+                record.pg_observations.insert(
+                    observation.pg_id,
+                    NodePgObservationRecord {
+                        pg_id: observation.pg_id,
+                        state: observation.state,
+                        observed_epoch: heartbeat.observed_epoch,
+                        observed_at_ms: heartbeat.now_ms,
+                    },
+                );
+            }
         }
         if epoch_changed {
             if let Some(node_id) = affected_node {
@@ -1147,6 +1214,12 @@ pub enum ControlPlaneError {
     #[error("PG {pg_id} acting set repeats node {node_id}")]
     DuplicateActingSetNode { pg_id: u32, node_id: u32 },
 
+    #[error("node {node_id} heartbeat repeats PG {pg_id} observation")]
+    DuplicatePgObservation { node_id: u32, pg_id: u32 },
+
+    #[error("node {node_id} heartbeat reports PG {pg_id} outside its acting set")]
+    PgObservationNotInActingSet { node_id: u32, pg_id: u32 },
+
     #[error("PG {pg_id} Active state requires complete_pg_peering")]
     ActivePgRequiresPeeringComplete { pg_id: u32 },
 
@@ -1253,7 +1326,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=3\n");
+    out.push_str("version=4\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -1271,6 +1344,13 @@ fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
                 history.cluster_epoch.get(),
                 format_node_record(record)
             ));
+            for observation in record.pg_observations.values() {
+                out.push_str(&format!(
+                    "history_node_pg={},{}\n",
+                    history.cluster_epoch.get(),
+                    format_node_pg_record(record.node_id, observation)
+                ));
+            }
         }
         for record in &history.pgs {
             out.push_str(&format!(
@@ -1282,6 +1362,12 @@ fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     }
     for record in snapshot.nodes.values() {
         out.push_str(&format!("node={}\n", format_node_record(record)));
+        for observation in record.pg_observations.values() {
+            out.push_str(&format!(
+                "node_pg={}\n",
+                format_node_pg_record(record.node_id, observation)
+            ));
+        }
     }
     for record in snapshot.pgs.values() {
         out.push_str(&format!("pg={}\n", format_pg_record(record)));
@@ -1312,6 +1398,17 @@ fn format_pg_record(record: &PgControlRecord) -> String {
     )
 }
 
+fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
+    format!(
+        "{},{},{},{},{}",
+        node_id.as_u32(),
+        record.pg_id.get(),
+        pg_state_as_str(record.state),
+        record.observed_epoch.get(),
+        record.observed_at_ms
+    )
+}
+
 fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlaneError> {
     let mut version = None;
     let mut authority_incarnation = None;
@@ -1319,7 +1416,9 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
     let mut nodes = BTreeMap::new();
     let mut pgs = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
+    let mut node_pg_lines = BTreeMap::<(NodeId, PgId), usize>::new();
     let mut history = BTreeMap::<ClusterEpoch, ParsedHistoryRecord>::new();
+    let mut parsed_pg_observations = false;
 
     for (idx, line) in contents.lines().enumerate() {
         let line_number = idx + 1;
@@ -1341,6 +1440,12 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
                     .ok_or_else(|| parse_error(line_number, "cluster epoch must be nonzero"))?,
             );
         } else if let Some(value) = line.strip_prefix("history=") {
+            if version == Some(2) {
+                return Err(parse_error(
+                    line_number,
+                    "history records require control-plane state version 3",
+                ));
+            }
             let record = parse_history_record(line_number, value)?;
             if history
                 .insert(
@@ -1352,6 +1457,12 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
                 return Err(parse_error(line_number, "duplicate history record"));
             }
         } else if let Some(value) = line.strip_prefix("history_node=") {
+            if version == Some(2) {
+                return Err(parse_error(
+                    line_number,
+                    "history records require control-plane state version 3",
+                ));
+            }
             let (epoch, record) = parse_history_node_record(line_number, value)?;
             let history_record = history
                 .get_mut(&epoch)
@@ -1361,7 +1472,46 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             } else {
                 return Err(parse_error(line_number, "duplicate history node record"));
             }
+        } else if let Some(value) = line.strip_prefix("history_node_pg=") {
+            if matches!(version, Some(2 | 3)) {
+                return Err(parse_error(
+                    line_number,
+                    "PG observation records require control-plane state version 4",
+                ));
+            }
+            parsed_pg_observations = true;
+            let (epoch, node_id, observation) = parse_history_node_pg_record(line_number, value)?;
+            let history_record = history.get_mut(&epoch).ok_or_else(|| {
+                parse_error(line_number, "history node PG references unknown epoch")
+            })?;
+            let node = history_record
+                .record
+                .nodes
+                .iter_mut()
+                .find(|record| record.node_id == node_id)
+                .ok_or_else(|| {
+                    parse_error(line_number, "history node PG references unknown node")
+                })?;
+            if node
+                .pg_observations
+                .insert(observation.pg_id, observation)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate history node PG observation",
+                ));
+            }
+            history_record
+                .node_pg_lines
+                .insert((node_id, observation.pg_id), line_number);
         } else if let Some(value) = line.strip_prefix("history_pg=") {
+            if version == Some(2) {
+                return Err(parse_error(
+                    line_number,
+                    "history records require control-plane state version 3",
+                ));
+            }
             let (epoch, record) = parse_history_pg_record(line_number, value)?;
             let history_record = history
                 .get_mut(&epoch)
@@ -1377,6 +1527,26 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             if nodes.insert(record.node_id, record).is_some() {
                 return Err(parse_error(line_number, "duplicate node record"));
             }
+        } else if let Some(value) = line.strip_prefix("node_pg=") {
+            if matches!(version, Some(2 | 3)) {
+                return Err(parse_error(
+                    line_number,
+                    "PG observation records require control-plane state version 4",
+                ));
+            }
+            parsed_pg_observations = true;
+            let (node_id, observation) = parse_node_pg_record(line_number, value)?;
+            let node = nodes
+                .get_mut(&node_id)
+                .ok_or_else(|| parse_error(line_number, "node PG references unknown node"))?;
+            if node
+                .pg_observations
+                .insert(observation.pg_id, observation)
+                .is_some()
+            {
+                return Err(parse_error(line_number, "duplicate node PG observation"));
+            }
+            node_pg_lines.insert((node_id, observation.pg_id), line_number);
         } else if let Some(value) = line.strip_prefix("pg=") {
             let record = parse_pg_record(line_number, value)?;
             let pg_id = record.pg_id;
@@ -1391,7 +1561,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if !matches!(version, 2 | 3) {
+    if !matches!(version, 2..=4) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -1404,7 +1574,14 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             "history records require control-plane state version 3",
         ));
     }
+    if version < 4 && parsed_pg_observations {
+        return Err(parse_error(
+            0,
+            "PG observation records require control-plane state version 4",
+        ));
+    }
     validate_current_pgs(&pgs, &pg_lines, &nodes)?;
+    validate_current_pg_observations(&nodes, &node_pg_lines, &pgs, cluster_epoch)?;
     validate_parsed_history(&history, cluster_epoch)?;
     let mut history: Vec<ClusterMapHistoryRecord> =
         history.into_values().map(|record| record.record).collect();
@@ -1425,6 +1602,7 @@ struct ParsedHistoryRecord {
     node_ids: BTreeSet<NodeId>,
     pg_ids: BTreeSet<PgId>,
     pg_lines: BTreeMap<PgId, usize>,
+    node_pg_lines: BTreeMap<(NodeId, PgId), usize>,
 }
 
 impl ParsedHistoryRecord {
@@ -1435,6 +1613,7 @@ impl ParsedHistoryRecord {
             node_ids: BTreeSet::new(),
             pg_ids: BTreeSet::new(),
             pg_lines: BTreeMap::new(),
+            node_pg_lines: BTreeMap::new(),
         }
     }
 }
@@ -1450,6 +1629,38 @@ fn validate_current_pgs(
                 return Err(parse_error(
                     pg_lines.get(&pg.pg_id).copied().unwrap_or(0),
                     "PG acting set references unknown node",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_pg_observations(
+    nodes: &BTreeMap<NodeId, NodeControlRecord>,
+    node_pg_lines: &BTreeMap<(NodeId, PgId), usize>,
+    pgs: &BTreeMap<PgId, PgControlRecord>,
+    current_epoch: ClusterEpoch,
+) -> Result<(), ControlPlaneError> {
+    for node in nodes.values() {
+        for observation in node.pg_observations.values() {
+            let line = node_pg_lines
+                .get(&(node.node_id, observation.pg_id))
+                .copied()
+                .unwrap_or(0);
+            if observation.observed_epoch != current_epoch {
+                return Err(parse_error(
+                    line,
+                    "node PG observation epoch must match current cluster epoch",
+                ));
+            }
+            let pg = pgs
+                .get(&observation.pg_id)
+                .ok_or_else(|| parse_error(line, "node PG observation references unknown PG"))?;
+            if !pg.acting_set.contains(&node.node_id) {
+                return Err(parse_error(
+                    line,
+                    "node PG observation references PG outside node acting set",
                 ));
             }
         }
@@ -1478,6 +1689,35 @@ fn validate_parsed_history(
                             .copied()
                             .unwrap_or(record.line),
                         "history PG acting set references node absent from history map",
+                    ));
+                }
+            }
+        }
+        for node in &record.record.nodes {
+            for observation in node.pg_observations.values() {
+                let line = record
+                    .node_pg_lines
+                    .get(&(node.node_id, observation.pg_id))
+                    .copied()
+                    .unwrap_or(record.line);
+                if observation.observed_epoch != *epoch {
+                    return Err(parse_error(
+                        line,
+                        "history node PG observation epoch must match history epoch",
+                    ));
+                }
+                let pg = record
+                    .record
+                    .pgs
+                    .iter()
+                    .find(|pg| pg.pg_id == observation.pg_id)
+                    .ok_or_else(|| {
+                        parse_error(line, "history node PG observation references unknown PG")
+                    })?;
+                if !pg.acting_set.contains(&node.node_id) {
+                    return Err(parse_error(
+                        line,
+                        "history node PG observation references PG outside node acting set",
                     ));
                 }
             }
@@ -1519,6 +1759,19 @@ fn parse_history_node_record(
     Ok((epoch, parse_node_record(line, record)?))
 }
 
+fn parse_history_node_pg_record(
+    line: usize,
+    value: &str,
+) -> Result<(ClusterEpoch, NodeId, NodePgObservationRecord), ControlPlaneError> {
+    let (epoch, record) = value
+        .split_once(',')
+        .ok_or_else(|| parse_error(line, "history node PG record must start with epoch"))?;
+    let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history node PG epoch")?)
+        .ok_or_else(|| parse_error(line, "history node PG epoch must be nonzero"))?;
+    let (node_id, record) = parse_node_pg_record(line, record)?;
+    Ok((epoch, node_id, record))
+}
+
 fn parse_history_pg_record(
     line: usize,
     value: &str,
@@ -1529,6 +1782,34 @@ fn parse_history_pg_record(
     let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history PG epoch")?)
         .ok_or_else(|| parse_error(line, "history PG epoch must be nonzero"))?;
     Ok((epoch, parse_pg_record(line, record)?))
+}
+
+fn parse_node_pg_record(
+    line: usize,
+    value: &str,
+) -> Result<(NodeId, NodePgObservationRecord), ControlPlaneError> {
+    let fields: Vec<&str> = value.split(',').collect();
+    if fields.len() != 5 {
+        return Err(parse_error(
+            line,
+            "node PG observation record must have five fields",
+        ));
+    }
+    let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
+    let pg_id = PgId::new(parse_u32(line, fields[1], "PG id")?);
+    let state = pg_state_from_str(fields[2])?;
+    let observed_epoch = ClusterEpoch::new(parse_u64(line, fields[3], "observed epoch")?)
+        .ok_or_else(|| parse_error(line, "observed epoch must be nonzero"))?;
+    let observed_at_ms = parse_u64(line, fields[4], "observed at")?;
+    Ok((
+        node_id,
+        NodePgObservationRecord {
+            pg_id,
+            state,
+            observed_epoch,
+            observed_at_ms,
+        },
+    ))
 }
 
 fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, ControlPlaneError> {
@@ -1554,6 +1835,7 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
         last_observed_epoch,
         last_heartbeat_ms,
         lease_deadline_ms,
+        pg_observations: BTreeMap::new(),
     })
 }
 
@@ -1632,6 +1914,35 @@ fn validate_acting_set(
             return Err(ControlPlaneError::UnknownActingSetNode {
                 pg_id: pg_id.get(),
                 node_id: node_id.as_u32(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_pg_heartbeat_observations(
+    snapshot: &ClusterControlSnapshot,
+    node_id: NodeId,
+    observations: &[NodePgHeartbeatObservation],
+) -> Result<(), ControlPlaneError> {
+    let mut observed_pgs = BTreeSet::new();
+    for observation in observations {
+        if !observed_pgs.insert(observation.pg_id) {
+            return Err(ControlPlaneError::DuplicatePgObservation {
+                node_id: node_id.as_u32(),
+                pg_id: observation.pg_id.get(),
+            });
+        }
+        let pg = snapshot
+            .pgs
+            .get(&observation.pg_id)
+            .ok_or(ControlPlaneError::UnknownPg {
+                pg_id: observation.pg_id.get(),
+            })?;
+        if !pg.acting_set.contains(&node_id) {
+            return Err(ControlPlaneError::PgObservationNotInActingSet {
+                node_id: node_id.as_u32(),
+                pg_id: observation.pg_id.get(),
             });
         }
     }
@@ -1813,6 +2124,7 @@ mod tests {
             observed_epoch,
             now_ms,
             lease_duration_ms: 100,
+            pg_observations: Vec::new(),
         }
     }
 
@@ -2075,6 +2387,79 @@ mod tests {
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "history PG acting set references node absent from history map"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_pg_observations_before_version_four() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=3\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node_pg=1,7,peering,2,100\n",
+                "pg=7,peering,1\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "PG observation records require control-plane state version 4"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_current_pg_observation_outside_acting_set() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=4\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=2,active,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
+                "node_pg=2,7,peering,2,100\n",
+                "pg=7,peering,1\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "node PG observation references PG outside node acting set"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_current_pg_observation_wrong_epoch() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=4\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=3\n",
+                "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
+                "node_pg=1,7,peering,2,100\n",
+                "pg=7,peering,1\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "node PG observation epoch must match current cluster epoch"
         ));
     }
 
@@ -2701,6 +3086,200 @@ mod tests {
             .heartbeat(heartbeat(6, caught_up.cluster_epoch(), 300))
             .unwrap();
         assert!(final_lease.serving());
+    }
+
+    #[test]
+    fn heartbeat_records_current_epoch_pg_observations() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(15), vec![NodeId::new(1)])
+            .unwrap();
+
+        let mut heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(15),
+            state: PgState::Peering,
+        }];
+        authority.heartbeat(heartbeat).unwrap();
+
+        let observation = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(15))
+            .unwrap();
+        assert_eq!(observation.pg_id(), PgId::new(15));
+        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(
+            observation.observed_epoch(),
+            authority.snapshot().cluster_epoch()
+        );
+        assert_eq!(observation.observed_at_ms(), 2_000);
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(
+            persisted
+                .node(NodeId::new(1))
+                .unwrap()
+                .pg_observation(PgId::new(15))
+                .unwrap()
+                .state(),
+            PgState::Peering
+        );
+    }
+
+    #[test]
+    fn stale_heartbeat_does_not_mutate_pg_observations() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(16), vec![NodeId::new(1)])
+            .unwrap();
+        let current_epoch = authority.snapshot().cluster_epoch();
+
+        let mut stale = heartbeat_from_record(
+            &authority,
+            1,
+            ClusterEpoch::new(current_epoch.get() - 1).unwrap(),
+            2_000,
+        );
+        stale.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(16),
+            state: PgState::Active,
+        }];
+        let response = authority.heartbeat(stale).unwrap();
+        assert!(!response.serving());
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(16))
+            .is_none());
+    }
+
+    #[test]
+    fn heartbeat_rejects_invalid_pg_observations() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(17), vec![NodeId::new(1)])
+            .unwrap();
+
+        let mut duplicate =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        duplicate.pg_observations = vec![
+            NodePgHeartbeatObservation {
+                pg_id: PgId::new(17),
+                state: PgState::Peering,
+            },
+            NodePgHeartbeatObservation {
+                pg_id: PgId::new(17),
+                state: PgState::Peering,
+            },
+        ];
+        assert!(matches!(
+            authority.heartbeat(duplicate),
+            Err(ControlPlaneError::DuplicatePgObservation {
+                node_id: 1,
+                pg_id: 17
+            })
+        ));
+
+        let mut unknown =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_001);
+        unknown.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(99),
+            state: PgState::Peering,
+        }];
+        assert!(matches!(
+            authority.heartbeat(unknown),
+            Err(ControlPlaneError::UnknownPg { pg_id: 99 })
+        ));
+
+        let mut wrong_node =
+            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 2_002);
+        wrong_node.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(17),
+            state: PgState::Peering,
+        }];
+        assert!(matches!(
+            authority.heartbeat(wrong_node),
+            Err(ControlPlaneError::PgObservationNotInActingSet {
+                node_id: 2,
+                pg_id: 17
+            })
+        ));
+    }
+
+    #[test]
+    fn epoch_change_clears_current_pg_observations_and_preserves_history() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(18), vec![NodeId::new(1)])
+            .unwrap();
+        let observation_epoch = authority.snapshot().cluster_epoch();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, observation_epoch, 2_000);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(18),
+            state: PgState::Peering,
+        }];
+        authority.heartbeat(heartbeat).unwrap();
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(18))
+            .is_some());
+
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(18))
+            .is_none());
+        let history = authority
+            .snapshot()
+            .cluster_map_at_epoch(observation_epoch)
+            .unwrap();
+        let historical_node = history
+            .nodes()
+            .iter()
+            .find(|record| record.node_id() == NodeId::new(1))
+            .unwrap();
+        assert_eq!(
+            historical_node
+                .pg_observation(PgId::new(18))
+                .unwrap()
+                .observed_epoch(),
+            observation_epoch
+        );
     }
 
     #[test]

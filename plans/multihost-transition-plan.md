@@ -7061,6 +7061,12 @@ Status:
   lease/epoch/incarnation fencing plus an `Active` PG served by the deterministic
   primary. Degraded or backfilling read relaxations remain deferred until repair
   can provide explicit shard/readability proofs.
+- Added current-epoch PG state summaries to storage-node heartbeats. The
+  authority persists per-node PG observations only for current-epoch heartbeats
+  from nodes in the authoritative PG acting set, rejects malformed persisted
+  observations, does not mutate summaries on stale heartbeats, and clears current
+  observations on epoch changes while retaining the old summaries in cluster-map
+  history for future peering diagnostics.
 
 Exit criteria:
 
