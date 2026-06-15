@@ -2864,6 +2864,27 @@ mod tests {
         }
     }
 
+    fn heartbeat_until_serving_with_endpoint(
+        authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+        node_id: u32,
+        now_ms: u64,
+        endpoint: String,
+    ) -> HeartbeatLease {
+        let mut heartbeat = heartbeat(node_id, authority.snapshot().cluster_epoch(), now_ms);
+        heartbeat.endpoint = endpoint;
+        let first = authority.heartbeat(heartbeat, now_ms).unwrap();
+        if first.serving() {
+            first
+        } else {
+            authority
+                .heartbeat(
+                    heartbeat_from_record(authority, node_id, first.cluster_epoch(), now_ms + 1),
+                    now_ms + 1,
+                )
+                .unwrap()
+        }
+    }
+
     fn heartbeat_from_record<S: ControlPlaneStore>(
         authority: &SingleAuthorityControlPlane<S>,
         node_id: u32,
@@ -3811,6 +3832,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_map_builds_storage_cluster_with_validity_bound() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let endpoint = tmp
+            .path()
+            .join("node-1.sock")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            heartbeat_until_serving_with_endpoint(&mut authority, 1, 1_000, endpoint).serving()
+        );
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_002);
+        let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let valid_until_ms = runtime_map.valid_until_ms().unwrap();
+
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+
+        assert_eq!(cluster.cluster_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(cluster.operation_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(cluster.route_map_valid_until_ms(), Some(valid_until_ms));
+        cluster
+            .require_route_map_valid_at(valid_until_ms - 1)
+            .unwrap();
+        assert!(matches!(
+            cluster.require_route_map_valid_at(valid_until_ms),
+            Err(crate::StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: expired_at,
+                now_ms,
+            }) if cluster_epoch == runtime_map.cluster_epoch()
+                && expired_at == valid_until_ms
+                && now_ms == valid_until_ms
+        ));
+        let route = cluster.local_pg_route(PgId::new(31)).unwrap();
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+        assert_eq!(route.state(), PgState::Active);
+    }
+
+    #[test]
     fn runtime_node_routes_build_unix_storage_client_configs() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -3858,6 +3939,70 @@ mod tests {
             configured.rpc_control_admission_wait_timeout(),
             std::time::Duration::from_millis(300)
         );
+    }
+
+    #[test]
+    fn runtime_map_installs_unix_storage_clients_from_absolute_endpoints() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let endpoint = tmp
+            .path()
+            .join("node-1.sock")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            heartbeat_until_serving_with_endpoint(&mut authority, 1, 1_000, endpoint).serving()
+        );
+        authority
+            .set_pg_acting_set(PgId::new(32), vec![NodeId::new(1)])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+
+        let cluster = crate::StorageCluster::from_runtime_map_with_unix_storage_node_clients(
+            NodeId::new(1),
+            &runtime_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+
+        assert_eq!(cluster.local_node_count(), 1);
+        assert_eq!(
+            cluster.local_node_ids().collect::<Vec<_>>(),
+            vec![NodeId::new(1)]
+        );
+        assert_eq!(
+            cluster.local_pg_route(PgId::new(32)).unwrap().state(),
+            PgState::Peering
+        );
+    }
+
+    #[test]
+    fn runtime_map_unix_storage_clients_reject_relative_endpoints() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(33), vec![NodeId::new(1)])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+
+        assert!(matches!(
+            crate::StorageCluster::from_runtime_map_with_unix_storage_node_clients(
+                NodeId::new(1),
+                &runtime_map,
+                crate::EcShape { k: 1, m: 0 },
+            ),
+            Err(crate::ClusterBuildError::RemoteStorageNodeClientSocketPathNotAbsolute { path })
+                if path.as_path() == std::path::Path::new("node-1.sock")
+        ));
     }
 
     #[test]

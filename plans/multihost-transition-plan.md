@@ -7145,6 +7145,11 @@ Status:
   narrow helper that turns transport-neutral node route endpoints into
   storage-node client configs without teaching the authority about socket
   paths.
+- Extended that bridge to `StorageCluster` construction. Runtime snapshots can
+  now produce a cluster handle directly, optionally installing Unix
+  storage-node clients from absolute runtime endpoints, while preserving the
+  authority route-map validity deadline and exposing the same fail-closed
+  validity check at the cluster boundary.
 
 Exit criteria:
 

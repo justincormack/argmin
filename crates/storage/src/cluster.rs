@@ -17,6 +17,7 @@ pub use local::{
 };
 use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 
+use crate::control_plane::ClusterRuntimeMapSnapshot;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::CommitDirectPutObjectCommand;
@@ -1870,6 +1871,39 @@ impl StorageCluster {
         Self::from_local_map_with_epoch(Arc::clone(&local_map), local_map.epoch())
     }
 
+    pub fn from_runtime_map(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let local_map = Arc::new(
+            LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+                metadata_primary_node_id,
+                runtime_map,
+                default_ec_shape,
+            )?,
+        );
+        Self::from_local_map(local_map)
+    }
+
+    pub fn from_runtime_map_with_unix_storage_node_clients(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+        )?;
+        let storage_node_configs = runtime_map
+            .nodes()
+            .iter()
+            .map(LocalUnixStorageNodeClientConfig::from_runtime_node_route);
+        local_map.install_unix_storage_node_clients(storage_node_configs)?;
+        Self::from_local_map(Arc::new(local_map))
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_from_local_map_with_epoch(
         local_map: Arc<LocalClusterMap>,
@@ -1896,6 +1930,18 @@ impl StorageCluster {
 
     pub fn operation_epoch(&self) -> ClusterEpoch {
         self.operation_epoch
+    }
+
+    pub fn route_map_valid_until_ms(&self) -> Option<u64> {
+        self.local_map.route_map_valid_until_ms()
+    }
+
+    pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
+        self.local_map.is_route_map_valid_at(now_ms)
+    }
+
+    pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
+        self.local_map.require_route_map_valid_at(now_ms)
     }
 
     fn require_current_payload_operation_epoch(&self, pg_id: u32) -> Result<(), StoreError> {
