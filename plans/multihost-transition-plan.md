@@ -7134,6 +7134,10 @@ Status:
   snapshots carry the primary lease deadline, and the runtime map exposes the
   minimum active-route deadline as its `valid_until_ms` so later install/serve
   paths know when the map must stop routing unsafe work.
+- Carried that runtime-map validity bound into `LocalClusterMap`. Static maps
+  remain unbounded, while control-plane-derived/supplied route maps can retain
+  `valid_until_ms` and expose `require_route_map_valid_at(now_ms)` for later
+  dynamic install and serving guards.
 
 Exit criteria:
 

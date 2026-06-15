@@ -128,6 +128,15 @@ pub enum StoreError {
     },
 
     #[error(
+        "runtime route map for cluster epoch {cluster_epoch} expired at {valid_until_ms}; current time is {now_ms}"
+    )]
+    RouteMapExpired {
+        cluster_epoch: ClusterEpoch,
+        valid_until_ms: u64,
+        now_ms: u64,
+    },
+
+    #[error(
         "metadata command for local node {node_id} PG {pg_id} has epoch {command_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleMetadataCommand {

@@ -1108,6 +1108,7 @@ impl LocalClusterRuntimeState {
 #[derive(Debug)]
 pub struct LocalClusterMap {
     epoch: ClusterEpoch,
+    route_map_valid_until_ms: Option<u64>,
     metadata_primary_node_id: NodeId,
     nodes: BTreeMap<NodeId, LocalNodeStore>,
     pg_ids: Box<[u32]>,
@@ -1252,6 +1253,7 @@ impl LocalClusterMap {
             pg_topology,
             default_ec_shape,
             pg_routes,
+            route_map_valid_until_ms: None,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
@@ -1266,6 +1268,26 @@ impl LocalClusterMap {
         default_ec_shape: EcShape,
         cluster_epoch: ClusterEpoch,
         pg_routes: impl IntoIterator<Item = LocalPgRoute>,
+    ) -> Result<Self, ClusterBuildError> {
+        Self::open_frontend_topology_only_with_pg_routes_and_validity(
+            metadata_primary_node_id,
+            node_ids,
+            pg_ids,
+            default_ec_shape,
+            cluster_epoch,
+            pg_routes,
+            None,
+        )
+    }
+
+    pub fn open_frontend_topology_only_with_pg_routes_and_validity(
+        metadata_primary_node_id: NodeId,
+        node_ids: impl IntoIterator<Item = NodeId>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+        pg_routes: impl IntoIterator<Item = LocalPgRoute>,
+        route_map_valid_until_ms: Option<u64>,
     ) -> Result<Self, ClusterBuildError> {
         let mut ordered_node_ids = Vec::new();
         let mut node_id_set = BTreeSet::<NodeId>::new();
@@ -1319,6 +1341,7 @@ impl LocalClusterMap {
             pg_topology,
             default_ec_shape,
             pg_routes,
+            route_map_valid_until_ms,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
@@ -1418,6 +1441,7 @@ impl LocalClusterMap {
             pg_topology,
             default_ec_shape,
             pg_routes,
+            route_map_valid_until_ms: None,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
@@ -1427,6 +1451,26 @@ impl LocalClusterMap {
 
     pub fn epoch(&self) -> ClusterEpoch {
         self.epoch
+    }
+
+    pub fn route_map_valid_until_ms(&self) -> Option<u64> {
+        self.route_map_valid_until_ms
+    }
+
+    pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
+        self.route_map_valid_until_ms
+            .is_none_or(|valid_until_ms| valid_until_ms > now_ms)
+    }
+
+    pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
+        match self.route_map_valid_until_ms {
+            Some(valid_until_ms) if valid_until_ms <= now_ms => Err(StoreError::RouteMapExpired {
+                cluster_epoch: self.epoch,
+                valid_until_ms,
+                now_ms,
+            }),
+            _ => Ok(()),
+        }
     }
 
     pub fn metadata_primary_node_id(&self) -> NodeId {
@@ -7279,6 +7323,42 @@ mod tests {
         assert_eq!(route.acting_set(), &[NodeId::new(2), NodeId::new(1)]);
         assert_eq!(route.cluster_epoch(), epoch);
         assert_eq!(route.state(), PgState::Active);
+        assert_eq!(map.route_map_valid_until_ms(), None);
+        assert!(map.is_route_map_valid_at(u64::MAX));
+        map.require_route_map_valid_at(u64::MAX).unwrap();
+    }
+
+    #[test]
+    fn supplied_pg_routes_can_carry_runtime_validity_deadline() {
+        let node_ids = [NodeId::new(0), NodeId::new(1)];
+        let epoch = ClusterEpoch::new(7).unwrap();
+        let ec_shape = EcShape { k: 1, m: 1 };
+        let acting_set = Arc::<[NodeId]>::from(vec![NodeId::new(1)]);
+        let route = LocalPgRoute::active(epoch, PgId::new(0), NodeId::new(1), acting_set);
+
+        let map = LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(0),
+            node_ids,
+            &[0],
+            ec_shape,
+            epoch,
+            vec![route],
+            Some(1_500),
+        )
+        .unwrap();
+
+        assert_eq!(map.route_map_valid_until_ms(), Some(1_500));
+        assert!(map.is_route_map_valid_at(1_499));
+        map.require_route_map_valid_at(1_499).unwrap();
+        assert!(!map.is_route_map_valid_at(1_500));
+        assert!(matches!(
+            map.require_route_map_valid_at(1_500),
+            Err(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 1_500,
+                now_ms: 1_500,
+            }) if cluster_epoch == epoch
+        ));
     }
 
     #[test]
