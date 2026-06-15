@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
-use crate::control_plane::PgRouteSnapshot;
+use crate::control_plane::{ClusterRuntimeMapSnapshot, NodeRouteSnapshot, PgRouteSnapshot};
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::MetadataCommandLogIndex;
@@ -108,6 +108,10 @@ impl LocalUnixStorageNodeClientConfig {
         }
     }
 
+    pub fn from_runtime_node_route(node: &NodeRouteSnapshot) -> Self {
+        Self::new(node.node_id(), node.endpoint())
+    }
+
     pub fn with_rpc_admission_limit(
         node_id: NodeId,
         socket_path: impl Into<PathBuf>,
@@ -136,6 +140,21 @@ impl LocalUnixStorageNodeClientConfig {
             rpc_admission_wait_timeout,
             rpc_control_admission_wait_timeout,
         }
+    }
+
+    pub fn with_rpc_admission_from_runtime_node_route(
+        node: &NodeRouteSnapshot,
+        rpc_admission_limit: usize,
+        rpc_admission_wait_timeout: Duration,
+        rpc_control_admission_wait_timeout: Duration,
+    ) -> Self {
+        Self::with_rpc_admission(
+            node.node_id(),
+            node.endpoint(),
+            rpc_admission_limit,
+            rpc_admission_wait_timeout,
+            rpc_control_admission_wait_timeout,
+        )
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -1347,6 +1366,38 @@ impl LocalClusterMap {
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
         })
+    }
+
+    pub fn open_frontend_topology_only_with_runtime_map(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+    ) -> Result<Self, ClusterBuildError> {
+        let node_ids: Vec<NodeId> = runtime_map
+            .nodes()
+            .iter()
+            .map(NodeRouteSnapshot::node_id)
+            .collect();
+        let pg_ids: Vec<u32> = runtime_map
+            .pg_routes()
+            .iter()
+            .map(|route| route.pg_id().get())
+            .collect();
+        let pg_routes: Vec<LocalPgRoute> = runtime_map
+            .pg_routes()
+            .iter()
+            .map(LocalPgRoute::from)
+            .collect();
+
+        Self::open_frontend_topology_only_with_pg_routes_and_validity(
+            metadata_primary_node_id,
+            node_ids,
+            &pg_ids,
+            default_ec_shape,
+            runtime_map.cluster_epoch(),
+            pg_routes,
+            runtime_map.valid_until_ms(),
+        )
     }
 
     fn open_with_configs_inner(

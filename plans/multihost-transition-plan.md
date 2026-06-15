@@ -7138,6 +7138,13 @@ Status:
   remain unbounded, while control-plane-derived/supplied route maps can retain
   `valid_until_ms` and expose `require_route_map_valid_at(now_ms)` for later
   dynamic install and serving guards.
+- Added the first direct authority-to-local-runtime install bridge. A frontend
+  topology-only `LocalClusterMap` can now be built from a
+  `ClusterRuntimeMapSnapshot`, preserving the authority epoch, all exported PG
+  routes, and the map validity deadline. The Unix local runtime also has a
+  narrow helper that turns transport-neutral node route endpoints into
+  storage-node client configs without teaching the authority about socket
+  paths.
 
 Exit criteria:
 

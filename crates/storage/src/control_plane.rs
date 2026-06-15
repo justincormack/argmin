@@ -3764,6 +3764,103 @@ mod tests {
     }
 
     #[test]
+    fn runtime_map_builds_frontend_topology_with_validity_bound() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(29), vec![NodeId::new(2), NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 2, 29, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(29),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 2, 29, PgState::Active, 2_002);
+        let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let valid_until_ms = runtime_map
+            .valid_until_ms()
+            .expect("active runtime map should have a validity deadline");
+
+        let local_map =
+            crate::cluster::LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+                NodeId::new(1),
+                &runtime_map,
+                crate::EcShape { k: 1, m: 1 },
+            )
+            .unwrap();
+
+        assert_eq!(local_map.epoch(), runtime_map.cluster_epoch());
+        assert_eq!(local_map.route_map_valid_until_ms(), Some(valid_until_ms));
+        assert!(local_map.is_route_map_valid_at(valid_until_ms - 1));
+        assert!(!local_map.is_route_map_valid_at(valid_until_ms));
+        let route = local_map.pg_route(PgId::new(29)).unwrap();
+        assert_eq!(route.primary_node_id(), NodeId::new(2));
+        assert_eq!(route.acting_set(), &[NodeId::new(2), NodeId::new(1)]);
+        assert_eq!(route.state(), PgState::Active);
+    }
+
+    #[test]
+    fn runtime_node_routes_build_unix_storage_client_configs() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+        let node = &runtime_map.nodes()[0];
+
+        let default_config =
+            crate::cluster::LocalUnixStorageNodeClientConfig::from_runtime_node_route(node);
+        assert_eq!(default_config.node_id(), NodeId::new(1));
+        assert_eq!(
+            default_config.socket_path(),
+            std::path::Path::new("node-1.sock")
+        );
+        assert_eq!(
+            default_config.rpc_admission_limit(),
+            crate::cluster::LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT
+        );
+
+        let configured =
+            crate::cluster::LocalUnixStorageNodeClientConfig::with_rpc_admission_from_runtime_node_route(
+                node,
+                17,
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(300),
+            );
+        assert_eq!(configured.node_id(), NodeId::new(1));
+        assert_eq!(
+            configured.socket_path(),
+            std::path::Path::new("node-1.sock")
+        );
+        assert_eq!(configured.rpc_admission_limit(), 17);
+        assert_eq!(
+            configured.rpc_admission_wait_timeout(),
+            std::time::Duration::from_millis(200)
+        );
+        assert_eq!(
+            configured.rpc_control_admission_wait_timeout(),
+            std::time::Duration::from_millis(300)
+        );
+    }
+
+    #[test]
     fn runtime_map_requires_endpoints_for_routed_nodes() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
