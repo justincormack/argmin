@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::time::Instant;
 
+use placement::NodeId;
 #[cfg(any(test, feature = "test-hooks"))]
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -18,7 +19,7 @@ use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
-use crate::control_plane::{NodePgHeartbeatObservation, PgMetadataProof};
+use crate::control_plane::{NodeHeartbeat, NodePgHeartbeatObservation, PgMetadataProof};
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
@@ -49,7 +50,7 @@ use crate::types::{
 };
 #[cfg(test)]
 use crate::types::{StreamUploadState, StreamUploadTarget};
-use crate::{PgId, PgState};
+use crate::{ClusterEpoch, PgId, PgState};
 
 const TRACE_TARGET: &str = "storage";
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1161,6 +1162,29 @@ impl SharedStorageNode {
         })
     }
 
+    pub fn control_plane_heartbeat(
+        &self,
+        node_id: NodeId,
+        node_incarnation: u64,
+        endpoint: impl Into<String>,
+        observed_epoch: ClusterEpoch,
+        requested_lease_duration_ms: u64,
+        pg_states: impl IntoIterator<Item = (PgId, PgState)>,
+    ) -> Result<NodeHeartbeat, StoreError> {
+        let pg_observations = pg_states
+            .into_iter()
+            .map(|(pg_id, state)| self.pg_heartbeat_observation(pg_id, state))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(NodeHeartbeat {
+            node_id,
+            node_incarnation,
+            endpoint: endpoint.into(),
+            observed_epoch,
+            requested_lease_duration_ms,
+            pg_observations,
+        })
+    }
+
     /// Write a shard file durably without taking the per-PG mutex.
     ///
     /// This is used on the write hot path so file IO and fsync do not hold the
@@ -1808,6 +1832,56 @@ mod tests {
             observation.metadata_proof.state_digest,
             metadata_state.state_digest
         );
+    }
+
+    #[test]
+    fn shared_node_control_plane_heartbeat_includes_pg_proofs() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+
+        let heartbeat = node
+            .control_plane_heartbeat(
+                NodeId::new(7),
+                42,
+                "node-7.sock",
+                ClusterEpoch::new(3).unwrap(),
+                1_000,
+                [
+                    (PgId::new(0), PgState::Peering),
+                    (PgId::new(1), PgState::Active),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(heartbeat.node_id, NodeId::new(7));
+        assert_eq!(heartbeat.node_incarnation, 42);
+        assert_eq!(heartbeat.endpoint, "node-7.sock");
+        assert_eq!(heartbeat.observed_epoch, ClusterEpoch::new(3).unwrap());
+        assert_eq!(heartbeat.requested_lease_duration_ms, 1_000);
+        assert_eq!(heartbeat.pg_observations.len(), 2);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
+        assert_eq!(heartbeat.pg_observations[1].pg_id, PgId::new(1));
+        assert_eq!(heartbeat.pg_observations[1].state, PgState::Active);
+
+        for observation in &heartbeat.pg_observations {
+            let metadata_state = {
+                let pg = node.get_pg(observation.pg_id.get()).unwrap();
+                pg.metadata_command_replica_state().unwrap()
+            };
+            assert_eq!(
+                observation.metadata_proof.applied_log_index,
+                metadata_state.applied_log_index
+            );
+            assert_eq!(
+                observation.metadata_proof.applied_log_hash,
+                metadata_state.applied_log_hash
+            );
+            assert_eq!(
+                observation.metadata_proof.state_digest,
+                metadata_state.state_digest
+            );
+        }
     }
 
     fn create_bucket_for_snapshot_test(node: &SharedStorageNode, name: &str) -> BucketName {

@@ -7125,6 +7125,11 @@ Status:
   already compare. Dynamic heartbeat wiring still remains to be added, but the
   proof source is now the PG's persisted command-log state rather than only a
   synthetic test placeholder.
+- Extended that bridge to full storage-node heartbeat construction. Runtime
+  heartbeat loops can now supply the installed PG states from their current
+  route map and receive a `NodeHeartbeat` populated with node identity, observed
+  epoch, lease request, endpoint, and per-PG durable metadata proofs from the
+  local `SharedStorageNode`.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary
