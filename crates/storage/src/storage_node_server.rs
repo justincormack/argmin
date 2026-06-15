@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::control_plane::{ClusterRuntimeMapSnapshot, PgRouteSnapshot};
+use crate::control_plane::{ClusterRuntimeMapSnapshot, NodeHeartbeat, PgRouteSnapshot};
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
@@ -293,6 +293,40 @@ impl StorageNodeProcessConfig {
             pg_routes,
         })
     }
+
+    pub fn control_plane_heartbeat(
+        &self,
+        node: &SharedStorageNode,
+        node_incarnation: u64,
+        requested_lease_duration_ms: u64,
+    ) -> Result<NodeHeartbeat, StorageNodeServerError> {
+        for route in &self.pg_routes {
+            if route.cluster_epoch != self.cluster_epoch {
+                return Err(StorageNodeServerError::RouteEpochMismatch {
+                    pg_id: route.pg_id,
+                    route_epoch: route.cluster_epoch,
+                    config_epoch: self.cluster_epoch,
+                });
+            }
+        }
+        let endpoint =
+            self.socket_path
+                .to_str()
+                .ok_or_else(|| StorageNodeServerError::SocketPathNotUtf8 {
+                    path: self.socket_path.clone(),
+                })?;
+        node.control_plane_heartbeat(
+            self.node_id,
+            node_incarnation,
+            endpoint,
+            self.cluster_epoch,
+            requested_lease_duration_ms,
+            self.pg_routes
+                .iter()
+                .map(|route| (PgId::new(route.pg_id), route.state)),
+        )
+        .map_err(StorageNodeServerError::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +504,14 @@ pub enum StorageNodeServerError {
     RoutePgNotConfigured { pg_id: u32 },
     #[error("storage-node PG route {pg_id} is inconsistent across static config")]
     InconsistentPgRoute { pg_id: u32 },
+    #[error(
+        "storage-node PG route {pg_id} has cluster epoch {route_epoch}, expected config epoch {config_epoch}"
+    )]
+    RouteEpochMismatch {
+        pg_id: u32,
+        route_epoch: ClusterEpoch,
+        config_epoch: ClusterEpoch,
+    },
     #[error("storage-node PG route {pg_id} primary node {primary_node_id} is not in acting set")]
     RoutePrimaryNotInActingSet { pg_id: u32, primary_node_id: u32 },
     #[error("storage node {node_id} is absent from runtime map for cluster epoch {cluster_epoch}")]
@@ -499,6 +541,8 @@ pub enum StorageNodeServerError {
     SocketPathMissingParent { path: PathBuf },
     #[error("storage-node socket path {path:?} must be absolute")]
     SocketPathNotAbsolute { path: PathBuf },
+    #[error("storage-node socket path {path:?} is not valid UTF-8")]
+    SocketPathNotUtf8 { path: PathBuf },
     #[error("storage-node socket path {path:?} has no file name")]
     SocketPathMissingFileName { path: PathBuf },
     #[error("storage-node socket directory {path:?} must be private; mode is {mode:#o}")]
@@ -7971,6 +8015,97 @@ mod tests {
             primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }
+    }
+
+    #[test]
+    fn storage_node_process_config_builds_control_plane_heartbeat() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![0, 1];
+        config.pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: config.cluster_epoch,
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            },
+            StorageNodePgRoute {
+                pg_id: 1,
+                cluster_epoch: config.cluster_epoch,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            },
+        ];
+        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+
+        let heartbeat = config.control_plane_heartbeat(&node, 12, 2_000).unwrap();
+
+        assert_eq!(heartbeat.node_id, config.node_id);
+        assert_eq!(heartbeat.node_incarnation, 12);
+        assert_eq!(heartbeat.endpoint, config.socket_path.to_str().unwrap());
+        assert_eq!(heartbeat.observed_epoch, config.cluster_epoch);
+        assert_eq!(heartbeat.requested_lease_duration_ms, 2_000);
+        assert_eq!(heartbeat.pg_observations.len(), 2);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
+        assert_eq!(heartbeat.pg_observations[1].pg_id, PgId::new(1));
+        assert_eq!(heartbeat.pg_observations[1].state, PgState::Active);
+        for observation in &heartbeat.pg_observations {
+            let metadata_state = {
+                let pg = node.get_pg(observation.pg_id.get()).unwrap();
+                pg.metadata_command_replica_state().unwrap()
+            };
+            assert_eq!(
+                observation.metadata_proof.applied_log_index,
+                metadata_state.applied_log_index
+            );
+            assert_eq!(
+                observation.metadata_proof.applied_log_hash,
+                metadata_state.applied_log_hash
+            );
+            assert_eq!(
+                observation.metadata_proof.state_digest,
+                metadata_state.state_digest
+            );
+        }
+    }
+
+    #[test]
+    fn storage_node_process_config_rejects_route_epoch_mismatch_for_heartbeat() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.pg_routes[0].cluster_epoch = ClusterEpoch::new(1).unwrap();
+        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+
+        assert!(matches!(
+            config.control_plane_heartbeat(&node, 12, 2_000),
+            Err(StorageNodeServerError::RouteEpochMismatch {
+                pg_id: 0,
+                route_epoch,
+                config_epoch,
+            }) if route_epoch == ClusterEpoch::new(1).unwrap()
+                && config_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_node_process_config_rejects_non_utf8_heartbeat_endpoint() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.socket_path = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+
+        assert!(matches!(
+            config.control_plane_heartbeat(&node, 12, 2_000),
+            Err(StorageNodeServerError::SocketPathNotUtf8 { path }) if path == config.socket_path
+        ));
     }
 
     #[test]

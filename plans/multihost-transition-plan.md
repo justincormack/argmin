@@ -7130,6 +7130,11 @@ Status:
   route map and receive a `NodeHeartbeat` populated with node identity, observed
   epoch, lease request, endpoint, and per-PG durable metadata proofs from the
   local `SharedStorageNode`.
+- Connected the storage-node process config to that heartbeat builder. A
+  process config derived from a runtime map can now build its authority
+  heartbeat from the installed PG routes and local durable PG state, rejecting
+  route epoch mismatches and non-UTF8 endpoints instead of advertising stale PG
+  state or a lossy route identity.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary
