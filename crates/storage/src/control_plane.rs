@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::{ClusterEpoch, PgId, PgState};
 
+const CLUSTER_MAP_HISTORY_LIMIT: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
 
@@ -192,6 +194,7 @@ pub struct ClusterControlSnapshot {
     cluster_epoch: ClusterEpoch,
     nodes: BTreeMap<NodeId, NodeControlRecord>,
     pgs: BTreeMap<PgId, PgControlRecord>,
+    history: Vec<ClusterMapHistoryRecord>,
 }
 
 impl ClusterControlSnapshot {
@@ -201,6 +204,7 @@ impl ClusterControlSnapshot {
             cluster_epoch: ClusterEpoch::INITIAL,
             nodes: BTreeMap::new(),
             pgs: BTreeMap::new(),
+            history: Vec::new(),
         }
     }
 
@@ -232,6 +236,17 @@ impl ClusterControlSnapshot {
         self.pgs.values()
     }
 
+    pub fn cluster_map_history(&self) -> &[ClusterMapHistoryRecord] {
+        &self.history
+    }
+
+    #[must_use]
+    pub fn cluster_map_at_epoch(&self, epoch: ClusterEpoch) -> Option<&ClusterMapHistoryRecord> {
+        self.history
+            .iter()
+            .find(|record| record.cluster_epoch == epoch)
+    }
+
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
         self.authority_incarnation = self.authority_incarnation.next()?;
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
@@ -241,6 +256,56 @@ impl ClusterControlSnapshot {
     fn bump_epoch(&mut self) -> Result<(), ControlPlaneError> {
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
         Ok(())
+    }
+
+    fn record_history_from(&mut self, previous: &Self) {
+        if previous.cluster_epoch == self.cluster_epoch {
+            return;
+        }
+        self.history
+            .retain(|record| record.cluster_epoch != previous.cluster_epoch);
+        self.history
+            .push(ClusterMapHistoryRecord::from_snapshot(previous));
+        prune_cluster_map_history(&mut self.history);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMapHistoryRecord {
+    authority_incarnation: AuthorityIncarnation,
+    cluster_epoch: ClusterEpoch,
+    nodes: Vec<NodeControlRecord>,
+    pgs: Vec<PgControlRecord>,
+}
+
+impl ClusterMapHistoryRecord {
+    fn from_snapshot(snapshot: &ClusterControlSnapshot) -> Self {
+        Self {
+            authority_incarnation: snapshot.authority_incarnation,
+            cluster_epoch: snapshot.cluster_epoch,
+            nodes: snapshot.nodes.values().cloned().collect(),
+            pgs: snapshot.pgs.values().cloned().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn authority_incarnation(&self) -> AuthorityIncarnation {
+        self.authority_incarnation
+    }
+
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> &[NodeControlRecord] {
+        &self.nodes
+    }
+
+    #[must_use]
+    pub fn pgs(&self) -> &[PgControlRecord] {
+        &self.pgs
     }
 }
 
@@ -513,7 +578,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let loaded_existing_state = loaded.is_some();
         let mut snapshot = loaded.unwrap_or_else(ClusterControlSnapshot::empty);
         if loaded_existing_state {
+            let previous_snapshot = snapshot.clone();
             snapshot.bump_authority_after_restart()?;
+            snapshot.record_history_from(&previous_snapshot);
         }
         store.save(&snapshot)?;
         Ok(Self { store, snapshot })
@@ -963,8 +1030,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
 
     fn commit_snapshot(
         &mut self,
-        next_snapshot: ClusterControlSnapshot,
+        mut next_snapshot: ClusterControlSnapshot,
     ) -> Result<(), ControlPlaneError> {
+        next_snapshot.record_history_from(&self.snapshot);
         self.store.save(&next_snapshot)?;
         self.snapshot = next_snapshot;
         Ok(())
@@ -1107,34 +1175,63 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=2\n");
+    out.push_str("version=3\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
     ));
     out.push_str(&format!("cluster_epoch={}\n", snapshot.cluster_epoch.get()));
-    for record in snapshot.nodes.values() {
+    for history in &snapshot.history {
         out.push_str(&format!(
-            "node={},{},{},{},{},{},{},{}\n",
-            record.node_id.as_u32(),
-            record.membership.as_str(),
-            record.availability.as_str(),
-            record.node_incarnation,
-            option_u64(record.last_observed_epoch.map(ClusterEpoch::get)),
-            option_u64(record.last_heartbeat_ms),
-            option_u64(record.lease_deadline_ms),
-            hex_encode(record.endpoint.as_bytes())
+            "history={},{}\n",
+            history.cluster_epoch.get(),
+            history.authority_incarnation.get()
         ));
+        for record in &history.nodes {
+            out.push_str(&format!(
+                "history_node={},{}\n",
+                history.cluster_epoch.get(),
+                format_node_record(record)
+            ));
+        }
+        for record in &history.pgs {
+            out.push_str(&format!(
+                "history_pg={},{}\n",
+                history.cluster_epoch.get(),
+                format_pg_record(record)
+            ));
+        }
+    }
+    for record in snapshot.nodes.values() {
+        out.push_str(&format!("node={}\n", format_node_record(record)));
     }
     for record in snapshot.pgs.values() {
-        out.push_str(&format!(
-            "pg={},{},{}\n",
-            record.pg_id.get(),
-            pg_state_as_str(record.state),
-            format_node_list(&record.acting_set)
-        ));
+        out.push_str(&format!("pg={}\n", format_pg_record(record)));
     }
     out
+}
+
+fn format_node_record(record: &NodeControlRecord) -> String {
+    format!(
+        "{},{},{},{},{},{},{},{}",
+        record.node_id.as_u32(),
+        record.membership.as_str(),
+        record.availability.as_str(),
+        record.node_incarnation,
+        option_u64(record.last_observed_epoch.map(ClusterEpoch::get)),
+        option_u64(record.last_heartbeat_ms),
+        option_u64(record.lease_deadline_ms),
+        hex_encode(record.endpoint.as_bytes())
+    )
+}
+
+fn format_pg_record(record: &PgControlRecord) -> String {
+    format!(
+        "{},{},{}",
+        record.pg_id.get(),
+        pg_state_as_str(record.state),
+        format_node_list(&record.acting_set)
+    )
 }
 
 fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlaneError> {
@@ -1143,6 +1240,8 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
     let mut cluster_epoch = None;
     let mut nodes = BTreeMap::new();
     let mut pgs = BTreeMap::new();
+    let mut pg_lines = BTreeMap::new();
+    let mut history = BTreeMap::<ClusterEpoch, ParsedHistoryRecord>::new();
 
     for (idx, line) in contents.lines().enumerate() {
         let line_number = idx + 1;
@@ -1163,6 +1262,38 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
                 ClusterEpoch::new(parse_u64(line_number, value, "cluster_epoch")?)
                     .ok_or_else(|| parse_error(line_number, "cluster epoch must be nonzero"))?,
             );
+        } else if let Some(value) = line.strip_prefix("history=") {
+            let record = parse_history_record(line_number, value)?;
+            if history
+                .insert(
+                    record.cluster_epoch,
+                    ParsedHistoryRecord::new(record, line_number),
+                )
+                .is_some()
+            {
+                return Err(parse_error(line_number, "duplicate history record"));
+            }
+        } else if let Some(value) = line.strip_prefix("history_node=") {
+            let (epoch, record) = parse_history_node_record(line_number, value)?;
+            let history_record = history
+                .get_mut(&epoch)
+                .ok_or_else(|| parse_error(line_number, "history node references unknown epoch"))?;
+            if history_record.node_ids.insert(record.node_id) {
+                history_record.record.nodes.push(record);
+            } else {
+                return Err(parse_error(line_number, "duplicate history node record"));
+            }
+        } else if let Some(value) = line.strip_prefix("history_pg=") {
+            let (epoch, record) = parse_history_pg_record(line_number, value)?;
+            let history_record = history
+                .get_mut(&epoch)
+                .ok_or_else(|| parse_error(line_number, "history PG references unknown epoch"))?;
+            if history_record.pg_ids.insert(record.pg_id) {
+                history_record.pg_lines.insert(record.pg_id, line_number);
+                history_record.record.pgs.push(record);
+            } else {
+                return Err(parse_error(line_number, "duplicate history PG record"));
+            }
         } else if let Some(value) = line.strip_prefix("node=") {
             let record = parse_node_record(line_number, value)?;
             if nodes.insert(record.node_id, record).is_some() {
@@ -1170,27 +1301,156 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             }
         } else if let Some(value) = line.strip_prefix("pg=") {
             let record = parse_pg_record(line_number, value)?;
-            if pgs.insert(record.pg_id, record).is_some() {
+            let pg_id = record.pg_id;
+            if pgs.insert(pg_id, record).is_some() {
                 return Err(parse_error(line_number, "duplicate PG record"));
             }
+            pg_lines.insert(pg_id, line_number);
         } else {
             return Err(parse_error(line_number, "unknown control-plane state line"));
         }
     }
 
-    if version != Some(2) {
+    let version = version
+        .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
+    if !matches!(version, 2 | 3) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
         ));
     }
+    let cluster_epoch = cluster_epoch.ok_or_else(|| parse_error(0, "missing cluster epoch"))?;
+    if version == 2 && !history.is_empty() {
+        return Err(parse_error(
+            0,
+            "history records require control-plane state version 3",
+        ));
+    }
+    validate_current_pgs(&pgs, &pg_lines, &nodes)?;
+    validate_parsed_history(&history, cluster_epoch)?;
+    let mut history: Vec<ClusterMapHistoryRecord> =
+        history.into_values().map(|record| record.record).collect();
+    prune_cluster_map_history(&mut history);
     Ok(ClusterControlSnapshot {
         authority_incarnation: authority_incarnation
             .ok_or_else(|| parse_error(0, "missing authority incarnation"))?,
-        cluster_epoch: cluster_epoch.ok_or_else(|| parse_error(0, "missing cluster epoch"))?,
+        cluster_epoch,
         nodes,
         pgs,
+        history,
     })
+}
+
+struct ParsedHistoryRecord {
+    record: ClusterMapHistoryRecord,
+    line: usize,
+    node_ids: BTreeSet<NodeId>,
+    pg_ids: BTreeSet<PgId>,
+    pg_lines: BTreeMap<PgId, usize>,
+}
+
+impl ParsedHistoryRecord {
+    fn new(record: ClusterMapHistoryRecord, line: usize) -> Self {
+        Self {
+            record,
+            line,
+            node_ids: BTreeSet::new(),
+            pg_ids: BTreeSet::new(),
+            pg_lines: BTreeMap::new(),
+        }
+    }
+}
+
+fn validate_current_pgs(
+    pgs: &BTreeMap<PgId, PgControlRecord>,
+    pg_lines: &BTreeMap<PgId, usize>,
+    nodes: &BTreeMap<NodeId, NodeControlRecord>,
+) -> Result<(), ControlPlaneError> {
+    for pg in pgs.values() {
+        for node_id in &pg.acting_set {
+            if !nodes.contains_key(node_id) {
+                return Err(parse_error(
+                    pg_lines.get(&pg.pg_id).copied().unwrap_or(0),
+                    "PG acting set references unknown node",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_parsed_history(
+    history: &BTreeMap<ClusterEpoch, ParsedHistoryRecord>,
+    current_epoch: ClusterEpoch,
+) -> Result<(), ControlPlaneError> {
+    for (epoch, record) in history {
+        if *epoch >= current_epoch {
+            return Err(parse_error(
+                record.line,
+                "history epoch must be older than current cluster epoch",
+            ));
+        }
+        for pg in &record.record.pgs {
+            for node_id in &pg.acting_set {
+                if !record.node_ids.contains(node_id) {
+                    return Err(parse_error(
+                        record
+                            .pg_lines
+                            .get(&pg.pg_id)
+                            .copied()
+                            .unwrap_or(record.line),
+                        "history PG acting set references node absent from history map",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_history_record(
+    line: usize,
+    value: &str,
+) -> Result<ClusterMapHistoryRecord, ControlPlaneError> {
+    let fields: Vec<&str> = value.split(',').collect();
+    if fields.len() != 2 {
+        return Err(parse_error(line, "history record must have two fields"));
+    }
+    let cluster_epoch = ClusterEpoch::new(parse_u64(line, fields[0], "history cluster epoch")?)
+        .ok_or_else(|| parse_error(line, "history cluster epoch must be nonzero"))?;
+    let authority_incarnation =
+        AuthorityIncarnation::new(parse_u64(line, fields[1], "history authority incarnation")?)
+            .ok_or_else(|| parse_error(line, "history authority incarnation must be nonzero"))?;
+    Ok(ClusterMapHistoryRecord {
+        authority_incarnation,
+        cluster_epoch,
+        nodes: Vec::new(),
+        pgs: Vec::new(),
+    })
+}
+
+fn parse_history_node_record(
+    line: usize,
+    value: &str,
+) -> Result<(ClusterEpoch, NodeControlRecord), ControlPlaneError> {
+    let (epoch, record) = value
+        .split_once(',')
+        .ok_or_else(|| parse_error(line, "history node record must start with epoch"))?;
+    let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history node epoch")?)
+        .ok_or_else(|| parse_error(line, "history node epoch must be nonzero"))?;
+    Ok((epoch, parse_node_record(line, record)?))
+}
+
+fn parse_history_pg_record(
+    line: usize,
+    value: &str,
+) -> Result<(ClusterEpoch, PgControlRecord), ControlPlaneError> {
+    let (epoch, record) = value
+        .split_once(',')
+        .ok_or_else(|| parse_error(line, "history PG record must start with epoch"))?;
+    let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history PG epoch")?)
+        .ok_or_else(|| parse_error(line, "history PG epoch must be nonzero"))?;
+    Ok((epoch, parse_pg_record(line, record)?))
 }
 
 fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, ControlPlaneError> {
@@ -1298,6 +1558,14 @@ fn validate_acting_set(
         }
     }
     Ok(())
+}
+
+fn prune_cluster_map_history(history: &mut Vec<ClusterMapHistoryRecord>) {
+    history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
+    let excess = history.len().saturating_sub(CLUSTER_MAP_HISTORY_LIMIT);
+    if excess > 0 {
+        history.drain(..excess);
+    }
 }
 
 fn mark_pgs_peering_for_nodes(
@@ -1561,6 +1829,80 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_authority_loads_version_two_state_without_history() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            "version=2\nauthority_incarnation=1\ncluster_epoch=1\nnode=1,active,healthy,11,1,100,200,6e6f64652d312e736f636b\n",
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        let authority = SingleAuthorityControlPlane::open(store).unwrap();
+        assert_eq!(authority.snapshot().cluster_map_history().len(), 1);
+        let loaded_epoch = ClusterEpoch::INITIAL;
+        let history = authority
+            .snapshot()
+            .cluster_map_at_epoch(loaded_epoch)
+            .unwrap();
+        assert_eq!(history.nodes().len(), 1);
+        assert_eq!(history.nodes()[0].endpoint(), "node-1.sock");
+    }
+
+    #[test]
+    fn cluster_map_history_is_persisted_across_epoch_changes_and_pruned() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let initial_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+
+        let persisted = store.load().unwrap().unwrap();
+        let initial_history = persisted.cluster_map_at_epoch(initial_epoch).unwrap();
+        assert_eq!(
+            initial_history.authority_incarnation(),
+            AuthorityIncarnation::INITIAL
+        );
+        assert_eq!(initial_history.nodes().len(), 0);
+        assert_eq!(initial_history.pgs().len(), 0);
+
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(3), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        let pg_epoch = authority.snapshot().cluster_epoch();
+        let restarted = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let before_restart = restarted.snapshot().cluster_map_at_epoch(pg_epoch).unwrap();
+        assert_eq!(before_restart.pgs().len(), 1);
+        assert_eq!(
+            before_restart.pgs()[0].acting_set(),
+            &[NodeId::new(1), NodeId::new(2)]
+        );
+
+        let mut authority = restarted;
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+        let history = authority.snapshot().cluster_map_history();
+        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT);
+        assert!(history.first().unwrap().cluster_epoch() > initial_epoch);
+        assert!(history.last().unwrap().cluster_epoch() < authority.snapshot().cluster_epoch());
+
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(
+            persisted.cluster_map_history().len(),
+            CLUSTER_MAP_HISTORY_LIMIT
+        );
+        assert!(persisted.cluster_map_at_epoch(initial_epoch).is_none());
+    }
+
+    #[test]
     fn file_backed_authority_rejects_duplicate_pg_acting_set_nodes() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("control-plane.state");
@@ -1574,6 +1916,87 @@ mod tests {
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "PG acting set contains duplicate node"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_current_pg_nodes_absent_from_current_map() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=3\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "pg=7,active,1:99\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "PG acting set references unknown node"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_history_in_version_two_state() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            "version=2\nauthority_incarnation=1\ncluster_epoch=2\nhistory=1,1\n",
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "history records require control-plane state version 3"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_current_or_future_history_epochs() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            "version=3\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "history epoch must be older than current cluster epoch"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_history_pg_nodes_absent_from_history_map() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=3\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=3\n",
+                "history=2,1\n",
+                "history_node=2,1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "history_pg=2,7,peering,1:2\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "history PG acting set references node absent from history map"
         ));
     }
 

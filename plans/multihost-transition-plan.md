@@ -7045,6 +7045,11 @@ Status:
   authorization returns the validated node lease deadline so callers can bound
   primary work, and PG peering completion uses the same lease-aware validation
   before persisting `Active`.
+- Added bounded cluster-map history retention to the single-authority control
+  snapshot. Epoch-changing commits and authority restarts durably retain the
+  previous map before exposing the new epoch, old `version=2` state still loads,
+  and history is pruned to a fixed recent window for stale-route diagnostics and
+  future cross-epoch fault-injection checks.
 
 Exit criteria:
 
