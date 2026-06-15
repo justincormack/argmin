@@ -7102,6 +7102,13 @@ Status:
   ordinary epoch changes. Restart still records the previous map in history, so
   stale-route diagnostics retain the pre-restart observations, but the newly
   persisted current map cannot contain node observations from the old epoch.
+- Bound `Active` PG records to the primary that completed peering. The
+  authority now persists the active primary in the version 6 control-plane state
+  format, clears that binding whenever a PG returns to `Peering`, and fails
+  closed rather than dynamically selecting a different acting-set member while a
+  PG remains `Active`. Because the control-plane store is still pre-release, the
+  loader now accepts only the current version 6 format rather than carrying
+  compatibility for earlier Phase 11 scratch formats.
 
 Exit criteria:
 
