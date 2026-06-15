@@ -260,6 +260,9 @@ impl ClusterControlSnapshot {
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
         self.authority_incarnation = self.authority_incarnation.next()?;
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
+        for record in self.nodes.values_mut() {
+            record.pg_observations.clear();
+        }
         Ok(())
     }
 
@@ -4116,6 +4119,67 @@ mod tests {
                 .observed_epoch(),
             observation_epoch
         );
+    }
+
+    #[test]
+    fn restart_epoch_bump_clears_current_pg_observations_and_preserves_history() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(18), vec![NodeId::new(1)])
+            .unwrap();
+        let observation_epoch = authority.snapshot().cluster_epoch();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, observation_epoch, 2_000);
+        let metadata_proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(18),
+            state: PgState::Peering,
+            metadata_proof,
+        }];
+        authority.heartbeat(heartbeat).unwrap();
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(18))
+            .is_some());
+
+        let restarted = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        assert!(restarted.snapshot().cluster_epoch() > observation_epoch);
+        assert!(restarted
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(18))
+            .is_none());
+        let historical_node = restarted
+            .snapshot()
+            .cluster_map_at_epoch(observation_epoch)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|record| record.node_id() == NodeId::new(1))
+            .unwrap();
+        let historical_observation = historical_node.pg_observation(PgId::new(18)).unwrap();
+        assert_eq!(historical_observation.observed_epoch(), observation_epoch);
+        assert_eq!(historical_observation.metadata_proof(), metadata_proof);
+
+        let persisted = store.load().unwrap().unwrap();
+        assert!(persisted
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(18))
+            .is_none());
+        SingleAuthorityControlPlane::open(store).unwrap();
     }
 
     #[test]

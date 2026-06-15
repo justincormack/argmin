@@ -7098,6 +7098,10 @@ Status:
   control-plane state format now writes this proof as version 5 while preserving
   read compatibility for version 4 PG observations by treating missing proof
   fields as the empty proof.
+- Fixed the restart epoch-bump path to clear current PG observations just like
+  ordinary epoch changes. Restart still records the previous map in history, so
+  stale-route diagnostics retain the pre-restart observations, but the newly
+  persisted current map cannot contain node observations from the old epoch.
 
 Exit criteria:
 
