@@ -489,6 +489,58 @@ impl PgPrimaryAuthorization {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgServiceOperation {
+    MetadataRead,
+    MetadataList,
+    MetadataWrite,
+    PayloadRead,
+    PayloadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgOperationAuthorization {
+    operation: PgServiceOperation,
+    primary: PgPrimaryAuthorization,
+}
+
+impl PgOperationAuthorization {
+    #[must_use]
+    pub fn operation(&self) -> PgServiceOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> PgPrimaryAuthorization {
+        self.primary
+    }
+
+    #[must_use]
+    pub fn authority_incarnation(&self) -> AuthorityIncarnation {
+        self.primary.authority_incarnation()
+    }
+
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.primary.cluster_epoch()
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.primary.pg_id()
+    }
+
+    #[must_use]
+    pub fn primary_node_id(&self) -> NodeId {
+        self.primary.primary_node_id()
+    }
+
+    #[must_use]
+    pub fn lease_deadline_ms(&self) -> u64 {
+        self.primary.lease_deadline_ms()
+    }
+}
+
 pub trait ControlPlaneStore {
     fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError>;
     fn save(&self, snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError>;
@@ -1014,6 +1066,25 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             primary_node_id,
             lease_deadline_ms: node_authorization.lease_deadline_ms(),
         })
+    }
+
+    pub fn authorize_pg_operation(
+        &self,
+        operation: PgServiceOperation,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        node_incarnation: u64,
+        observed_epoch: ClusterEpoch,
+        now_ms: u64,
+    ) -> Result<PgOperationAuthorization, ControlPlaneError> {
+        let primary = self.authorize_pg_primary_service(
+            pg_id,
+            primary_node_id,
+            node_incarnation,
+            observed_epoch,
+            now_ms,
+        )?;
+        Ok(PgOperationAuthorization { operation, primary })
     }
 
     #[must_use]
@@ -2504,6 +2575,105 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn pg_operation_authorization_requires_active_primary_for_all_operation_classes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(14), vec![NodeId::new(1)])
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                2_000,
+            ))
+            .unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(14),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            )
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                3_000,
+            ))
+            .unwrap();
+
+        let operations = [
+            PgServiceOperation::MetadataRead,
+            PgServiceOperation::MetadataList,
+            PgServiceOperation::MetadataWrite,
+            PgServiceOperation::PayloadRead,
+            PgServiceOperation::PayloadWrite,
+        ];
+        for operation in operations {
+            let authorization = authority
+                .authorize_pg_operation(
+                    operation,
+                    PgId::new(14),
+                    NodeId::new(1),
+                    node_incarnation(&authority, 1),
+                    authority.snapshot().cluster_epoch(),
+                    3_050,
+                )
+                .unwrap();
+            assert_eq!(authorization.operation(), operation);
+            assert_eq!(authorization.pg_id(), PgId::new(14));
+            assert_eq!(authorization.primary_node_id(), NodeId::new(1));
+            assert_eq!(
+                authorization.cluster_epoch(),
+                authority.snapshot().cluster_epoch()
+            );
+        }
+
+        for state in [
+            PgState::Peering,
+            PgState::Degraded,
+            PgState::Backfilling,
+            PgState::Inconsistent,
+        ] {
+            authority.set_pg_state(PgId::new(14), state).unwrap();
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    1,
+                    authority.snapshot().cluster_epoch(),
+                    4_000,
+                ))
+                .unwrap();
+            for operation in operations {
+                assert!(matches!(
+                    authority.authorize_pg_operation(
+                        operation,
+                        PgId::new(14),
+                        NodeId::new(1),
+                        node_incarnation(&authority, 1),
+                        authority.snapshot().cluster_epoch(),
+                        4_050,
+                    ),
+                    Err(ControlPlaneError::PgNotActive {
+                        pg_id: 14,
+                        state: err_state,
+                        ..
+                    }) if err_state == state
+                ));
+            }
+        }
     }
 
     #[test]

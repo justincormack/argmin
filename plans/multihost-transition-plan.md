@@ -7055,6 +7055,12 @@ Status:
   before the new epoch is exposed. This prevents a recovered earlier acting-set
   member from becoming deterministic primary in a later epoch without an
   explicit peering completion.
+- Added a central PG operation authorization policy for metadata reads, metadata
+  lists, metadata writes, payload reads, and payload writes. The Phase 11 policy
+  is intentionally conservative: every operation class requires current
+  lease/epoch/incarnation fencing plus an `Active` PG served by the deterministic
+  primary. Degraded or backfilling read relaxations remain deferred until repair
+  can provide explicit shard/readability proofs.
 
 Exit criteria:
 
