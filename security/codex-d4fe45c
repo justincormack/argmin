@@ -1,0 +1,218 @@
+Active PG primary can change without peering
+Link: https://chatgpt.com/codex/cloud/security/findings/f4ea71fb47808191b0d12d944711138b?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Resolution
+Fixed in commit `4d6ca72c Bind active PGs to peered primary`.
+
+The finding was valid as a Phase 11 control-plane correctness defect. `Active`
+PG records now persist the primary that completed peering in the version 6
+control-plane state format. Serving and PG-operation authorization use that
+bound primary instead of dynamically reselecting from the acting set, and
+returning a PG to `Peering` clears the binding. `complete_pg_peering()` is
+idempotent only for the already-bound active primary and only consults dynamic
+deterministic primary selection for the `Peering` to `Active` transition. The
+fix includes a regression where another acting-set member heartbeats first in
+the active epoch but cannot become the serving primary or re-complete peering
+while the PG remains active.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d4fe45c
+Author: justin@specialbusservice.com
+Created: 15/06/2026, 12:55:17
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: active PG records do not bind an epoch to a specific peered primary, and epoch changes can leave PGs Active while `serving_pg_primary` selects whichever acting-set node first observes the new epoch.
+The commit introduces durable PG acting-set/state records and a new `serving_pg_primary` API. `complete_pg_peering` verifies that the supplied primary is currently deterministic, but then only stores `PgState::Active` and bumps the cluster epoch; it does not store that primary in the PG record. After that epoch bump, all nodes have stale `last_observed_epoch` values until they heartbeat again. `serving_pg_primary` then recomputes the primary dynamically as the first acting-set member that is healthy and has observed the current epoch. This means an acting-set member that was not the peering-completing primary can heartbeat first and become the serving primary while the PG remains Active, without a peering transition. The same issue can happen after unrelated membership, endpoint, or incarnation changes that bump the cluster epoch without moving active PGs to Peering. In a multihost deployment using this control plane for routing writes, this can cause primary changes without command-log/shard peering, risking stale-primary behavior, split-brain writes, or data loss. The code is not currently wired into the public S3 HTTP path, but the introduced control-plane API itself has an unsafe primary-selection invariant.
+
+# Validation
+## Rubric
+- [x] Confirm PgControlRecord and persisted PG format do not store/bind the peering-completing primary.
+- [x] Confirm complete_pg_peering validates the caller-supplied primary but only stores Active state and bumps cluster_epoch.
+- [x] Confirm serving_pg_primary recomputes primary dynamically from current node heartbeat last_observed_epoch/health rather than a persisted peered-primary field.
+- [x] Reproduce with public APIs that a non-peering-completing acting-set member can heartbeat first after the peering epoch bump and become serving primary while PG remains Active.
+- [x] Attempt crash/valgrind-or-ASan/debugger validation before finalizing: assertion-panic PoC produced; valgrind/gdb unavailable; ASan unsupported by rustc; LLDB backtrace captured.
+## Report
+Validated the finding with a targeted Rust integration-test PoC using the public storage::control_plane API. Code review evidence: PgControlRecord stores only pg_id/state/acting_set and no peered primary at crates/storage/src/control_plane.rs:247-252; complete_pg_peering validates the supplied primary via deterministic_pg_primary at lines 610-614, but persists only PgState::Active and bumps the epoch at lines 622-625; NodeControlRecord::can_serve_primary requires last_observed_epoch == cluster_epoch at lines 182-185; serving_pg_primary dynamically recomputes from current heartbeat state at lines 761-776. The PoC creates nodes 1 and 2, catches both up, sets PG 42 acting_set=[1,2], completes peering with NodeId(1), then sends the first post-peering-epoch heartbeat from NodeId(2). The PG remains Active, but serving_pg_primary(pg) returns Some(NodeId(2)). Reproduction command: cargo test -p storage --test control_plane_primary_poc active_pg_primary_can_change_after_peering_epoch_bump -- --nocapture. Key output: PG state=Active, primary_that_completed_peering=NodeId(1), observed_primary_after_node2_heartbeat=Some(NodeId(2)), epoch=7; assertion failed at crates/storage/tests/control_plane_primary_poc.rs:97 because left was Some(NodeId(2)) and right was Some(NodeId(1)). This demonstrates an Active PG primary change without another peering transition. I also attempted memory-style validation per instructions: valgrind and gdb were not installed; ASan failed because this rustc rejects -C sanitizer=address; LLDB was available and captured a non-interactive backtrace stopping at the PoC assertion panic.
+
+# Evidence
+crates/storage/src/control_plane.rs (L461 to 500)
+  Note: Membership changes bump the epoch, but affected PGs are marked Peering only for Out/Removed transitions; other epoch-changing membership updates can leave active PGs with dynamic primary reselection.
+```
+    pub fn set_node_membership(
+        &mut self,
+        node_id: NodeId,
+        membership: NodeMembershipState,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let mut next_snapshot = self.snapshot.clone();
+        let mut changed = false;
+        let mut affected_node = None;
+        match next_snapshot.nodes.get_mut(&node_id) {
+            Some(record) if record.membership == membership => {}
+            Some(record) if record.membership == NodeMembershipState::Removed => {
+                return Err(ControlPlaneError::RemovedNodeCannotRejoin {
+                    node_id: node_id.as_u32(),
+                });
+            }
+            Some(record) => {
+                record.membership = membership;
+                if matches!(
+                    membership,
+                    NodeMembershipState::Out | NodeMembershipState::Removed
+                ) {
+                    record.availability = NodeAvailabilityState::Unavailable;
+                    record.lease_deadline_ms = None;
+                    affected_node = Some(node_id);
+                }
+                changed = true;
+            }
+            None => {
+                next_snapshot
+                    .nodes
+                    .insert(node_id, NodeControlRecord::new(node_id, membership));
+                changed = true;
+            }
+        }
+        if changed {
+            if let Some(node_id) = affected_node {
+                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+            }
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+```
+
+crates/storage/src/control_plane.rs (L595 to 625)
+  Note: `complete_pg_peering` validates the caller-supplied primary, but persists only `PgState::Active` and bumps the epoch; the validated primary is not stored or otherwise bound to the active epoch.
+```
+    pub fn complete_pg_peering(
+        &mut self,
+        pg_id: PgId,
+        primary: NodeId,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let record = self
+            .snapshot
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if !record.acting_set.contains(&primary) {
+            return Err(ControlPlaneError::PgPrimaryNotInActingSet {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            });
+        }
+        if self.deterministic_pg_primary(pg_id, record.acting_set()) != Some(primary) {
+            return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            });
+        }
+
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record validated before peering completion");
+        if record.state != PgState::Active {
+            record.state = PgState::Active;
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+```
+
+crates/storage/src/control_plane.rs (L677 to 703)
+  Note: Heartbeat processing can bump the cluster epoch for incarnation, endpoint, or availability changes, but does not move active PGs through Peering before nodes become eligible to serve the new epoch.
+```
+        let mut epoch_changed = false;
+        let mut next_snapshot = self.snapshot.clone();
+        {
+            let record = next_snapshot
+                .nodes
+                .get_mut(&heartbeat.node_id)
+                .expect("node record validated before heartbeat mutation");
+            if heartbeat.node_incarnation > record.node_incarnation {
+                record.node_incarnation = heartbeat.node_incarnation;
+                epoch_changed = true;
+            }
+            if record.endpoint != heartbeat.endpoint {
+                record.endpoint = heartbeat.endpoint;
+                epoch_changed = true;
+            }
+            if record.availability != NodeAvailabilityState::Healthy {
+                record.availability = NodeAvailabilityState::Healthy;
+                epoch_changed = true;
+            }
+            record.last_observed_epoch = Some(heartbeat.observed_epoch);
+            record.last_heartbeat_ms = Some(heartbeat.now_ms);
+            record.lease_deadline_ms = Some(lease_deadline_ms);
+        }
+        if epoch_changed {
+            next_snapshot.bump_epoch()?;
+        }
+        self.commit_snapshot(next_snapshot)?;
+```
+
+crates/storage/src/control_plane.rs (L761 to 776)
+  Note: `serving_pg_primary` recomputes the active primary dynamically from current heartbeat state, so after an epoch bump the first acting-set node to observe the epoch can become primary even if it did not complete peering.
+```
+    pub fn serving_pg_primary(&self, pg_id: PgId) -> Option<NodeId> {
+        let record = self.snapshot.pgs.get(&pg_id)?;
+        if record.state != PgState::Active {
+            return None;
+        }
+        self.deterministic_pg_primary(pg_id, record.acting_set())
+    }
+
+    #[must_use]
+    pub fn deterministic_pg_primary(&self, _pg_id: PgId, acting_set: &[NodeId]) -> Option<NodeId> {
+        acting_set.iter().copied().find(|node_id| {
+            self.snapshot
+                .nodes
+                .get(node_id)
+                .is_some_and(|record| record.can_serve_primary(self.snapshot.cluster_epoch))
+        })
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from high to ignore for current security triage. The validation evidence strongly supports a real control-plane correctness bug, but it is not reachable from the main argmin-s3 S3 HTTP service or current storage-node RPC path. Static evidence shows complete_pg_peering/serving_pg_primary are confined to crates/storage/src/control_plane.rs and tests, while current runtime construction uses static LocalPgRoute primary_node_id and configured Unix storage-node socket clients. A high rating would require a demonstrated in-scope attacker path to trigger the unsafe primary selection and route real writes through it; that path is absent in repository artifacts.
+## Likelihood
+ignore - Exploitation from the current threat-model surface is not realistic: public S3 clients cannot call the API, storage-node runtime routing is static/configured, and using the bug requires future integration plus an internal node/control-plane actor able to influence heartbeat/epoch ordering.
+## Impact
+ignore - If the new control-plane API were wired into multihost write routing, the impact could be high for integrity and availability because writes could be routed to a primary that did not complete peering. In the current repository runtime, no product path reaches this API, so there is no demonstrated security impact for deployed argmin-s3.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin; no cloud APIs were called and no deployment/IaC manifests were found.
+- The main deployable product is the argmin-s3 binary and its S3 HTTP/storage-node runtime paths.
+- The in-scope attacker for the project threat model is primarily an S3 client or an actor able to reach configured service endpoints, not an arbitrary Rust library consumer executing inside the process.
+- The unfinished SingleAuthorityControlPlane API must be wired into runtime routing for writes or metadata mutations.
+- An internal node/control-plane caller must be able to influence peering completion, heartbeat ordering, or epoch-changing heartbeats.
+- The frontend/storage routing layer must trust serving_pg_primary for active PG write routing.
+## Path
+S3 client -> HTTP frontend -> current static LocalPgRoute routing
+                                      X no runtime call to SingleAuthorityControlPlane
+Hypothetical future: internal heartbeat/peering -> serving_pg_primary -> wrong primary -> split-brain/data loss
+## Path evidence
+- `crates/storage/src/control_plane.rs:247-252` - PgControlRecord persists pg_id, state, and acting_set only; there is no persisted peered primary or active epoch binding.
+- `crates/storage/src/control_plane.rs:595-625` - complete_pg_peering validates the supplied primary but only sets PgState::Active and bumps the epoch.
+- `crates/storage/src/control_plane.rs:677-703` - heartbeat processing can bump the cluster epoch for node incarnation, endpoint, or availability changes without moving all still-active PGs through Peering.
+- `crates/storage/src/control_plane.rs:760-776` - serving_pg_primary recomputes the serving primary from current heartbeat state instead of returning a primary bound during peering.
+- `crates/argmin-s3/src/main.rs:277-307` - Current remote frontend construction uses configured cluster epoch and Unix storage-node clients to build a StorageCluster; this code does not instantiate or call SingleAuthorityControlPlane.
+- `crates/storage/src/cluster/local.rs:737-769` - Current LocalPgRoute stores a static primary_node_id used by the runtime storage map, contrasting with the unused dynamic control-plane primary API.
+- `crates/argmin-s3/src/config.rs:178` - The HTTP service defaults to 127.0.0.1:9000; public exposure requires operator configuration.
+- `crates/server-http/src/http/mod.rs:3067-3118` - The public S3 HTTP path authenticates requests via SigV4 credential verification before dispatch.
+- `crates/storage/src/storage_node_server.rs:7698-7724` - Storage-node RPC is bound to Unix socket paths whose parent directory must be private, reducing exposure of internal storage RPC.
+## Narrative
+The core bug statement is supported: PgControlRecord stores only state and acting_set, complete_pg_peering validates but does not store the primary, heartbeat can bump epochs, and serving_pg_primary dynamically selects the first healthy acting-set member observed at the current epoch. The validation PoC demonstrates the primary can change while the PG remains Active. However, the current product runtime does not expose or use this API: argmin-s3 builds static/configured storage routes and storage-node RPC uses private Unix sockets. Thus this is a real correctness defect in an unfinished internal control-plane component, but not a currently reachable high-severity security vulnerability for the deployed S3 service.
+## Controls
+- SigV4 authentication on S3 HTTP frontend
+- default HTTP listen address is 127.0.0.1:9000
+- optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- storage-node RPC uses Unix sockets and rejects non-private socket directories
+- current runtime uses static/configured PG routes rather than SingleAuthorityControlPlane
+## Blindspots
+- Static-only review cannot prove no external downstream project consumes the storage crate API directly.
+- No deployment manifests or load balancer configuration were present, so network exposure is inferred from application defaults and code.
+- README and transition-plan text describe evolving multihost phases and may lag code behavior; this assessment is based on current code reachability.
+- The validation PoC was accepted from the earlier stage rather than re-run during this attack-path pass.
