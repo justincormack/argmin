@@ -7074,6 +7074,11 @@ Status:
   primary and available peers have demonstrated that they installed the current
   map. Durable command-log reconstruction and replica proof checks remain the
   next peering layer.
+- Tightened active PG service so the deterministic primary is not considered
+  serving, and cannot receive PG-operation authorization, until it has also
+  heartbeated that PG as `Active` in the post-peering cluster epoch. This keeps
+  peering completion, epoch fencing, and local primary state installation as
+  distinct observable steps.
 
 Exit criteria:
 
