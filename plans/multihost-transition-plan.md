@@ -7208,6 +7208,12 @@ Status:
   installable over the running process identity. Epochs, validity deadlines, PG
   sets, and route tables may change, but a refresh cannot silently change the
   node id, data directory, default EC shape, or bound Unix socket path.
+- Extended the route-map expiry policy with an explicit cleanup exception for
+  release-only storage RPCs. Serving, acquire, validate, heartbeat, and command
+  paths still require a fresh installed map, but session metadata-lock release
+  and durable reservation/drain/reclaim release paths validate only route
+  identity so stale-map cleanup does not depend on transport teardown or lease
+  expiry.
 
 Exit criteria:
 

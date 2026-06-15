@@ -2337,9 +2337,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcProofReleaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_cleanup(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let route = self
@@ -2542,9 +2544,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcBucketWriteReservationRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_cleanup(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = self.validate_primary_pg_for_bucket(
@@ -2620,9 +2624,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcBucketWriteDrainRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_cleanup(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = self.validate_primary_pg_for_bucket(
@@ -2898,9 +2904,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcBucketDeleteFinalizeClaimRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_cleanup(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = self.validate_primary_pg_for_bucket(
@@ -3076,8 +3084,8 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcLifecycleSweepClaimRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_lifecycle_sweep_claim_route(&request, "lifecycle sweep claim release")
+        if let Err(error) = self
+            .validate_lifecycle_sweep_claim_cleanup_route(&request, "lifecycle sweep claim release")
         {
             return encode_storage_rpc_error_response(&error);
         }
@@ -4142,9 +4150,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcObjectPayloadReclaimClaimRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_cleanup(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = self.validate_primary_pg_for_object(
@@ -7033,7 +7043,7 @@ impl StorageNodeConnectionHandler {
         session: &mut StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_metadata_lock_release(
+        if let Err(error) = self.validate_pg_route_for_cleanup(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
@@ -7159,7 +7169,7 @@ impl StorageNodeConnectionHandler {
         Ok(())
     }
 
-    fn validate_pg_route_for_metadata_lock_release(
+    fn validate_pg_route_for_cleanup(
         &self,
         node_id: NodeId,
         cluster_epoch: ClusterEpoch,
@@ -7374,6 +7384,25 @@ impl StorageNodeConnectionHandler {
         operation: &'static str,
     ) -> Result<(), StorageRpcErrorResponse> {
         self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        if request.claim.pg_id != request.pg_id.get() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} request PG {} does not match claim PG {}",
+                    request.pg_id.get(),
+                    request.claim.pg_id
+                ),
+            });
+        }
+        self.validate_primary_pg_for_bucket(request.pg_id, &request.claim.bucket, operation)
+    }
+
+    fn validate_lifecycle_sweep_claim_cleanup_route(
+        &self,
+        request: &StorageRpcLifecycleSweepClaimRecordRequest,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_for_cleanup(request.node_id, request.cluster_epoch, request.pg_id)?;
         if request.claim.pg_id != request.pg_id.get() {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
@@ -8330,6 +8359,76 @@ mod tests {
             .unwrap();
 
         assert!(!session.holds_metadata_command_pg_lock(PgId::new(0)));
+    }
+
+    #[test]
+    fn bucket_write_reservation_release_allows_expired_route_map_cleanup() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("expired-route-reservation-cleanup");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let record = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "reservation-expired-route-cleanup",
+                "owner-token-expired-route-cleanup",
+                config.cluster_epoch,
+                "put-object",
+                10,
+                Some(20),
+                Some("key=a"),
+            )
+            .unwrap()
+        };
+
+        config.route_map_valid_until_ms = Some(1);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let serving_error = handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(serving_error.code, StorageRpcErrorCode::StaleShardLocation);
+
+        let request = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            record: record.clone(),
+        };
+        let response = handler
+            .bucket_write_reservation_release_response(request)
+            .unwrap();
+        decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            &record.reservation_id,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
