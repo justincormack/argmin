@@ -7240,6 +7240,16 @@ Status:
   fail closed on expiry, records last success/error status for diagnostics, and
   stops/joins explicitly so future process wiring does not leak heartbeat
   workers.
+- Added a durable monotonic storage-node incarnation source. Each storage-node
+  boot can now advance and persist a never-reused incarnation in its data
+  directory before heartbeating, using an atomic write/sync/rename/sync
+  sequence and rejecting corrupt or overflowed counters. The public boundary is
+  on the bound `StorageNodeServer`, so process wiring advances the counter only
+  after the server owns the data-directory lock, and the bound server serializes
+  same-process callers around the read/modify/write. This provides the
+  production fencing input for the heartbeat loop; the remaining process wiring
+  should call it once during storage-node startup and then pass the returned
+  incarnation to the refresh loop.
 
 Exit criteria:
 

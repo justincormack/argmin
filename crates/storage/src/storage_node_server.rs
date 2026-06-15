@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -240,6 +240,8 @@ use crate::{
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
 
 const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
+const STORAGE_NODE_INCARNATION_FILE: &str = "control-plane-node-incarnation";
+const STORAGE_NODE_INCARNATION_TMP_FILE: &str = ".control-plane-node-incarnation.tmp";
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 const STORAGE_NODE_MAX_ACTIVE_SESSIONS: usize = 1024;
@@ -707,6 +709,10 @@ pub enum StorageNodeServerError {
         #[source]
         source: io::Error,
     },
+    #[error("invalid storage-node incarnation {value:?} in {path:?}")]
+    InvalidNodeIncarnation { path: PathBuf, value: String },
+    #[error("storage-node incarnation counter overflowed in {path:?}")]
+    NodeIncarnationOverflow { path: PathBuf },
     #[error("failed to open storage node: {0}")]
     Store(#[from] StoreError),
     #[error("storage RPC stream error: {message}")]
@@ -768,6 +774,7 @@ pub fn validate_storage_node_process_configs(
 pub struct StorageNodeServer {
     config: RwLock<StorageNodeProcessConfig>,
     _data_dir_lock: StorageNodeDataDirLock,
+    control_plane_incarnation_lock: Mutex<()>,
     _node: Arc<SharedStorageNode>,
     listener: UnixListener,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
@@ -838,12 +845,21 @@ impl StorageNodeServer {
         Ok(Self {
             config: RwLock::new(config),
             _data_dir_lock: data_dir_lock,
+            control_plane_incarnation_lock: Mutex::new(()),
             _node: Arc::new(node),
             listener,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(StorageNodeActiveSessions::default()),
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
         })
+    }
+
+    pub fn advance_control_plane_node_incarnation(&self) -> Result<u64, StorageNodeServerError> {
+        let _guard = self
+            .control_plane_incarnation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        advance_storage_node_incarnation(&self.config_snapshot().data_dir)
     }
 
     pub fn accept_one(&self) -> Result<(), StorageNodeServerError> {
@@ -8181,6 +8197,96 @@ impl Drop for StorageNodeServer {
     }
 }
 
+fn advance_storage_node_incarnation(data_dir: &Path) -> Result<u64, StorageNodeServerError> {
+    fs::create_dir_all(data_dir).map_err(|source| StorageNodeServerError::Io {
+        context: "create storage-node data directory for incarnation",
+        path: data_dir.to_path_buf(),
+        source,
+    })?;
+    let path = data_dir.join(STORAGE_NODE_INCARNATION_FILE);
+    let current = match fs::read_to_string(&path) {
+        Ok(contents) => parse_storage_node_incarnation(&path, &contents)?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+        Err(source) => {
+            return Err(StorageNodeServerError::Io {
+                context: "read storage-node incarnation",
+                path,
+                source,
+            });
+        }
+    };
+    let next = current
+        .checked_add(1)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| StorageNodeServerError::NodeIncarnationOverflow { path: path.clone() })?;
+    persist_storage_node_incarnation(data_dir, &path, next)?;
+    Ok(next)
+}
+
+fn parse_storage_node_incarnation(
+    path: &Path,
+    contents: &str,
+) -> Result<u64, StorageNodeServerError> {
+    let trimmed = contents.trim();
+    let incarnation =
+        trimmed
+            .parse::<u64>()
+            .map_err(|_| StorageNodeServerError::InvalidNodeIncarnation {
+                path: path.to_path_buf(),
+                value: contents.to_owned(),
+            })?;
+    if incarnation == 0 {
+        return Err(StorageNodeServerError::InvalidNodeIncarnation {
+            path: path.to_path_buf(),
+            value: contents.to_owned(),
+        });
+    }
+    Ok(incarnation)
+}
+
+fn persist_storage_node_incarnation(
+    data_dir: &Path,
+    path: &Path,
+    incarnation: u64,
+) -> Result<(), StorageNodeServerError> {
+    let tmp_path = data_dir.join(STORAGE_NODE_INCARNATION_TMP_FILE);
+    {
+        let mut tmp_file =
+            File::create(&tmp_path).map_err(|source| StorageNodeServerError::Io {
+                context: "create storage-node incarnation",
+                path: tmp_path.clone(),
+                source,
+            })?;
+        tmp_file
+            .write_all(format!("{incarnation}\n").as_bytes())
+            .map_err(|source| StorageNodeServerError::Io {
+                context: "write storage-node incarnation",
+                path: tmp_path.clone(),
+                source,
+            })?;
+        tmp_file
+            .sync_all()
+            .map_err(|source| StorageNodeServerError::Io {
+                context: "sync storage-node incarnation",
+                path: tmp_path.clone(),
+                source,
+            })?;
+    }
+    fs::rename(&tmp_path, path).map_err(|source| StorageNodeServerError::Io {
+        context: "commit storage-node incarnation",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    File::open(data_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| StorageNodeServerError::Io {
+            context: "sync storage-node incarnation directory",
+            path: data_dir.to_path_buf(),
+            source,
+        })?;
+    Ok(())
+}
+
 struct StorageNodeDataDirLock {
     _file: File,
 }
@@ -8445,7 +8551,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -8528,6 +8634,102 @@ mod tests {
             primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }
+    }
+
+    #[test]
+    fn storage_node_incarnation_advances_and_persists() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+
+        assert_eq!(advance_storage_node_incarnation(&data_dir).unwrap(), 1);
+        assert_eq!(advance_storage_node_incarnation(&data_dir).unwrap(), 2);
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join(STORAGE_NODE_INCARNATION_FILE)).unwrap(),
+            "2\n"
+        );
+        assert!(!data_dir.join(STORAGE_NODE_INCARNATION_TMP_FILE).exists());
+    }
+
+    #[test]
+    fn storage_node_server_advances_incarnation_while_bound() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        assert_eq!(server.advance_control_plane_node_incarnation().unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(config.data_dir.join(STORAGE_NODE_INCARNATION_FILE)).unwrap(),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn storage_node_server_serializes_concurrent_incarnation_advances() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let caller_count = 8;
+        let barrier = Arc::new(Barrier::new(caller_count));
+        let mut joins = Vec::new();
+
+        for _ in 0..caller_count {
+            let server = Arc::clone(&server);
+            let barrier = Arc::clone(&barrier);
+            joins.push(thread::spawn(move || {
+                barrier.wait();
+                server.advance_control_plane_node_incarnation().unwrap()
+            }));
+        }
+
+        let mut incarnations = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        incarnations.sort_unstable();
+
+        assert_eq!(incarnations, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            std::fs::read_to_string(config.data_dir.join(STORAGE_NODE_INCARNATION_FILE)).unwrap(),
+            "8\n"
+        );
+        assert!(!config
+            .data_dir
+            .join(STORAGE_NODE_INCARNATION_TMP_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn storage_node_incarnation_rejects_invalid_persisted_value() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join(STORAGE_NODE_INCARNATION_FILE);
+        std::fs::write(&path, "0\n").unwrap();
+
+        assert!(matches!(
+            advance_storage_node_incarnation(&data_dir),
+            Err(StorageNodeServerError::InvalidNodeIncarnation {
+                path: error_path,
+                value,
+            }) if error_path == path && value == "0\n"
+        ));
+    }
+
+    #[test]
+    fn storage_node_incarnation_rejects_overflow() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join(STORAGE_NODE_INCARNATION_FILE);
+        std::fs::write(&path, format!("{}\n", u64::MAX)).unwrap();
+
+        assert!(matches!(
+            advance_storage_node_incarnation(&data_dir),
+            Err(StorageNodeServerError::NodeIncarnationOverflow { path: error_path })
+                if error_path == path
+        ));
     }
 
     #[test]
