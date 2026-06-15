@@ -6859,6 +6859,24 @@ Status:
   requires closing the remaining request-path unbounded-loop audit before
   Phase 11, while keeping longer-running cleanup behind durable background
   ownership instead of request workers.
+- Follow-up repeated UAT and soak runs no longer reproduce the old widespread
+  slowdown, SDK operation-attempt timeout, transport EOF, or expected-contention
+  HTTP 500 patterns after the bounded-work, admission-class, recovery, and typed
+  RPC/error-mapping fixes. The only new observed failure was a concrete
+  `UploadPart`/`AbortMultipartUpload` race where the Unix stream command-build
+  RPC collapsed `NoSuchUpload` into a generic storage RPC error; that path now
+  preserves typed `NoSuchUpload` and has focused Unix and S3 race coverage. The
+  remaining Phase 10.9 work is therefore the closeout audit for request-path
+  unbounded work plus any strict forced-overload validation needed to document
+  bounded `SlowDown`/recovery behavior, not more broad soak-pattern debugging.
+- The closeout audit converted the remaining bucket metadata request loops to
+  carry `RequestWorkBudget` through command-id allocation, pending-slot drain,
+  pending-slot installation, and acting-set apply/reissue. This covered bucket
+  create, bucket control-plane updates, completed multipart order reservation,
+  and the completed-multipart commit path, and removed the unused unbudgeted
+  helper wrappers from production. The boundary checker now rejects production
+  calls back to the unbudgeted bucket metadata drain/retry helpers while leaving
+  test-only local helpers available for focused state-machine coverage.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

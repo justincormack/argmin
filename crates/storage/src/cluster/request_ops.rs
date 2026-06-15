@@ -878,13 +878,23 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         let pg_id = PgId::new(pg_id);
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("create_bucket_metadata")
+        .for_pg(pg_id);
         loop {
+            work_budget.check("create bucket metadata command budget exhausted")?;
             let (command, clear_pending_on_zero_apply) = match self
                 .pending_metadata_command_for_bucket(pg_id, &bucket)?
             {
                 Some(command) => {
-                    if self.drain_unrelated_pending_metadata_command_for_bucket(
-                        pg_id, &bucket, &command,
+                    if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                        pg_id,
+                        &bucket,
+                        &command,
+                        &mut work_budget,
                     )? {
                         continue;
                     }
@@ -895,7 +905,12 @@ impl super::StorageCluster {
                             (command, false)
                         }
                         _ => {
-                            self.drain_pending_metadata_command_pg_slot(pg_id, &bucket, &command)?;
+                            self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                                pg_id,
+                                &bucket,
+                                &command,
+                                &mut work_budget,
+                            )?;
                             continue;
                         }
                     }
@@ -913,8 +928,12 @@ impl super::StorageCluster {
                         })) => {}
                         Err(other) => return Err(other),
                     }
-                    let Some(command_id) =
-                        self.next_bucket_metadata_command_id_or_drain(pg_id, &bucket)?
+                    let Some(command_id) = self
+                        .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                            pg_id,
+                            &bucket,
+                            &mut work_budget,
+                        )?
                     else {
                         continue;
                     };
@@ -927,17 +946,23 @@ impl super::StorageCluster {
                         }
                         CreateBucketCommandBuild::Command(command) => *command,
                     };
-                    if !self.try_set_bucket_pg_pending_command_or_retry(pg_id, &bucket, &command)? {
+                    if !self.try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                        pg_id,
+                        &bucket,
+                        &command,
+                        &mut work_budget,
+                    )? {
                         continue;
                     }
                     (command, true)
                 }
             };
             let outcome = self
-                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
                     &command,
                     clear_pending_on_zero_apply,
+                    &mut work_budget,
                 )?;
             match outcome {
                 FinishPendingMetadataCommandResult::Applied => {}
@@ -1219,6 +1244,7 @@ impl super::StorageCluster {
             .map_err(|error| error.source)
     }
 
+    #[cfg(test)]
     pub(super) fn finish_pending_metadata_command_to_acting_set(
         &self,
         pg_id: PgId,
@@ -1264,26 +1290,6 @@ impl super::StorageCluster {
                 unreachable!("partial exact conflict retry is disabled for this caller")
             }
         }
-    }
-
-    pub(super) fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-        clear_pending_on_zero_apply: bool,
-    ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
-        let mut work_budget = super::RequestWorkBudget::new(
-            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
-            None,
-        )
-        .for_operation("metadata_command_apply_partial_retry")
-        .for_pg(pg_id);
-        self.finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
-            pg_id,
-            command,
-            clear_pending_on_zero_apply,
-            &mut work_budget,
-        )
     }
 
     pub(super) fn finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
@@ -1380,6 +1386,7 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn drain_bucket_pg_pending_metadata_command(
         &self,
         pg_id: PgId,
@@ -1421,20 +1428,6 @@ impl super::StorageCluster {
         command.bucket_name()
     }
 
-    fn drain_unrelated_pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        let pending_bucket = Self::metadata_command_bucket_name(command).clone();
-        if pending_bucket == *bucket {
-            return Ok(false);
-        }
-        self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, command)?;
-        Ok(true)
-    }
-
     fn drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
         &self,
         pg_id: PgId,
@@ -1455,6 +1448,7 @@ impl super::StorageCluster {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(super) fn drain_pending_metadata_command_pg_slot(
         &self,
         pg_id: PgId,
@@ -1503,25 +1497,6 @@ impl super::StorageCluster {
         Ok(())
     }
 
-    fn drain_pending_completed_multipart_sequence_command(
-        &self,
-        pg_id: PgId,
-        _bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let mut work_budget = super::RequestWorkBudget::new(
-            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
-            None,
-        )
-        .for_operation("completed_multipart_sequence_drain")
-        .for_pg(pg_id);
-        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
-            pg_id,
-            command,
-            &mut work_budget,
-        )
-    }
-
     fn drain_pending_completed_multipart_sequence_command_with_work_budget(
         &self,
         pg_id: PgId,
@@ -1537,29 +1512,22 @@ impl super::StorageCluster {
         Ok(())
     }
 
-    fn next_bucket_metadata_command_id_or_drain(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
-        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, false, None)
-    }
-
     fn next_bucket_metadata_command_id_or_drain_with_work_budget(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
-        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, false, Some(work_budget))
+        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, false, work_budget)
     }
 
-    fn next_completion_bucket_metadata_command_id_or_drain(
+    fn next_completion_bucket_metadata_command_id_or_drain_with_work_budget(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
-        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, true, None)
+        self.next_bucket_metadata_command_id_or_drain_inner(pg_id, bucket, true, work_budget)
     }
 
     fn next_bucket_metadata_command_id_or_drain_inner(
@@ -1567,7 +1535,7 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         completion_admission: bool,
-        work_budget: Option<&mut super::RequestWorkBudget>,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<Option<MetadataCommandId>, BucketSnapshotLoadError> {
         let command_id_result = if completion_admission {
             self.next_completion_bucket_metadata_command_id(pg_id)
@@ -1581,50 +1549,16 @@ impl super::StorageCluster {
             })) => {
                 if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&command).clone();
-                    if let Some(work_budget) = work_budget {
-                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
-                            pg_id,
-                            &pending_bucket,
-                            &command,
-                            work_budget,
-                        )?;
-                    } else {
-                        self.drain_pending_metadata_command_pg_slot(
-                            pg_id,
-                            &pending_bucket,
-                            &command,
-                        )?;
-                    }
+                    self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        &pending_bucket,
+                        &command,
+                        work_budget,
+                    )?;
                 }
                 Ok(None)
             }
             Err(error) => Err(error),
-        }
-    }
-
-    fn try_set_bucket_pg_pending_command_or_retry(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command) {
-            Ok(Some(())) => Ok(true),
-            Ok(None) => {
-                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
-                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
-                }
-                Ok(false)
-            }
-            Err(StoreError::MetadataCommandLogConflict { .. }) => {
-                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
-                    self.drain_pending_metadata_command_pg_slot(pg_id, &pending_bucket, &pending)?;
-                }
-                Ok(false)
-            }
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -1665,6 +1599,7 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn try_set_bucket_control_pending_command_or_retry(
         &self,
         pg_id: PgId,
@@ -1706,11 +1641,63 @@ impl super::StorageCluster {
         }
     }
 
-    fn finish_pending_command_for_completed_multipart_order(
+    fn try_set_bucket_control_pending_command_or_retry_with_work_budget(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        match primary
+            .metadata_command_client()
+            .try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket)
+        {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        &pending_bucket,
+                        &pending,
+                        work_budget,
+                    )?;
+                    return Ok(false);
+                }
+
+                if primary
+                    .bucket_write_reservation_client()
+                    .durable_bucket_write_drain_exists(pg_id, bucket)?
+                {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    return Ok(false);
+                }
+                Ok(false)
+            }
+            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
+                    self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                        pg_id,
+                        &pending_bucket,
+                        &pending,
+                        work_budget,
+                    )?;
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn finish_pending_command_for_completed_multipart_order(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<super::PendingMetadataCommandOutcome, ObjectPgActionError> {
         match command.payload() {
             MetadataCommandPayload::ReserveObjectGeneration(_)
@@ -1738,7 +1725,12 @@ impl super::StorageCluster {
             | MetadataCommandPayload::MarkBucketDeleting(_)
             | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
             | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => self
-                .drain_bucket_pg_pending_metadata_command(pg_id, bucket, command, false)
+                .drain_bucket_pg_pending_metadata_command_with_work_budget(
+                    pg_id,
+                    command,
+                    false,
+                    work_budget,
+                )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error),
         }
     }
@@ -2877,11 +2869,20 @@ impl super::StorageCluster {
                         MetadataCommandPayload::MarkBucketDeleting(mark)
                             if mark.bucket_name() == bucket
                     ) {
+                        let mut work_budget = super::RequestWorkBudget::new(
+                            std::time::Duration::from_millis(
+                                BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS,
+                            ),
+                            None,
+                        )
+                        .for_operation("bucket_delete_begin")
+                        .for_pg(pg_id);
                         let outcome = self
-                            .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
+                            .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                                 pg_id,
                                 &command,
                                 false,
+                                &mut work_budget,
                             )
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                         if matches!(
@@ -4432,13 +4433,23 @@ impl super::StorageCluster {
             }
         }
 
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("put_bucket_versioning")
+        .for_pg(pg_id);
         loop {
+            work_budget.check("put bucket versioning command budget exhausted")?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
-                if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                {
+                if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 match command.payload() {
@@ -4457,41 +4468,62 @@ impl super::StorageCluster {
                                     "conflicting pending put bucket versioning command",
                                 ));
                             }
-                            self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                            self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                                pg_id,
+                                bucket,
+                                &command,
+                                &mut work_budget,
+                            )?;
                             continue;
                         }
                         (command, false)
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command(
-                            pg_id, bucket, &command,
+                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
                         )?;
                         continue;
                     }
                     _ => {
-                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            pg_id,
+                            bucket,
+                            &command,
+                            &mut work_budget,
+                        )?;
                         continue;
                     }
                 }
             } else {
-                let Some(command_id) =
-                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                let Some(command_id) = self
+                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &mut work_budget,
+                    )?
                 else {
                     continue;
                 };
                 let command = primary_store
                     .bucket_metadata_client()
                     .build_put_bucket_versioning_command(pg_id, bucket, command_id, state)?;
-                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 (command, true)
             };
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
+            let outcome = self.finish_pending_metadata_command_to_acting_set_with_work_budget(
                 pg_id,
-                bucket,
                 &command,
                 clear_pending_on_zero_apply,
+                &mut work_budget,
             )?;
             if outcome == super::PendingMetadataCommandOutcome::Abandoned {
                 continue;
@@ -4596,13 +4628,23 @@ impl super::StorageCluster {
                 .head_bucket_raw(pg_id, bucket)?;
         }
 
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("put_bucket_acl")
+        .for_pg(pg_id);
         loop {
+            work_budget.check("put bucket acl command budget exhausted")?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
-                if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                {
+                if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 match command.payload() {
@@ -4626,25 +4668,41 @@ impl super::StorageCluster {
                                     "conflicting pending put bucket acl command",
                                 ));
                             }
-                            self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                            self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                                pg_id,
+                                bucket,
+                                &command,
+                                &mut work_budget,
+                            )?;
                             continue;
                         }
                         (command, false)
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command(
-                            pg_id, bucket, &command,
+                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
                         )?;
                         continue;
                     }
                     _ => {
-                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            pg_id,
+                            bucket,
+                            &command,
+                            &mut work_budget,
+                        )?;
                         continue;
                     }
                 }
             } else {
-                let Some(command_id) =
-                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                let Some(command_id) = self
+                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &mut work_budget,
+                    )?
                 else {
                     continue;
                 };
@@ -4658,16 +4716,21 @@ impl super::StorageCluster {
                         public_read,
                         public_write,
                     )?;
-                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 (command, true)
             };
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
+            let outcome = self.finish_pending_metadata_command_to_acting_set_with_work_budget(
                 pg_id,
-                bucket,
                 &command,
                 clear_pending_on_zero_apply,
+                &mut work_budget,
             )?;
             if outcome == super::PendingMetadataCommandOutcome::Abandoned {
                 continue;
@@ -4695,13 +4758,23 @@ impl super::StorageCluster {
                 .head_bucket_raw(pg_id, bucket)?;
         }
 
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("put_bucket_property")
+        .for_pg(pg_id);
         loop {
+            work_budget.check("put bucket property command budget exhausted")?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
-                if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                {
+                if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 match command.payload() {
@@ -4715,41 +4788,62 @@ impl super::StorageCluster {
                                 pg_id, bucket, property, &mutation,
                             )?
                         {
-                            self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                            self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                                pg_id,
+                                bucket,
+                                &command,
+                                &mut work_budget,
+                            )?;
                             continue;
                         }
                         (command, false)
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command(
-                            pg_id, bucket, &command,
+                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
                         )?;
                         continue;
                     }
                     _ => {
-                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            pg_id,
+                            bucket,
+                            &command,
+                            &mut work_budget,
+                        )?;
                         continue;
                     }
                 }
             } else {
-                let Some(command_id) =
-                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                let Some(command_id) = self
+                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &mut work_budget,
+                    )?
                 else {
                     continue;
                 };
                 let command = primary_store
                     .bucket_metadata_client()
                     .build_put_bucket_property_command(pg_id, bucket, command_id, &mutation)?;
-                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 (command, true)
             };
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
+            let outcome = self.finish_pending_metadata_command_to_acting_set_with_work_budget(
                 pg_id,
-                bucket,
                 &command,
                 clear_pending_on_zero_apply,
+                &mut work_budget,
             )?;
             if outcome == super::PendingMetadataCommandOutcome::Abandoned {
                 continue;
@@ -4814,13 +4908,23 @@ impl super::StorageCluster {
                 .bucket_metadata_client()
                 .head_bucket_raw(pg_id, bucket)?;
         }
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("put_bucket_subresource")
+        .for_pg(pg_id);
         loop {
+            work_budget.check("put bucket subresource command budget exhausted")?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
-                if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)?
-                {
+                if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 match command.payload() {
@@ -4830,35 +4934,51 @@ impl super::StorageCluster {
                         (command, false)
                     }
                     MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command(
-                            pg_id, bucket, &command,
+                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
                         )?;
                         continue;
                     }
                     _ => {
-                        self.drain_pending_metadata_command_pg_slot(pg_id, bucket, &command)?;
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            pg_id,
+                            bucket,
+                            &command,
+                            &mut work_budget,
+                        )?;
                         continue;
                     }
                 }
             } else {
-                let Some(command_id) =
-                    self.next_bucket_metadata_command_id_or_drain(pg_id, bucket)?
+                let Some(command_id) = self
+                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &mut work_budget,
+                    )?
                 else {
                     continue;
                 };
                 let command = primary_store
                     .bucket_metadata_client()
                     .build_put_bucket_subresource_command(pg_id, bucket, command_id, &mutation)?;
-                if !self.try_set_bucket_control_pending_command_or_retry(pg_id, bucket, &command)? {
+                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                )? {
                     continue;
                 }
                 (command, true)
             };
-            let outcome = self.finish_pending_metadata_command_to_acting_set(
+            let outcome = self.finish_pending_metadata_command_to_acting_set_with_work_budget(
                 pg_id,
-                bucket,
                 &command,
                 clear_pending_on_zero_apply,
+                &mut work_budget,
             )?;
             if outcome == super::PendingMetadataCommandOutcome::Abandoned {
                 continue;
@@ -9319,6 +9439,7 @@ impl super::StorageCluster {
     fn reserve_completed_multipart_upload_order(
         &self,
         bucket: &BucketName,
+        work_budget: &mut super::RequestWorkBudget,
     ) -> Result<u64, ObjectPgActionError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let bucket_metadata_client = self
@@ -9327,9 +9448,15 @@ impl super::StorageCluster {
             .bucket_metadata_client()
             .clone();
         loop {
+            work_budget.check("completed multipart order reservation budget exhausted")?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if self
-                    .drain_unrelated_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        work_budget,
+                    )
                     .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                 {
                     continue;
@@ -9339,7 +9466,12 @@ impl super::StorageCluster {
                 {
                     let completion_order = advance.completion_order;
                     match self
-                        .drain_bucket_pg_pending_metadata_command(pg_id, bucket, &command, false)
+                        .drain_bucket_pg_pending_metadata_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            false,
+                            work_budget,
+                        )
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                     {
                         super::PendingMetadataCommandOutcome::Applied => {
@@ -9353,9 +9485,11 @@ impl super::StorageCluster {
                         super::PendingMetadataCommandOutcome::Abandoned => continue,
                     }
                 }
-                match self
-                    .finish_pending_command_for_completed_multipart_order(pg_id, bucket, &command)?
-                {
+                match self.finish_pending_command_for_completed_multipart_order(
+                    pg_id,
+                    &command,
+                    work_budget,
+                )? {
                     super::PendingMetadataCommandOutcome::Applied => continue,
                     super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                         return Err(super::conflicting_pending_object_metadata_command(
@@ -9371,7 +9505,11 @@ impl super::StorageCluster {
                 self.metadata_command_apply_test_hook_scope_id(),
             );
             let Some(command_id) = self
-                .next_completion_bucket_metadata_command_id_or_drain(pg_id, bucket)
+                .next_completion_bucket_metadata_command_id_or_drain_with_work_budget(
+                    pg_id,
+                    bucket,
+                    work_budget,
+                )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
             else {
                 continue;
@@ -9382,13 +9520,22 @@ impl super::StorageCluster {
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             if !self
-                .try_set_bucket_pg_pending_command_or_retry(pg_id, bucket, &command)
+                .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                    pg_id,
+                    bucket,
+                    &command,
+                    work_budget,
+                )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
             {
                 continue;
             }
-            match self.finish_pending_metadata_command_to_acting_set(pg_id, bucket, &command, true)
-            {
+            match self.finish_pending_metadata_command_to_acting_set_with_work_budget(
+                pg_id,
+                &command,
+                true,
+                work_budget,
+            ) {
                 Ok(super::PendingMetadataCommandOutcome::Applied) => return Ok(completion_order),
                 Ok(
                     super::PendingMetadataCommandOutcome::Abandoned
@@ -9408,7 +9555,13 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<u64, ObjectPgActionError> {
-        self.reserve_completed_multipart_upload_order(bucket)
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("test_completed_multipart_order")
+        .for_pg(PgId::new(self.bucket_metadata_pg_id(bucket)));
+        self.reserve_completed_multipart_upload_order(bucket, &mut work_budget)
     }
 
     fn apply_multipart_completion_command(
@@ -9500,8 +9653,15 @@ impl super::StorageCluster {
         let generation_id = req.generation_id;
         let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("complete_multipart_upload_commit")
+        .for_pg(pg_id);
 
         'retry_after_pending_conflict: loop {
+            work_budget.check("complete multipart commit budget exhausted")?;
             let reservation = match self.acquire_completion_durable_bucket_write_reservation(
                 &bucket,
                 "complete-multipart-upload",
@@ -9586,13 +9746,14 @@ impl super::StorageCluster {
             } else {
                 VersionId::Null
             };
-            let completion_order = match self.reserve_completed_multipart_upload_order(&bucket) {
-                Ok(completion_order) => completion_order,
-                Err(error) => {
-                    release_bucket_write_proof!()?;
-                    return Err(error);
-                }
-            };
+            let completion_order =
+                match self.reserve_completed_multipart_upload_order(&bucket, &mut work_budget) {
+                    Ok(completion_order) => completion_order,
+                    Err(error) => {
+                        release_bucket_write_proof!()?;
+                        return Err(error);
+                    }
+                };
             let expected_object_parts: Vec<ObjectPartRecord> = req
                 .part_records
                 .iter()

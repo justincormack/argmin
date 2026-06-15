@@ -3497,11 +3497,19 @@ impl StorageCluster {
                         work_budget,
                     )
                     .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
-                None => self
-                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry(
-                        pg_id, command, false,
+                None => {
+                    let mut work_budget =
+                        RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
+                            .for_operation("metadata_command_apply_partial_retry")
+                            .for_pg(pg_id);
+                    self.finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                        pg_id,
+                        command,
+                        false,
+                        &mut work_budget,
                     )
-                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                }
             };
             return Ok(match outcome {
                 request_ops::FinishPendingMetadataCommandResult::Applied => {

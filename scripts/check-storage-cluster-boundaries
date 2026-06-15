@@ -2084,9 +2084,9 @@ pending_command_publishers=$(
 	            helper = "try_set_object_pg_pending_command_or_drain"
 	        } else if ($0 ~ /try_install_object_pg_pending_command_or_drain\(/) {
 	            helper = "try_install_object_pg_pending_command_or_drain"
-	        } else if ($0 ~ /try_set_bucket_pg_pending_command_or_retry\(/) {
+	        } else if ($0 ~ /try_set_bucket_pg_pending_command_or_retry(_with_work_budget)?\(/) {
 	            helper = "try_set_bucket_pg_pending_command_or_retry"
-	        } else if ($0 ~ /try_set_bucket_control_pending_command_or_retry\(/) {
+	        } else if ($0 ~ /try_set_bucket_control_pending_command_or_retry(_with_work_budget)?\(/) {
 	            helper = "try_set_bucket_control_pending_command_or_retry"
 	        } else if ($0 ~ /install_snapshot_sensitive_metadata_command_or_drain\(/) {
 	            helper = "install_snapshot_sensitive_metadata_command_or_drain"
@@ -2101,7 +2101,9 @@ pending_command_publishers=$(
 	            || current_fn == "try_set_object_pg_pending_command_or_drain" \
 	            || current_fn == "try_install_object_pg_pending_command_or_drain" \
 	            || current_fn == "try_set_bucket_pg_pending_command_or_retry" \
+	            || current_fn == "try_set_bucket_pg_pending_command_or_retry_with_work_budget" \
 	            || current_fn == "try_set_bucket_control_pending_command_or_retry" \
+	            || current_fn == "try_set_bucket_control_pending_command_or_retry_with_work_budget" \
 	            || current_fn == "install_snapshot_sensitive_metadata_command_or_drain" \
 	            || current_fn == "try_set_pending_metadata_command_for_bucket") {
             next
@@ -2714,6 +2716,54 @@ raw_coordinator_bucket_snapshot_metadata_mappers=$(
 fail_with_matches \
     "Production coordinator bucket snapshot mappers must handle metadata command contention before raw Metadata fallback" \
     "$raw_coordinator_bucket_snapshot_metadata_mappers"
+
+unbudgeted_request_work_helpers=$(
+    awk '
+    FNR == 1 {
+        current_fn = ""
+        pending_test_cfg = 0
+        in_test_hook = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*#\[/ {
+        next
+    }
+    /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+|pub\(super\)[[:space:]]+|pub\(crate\)[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/ {
+        current_fn = $0
+        sub(/^.*fn[[:space:]]+/, "", current_fn)
+        sub(/\(.*/, "", current_fn)
+        in_test_hook = pending_test_cfg
+        pending_test_cfg = 0
+    }
+    pending_test_cfg && $0 !~ /^[[:space:]]*$/ {
+        pending_test_cfg = 0
+    }
+    {
+        if (in_test_hook || current_fn ~ /^test_/) {
+            next
+        }
+        if (current_fn == "drain_unrelated_pending_metadata_command_for_bucket" \
+            || current_fn == "drain_pending_metadata_command_pg_slot" \
+            || current_fn == "drain_bucket_pg_pending_metadata_command" \
+            || current_fn == "drain_pending_completed_multipart_sequence_command" \
+            || current_fn == "next_bucket_metadata_command_id_or_drain" \
+            || current_fn == "next_completion_bucket_metadata_command_id_or_drain" \
+            || current_fn == "try_set_bucket_pg_pending_command_or_retry" \
+            || current_fn == "try_set_bucket_control_pending_command_or_retry") {
+            next
+        }
+        if ($0 ~ /\.(drain_unrelated_pending_metadata_command_for_bucket|drain_pending_metadata_command_pg_slot|drain_bucket_pg_pending_metadata_command|drain_pending_completed_multipart_sequence_command|next_bucket_metadata_command_id_or_drain|next_completion_bucket_metadata_command_id_or_drain|try_set_bucket_pg_pending_command_or_retry|try_set_bucket_control_pending_command_or_retry)\(/) {
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster/request_ops.rs
+)
+fail_with_matches \
+    "Production request paths must use request-work-budget variants for bucket metadata drain/retry helpers" \
+    "$unbudgeted_request_work_helpers"
 
 if [[ "$failed" -ne 0 ]]; then
     echo
