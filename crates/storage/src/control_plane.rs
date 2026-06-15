@@ -478,6 +478,7 @@ pub struct NodeServiceAuthorization {
     authority_incarnation: AuthorityIncarnation,
     cluster_epoch: ClusterEpoch,
     node_id: NodeId,
+    node_incarnation: u64,
     lease_deadline_ms: u64,
 }
 
@@ -498,6 +499,11 @@ impl NodeServiceAuthorization {
     }
 
     #[must_use]
+    pub fn node_incarnation(&self) -> u64 {
+        self.node_incarnation
+    }
+
+    #[must_use]
     pub fn lease_deadline_ms(&self) -> u64 {
         self.lease_deadline_ms
     }
@@ -509,6 +515,7 @@ pub struct PgPrimaryAuthorization {
     cluster_epoch: ClusterEpoch,
     pg_id: PgId,
     primary_node_id: NodeId,
+    primary_node_incarnation: u64,
     lease_deadline_ms: u64,
 }
 
@@ -531,6 +538,11 @@ impl PgPrimaryAuthorization {
     #[must_use]
     pub fn primary_node_id(&self) -> NodeId {
         self.primary_node_id
+    }
+
+    #[must_use]
+    pub fn primary_node_incarnation(&self) -> u64 {
+        self.primary_node_incarnation
     }
 
     #[must_use]
@@ -583,6 +595,11 @@ impl PgOperationAuthorization {
     #[must_use]
     pub fn primary_node_id(&self) -> NodeId {
         self.primary.primary_node_id()
+    }
+
+    #[must_use]
+    pub fn primary_node_incarnation(&self) -> u64 {
+        self.primary.primary_node_incarnation()
     }
 
     #[must_use]
@@ -1096,6 +1113,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             authority_incarnation: self.snapshot.authority_incarnation,
             cluster_epoch: self.snapshot.cluster_epoch,
             node_id,
+            node_incarnation,
             lease_deadline_ms,
         })
     }
@@ -1142,6 +1160,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             cluster_epoch: self.snapshot.cluster_epoch,
             pg_id,
             primary_node_id,
+            primary_node_incarnation: node_authorization.node_incarnation(),
             lease_deadline_ms: node_authorization.lease_deadline_ms(),
         })
     }
@@ -1163,6 +1182,98 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             now_ms,
         )?;
         Ok(PgOperationAuthorization { operation, primary })
+    }
+
+    pub fn validate_pg_operation_authorization(
+        &self,
+        authorization: &PgOperationAuthorization,
+        now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        if authorization.authority_incarnation() != self.snapshot.authority_incarnation {
+            return Err(ControlPlaneError::StaleAuthorityIncarnation {
+                authority_incarnation: authorization.authority_incarnation(),
+                current_authority_incarnation: self.snapshot.authority_incarnation,
+            });
+        }
+        if authorization.cluster_epoch() != self.snapshot.cluster_epoch {
+            return Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch: authorization.cluster_epoch(),
+                current_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        if authorization.lease_deadline_ms() <= now_ms {
+            return Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: authorization.primary_node_id().as_u32(),
+                now_ms,
+                lease_deadline_ms: Some(authorization.lease_deadline_ms()),
+            });
+        }
+
+        let primary_node_id = authorization.primary_node_id();
+        let record =
+            self.snapshot
+                .nodes
+                .get(&primary_node_id)
+                .ok_or(ControlPlaneError::UnknownNode {
+                    node_id: primary_node_id.as_u32(),
+                })?;
+        if record.node_incarnation != authorization.primary_node_incarnation() {
+            return Err(ControlPlaneError::NodeIncarnationMismatch {
+                node_id: primary_node_id.as_u32(),
+                sender_incarnation: authorization.primary_node_incarnation(),
+                current_incarnation: record.node_incarnation,
+            });
+        }
+        if !record.can_serve_primary(self.snapshot.cluster_epoch) {
+            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: primary_node_id.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        let current_lease_deadline_ms =
+            record
+                .lease_deadline_ms
+                .ok_or(ControlPlaneError::NodeLeaseExpired {
+                    node_id: primary_node_id.as_u32(),
+                    now_ms,
+                    lease_deadline_ms: None,
+                })?;
+        if current_lease_deadline_ms <= now_ms {
+            return Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: primary_node_id.as_u32(),
+                now_ms,
+                lease_deadline_ms: Some(current_lease_deadline_ms),
+            });
+        }
+
+        let pg_id = authorization.pg_id();
+        let pg = self
+            .snapshot
+            .pgs
+            .get(&pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if pg.state != PgState::Active {
+            return Err(ControlPlaneError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+                state: pg.state,
+            });
+        }
+        let serving_primary = self
+            .deterministic_pg_primary(pg_id, pg.acting_set())
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            })?;
+        if serving_primary != primary_node_id {
+            return Err(ControlPlaneError::NodeNotPgPrimary {
+                pg_id: pg_id.get(),
+                node_id: primary_node_id.as_u32(),
+                primary_node_id: serving_primary.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        validate_pg_primary_active_observation(&self.snapshot, pg_id, primary_node_id)
     }
 
     #[must_use]
@@ -1255,6 +1366,22 @@ pub enum ControlPlaneError {
     StaleNodeObservedEpoch {
         node_id: u32,
         observed_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "authorization authority incarnation {authority_incarnation} is stale; current incarnation is {current_authority_incarnation}"
+    )]
+    StaleAuthorityIncarnation {
+        authority_incarnation: AuthorityIncarnation,
+        current_authority_incarnation: AuthorityIncarnation,
+    },
+
+    #[error(
+        "authorization cluster epoch {cluster_epoch} is stale; current epoch is {current_epoch}"
+    )]
+    StaleAuthorizationEpoch {
+        cluster_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
     },
 
@@ -3345,9 +3472,16 @@ mod tests {
             assert_eq!(authorization.pg_id(), PgId::new(14));
             assert_eq!(authorization.primary_node_id(), NodeId::new(1));
             assert_eq!(
+                authorization.primary_node_incarnation(),
+                node_incarnation(&authority, 1)
+            );
+            assert_eq!(
                 authorization.cluster_epoch(),
                 authority.snapshot().cluster_epoch()
             );
+            authority
+                .validate_pg_operation_authorization(&authorization, 3_060)
+                .unwrap();
         }
 
         for state in [
@@ -3383,6 +3517,85 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn pg_operation_authorization_validation_fences_stale_tokens() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(17), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 17, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(17),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 17, PgState::Active, 3_000);
+
+        let authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(17),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                authority.snapshot().cluster_epoch(),
+                3_050,
+            )
+            .unwrap();
+        authority
+            .validate_pg_operation_authorization(&authorization, 3_060)
+            .unwrap();
+
+        let mut shorter_lease =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 3_061);
+        shorter_lease.lease_duration_ms = 5;
+        shorter_lease.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(17),
+            state: PgState::Active,
+        }];
+        authority.heartbeat(shorter_lease).unwrap();
+        assert!(authorization.lease_deadline_ms() > 3_066);
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(&authorization, 3_066),
+            Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: 1,
+                lease_deadline_ms: Some(3_066),
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(
+                &authorization,
+                authorization.lease_deadline_ms()
+            ),
+            Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
+        ));
+
+        heartbeat_with_pg_observation(&mut authority, 1, 17, PgState::Active, 3_070);
+        authority
+            .set_pg_state(PgId::new(17), PgState::Peering)
+            .unwrap();
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(&authorization, 3_060),
+            Err(ControlPlaneError::StaleAuthorizationEpoch { .. })
+        ));
+
+        let restarted = SingleAuthorityControlPlane::open(store).unwrap();
+        assert!(matches!(
+            restarted.validate_pg_operation_authorization(&authorization, 3_060),
+            Err(ControlPlaneError::StaleAuthorityIncarnation { .. })
+        ));
     }
 
     #[test]

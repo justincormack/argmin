@@ -7079,6 +7079,12 @@ Status:
   heartbeated that PG as `Active` in the post-peering cluster epoch. This keeps
   peering completion, epoch fencing, and local primary state installation as
   distinct observable steps.
+- Added explicit validation for issued PG-operation authorization tokens. Tokens
+  now retain the validated primary node incarnation, and callers can re-check
+  authority incarnation, cluster epoch, node incarnation, both the token and
+  current node lease deadlines, active PG state, deterministic primary
+  assignment, and current primary PG observation before applying work that
+  started under an earlier view.
 
 Exit criteria:
 
