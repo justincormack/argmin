@@ -190,6 +190,25 @@ Example full acceptance run:
 ./scripts/uat-s3-tests --release
 ```
 
+Strict forced-overload validation uses the same standalone UAT topology but
+intentionally constrains storage-node RPC admission. It is a boundedness gate,
+not a throughput benchmark:
+
+```bash
+./scripts/uat-forced-overload
+```
+
+By default this runs the `atomic` and `versioning` external `s3-tests` binaries
+with `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT=8`, short storage-RPC admission
+waits, and the normal 30s SDK operation-attempt timeout. This strict timeout is
+not inherited from `S3_TEST_TIMEOUT_SECS`; use `--timeout-secs` or
+`ARGMIN_FORCED_OVERLOAD_TIMEOUT_SECS` only for explicit diagnostic runs. The
+wrapper validates that overload or metadata contention was actually observed,
+storage RPC errors stayed at zero, and no HTTP 500, transport EOF,
+connection-refused, panic, or SDK operation-attempt timeout shape appeared in
+the retained UAT logs. Exact `SlowDown` or `OperationAborted` counts are not
+benchmark targets; they are accepted S3-shaped pressure signals.
+
 The wrapper provides deterministic default credentials. Override them with the
 same environment variables if a specific test setup needs stable names or
 secrets across runs.

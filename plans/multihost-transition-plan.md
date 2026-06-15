@@ -6877,6 +6877,13 @@ Status:
   helper wrappers from production. The boundary checker now rejects production
   calls back to the unbudgeted bucket metadata drain/retry helpers while leaving
   test-only local helpers available for focused state-machine coverage.
+- Added `./scripts/uat-forced-overload` as the strict Phase 10.9 overload gate.
+  It runs a constrained multihost UAT with the minimum accepted storage-RPC
+  admission limit, requires observable overload/contention pressure, and fails
+  if pressure escapes as HTTP 500, storage RPC errors, transport EOF, connection
+  refusal, panic, or SDK operation-attempt timeout. This gate proves bounded
+  S3-shaped behavior; detailed per-PG/adaptive admission tuning remains deferred
+  until Phase 11 or until a more production-realistic workload benchmark exists.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 

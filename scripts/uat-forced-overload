@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/uat-forced-overload [options] [cargo nextest args...]
+
+Run a constrained multihost UAT and validate that overload stays bounded and
+S3-shaped. This is a stabilization gate, not a throughput benchmark.
+
+Options:
+  --data-dir PATH        Use a caller-owned data directory
+  --no-cleanup           Keep the generated data directory after a passing run
+  --listen ADDR          Server listen address (default: 127.0.0.1:19000)
+  --bucket-prefix PREFIX Bucket prefix for s3-tests (default: argmin-s3-)
+  --timeout-secs SECS    S3 client timeout (default: 30)
+  --repeat N             Repeat the selected s3-tests command N times
+  --binary PATH          Run an already-built argmin-s3-compatible binary
+  --release              Use a release argmin-s3 binary
+  -h, --help             Show this help
+
+Environment knobs:
+  ARGMIN_FORCED_OVERLOAD_RPC_LIMIT                 default: 8
+  ARGMIN_FORCED_OVERLOAD_RPC_WAIT_MS               default: 25
+  ARGMIN_FORCED_OVERLOAD_RPC_CONTROL_WAIT_MS       default: 250
+  ARGMIN_FORCED_OVERLOAD_MAX_INFLIGHT_REQUESTS     default: 32
+  ARGMIN_FORCED_OVERLOAD_TIMEOUT_SECS              default: 30
+  ARGMIN_FORCED_OVERLOAD_REQUIRE_STORAGE_RPC_WAIT  default: 1
+  ARGMIN_FORCED_OVERLOAD_ALLOW_RETRYABLE_FAILURE   default: 0
+
+If no cargo nextest args are supplied, the wrapper runs:
+  --test atomic --test versioning
+EOF
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 2
+}
+
+latest_metric_sample_value() {
+    local metrics_log="$1"
+    local metric_name="$2"
+    awk -v metric="$metric_name" '$1 == metric { value = $2 } END { if (value != "") print value; else print "0" }' "$metrics_log"
+}
+
+as_int() {
+    local value="${1:-0}"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$value"
+    else
+        printf '0\n'
+    fi
+}
+
+data_dir="${ARGMIN_FORCED_OVERLOAD_DATA_DIR:-}"
+cleanup=1
+caller_data_dir=0
+listen_addr=""
+bucket_prefix=""
+timeout_secs="${ARGMIN_FORCED_OVERLOAD_TIMEOUT_SECS:-30}"
+repeat_count=""
+uat_options=()
+nextest_args=()
+
+while (($#)); do
+    case "$1" in
+        --data-dir)
+            [[ $# -ge 2 ]] || die "--data-dir requires a value"
+            data_dir="$2"
+            caller_data_dir=1
+            cleanup=0
+            shift 2
+            ;;
+        --no-cleanup)
+            cleanup=0
+            shift
+            ;;
+        --listen)
+            [[ $# -ge 2 ]] || die "--listen requires a value"
+            listen_addr="$2"
+            shift 2
+            ;;
+        --bucket-prefix)
+            [[ $# -ge 2 ]] || die "--bucket-prefix requires a value"
+            bucket_prefix="$2"
+            shift 2
+            ;;
+        --timeout-secs)
+            [[ $# -ge 2 ]] || die "--timeout-secs requires a value"
+            timeout_secs="$2"
+            shift 2
+            ;;
+        --repeat)
+            [[ $# -ge 2 ]] || die "--repeat requires a value"
+            repeat_count="$2"
+            shift 2
+            ;;
+        --binary)
+            [[ $# -ge 2 ]] || die "--binary requires a value"
+            uat_options+=("--binary" "$2")
+            shift 2
+            ;;
+        --release)
+            uat_options+=("--release")
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            nextest_args+=("$@")
+            break
+            ;;
+        *)
+            nextest_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$data_dir" ]]; then
+    data_dir="$(mktemp -d "${TMPDIR:-/tmp}/argmin-s3-forced-overload.XXXXXX")"
+fi
+mkdir -p "$data_dir"
+
+if [[ ${#nextest_args[@]} -eq 0 ]]; then
+    nextest_args=(--test atomic --test versioning)
+fi
+
+if [[ -n "$listen_addr" ]]; then
+    uat_options+=("--listen" "$listen_addr")
+fi
+if [[ -n "$bucket_prefix" ]]; then
+    uat_options+=("--bucket-prefix" "$bucket_prefix")
+fi
+if [[ -n "$repeat_count" ]]; then
+    uat_options+=("--repeat" "$repeat_count")
+fi
+
+rpc_limit="${ARGMIN_FORCED_OVERLOAD_RPC_LIMIT:-8}"
+rpc_wait_ms="${ARGMIN_FORCED_OVERLOAD_RPC_WAIT_MS:-25}"
+rpc_control_wait_ms="${ARGMIN_FORCED_OVERLOAD_RPC_CONTROL_WAIT_MS:-250}"
+max_inflight_requests="${ARGMIN_FORCED_OVERLOAD_MAX_INFLIGHT_REQUESTS:-32}"
+require_storage_rpc_wait="${ARGMIN_FORCED_OVERLOAD_REQUIRE_STORAGE_RPC_WAIT:-1}"
+allow_retryable_failure="${ARGMIN_FORCED_OVERLOAD_ALLOW_RETRYABLE_FAILURE:-0}"
+
+if ! [[ "$rpc_limit" =~ ^[0-9]+$ ]] || ((rpc_limit < 8)); then
+    die "ARGMIN_FORCED_OVERLOAD_RPC_LIMIT must be an integer >= 8"
+fi
+if ! [[ "$rpc_wait_ms" =~ ^[1-9][0-9]*$ ]]; then
+    die "ARGMIN_FORCED_OVERLOAD_RPC_WAIT_MS must be a positive integer"
+fi
+if ! [[ "$rpc_control_wait_ms" =~ ^[1-9][0-9]*$ ]]; then
+    die "ARGMIN_FORCED_OVERLOAD_RPC_CONTROL_WAIT_MS must be a positive integer"
+fi
+if ! [[ "$max_inflight_requests" =~ ^[1-9][0-9]*$ ]]; then
+    die "ARGMIN_FORCED_OVERLOAD_MAX_INFLIGHT_REQUESTS must be a positive integer"
+fi
+if ! [[ "$timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
+    die "ARGMIN_FORCED_OVERLOAD_TIMEOUT_SECS/--timeout-secs must be a positive integer"
+fi
+
+logs_dir="$data_dir/logs"
+run_log="$data_dir/forced-overload-uat.log"
+
+cd "$ROOT"
+
+echo "== argmin-s3 forced-overload UAT =="
+echo "data_dir=$data_dir"
+echo "rpc_limit=$rpc_limit rpc_wait_ms=$rpc_wait_ms rpc_control_wait_ms=$rpc_control_wait_ms max_inflight_requests=$max_inflight_requests timeout_secs=$timeout_secs"
+printf 'nextest_args='
+printf ' %q' "${nextest_args[@]}"
+printf '\n'
+
+set +e
+env \
+    ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT="$rpc_limit" \
+    ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS="$rpc_wait_ms" \
+    ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS="$rpc_control_wait_ms" \
+    ARGMIN_MAX_INFLIGHT_REQUESTS="$max_inflight_requests" \
+    ARGMIN_ABORT_ON_500=1 \
+    ./scripts/uat-s3-tests \
+        --topology multihost \
+        --data-dir "$data_dir" \
+        --timeout-secs "$timeout_secs" \
+        "${uat_options[@]}" \
+        "${nextest_args[@]}" \
+    2>&1 | tee "$run_log"
+uat_status=${PIPESTATUS[0]}
+set -e
+
+metrics_log="$logs_dir/frontend-metrics-samples.log"
+if [[ ! -s "$metrics_log" ]]; then
+    echo "forced-overload validation failed: missing metrics log $metrics_log" >&2
+    echo "UAT data directory kept at $data_dir" >&2
+    exit 1
+fi
+
+slow_down="$(as_int "$(latest_metric_sample_value "$metrics_log" slow_down_response_total)")"
+request_admission_wait="$(as_int "$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)")"
+request_admission_timeout="$(as_int "$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)")"
+operation_aborted="$(as_int "$(latest_metric_sample_value "$metrics_log" operation_aborted_response_total)")"
+storage_rpc_errors="$(as_int "$(latest_metric_sample_value "$metrics_log" storage_rpc_error_total)")"
+storage_rpc_admission_wait="$(as_int "$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_total)")"
+storage_rpc_admission_timeout="$(as_int "$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_timeout_total)")"
+metadata_budget_exhausted="$(as_int "$(latest_metric_sample_value "$metrics_log" metadata_command_budget_exhausted_total)")"
+metadata_backoff="$(as_int "$(latest_metric_sample_value "$metrics_log" metadata_command_backoff_total)")"
+storage_rpc_active_total="$(as_int "$(latest_metric_sample_value "$metrics_log" storage_rpc_active_total)")"
+storage_rpc_pending_envelope_active="$(as_int "$(latest_metric_sample_value "$metrics_log" storage_rpc_pending_envelope_active)")"
+
+pressure_total=$((slow_down + request_admission_wait + request_admission_timeout + operation_aborted + storage_rpc_admission_wait + storage_rpc_admission_timeout + metadata_budget_exhausted + metadata_backoff))
+storage_rpc_pressure_total=$((storage_rpc_admission_wait + storage_rpc_admission_timeout))
+retryable_response_total=$((slow_down + operation_aborted))
+
+scan_files=("$run_log")
+if [[ -d "$logs_dir" ]]; then
+    while IFS= read -r -d '' file; do
+        scan_files+=("$file")
+    done < <(find "$logs_dir" -type f -name '*.log' ! -name 'frontend-metrics-samples.log' -print0)
+fi
+
+disallowed_matches="$(
+    grep -HnE \
+        'server produced HTTP 500|request_500|status=500|InternalError|dispatch_internal_error|cause_label=storage_rpc_error|server_detail="storage_rpc |DispatchFailure|UnexpectedEof|Connection refused|connection refused|TimeoutError|OperationAttempt|panicked at|thread .* panicked' \
+        "${scan_files[@]}" \
+        2>/dev/null \
+        | head -n 80 \
+        || true
+)"
+
+validation_failed=0
+if [[ -n "$disallowed_matches" ]]; then
+    validation_failed=1
+    echo "forced-overload validation failed: disallowed failure shape observed" >&2
+    printf '%s\n' "$disallowed_matches" >&2
+fi
+if ((storage_rpc_errors != 0)); then
+    validation_failed=1
+    echo "forced-overload validation failed: storage_rpc_error_total=$storage_rpc_errors" >&2
+fi
+if ((storage_rpc_admission_timeout > 0 && slow_down == 0)); then
+    validation_failed=1
+    echo "forced-overload validation failed: storage RPC admission timed out without any SlowDown response" >&2
+fi
+if ((request_admission_timeout > 0 && slow_down == 0)); then
+    validation_failed=1
+    echo "forced-overload validation failed: request admission timed out without any SlowDown response" >&2
+fi
+if ((pressure_total == 0)); then
+    validation_failed=1
+    echo "forced-overload validation failed: no overload/contention pressure was observed" >&2
+fi
+if [[ "$require_storage_rpc_wait" != "0" ]] && ((storage_rpc_pressure_total == 0)); then
+    validation_failed=1
+    echo "forced-overload validation failed: no storage RPC admission wait/timeout was observed" >&2
+fi
+if ((uat_status != 0)); then
+    if [[ "$allow_retryable_failure" != "0" && "$validation_failed" -eq 0 && "$retryable_response_total" -gt 0 ]]; then
+        echo "forced-overload UAT exited nonzero, accepted because only retryable overload/contention was detected" >&2
+    else
+        validation_failed=1
+        echo "forced-overload validation failed: UAT exited with status $uat_status" >&2
+    fi
+fi
+
+echo "== argmin-s3 forced-overload validation summary =="
+echo "metrics slow_down_response_total=$slow_down operation_aborted_response_total=$operation_aborted request_admission_wait_total=$request_admission_wait request_admission_timeout_total=$request_admission_timeout storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout storage_rpc_error_total=$storage_rpc_errors metadata_budget_exhausted_total=$metadata_budget_exhausted metadata_backoff_total=$metadata_backoff"
+echo "storage_rpc_active total=$storage_rpc_active_total pending_envelope_active=$storage_rpc_pending_envelope_active"
+
+if ((validation_failed != 0)); then
+    echo "UAT data directory kept at $data_dir" >&2
+    exit 1
+fi
+
+echo "forced-overload validation passed"
+if ((cleanup)) && ((caller_data_dir == 0)); then
+    rm -rf "$data_dir"
+else
+    echo "UAT data directory kept at $data_dir"
+fi
