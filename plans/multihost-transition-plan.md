@@ -7028,6 +7028,11 @@ Status:
   authority instances cannot reuse fencing tokens. This is intentionally still
   single-authority; Phase 12 can replace the store/authority implementation
   behind the same control-plane boundary with replicated consensus.
+- Added authority-side heartbeat failure detection. Expired heartbeat leases
+  mark nodes temporarily `Unavailable`, clear the stale lease, bump and persist a
+  new cluster epoch once per transition, and return the affected nodes so the
+  later PG-peering layer can move impacted PGs out of service before selecting
+  new primaries.
 
 Exit criteria:
 

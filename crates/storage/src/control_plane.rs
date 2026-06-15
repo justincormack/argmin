@@ -285,6 +285,30 @@ impl HeartbeatLease {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatLeaseExpiry {
+    cluster_epoch: ClusterEpoch,
+    expired_nodes: Vec<NodeId>,
+    snapshot: ClusterControlSnapshot,
+}
+
+impl HeartbeatLeaseExpiry {
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn expired_nodes(&self) -> &[NodeId] {
+        &self.expired_nodes
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &ClusterControlSnapshot {
+        &self.snapshot
+    }
+}
+
 pub trait ControlPlaneStore {
     fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError>;
     fn save(&self, snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError>;
@@ -390,8 +414,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_id: NodeId,
         membership: NodeMembershipState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let mut next_snapshot = self.snapshot.clone();
         let mut changed = false;
-        match self.snapshot.nodes.get_mut(&node_id) {
+        match next_snapshot.nodes.get_mut(&node_id) {
             Some(record) if record.membership == membership => {}
             Some(record) if record.membership == NodeMembershipState::Removed => {
                 return Err(ControlPlaneError::RemovedNodeCannotRejoin {
@@ -410,15 +435,15 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 changed = true;
             }
             None => {
-                self.snapshot
+                next_snapshot
                     .nodes
                     .insert(node_id, NodeControlRecord::new(node_id, membership));
                 changed = true;
             }
         }
         if changed {
-            self.snapshot.bump_epoch()?;
-            self.persist()?;
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
         }
         Ok(self.snapshot.clone())
     }
@@ -428,8 +453,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_id: NodeId,
         availability: NodeAvailabilityState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let mut next_snapshot = self.snapshot.clone();
         let record =
-            self.snapshot
+            next_snapshot
                 .nodes
                 .get_mut(&node_id)
                 .ok_or(ControlPlaneError::UnknownNode {
@@ -451,8 +477,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             if availability != NodeAvailabilityState::Healthy {
                 record.lease_deadline_ms = None;
             }
-            self.snapshot.bump_epoch()?;
-            self.persist()?;
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
         }
         Ok(self.snapshot.clone())
     }
@@ -505,9 +531,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
 
         let mut epoch_changed = false;
+        let mut next_snapshot = self.snapshot.clone();
         {
-            let record = self
-                .snapshot
+            let record = next_snapshot
                 .nodes
                 .get_mut(&heartbeat.node_id)
                 .expect("node record validated before heartbeat mutation");
@@ -528,9 +554,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.lease_deadline_ms = Some(lease_deadline_ms);
         }
         if epoch_changed {
-            self.snapshot.bump_epoch()?;
+            next_snapshot.bump_epoch()?;
         }
-        self.persist()?;
+        self.commit_snapshot(next_snapshot)?;
         let serving = self
             .snapshot
             .node(heartbeat.node_id)
@@ -545,6 +571,40 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         })
     }
 
+    pub fn expire_heartbeat_leases(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<HeartbeatLeaseExpiry, ControlPlaneError> {
+        let mut next_snapshot = self.snapshot.clone();
+        let mut expired_nodes = Vec::new();
+        for record in next_snapshot.nodes.values_mut() {
+            if matches!(
+                record.membership,
+                NodeMembershipState::Out | NodeMembershipState::Removed
+            ) || record.availability == NodeAvailabilityState::Unavailable
+            {
+                continue;
+            }
+            if record
+                .lease_deadline_ms
+                .is_some_and(|lease_deadline_ms| lease_deadline_ms <= now_ms)
+            {
+                record.availability = NodeAvailabilityState::Unavailable;
+                record.lease_deadline_ms = None;
+                expired_nodes.push(record.node_id);
+            }
+        }
+        if !expired_nodes.is_empty() {
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+        }
+        Ok(HeartbeatLeaseExpiry {
+            cluster_epoch: self.snapshot.cluster_epoch,
+            expired_nodes,
+            snapshot: self.snapshot.clone(),
+        })
+    }
+
     #[must_use]
     pub fn deterministic_pg_primary(&self, _pg_id: PgId, acting_set: &[NodeId]) -> Option<NodeId> {
         acting_set.iter().copied().find(|node_id| {
@@ -555,8 +615,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         })
     }
 
-    fn persist(&self) -> Result<(), ControlPlaneError> {
-        self.store.save(&self.snapshot)
+    fn commit_snapshot(
+        &mut self,
+        next_snapshot: ClusterControlSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        self.store.save(&next_snapshot)?;
+        self.snapshot = next_snapshot;
+        Ok(())
     }
 }
 
@@ -808,6 +873,43 @@ fn state_parent(path: &Path) -> Option<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[derive(Debug)]
+    struct FailingStore {
+        snapshot: ClusterControlSnapshot,
+        fail_saves: Cell<bool>,
+    }
+
+    impl FailingStore {
+        fn new(snapshot: ClusterControlSnapshot) -> Self {
+            Self {
+                snapshot,
+                fail_saves: Cell::new(false),
+            }
+        }
+
+        fn fail_saves(&self) {
+            self.fail_saves.set(true);
+        }
+    }
+
+    impl ControlPlaneStore for FailingStore {
+        fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+            Ok(Some(self.snapshot.clone()))
+        }
+
+        fn save(&self, _snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError> {
+            if self.fail_saves.get() {
+                Err(ControlPlaneError::Io {
+                    context: "test save failure",
+                    source: std::io::Error::other("injected save failure"),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn heartbeat(node_id: u32, observed_epoch: ClusterEpoch, now_ms: u64) -> NodeHeartbeat {
         NodeHeartbeat {
@@ -846,8 +948,8 @@ mod tests {
         }
     }
 
-    fn heartbeat_from_record(
-        authority: &SingleAuthorityControlPlane<FileControlPlaneStore>,
+    fn heartbeat_from_record<S: ControlPlaneStore>(
+        authority: &SingleAuthorityControlPlane<S>,
         node_id: u32,
         observed_epoch: ClusterEpoch,
         now_ms: u64,
@@ -1162,6 +1264,174 @@ mod tests {
         assert_eq!(
             authority.deterministic_pg_primary(PgId::new(7), &acting_set),
             Some(NodeId::new(3))
+        );
+    }
+
+    #[test]
+    fn expired_heartbeat_lease_marks_node_unavailable_and_bumps_epoch_once() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        let node_one = heartbeat_until_serving(&mut authority, 1, 1_000);
+        let node_two = heartbeat_until_serving(&mut authority, 2, 1_000);
+        assert!(node_one.serving());
+        assert!(node_two.serving());
+        let node_one_current = authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                1_002,
+            ))
+            .unwrap();
+        assert!(node_one_current.serving());
+        assert_eq!(
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(1), NodeId::new(2)]),
+            Some(NodeId::new(1))
+        );
+
+        let before_expiry_epoch = authority.snapshot().cluster_epoch();
+        let expiry = authority.expire_heartbeat_leases(1_102).unwrap();
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1), NodeId::new(2)]);
+        assert!(expiry.cluster_epoch() > before_expiry_epoch);
+        assert_eq!(expiry.snapshot().cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .availability(),
+            NodeAvailabilityState::Unavailable
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            None
+        );
+        assert_eq!(
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(1), NodeId::new(2)]),
+            None
+        );
+
+        let repeated = authority.expire_heartbeat_leases(9_999).unwrap();
+        assert_eq!(repeated.expired_nodes(), &[]);
+        assert_eq!(repeated.cluster_epoch(), expiry.cluster_epoch());
+
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(persisted.cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            persisted.node(NodeId::new(2)).unwrap().availability(),
+            NodeAvailabilityState::Unavailable
+        );
+    }
+
+    #[test]
+    fn heartbeat_after_expiry_must_observe_new_epoch_before_serving() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(3), NodeMembershipState::Active)
+            .unwrap();
+        let serving = heartbeat_until_serving(&mut authority, 3, 1_000);
+        assert!(serving.serving());
+
+        let expiry = authority.expire_heartbeat_leases(1_101).unwrap();
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(3)]);
+
+        let stale_after_expiry = authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                3,
+                serving.cluster_epoch(),
+                1_200,
+            ))
+            .unwrap();
+        assert!(!stale_after_expiry.serving());
+        assert_eq!(stale_after_expiry.cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(3))
+                .unwrap()
+                .availability(),
+            NodeAvailabilityState::Unavailable
+        );
+
+        let recovered = authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                3,
+                stale_after_expiry.cluster_epoch(),
+                1_300,
+            ))
+            .unwrap();
+        assert!(recovered.cluster_epoch() > stale_after_expiry.cluster_epoch());
+        assert!(!recovered.serving());
+
+        let caught_up = authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                3,
+                recovered.cluster_epoch(),
+                1_400,
+            ))
+            .unwrap();
+        assert!(caught_up.serving());
+        assert_eq!(
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(3)]),
+            Some(NodeId::new(3))
+        );
+    }
+
+    #[test]
+    fn failed_expiry_persist_does_not_expose_uncommitted_epoch_or_map() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(12), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 12, 1_000).serving());
+        let committed = authority.snapshot().clone();
+        assert_eq!(
+            committed.node(NodeId::new(12)).unwrap().availability(),
+            NodeAvailabilityState::Healthy
+        );
+
+        let failing_store = FailingStore::new(committed.clone());
+        let mut restarted = SingleAuthorityControlPlane::open(failing_store).unwrap();
+        assert!(restarted
+            .heartbeat(heartbeat_from_record(
+                &restarted,
+                12,
+                restarted.snapshot().cluster_epoch(),
+                1_001,
+            ))
+            .unwrap()
+            .serving());
+        let visible_before_failure = restarted.snapshot().clone();
+        restarted.store.fail_saves();
+        assert!(matches!(
+            restarted.expire_heartbeat_leases(1_101),
+            Err(ControlPlaneError::Io {
+                context: "test save failure",
+                ..
+            })
+        ));
+        assert_eq!(restarted.snapshot(), &visible_before_failure);
+        assert_eq!(
+            restarted.deterministic_pg_primary(PgId::new(1), &[NodeId::new(12)]),
+            Some(NodeId::new(12))
         );
     }
 
