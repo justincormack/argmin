@@ -7067,6 +7067,13 @@ Status:
   observations, does not mutate summaries on stale heartbeats, and clears current
   observations on epoch changes while retaining the old summaries in cluster-map
   history for future peering diagnostics.
+- Tightened PG peering completion so the authority only persists `Active` from
+  `Peering`, and only after current serving acting-set members have heartbeated
+  the PG as `Peering` in the current epoch. This keeps the Phase 11 authority
+  from treating peering as a naked administrative toggle before the selected
+  primary and available peers have demonstrated that they installed the current
+  map. Durable command-log reconstruction and replica proof checks remain the
+  next peering layer.
 
 Exit criteria:
 

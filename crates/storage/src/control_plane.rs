@@ -856,6 +856,16 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 node_id: primary.as_u32(),
             });
         }
+        if record.state != PgState::Peering && record.state != PgState::Active {
+            return Err(ControlPlaneError::PgNotPeering {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+                state: record.state,
+            });
+        }
+        if record.state == PgState::Peering {
+            validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
+        }
 
         let mut next_snapshot = self.snapshot.clone();
         let record = next_snapshot
@@ -1263,6 +1273,32 @@ pub enum ControlPlaneError {
     #[error("PG {pg_id} is {state} in cluster epoch {cluster_epoch}, not active")]
     PgNotActive {
         pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+
+    #[error("PG {pg_id} is {state} in cluster epoch {cluster_epoch}, not peering")]
+    PgNotPeering {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+
+    #[error(
+        "node {node_id} has not reported PG {pg_id} peering state in cluster epoch {cluster_epoch}"
+    )]
+    PgPeeringMissingObservation {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "node {node_id} reported PG {pg_id} as {state} in cluster epoch {cluster_epoch}, not peering"
+    )]
+    PgPeeringObservationNotPeering {
+        pg_id: u32,
+        node_id: u32,
         cluster_epoch: ClusterEpoch,
         state: PgState,
     },
@@ -1949,6 +1985,52 @@ fn validate_pg_heartbeat_observations(
     Ok(())
 }
 
+fn validate_pg_peering_observations(
+    snapshot: &ClusterControlSnapshot,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    now_ms: u64,
+) -> Result<(), ControlPlaneError> {
+    for node_id in acting_set {
+        let Some(node) = snapshot.nodes.get(node_id) else {
+            return Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: node_id.as_u32(),
+            });
+        };
+        if !node.can_serve_primary(snapshot.cluster_epoch)
+            || node
+                .lease_deadline_ms
+                .is_none_or(|lease_deadline_ms| lease_deadline_ms <= now_ms)
+        {
+            continue;
+        }
+        let observation =
+            node.pg_observation(pg_id)
+                .ok_or(ControlPlaneError::PgPeeringMissingObservation {
+                    pg_id: pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                })?;
+        if observation.observed_epoch != snapshot.cluster_epoch {
+            return Err(ControlPlaneError::StaleNodeObservedEpoch {
+                node_id: node_id.as_u32(),
+                observed_epoch: observation.observed_epoch,
+                current_epoch: snapshot.cluster_epoch,
+            });
+        }
+        if observation.state != PgState::Peering {
+            return Err(ControlPlaneError::PgPeeringObservationNotPeering {
+                pg_id: pg_id.get(),
+                node_id: node_id.as_u32(),
+                cluster_epoch: snapshot.cluster_epoch,
+                state: observation.state,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn prune_cluster_map_history(history: &mut Vec<ClusterMapHistoryRecord>) {
     history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
     let excess = history.len().saturating_sub(CLUSTER_MAP_HISTORY_LIMIT);
@@ -2165,6 +2247,26 @@ mod tests {
         heartbeat.node_incarnation = record.node_incarnation();
         heartbeat.endpoint = record.endpoint().to_owned();
         heartbeat
+    }
+
+    fn heartbeat_with_pg_observation<S: ControlPlaneStore>(
+        authority: &mut SingleAuthorityControlPlane<S>,
+        node_id: u32,
+        pg_id: u32,
+        state: PgState,
+        now_ms: u64,
+    ) -> HeartbeatLease {
+        let mut heartbeat = heartbeat_from_record(
+            authority,
+            node_id,
+            authority.snapshot().cluster_epoch(),
+            now_ms,
+        );
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(pg_id),
+            state,
+        }];
+        authority.heartbeat(heartbeat).unwrap()
     }
 
     fn node_incarnation<S: ControlPlaneStore>(
@@ -2669,14 +2771,13 @@ mod tests {
         ));
         assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
         for node_id in [1, 2] {
-            authority
-                .heartbeat(heartbeat_from_record(
-                    &authority,
-                    node_id,
-                    authority.snapshot().cluster_epoch(),
-                    2_000 + u64::from(node_id),
-                ))
-                .unwrap();
+            heartbeat_with_pg_observation(
+                &mut authority,
+                node_id,
+                8,
+                PgState::Peering,
+                2_000 + u64::from(node_id),
+            );
         }
         assert!(matches!(
             authority.complete_pg_peering(
@@ -2734,14 +2835,7 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(11), vec![NodeId::new(1)])
             .unwrap();
-        authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
-                1_050,
-            ))
-            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 11, PgState::Peering, 1_050);
         let lease_deadline = authority
             .snapshot()
             .node(NodeId::new(1))
@@ -2762,14 +2856,7 @@ mod tests {
             PgState::Peering
         );
 
-        authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
-                lease_deadline + 1,
-            ))
-            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 11, PgState::Peering, lease_deadline + 1);
         authority
             .complete_pg_peering(
                 PgId::new(11),
@@ -2778,6 +2865,107 @@ mod tests {
                 lease_deadline + 2,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn complete_pg_peering_requires_current_peering_observation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(12), vec![NodeId::new(1)])
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                2_000,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(12),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            ),
+            Err(ControlPlaneError::PgPeeringMissingObservation {
+                pg_id: 12,
+                node_id: 1,
+                ..
+            })
+        ));
+
+        heartbeat_with_pg_observation(&mut authority, 1, 12, PgState::Active, 2_020);
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(12),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_030,
+            ),
+            Err(ControlPlaneError::PgPeeringObservationNotPeering {
+                pg_id: 12,
+                node_id: 1,
+                state: PgState::Active,
+                ..
+            })
+        ));
+
+        heartbeat_with_pg_observation(&mut authority, 1, 12, PgState::Peering, 2_040);
+        authority
+            .complete_pg_peering(
+                PgId::new(12),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_pg_peering_only_activates_from_peering() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(15), vec![NodeId::new(1)])
+            .unwrap();
+        authority
+            .set_pg_state(PgId::new(15), PgState::Degraded)
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                2_000,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(15),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            ),
+            Err(ControlPlaneError::PgNotPeering {
+                pg_id: 15,
+                state: PgState::Degraded,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2863,14 +3051,13 @@ mod tests {
             .set_pg_acting_set(PgId::new(10), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
         for node_id in [1, 2] {
-            authority
-                .heartbeat(heartbeat_from_record(
-                    &authority,
-                    node_id,
-                    authority.snapshot().cluster_epoch(),
-                    2_000 + u64::from(node_id),
-                ))
-                .unwrap();
+            heartbeat_with_pg_observation(
+                &mut authority,
+                node_id,
+                10,
+                PgState::Peering,
+                2_000 + u64::from(node_id),
+            );
         }
         let node_one_incarnation = authority
             .snapshot()
@@ -2974,14 +3161,7 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(14), vec![NodeId::new(1)])
             .unwrap();
-        authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
-                2_000,
-            ))
-            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 14, PgState::Peering, 2_000);
         authority
             .complete_pg_peering(
                 PgId::new(14),
@@ -3427,14 +3607,13 @@ mod tests {
             .set_pg_acting_set(PgId::new(9), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
         for node_id in [1, 2] {
-            authority
-                .heartbeat(heartbeat_from_record(
-                    &authority,
-                    node_id,
-                    authority.snapshot().cluster_epoch(),
-                    1_003 + u64::from(node_id),
-                ))
-                .unwrap();
+            heartbeat_with_pg_observation(
+                &mut authority,
+                node_id,
+                9,
+                PgState::Peering,
+                1_003 + u64::from(node_id),
+            );
         }
         authority
             .complete_pg_peering(
@@ -3581,22 +3760,8 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(13), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
-        authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
-                1_000,
-            ))
-            .unwrap();
-        authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                2,
-                authority.snapshot().cluster_epoch(),
-                1_050,
-            ))
-            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 13, PgState::Peering, 1_000);
+        heartbeat_with_pg_observation(&mut authority, 2, 13, PgState::Peering, 1_050);
         authority
             .complete_pg_peering(
                 PgId::new(13),
@@ -3632,14 +3797,13 @@ mod tests {
         assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
         assert_eq!(expiry.peering_pgs(), &[PgId::new(13)]);
 
-        authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                2,
-                authority.snapshot().cluster_epoch(),
-                node_one_deadline + 1,
-            ))
-            .unwrap();
+        heartbeat_with_pg_observation(
+            &mut authority,
+            2,
+            13,
+            PgState::Peering,
+            node_one_deadline + 1,
+        );
         authority
             .complete_pg_peering(
                 PgId::new(13),
