@@ -7229,6 +7229,12 @@ Status:
   running server. Installs are monotonic under the config write lock: older
   epochs and same-epoch route-map validity regressions are rejected so racing
   heartbeat refreshes cannot roll a node back to an obsolete map.
+- Added a storage-node control-plane refresh loop wrapper around the one-shot
+  heartbeat/runtime-map/install path. The loop rejects zero intervals, retries
+  refresh failures on the next tick while the installed route map continues to
+  fail closed on expiry, records last success/error status for diagnostics, and
+  stops/joins explicitly so future process wiring does not leak heartbeat
+  workers.
 
 Exit criteria:
 

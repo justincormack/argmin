@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::control_plane::{
@@ -660,6 +661,13 @@ pub enum StorageNodeServerError {
         current: Option<u64>,
         candidate: Option<u64>,
     },
+    #[error("storage-node control-plane refresh loop interval must be non-zero")]
+    ControlPlaneRefreshLoopZeroInterval,
+    #[error("spawn storage-node control-plane refresh loop")]
+    ControlPlaneRefreshLoopSpawn {
+        #[source]
+        source: io::Error,
+    },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
@@ -765,6 +773,48 @@ pub struct StorageNodeServer {
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageNodeControlPlaneRefreshLoopStatus {
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub last_lease: Option<HeartbeatLease>,
+    pub last_error: Option<String>,
+}
+
+pub struct StorageNodeControlPlaneRefreshLoop {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    status: Arc<Mutex<StorageNodeControlPlaneRefreshLoopStatus>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StorageNodeControlPlaneRefreshLoop {
+    pub fn status(&self) -> StorageNodeControlPlaneRefreshLoopStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn stop(&mut self) {
+        {
+            let (lock, cvar) = &*self.stop;
+            let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *stopped = true;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StorageNodeControlPlaneRefreshLoop {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl StorageNodeServer {
@@ -884,6 +934,79 @@ impl StorageNodeServer {
             authority_now_ms,
         )?;
         self.install_control_plane_refresh(refresh)
+    }
+
+    pub fn spawn_control_plane_refresh_loop<S, F>(
+        self: Arc<Self>,
+        mut control_plane: S,
+        node_incarnation: u64,
+        requested_lease_duration_ms: u64,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+    ) -> Result<StorageNodeControlPlaneRefreshLoop, StorageNodeServerError>
+    where
+        S: ControlPlaneHeartbeatRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        if refresh_interval.is_zero() {
+            return Err(StorageNodeServerError::ControlPlaneRefreshLoopZeroInterval);
+        }
+
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let status = Arc::new(Mutex::new(
+            StorageNodeControlPlaneRefreshLoopStatus::default(),
+        ));
+        let worker_stop = Arc::clone(&stop);
+        let worker_status = Arc::clone(&status);
+        let handle = thread::Builder::new()
+            .name(format!(
+                "argmin-storage-node-{}-control-plane-refresh",
+                self.config_snapshot().node_id.as_u32()
+            ))
+            .spawn(move || loop {
+                let result = self.refresh_and_install_control_plane_runtime_map(
+                    &mut control_plane,
+                    node_incarnation,
+                    requested_lease_duration_ms,
+                    authority_now_ms(),
+                );
+                {
+                    let mut status = worker_status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    status.attempts += 1;
+                    match result {
+                        Ok(lease) => {
+                            status.successes += 1;
+                            status.last_lease = Some(lease);
+                            status.last_error = None;
+                        }
+                        Err(error) => {
+                            status.failures += 1;
+                            status.last_error = Some(error.to_string());
+                        }
+                    }
+                }
+
+                let (lock, cvar) = &*worker_stop;
+                let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *stopped {
+                    break;
+                }
+                let (stopped, _) = cvar
+                    .wait_timeout(stopped, refresh_interval)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *stopped {
+                    break;
+                }
+            })
+            .map_err(|source| StorageNodeServerError::ControlPlaneRefreshLoopSpawn { source })?;
+
+        Ok(StorageNodeControlPlaneRefreshLoop {
+            stop,
+            status,
+            handle: Some(handle),
+        })
     }
 
     pub fn install_control_plane_refresh(
@@ -8321,6 +8444,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -8991,6 +9115,139 @@ mod tests {
             .unwrap();
         assert_eq!(observation.state(), PgState::Peering);
         assert_eq!(observation.observed_epoch(), installed_epoch);
+    }
+
+    #[test]
+    fn storage_node_control_plane_refresh_loop_installs_runtime_maps() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let second = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        assert!(second.serving());
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let mut config = config;
+        config.route_map_valid_until_ms = Some(1);
+        let server = Arc::new(StorageNodeServer::bind(config).unwrap());
+        let now = Arc::new(AtomicU64::new(1_003));
+        let loop_now = Arc::clone(&now);
+        let mut refresh_loop = Arc::clone(&server)
+            .spawn_control_plane_refresh_loop(
+                authority,
+                12,
+                1_000,
+                Duration::from_millis(5),
+                move || loop_now.fetch_add(1, Ordering::SeqCst),
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if refresh_loop.status().successes > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control-plane refresh loop did not install a runtime map: {:?}",
+                refresh_loop.status()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let installed_config = server.config_snapshot();
+        assert_eq!(installed_config.cluster_epoch, runtime_map.cluster_epoch());
+        assert_eq!(installed_config.route_map_valid_until_ms(), None);
+        assert_eq!(installed_config.pg_routes.len(), 1);
+        assert_eq!(installed_config.pg_routes[0].state, PgState::Peering);
+        assert_eq!(refresh_loop.status().failures, 0);
+
+        refresh_loop.stop();
+        let attempts_after_stop = refresh_loop.status().attempts;
+        thread::sleep(Duration::from_millis(15));
+        assert_eq!(refresh_loop.status().attempts, attempts_after_stop);
+    }
+
+    #[test]
+    fn storage_node_control_plane_refresh_loop_rejects_zero_interval() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
+            data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 1, m: 0 },
+            pg_ids: vec![0],
+            socket_path,
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+        };
+        let server = Arc::new(StorageNodeServer::bind(config).unwrap());
+        let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            Arc::clone(&server).spawn_control_plane_refresh_loop(
+                authority,
+                12,
+                1_000,
+                Duration::ZERO,
+                || 1_000,
+            ),
+            Err(StorageNodeServerError::ControlPlaneRefreshLoopZeroInterval)
+        ));
     }
 
     #[test]
