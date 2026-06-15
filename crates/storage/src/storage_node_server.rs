@@ -4297,6 +4297,9 @@ impl StorageNodeConnectionHandler {
             Err(ObjectPgActionError::StaleObjectReadSubject) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
             }
+            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::Missing
+            }
             Err(error) => {
                 match object_metadata_command_build_error_outcome(error, Some("CreateStreamUpload"))
                 {

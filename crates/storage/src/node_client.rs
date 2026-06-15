@@ -10338,6 +10338,24 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             |command| self.validate_create_stream_upload_command_response(command, &request),
         )? {
             Some(command) => Ok(command),
+            None if matches!(
+                request.precondition,
+                CreateStreamUploadPrecondition::UploadPart { .. }
+            ) =>
+            {
+                let StreamUploadTarget::UploadPart { upload_id, .. } = &request.request.target
+                else {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "decode stream upload command build response",
+                        "stream upload command build missing outcome for non-upload-part target"
+                            .to_string(),
+                    )));
+                };
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }
+                .into())
+            }
             None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "decode stream upload command build response",
                 "stream upload command build cannot return missing".to_string(),
@@ -19140,7 +19158,7 @@ mod tests {
         }
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let server_threads: Vec<_> = (0..17)
+        let server_threads: Vec<_> = (0..18)
             .map(|_| {
                 let server = Arc::clone(&server);
                 thread::spawn(move || server.accept_one().unwrap())
@@ -19411,6 +19429,42 @@ mod tests {
                 operation: "validate stream upload command build response",
                 ..
             })
+        ));
+
+        let missing_upload_id = crate::tests::multipart_upload_id("mut-stream-rpc-missing-upload");
+        let missing_upload = test_multipart_upload_record(
+            bucket.clone(),
+            key.clone(),
+            missing_upload_id.clone(),
+            UploadState::InProgress,
+        );
+        let missing_upload_part_stream_request = CreateStreamUploadReq {
+            session_id: crate::tests::stream_session_id("mut-rpc-miss"),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: missing_upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: ObjectEncryption::None,
+        };
+        let err = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
+            &client,
+            BuildCreateStreamUploadCommandReq {
+                pg_id: PgId::new(0),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &missing_upload_part_stream_request,
+                precondition: CreateStreamUploadPrecondition::UploadPart {
+                    expected_upload: &missing_upload,
+                },
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { upload_id })
+                if upload_id == missing_upload_id.as_str()
         ));
 
         let multipart_request = CreateMultipartUploadReq {
