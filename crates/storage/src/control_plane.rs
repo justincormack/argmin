@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use placement::NodeId;
 use thiserror::Error;
 
-use crate::{ClusterEpoch, PgId};
+use crate::{ClusterEpoch, PgId, PgState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -191,6 +191,7 @@ pub struct ClusterControlSnapshot {
     authority_incarnation: AuthorityIncarnation,
     cluster_epoch: ClusterEpoch,
     nodes: BTreeMap<NodeId, NodeControlRecord>,
+    pgs: BTreeMap<PgId, PgControlRecord>,
 }
 
 impl ClusterControlSnapshot {
@@ -199,6 +200,7 @@ impl ClusterControlSnapshot {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             cluster_epoch: ClusterEpoch::INITIAL,
             nodes: BTreeMap::new(),
+            pgs: BTreeMap::new(),
         }
     }
 
@@ -221,6 +223,15 @@ impl ClusterControlSnapshot {
         self.nodes.values()
     }
 
+    #[must_use]
+    pub fn pg(&self, pg_id: PgId) -> Option<&PgControlRecord> {
+        self.pgs.get(&pg_id)
+    }
+
+    pub fn pgs(&self) -> impl Iterator<Item = &PgControlRecord> {
+        self.pgs.values()
+    }
+
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
         self.authority_incarnation = self.authority_incarnation.next()?;
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
@@ -230,6 +241,38 @@ impl ClusterControlSnapshot {
     fn bump_epoch(&mut self) -> Result<(), ControlPlaneError> {
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgControlRecord {
+    pg_id: PgId,
+    state: PgState,
+    acting_set: Vec<NodeId>,
+}
+
+impl PgControlRecord {
+    fn new(pg_id: PgId, acting_set: Vec<NodeId>) -> Self {
+        Self {
+            pg_id,
+            state: PgState::Peering,
+            acting_set,
+        }
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn state(&self) -> PgState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn acting_set(&self) -> &[NodeId] {
+        &self.acting_set
     }
 }
 
@@ -289,6 +332,7 @@ impl HeartbeatLease {
 pub struct HeartbeatLeaseExpiry {
     cluster_epoch: ClusterEpoch,
     expired_nodes: Vec<NodeId>,
+    peering_pgs: Vec<PgId>,
     snapshot: ClusterControlSnapshot,
 }
 
@@ -301,6 +345,11 @@ impl HeartbeatLeaseExpiry {
     #[must_use]
     pub fn expired_nodes(&self) -> &[NodeId] {
         &self.expired_nodes
+    }
+
+    #[must_use]
+    pub fn peering_pgs(&self) -> &[PgId] {
+        &self.peering_pgs
     }
 
     #[must_use]
@@ -416,6 +465,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let mut next_snapshot = self.snapshot.clone();
         let mut changed = false;
+        let mut affected_node = None;
         match next_snapshot.nodes.get_mut(&node_id) {
             Some(record) if record.membership == membership => {}
             Some(record) if record.membership == NodeMembershipState::Removed => {
@@ -431,6 +481,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 ) {
                     record.availability = NodeAvailabilityState::Unavailable;
                     record.lease_deadline_ms = None;
+                    affected_node = Some(node_id);
                 }
                 changed = true;
             }
@@ -442,6 +493,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             }
         }
         if changed {
+            if let Some(node_id) = affected_node {
+                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+            }
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
         }
@@ -474,9 +528,99 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
         if record.availability != availability {
             record.availability = availability;
+            let mut affected_node = None;
             if availability != NodeAvailabilityState::Healthy {
                 record.lease_deadline_ms = None;
+                affected_node = Some(node_id);
             }
+            if let Some(node_id) = affected_node {
+                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+            }
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+        }
+        Ok(self.snapshot.clone())
+    }
+
+    pub fn set_pg_acting_set(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        validate_acting_set(&self.snapshot, pg_id, &acting_set)?;
+        let mut next_snapshot = self.snapshot.clone();
+        let mut changed = false;
+        match next_snapshot.pgs.get_mut(&pg_id) {
+            Some(record) if record.acting_set == acting_set => {}
+            Some(record) => {
+                record.acting_set = acting_set;
+                record.state = PgState::Peering;
+                changed = true;
+            }
+            None => {
+                next_snapshot
+                    .pgs
+                    .insert(pg_id, PgControlRecord::new(pg_id, acting_set));
+                changed = true;
+            }
+        }
+        if changed {
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+        }
+        Ok(self.snapshot.clone())
+    }
+
+    pub fn set_pg_state(
+        &mut self,
+        pg_id: PgId,
+        state: PgState,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        if state == PgState::Active {
+            return Err(ControlPlaneError::ActivePgRequiresPeeringComplete { pg_id: pg_id.get() });
+        }
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state != state {
+            record.state = state;
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+        }
+        Ok(self.snapshot.clone())
+    }
+
+    pub fn complete_pg_peering(
+        &mut self,
+        pg_id: PgId,
+        primary: NodeId,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let record = self
+            .snapshot
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if !record.acting_set.contains(&primary) {
+            return Err(ControlPlaneError::PgPrimaryNotInActingSet {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            });
+        }
+        if self.deterministic_pg_primary(pg_id, record.acting_set()) != Some(primary) {
+            return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            });
+        }
+
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record validated before peering completion");
+        if record.state != PgState::Active {
+            record.state = PgState::Active;
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
         }
@@ -595,14 +739,31 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             }
         }
         if !expired_nodes.is_empty() {
+            let peering_pgs = mark_pgs_peering_for_nodes(&mut next_snapshot, expired_nodes.clone());
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
+            return Ok(HeartbeatLeaseExpiry {
+                cluster_epoch: self.snapshot.cluster_epoch,
+                expired_nodes,
+                peering_pgs,
+                snapshot: self.snapshot.clone(),
+            });
         }
         Ok(HeartbeatLeaseExpiry {
             cluster_epoch: self.snapshot.cluster_epoch,
             expired_nodes,
+            peering_pgs: Vec::new(),
             snapshot: self.snapshot.clone(),
         })
+    }
+
+    #[must_use]
+    pub fn serving_pg_primary(&self, pg_id: PgId) -> Option<NodeId> {
+        let record = self.snapshot.pgs.get(&pg_id)?;
+        if record.state != PgState::Active {
+            return None;
+        }
+        self.deterministic_pg_primary(pg_id, record.acting_set())
     }
 
     #[must_use]
@@ -642,6 +803,27 @@ pub enum ControlPlaneError {
 
     #[error("unknown node {node_id}")]
     UnknownNode { node_id: u32 },
+
+    #[error("unknown PG {pg_id}")]
+    UnknownPg { pg_id: u32 },
+
+    #[error("PG {pg_id} acting set must not be empty")]
+    EmptyActingSet { pg_id: u32 },
+
+    #[error("PG {pg_id} acting set references unknown node {node_id}")]
+    UnknownActingSetNode { pg_id: u32, node_id: u32 },
+
+    #[error("PG {pg_id} acting set repeats node {node_id}")]
+    DuplicateActingSetNode { pg_id: u32, node_id: u32 },
+
+    #[error("PG {pg_id} Active state requires complete_pg_peering")]
+    ActivePgRequiresPeeringComplete { pg_id: u32 },
+
+    #[error("node {node_id} is not in PG {pg_id} acting set")]
+    PgPrimaryNotInActingSet { pg_id: u32, node_id: u32 },
+
+    #[error("node {node_id} is not serving current epoch as PG {pg_id} primary")]
+    PgPrimaryNotServingCurrentEpoch { pg_id: u32, node_id: u32 },
 
     #[error("removed node {node_id} cannot rejoin")]
     RemovedNodeCannotRejoin { node_id: u32 },
@@ -686,7 +868,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=1\n");
+    out.push_str("version=2\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -705,6 +887,14 @@ fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             hex_encode(record.endpoint.as_bytes())
         ));
     }
+    for record in snapshot.pgs.values() {
+        out.push_str(&format!(
+            "pg={},{},{}\n",
+            record.pg_id.get(),
+            pg_state_as_str(record.state),
+            format_node_list(&record.acting_set)
+        ));
+    }
     out
 }
 
@@ -713,6 +903,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
     let mut authority_incarnation = None;
     let mut cluster_epoch = None;
     let mut nodes = BTreeMap::new();
+    let mut pgs = BTreeMap::new();
 
     for (idx, line) in contents.lines().enumerate() {
         let line_number = idx + 1;
@@ -738,12 +929,17 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             if nodes.insert(record.node_id, record).is_some() {
                 return Err(parse_error(line_number, "duplicate node record"));
             }
+        } else if let Some(value) = line.strip_prefix("pg=") {
+            let record = parse_pg_record(line_number, value)?;
+            if pgs.insert(record.pg_id, record).is_some() {
+                return Err(parse_error(line_number, "duplicate PG record"));
+            }
         } else {
             return Err(parse_error(line_number, "unknown control-plane state line"));
         }
     }
 
-    if version != Some(1) {
+    if version != Some(2) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -754,6 +950,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             .ok_or_else(|| parse_error(0, "missing authority incarnation"))?,
         cluster_epoch: cluster_epoch.ok_or_else(|| parse_error(0, "missing cluster epoch"))?,
         nodes,
+        pgs,
     })
 }
 
@@ -780,6 +977,30 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
         last_observed_epoch,
         last_heartbeat_ms,
         lease_deadline_ms,
+    })
+}
+
+fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
+    let fields: Vec<&str> = value.split(',').collect();
+    if fields.len() != 3 {
+        return Err(parse_error(line, "PG record must have three fields"));
+    }
+    let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
+    let state = pg_state_from_str(fields[1])?;
+    let acting_set = parse_node_list(line, fields[2])?;
+    if acting_set.is_empty() {
+        return Err(parse_error(line, "PG acting set must not be empty"));
+    }
+    let mut unique_nodes = BTreeSet::new();
+    for node_id in &acting_set {
+        if !unique_nodes.insert(*node_id) {
+            return Err(parse_error(line, "PG acting set contains duplicate node"));
+        }
+    }
+    Ok(PgControlRecord {
+        pg_id,
+        state,
+        acting_set,
     })
 }
 
@@ -812,6 +1033,94 @@ fn parse_option_cluster_epoch(
             })
             .transpose()
     })
+}
+
+fn validate_acting_set(
+    snapshot: &ClusterControlSnapshot,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+) -> Result<(), ControlPlaneError> {
+    if acting_set.is_empty() {
+        return Err(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() });
+    }
+    let mut unique_nodes = BTreeSet::new();
+    for node_id in acting_set {
+        if !unique_nodes.insert(*node_id) {
+            return Err(ControlPlaneError::DuplicateActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: node_id.as_u32(),
+            });
+        }
+        if !snapshot.nodes.contains_key(node_id) {
+            return Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: node_id.as_u32(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn mark_pgs_peering_for_nodes(
+    snapshot: &mut ClusterControlSnapshot,
+    nodes: impl IntoIterator<Item = NodeId>,
+) -> Vec<PgId> {
+    let affected_nodes: Vec<NodeId> = nodes.into_iter().collect();
+    let mut peering_pgs = Vec::new();
+    for record in snapshot.pgs.values_mut() {
+        if record.state != PgState::Peering
+            && record
+                .acting_set
+                .iter()
+                .any(|node_id| affected_nodes.contains(node_id))
+        {
+            record.state = PgState::Peering;
+            peering_pgs.push(record.pg_id);
+        }
+    }
+    peering_pgs
+}
+
+fn pg_state_as_str(state: PgState) -> &'static str {
+    match state {
+        PgState::Active => "active",
+        PgState::Peering => "peering",
+        PgState::Degraded => "degraded",
+        PgState::Backfilling => "backfilling",
+        PgState::Inconsistent => "inconsistent",
+    }
+}
+
+fn pg_state_from_str(value: &str) -> Result<PgState, ControlPlaneError> {
+    match value {
+        "active" => Ok(PgState::Active),
+        "peering" => Ok(PgState::Peering),
+        "degraded" => Ok(PgState::Degraded),
+        "backfilling" => Ok(PgState::Backfilling),
+        "inconsistent" => Ok(PgState::Inconsistent),
+        _ => Err(ControlPlaneError::InvalidState {
+            field: "pg",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn format_node_list(nodes: &[NodeId]) -> String {
+    nodes
+        .iter()
+        .map(|node_id| node_id.as_u32().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn parse_node_list(line: usize, value: &str) -> Result<Vec<NodeId>, ControlPlaneError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(':')
+        .map(|value| parse_u32(line, value, "node id").map(NodeId::new))
+        .collect()
 }
 
 fn parse_u32(line: usize, value: &str, field: &'static str) -> Result<u32, ControlPlaneError> {
@@ -1002,6 +1311,23 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_authority_rejects_duplicate_pg_acting_set_nodes() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            "version=2\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1\n",
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "PG acting set contains duplicate node"
+        ));
+    }
+
+    #[test]
     fn heartbeat_lease_is_issued_after_persisted_epoch_map_tuple() {
         let tmp = test_util::tempdir();
         let store_path = tmp.path().join("control-plane.state");
@@ -1124,6 +1450,129 @@ mod tests {
         assert_eq!(
             authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(5)]),
             Some(NodeId::new(5))
+        );
+    }
+
+    #[test]
+    fn pg_acting_set_changes_start_in_peering_and_validate_nodes() {
+        let tmp = test_util::tempdir();
+        let store_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&store_path);
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+
+        assert!(matches!(
+            authority.set_pg_acting_set(PgId::new(7), Vec::new()),
+            Err(ControlPlaneError::EmptyActingSet { pg_id: 7 })
+        ));
+        assert!(matches!(
+            authority.set_pg_acting_set(PgId::new(7), vec![NodeId::new(99)]),
+            Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: 7,
+                node_id: 99
+            })
+        ));
+        assert!(matches!(
+            authority.set_pg_acting_set(PgId::new(7), vec![NodeId::new(1), NodeId::new(1)]),
+            Err(ControlPlaneError::DuplicateActingSetNode {
+                pg_id: 7,
+                node_id: 1
+            })
+        ));
+
+        let before = authority.snapshot().cluster_epoch();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        assert!(authority.snapshot().cluster_epoch() > before);
+        let pg = authority.snapshot().pg(PgId::new(7)).unwrap();
+        assert_eq!(pg.pg_id(), PgId::new(7));
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
+        assert_eq!(authority.serving_pg_primary(PgId::new(7)), None);
+
+        let persisted = store.load().unwrap().unwrap();
+        let persisted_pg = persisted.pg(PgId::new(7)).unwrap();
+        assert_eq!(persisted_pg.state(), PgState::Peering);
+        assert_eq!(persisted_pg.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
+        assert!(std::fs::metadata(store_path).unwrap().is_file());
+    }
+
+    #[test]
+    fn active_pg_primary_comes_from_authoritative_acting_set() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                1_002,
+            ))
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
+
+        assert!(matches!(
+            authority.set_pg_state(PgId::new(8), PgState::Active),
+            Err(ControlPlaneError::ActivePgRequiresPeeringComplete { pg_id: 8 })
+        ));
+        assert!(matches!(
+            authority.complete_pg_peering(PgId::new(8), NodeId::new(2)),
+            Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
+                pg_id: 8,
+                node_id: 2
+            })
+        ));
+        assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
+        for node_id in [1, 2] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    2_000 + u64::from(node_id),
+                ))
+                .unwrap();
+        }
+        assert!(matches!(
+            authority.complete_pg_peering(PgId::new(8), NodeId::new(99)),
+            Err(ControlPlaneError::PgPrimaryNotInActingSet {
+                pg_id: 8,
+                node_id: 99
+            })
+        ));
+        authority
+            .complete_pg_peering(PgId::new(8), NodeId::new(1))
+            .unwrap();
+        assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
+        for node_id in [1, 2] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    3_000 + u64::from(node_id),
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(8)),
+            Some(NodeId::new(1))
         );
     }
 
@@ -1295,12 +1744,47 @@ mod tests {
             authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(1), NodeId::new(2)]),
             Some(NodeId::new(1))
         );
+        authority
+            .set_pg_acting_set(PgId::new(9), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        for node_id in [1, 2] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    1_003 + u64::from(node_id),
+                ))
+                .unwrap();
+        }
+        authority
+            .complete_pg_peering(PgId::new(9), NodeId::new(1))
+            .unwrap();
+        for node_id in [1, 2] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    1_010 + u64::from(node_id),
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(9)),
+            Some(NodeId::new(1))
+        );
 
         let before_expiry_epoch = authority.snapshot().cluster_epoch();
-        let expiry = authority.expire_heartbeat_leases(1_102).unwrap();
+        let expiry = authority.expire_heartbeat_leases(1_112).unwrap();
         assert_eq!(expiry.expired_nodes(), &[NodeId::new(1), NodeId::new(2)]);
+        assert_eq!(expiry.peering_pgs(), &[PgId::new(9)]);
         assert!(expiry.cluster_epoch() > before_expiry_epoch);
         assert_eq!(expiry.snapshot().cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            expiry.snapshot().pg(PgId::new(9)).unwrap().state(),
+            PgState::Peering
+        );
         assert_eq!(
             authority
                 .snapshot()
@@ -1321,13 +1805,19 @@ mod tests {
             authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(1), NodeId::new(2)]),
             None
         );
+        assert_eq!(authority.serving_pg_primary(PgId::new(9)), None);
 
         let repeated = authority.expire_heartbeat_leases(9_999).unwrap();
         assert_eq!(repeated.expired_nodes(), &[]);
+        assert_eq!(repeated.peering_pgs(), &[]);
         assert_eq!(repeated.cluster_epoch(), expiry.cluster_epoch());
 
         let persisted = store.load().unwrap().unwrap();
         assert_eq!(persisted.cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            persisted.pg(PgId::new(9)).unwrap().state(),
+            PgState::Peering
+        );
         assert_eq!(
             persisted.node(NodeId::new(2)).unwrap().availability(),
             NodeAvailabilityState::Unavailable

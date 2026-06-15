@@ -7033,6 +7033,11 @@ Status:
   new cluster epoch once per transition, and return the affected nodes so the
   later PG-peering layer can move impacted PGs out of service before selecting
   new primaries.
+- Added authoritative PG acting-set and PG-state records to the control-plane
+  map. Acting-set changes start PGs in `Peering`, active PG primary selection is
+  derived from the durable PG map plus node availability/observed-epoch state,
+  and node expiry or removal moves affected active PGs back to `Peering` in the
+  same durable epoch transition.
 
 Exit criteria:
 
