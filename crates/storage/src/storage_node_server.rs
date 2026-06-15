@@ -7952,6 +7952,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use crate::control_plane::{
+        FileControlPlaneStore, NodeHeartbeat, NodeMembershipState, SingleAuthorityControlPlane,
+    };
     use crate::metadata_command::{
         BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
         DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
@@ -8155,6 +8158,80 @@ mod tests {
             heartbeat.pg_observations[0].metadata_proof.state_digest,
             metadata_state.state_digest
         );
+    }
+
+    #[test]
+    fn runtime_map_storage_node_server_heartbeat_updates_authority_pg_observation() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let second = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        assert!(second.serving());
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let server = StorageNodeServer::bind(config).unwrap();
+        let heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
+        assert_eq!(heartbeat.observed_epoch, runtime_map.cluster_epoch());
+        assert_eq!(heartbeat.pg_observations.len(), 1);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, pg_id);
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
+        let proof = heartbeat.pg_observations[0].metadata_proof;
+
+        authority.heartbeat(heartbeat, 1_003).unwrap();
+
+        let observation = authority
+            .snapshot()
+            .node(node_id)
+            .unwrap()
+            .pg_observation(pg_id)
+            .unwrap();
+        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(observation.observed_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(observation.observed_at_ms(), 1_003);
+        assert_eq!(observation.metadata_proof(), proof);
     }
 
     #[test]

@@ -7138,6 +7138,10 @@ Status:
 - Exposed the same heartbeat construction from a running `StorageNodeServer`, so
   the future heartbeat loop can use the server's installed config and opened
   local PG stores directly instead of reconstructing process state externally.
+- Added an end-to-end authority/runtime/server heartbeat bridge test: a runtime
+  map derived from the authority can configure a storage-node server, the server
+  can build a current-epoch heartbeat from local durable PG state, and the
+  authority persists that PG observation for peering.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary
