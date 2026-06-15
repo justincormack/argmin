@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg(any(test, feature = "test-hooks"))]
-use std::sync::Mutex;
-use std::sync::{Arc, RwLock, Weak};
+use std::io;
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ec::{EcConfig, ErasureCodec};
@@ -824,6 +825,13 @@ pub enum StorageClusterRuntimeMapRefreshError {
         current: Option<u64>,
         candidate: Option<u64>,
     },
+    #[error("storage cluster runtime-map refresh loop interval must be non-zero")]
+    RefreshLoopZeroInterval,
+    #[error("spawn storage cluster runtime-map refresh loop")]
+    RefreshLoopSpawn {
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Clone)]
@@ -837,6 +845,54 @@ pub struct StorageCluster {
 #[derive(Clone)]
 pub struct StorageClusterRuntimeMapHandle {
     cluster: Arc<RwLock<Arc<StorageCluster>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageClusterRuntimeMapRefreshLoopSuccess {
+    pub cluster_epoch: ClusterEpoch,
+    pub route_map_valid_until_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageClusterRuntimeMapRefreshLoopStatus {
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub last_success: Option<StorageClusterRuntimeMapRefreshLoopSuccess>,
+    pub last_error: Option<String>,
+}
+
+pub struct StorageClusterRuntimeMapRefreshLoop {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    status: Arc<Mutex<StorageClusterRuntimeMapRefreshLoopStatus>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StorageClusterRuntimeMapRefreshLoop {
+    pub fn status(&self) -> StorageClusterRuntimeMapRefreshLoopStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn stop(&mut self) {
+        {
+            let (lock, cvar) = &*self.stop;
+            let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *stopped = true;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StorageClusterRuntimeMapRefreshLoop {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl StorageClusterRuntimeMapHandle {
@@ -909,6 +965,120 @@ impl StorageClusterRuntimeMapHandle {
             )?;
         self.install(Arc::clone(&candidate))?;
         Ok(candidate)
+    }
+
+    pub fn spawn_control_plane_refresh_loop<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        self.spawn_control_plane_refresh_loop_inner(
+            control_plane,
+            refresh_interval,
+            authority_now_ms,
+            None,
+        )
+    }
+
+    pub fn spawn_control_plane_refresh_loop_with_unix_storage_node_clients<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        self.spawn_control_plane_refresh_loop_inner(
+            control_plane,
+            refresh_interval,
+            authority_now_ms,
+            Some(admission_settings),
+        )
+    }
+
+    fn spawn_control_plane_refresh_loop_inner<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+        admission_settings: Option<LocalUnixStorageNodeClientAdmissionSettings>,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        if refresh_interval.is_zero() {
+            return Err(StorageClusterRuntimeMapRefreshError::RefreshLoopZeroInterval);
+        }
+
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let status = Arc::new(Mutex::new(
+            StorageClusterRuntimeMapRefreshLoopStatus::default(),
+        ));
+        let worker_stop = Arc::clone(&stop);
+        let worker_status = Arc::clone(&status);
+        let handle = thread::Builder::new()
+            .name("argmin-storage-cluster-control-plane-refresh".to_string())
+            .spawn(move || loop {
+                let result = match admission_settings {
+                    Some(admission_settings) => self
+                        .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                            &control_plane,
+                            authority_now_ms(),
+                            admission_settings,
+                        ),
+                    None => self
+                        .refresh_from_control_plane_runtime_map(&control_plane, authority_now_ms()),
+                };
+                {
+                    let mut status = worker_status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    status.attempts += 1;
+                    match result {
+                        Ok(cluster) => {
+                            status.successes += 1;
+                            status.last_success =
+                                Some(StorageClusterRuntimeMapRefreshLoopSuccess {
+                                    cluster_epoch: cluster.cluster_epoch(),
+                                    route_map_valid_until_ms: cluster.route_map_valid_until_ms(),
+                                });
+                            status.last_error = None;
+                        }
+                        Err(error) => {
+                            status.failures += 1;
+                            status.last_error = Some(error.to_string());
+                        }
+                    }
+                }
+
+                let (lock, cvar) = &*worker_stop;
+                let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *stopped {
+                    break;
+                }
+                let (stopped, _) = cvar
+                    .wait_timeout(stopped, refresh_interval)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *stopped {
+                    break;
+                }
+            })
+            .map_err(|source| StorageClusterRuntimeMapRefreshError::RefreshLoopSpawn { source })?;
+
+        Ok(StorageClusterRuntimeMapRefreshLoop {
+            stop,
+            status,
+            handle: Some(handle),
+        })
     }
 }
 

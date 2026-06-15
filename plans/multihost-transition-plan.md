@@ -7197,6 +7197,11 @@ Status:
   epoch or a same-epoch map with reduced route-map validity. Unix storage-node
   client rebuilds take explicit RPC admission settings so forced-overload
   limits and wait-timeout tuning cannot be reset by refresh.
+- Added the frontend control-plane runtime-map refresh loop wrapper around that
+  install boundary. The loop rejects zero intervals, records last success/error
+  status for diagnostics, preserves explicit Unix RPC admission settings when
+  rebuilding storage-node clients, and stops/joins explicitly so future
+  frontend process wiring can refresh maps without leaking workers.
 - Added the matching storage-node process config bridge. A storage node can now
   derive its startup PG set, route table, cluster epoch, and socket endpoint
   from a `ClusterRuntimeMapSnapshot`, filtering the authority route view to only

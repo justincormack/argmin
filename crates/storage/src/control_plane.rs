@@ -2877,7 +2877,11 @@ fn state_parent(path: &Path) -> Option<&Path> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
 
     #[derive(Debug)]
     struct FailingStore {
@@ -4287,6 +4291,117 @@ mod tests {
             )
         ));
         assert_eq!(handle.current().route_map_valid_until_ms(), None);
+    }
+
+    #[test]
+    fn storage_cluster_runtime_map_refresh_loop_installs_current_map() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+
+        let peering_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &peering_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_003);
+        let expected_runtime_map = authority.snapshot().runtime_map(2_004).unwrap();
+        let now = Arc::new(AtomicU64::new(2_004));
+        let loop_now = Arc::clone(&now);
+        let mut refresh_loop = handle
+            .clone()
+            .spawn_control_plane_refresh_loop(authority, Duration::from_millis(5), move || {
+                loop_now.fetch_add(1, Ordering::SeqCst)
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if refresh_loop.status().successes > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "frontend runtime-map refresh loop did not install a map: {:?}",
+                refresh_loop.status()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let current = handle.current();
+        assert_eq!(
+            current.cluster_epoch(),
+            expected_runtime_map.cluster_epoch()
+        );
+        assert_eq!(
+            current.local_pg_route(PgId::new(31)).unwrap().state(),
+            PgState::Active
+        );
+        assert_eq!(
+            current.route_map_valid_until_ms(),
+            expected_runtime_map.valid_until_ms()
+        );
+        assert_eq!(refresh_loop.status().failures, 0);
+        assert_eq!(
+            refresh_loop.status().last_success,
+            Some(crate::StorageClusterRuntimeMapRefreshLoopSuccess {
+                cluster_epoch: expected_runtime_map.cluster_epoch(),
+                route_map_valid_until_ms: expected_runtime_map.valid_until_ms(),
+            })
+        );
+
+        refresh_loop.stop();
+        let attempts_after_stop = refresh_loop.status().attempts;
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(refresh_loop.status().attempts, attempts_after_stop);
+    }
+
+    #[test]
+    fn storage_cluster_runtime_map_refresh_loop_rejects_zero_interval() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 1_001);
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+
+        assert!(matches!(
+            handle.spawn_control_plane_refresh_loop(authority, Duration::ZERO, || 1_000),
+            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::RefreshLoopZeroInterval)
+        ));
     }
 
     #[test]

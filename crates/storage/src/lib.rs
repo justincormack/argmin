@@ -47,6 +47,8 @@ pub use cluster::{
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, ReleasedObjectPayloadLease,
     ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopStatus,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
