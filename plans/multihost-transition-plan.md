@@ -7122,6 +7122,11 @@ Status:
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary
   the later dynamic control-plane route update path should reuse.
+- Extended the control-plane route view to export every PG, not only active
+  PGs. `Active` PGs still require the persisted active primary, current lease,
+  and current active observation, while `Peering` and other non-active PGs are
+  exported as non-active routes so runtime maps can reject unsafe work with
+  `PgNotActive` instead of losing the PG as an unknown route.
 
 Exit criteria:
 

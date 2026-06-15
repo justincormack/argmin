@@ -313,6 +313,42 @@ impl ClusterControlSnapshot {
             .collect()
     }
 
+    pub fn pg_route(&self, pg_id: PgId, now_ms: u64) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state == PgState::Active {
+            return self.active_pg_route(pg_id, now_ms);
+        }
+        let primary = record
+            .acting_set
+            .first()
+            .copied()
+            .ok_or(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() })?;
+        for &node_id in &record.acting_set {
+            if !self.nodes.contains_key(&node_id) {
+                return Err(ControlPlaneError::UnknownActingSetNode {
+                    pg_id: pg_id.get(),
+                    node_id: node_id.as_u32(),
+                });
+            }
+        }
+        Ok(PgRouteSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            primary_node_id: primary,
+            acting_set: record.acting_set.clone(),
+            state: record.state,
+        })
+    }
+
+    pub fn pg_routes(&self, now_ms: u64) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+        self.pgs
+            .values()
+            .map(|record| self.pg_route(record.pg_id, now_ms))
+            .collect()
+    }
+
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
         self.authority_incarnation = self.authority_incarnation.next()?;
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
@@ -3451,6 +3487,53 @@ mod tests {
             .active_pg_routes(1_001)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn pg_route_exports_peering_pg_for_fail_closed_runtime_install() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(24), vec![NodeId::new(2), NodeId::new(1)])
+            .unwrap();
+
+        let route = authority.snapshot().pg_route(PgId::new(24), 1_001).unwrap();
+        assert_eq!(route.cluster_epoch(), authority.snapshot().cluster_epoch());
+        assert_eq!(route.pg_id(), PgId::new(24));
+        assert_eq!(route.primary_node_id(), NodeId::new(2));
+        assert_eq!(route.acting_set(), &[NodeId::new(2), NodeId::new(1)]);
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(
+            authority.snapshot().pg_routes(1_001).unwrap(),
+            vec![route.clone()]
+        );
+
+        let local_route = crate::cluster::LocalPgRoute::from(&route);
+        let local_map =
+            crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+                NodeId::new(1),
+                [NodeId::new(1), NodeId::new(2)],
+                &[24],
+                crate::EcShape { k: 1, m: 1 },
+                authority.snapshot().cluster_epoch(),
+                vec![local_route],
+            )
+            .unwrap();
+        assert!(matches!(
+            local_map.metadata_pg_primary_node(authority.snapshot().cluster_epoch(), PgId::new(24)),
+            Err(crate::StoreError::PgNotActive {
+                pg_id: 24,
+                state: PgState::Peering,
+                ..
+            })
+        ));
     }
 
     #[test]
