@@ -7214,6 +7214,11 @@ Status:
   and durable reservation/drain/reclaim release paths validate only route
   identity so stale-map cleanup does not depend on transport teardown or lease
   expiry.
+- Added an explicit storage-node runtime-map install boundary. A storage node
+  can now submit a heartbeat, build a validated next process config from the
+  authority runtime map, and install it for future sessions while preserving
+  process identity and rejecting in-place PG-set changes until dynamic PG-store
+  open/close is implemented.
 
 Exit criteria:
 

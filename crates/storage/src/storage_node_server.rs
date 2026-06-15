@@ -639,6 +639,13 @@ pub enum StorageNodeServerError {
         current: PathBuf,
         candidate: PathBuf,
     },
+    #[error(
+        "storage-node runtime refresh changed opened PG set from {current:?} to {candidate:?}"
+    )]
+    RuntimeRefreshPgSetChanged {
+        current: Vec<u32>,
+        candidate: Vec<u32>,
+    },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
@@ -748,8 +755,7 @@ pub struct StorageNodeServer {
 
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
-        validate_pg_ids(&config.pg_ids)?;
-        validate_pg_routes(&config.pg_ids, &config.pg_routes)?;
+        validate_process_config_route_table(&config)?;
         validate_socket_directory(&config.socket_path)?;
         let data_dir_lock = StorageNodeDataDirLock::acquire(&config.data_dir)?;
         cleanup_stale_socket_path(&config.socket_path)?;
@@ -847,6 +853,47 @@ impl StorageNodeServer {
             runtime_map,
             next_config,
         })
+    }
+
+    pub fn refresh_and_install_control_plane_runtime_map(
+        &mut self,
+        control_plane: &mut impl ControlPlaneHeartbeatRuntimeMapSource,
+        node_incarnation: u64,
+        requested_lease_duration_ms: u64,
+        authority_now_ms: u64,
+    ) -> Result<HeartbeatLease, StorageNodeServerError> {
+        let refresh = self.refresh_control_plane_runtime_map(
+            control_plane,
+            node_incarnation,
+            requested_lease_duration_ms,
+            authority_now_ms,
+        )?;
+        self.install_control_plane_refresh(refresh)
+    }
+
+    pub fn install_control_plane_refresh(
+        &mut self,
+        refresh: StorageNodeControlPlaneRefresh,
+    ) -> Result<HeartbeatLease, StorageNodeServerError> {
+        let (lease, _runtime_map, next_config) = refresh.into_parts();
+        self.install_control_plane_runtime_config(next_config)?;
+        Ok(lease)
+    }
+
+    pub fn install_control_plane_runtime_config(
+        &mut self,
+        next_config: StorageNodeProcessConfig,
+    ) -> Result<(), StorageNodeServerError> {
+        validate_process_config_route_table(&next_config)?;
+        next_config.validate_runtime_refresh_from(&self.config)?;
+        if next_config.pg_ids != self.config.pg_ids {
+            return Err(StorageNodeServerError::RuntimeRefreshPgSetChanged {
+                current: self.config.pg_ids.clone(),
+                candidate: next_config.pg_ids,
+            });
+        }
+        self.config = next_config;
+        Ok(())
     }
 
     fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
@@ -8067,6 +8114,23 @@ fn validate_pg_routes(
     Ok(())
 }
 
+fn validate_process_config_route_table(
+    config: &StorageNodeProcessConfig,
+) -> Result<(), StorageNodeServerError> {
+    validate_pg_ids(&config.pg_ids)?;
+    validate_pg_routes(&config.pg_ids, &config.pg_routes)?;
+    for route in &config.pg_routes {
+        if route.cluster_epoch != config.cluster_epoch {
+            return Err(StorageNodeServerError::RouteEpochMismatch {
+                pg_id: route.pg_id,
+                route_epoch: route.cluster_epoch,
+                config_epoch: config.cluster_epoch,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_socket_directory(socket_path: &Path) -> Result<(), StorageNodeServerError> {
     validate_absolute_socket_path(socket_path)?;
     let parent =
@@ -8489,6 +8553,45 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_runtime_config_install_rejects_pg_set_changes() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut candidate = config.clone();
+        candidate.pg_ids = vec![0, 1];
+        candidate.pg_routes.push(test_route(1));
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(candidate),
+            Err(StorageNodeServerError::RuntimeRefreshPgSetChanged {
+                current,
+                candidate,
+            }) if current == vec![0] && candidate == vec![0, 1]
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_validates_route_table() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut candidate = config.clone();
+        candidate.cluster_epoch = ClusterEpoch::new(2).unwrap();
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(candidate),
+            Err(StorageNodeServerError::RouteEpochMismatch {
+                pg_id: 0,
+                route_epoch,
+                config_epoch,
+            }) if route_epoch == ClusterEpoch::new(1).unwrap()
+                && config_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+    }
+
+    #[test]
     fn storage_node_process_config_builds_control_plane_heartbeat() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -8746,7 +8849,14 @@ mod tests {
             &runtime_map,
         )
         .unwrap();
-        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut config = config;
+        config.route_map_valid_until_ms = Some(1);
+        let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+        let stale_error = server
+            .connection_handler()
+            .validate_pg_route(node_id, runtime_map.cluster_epoch(), pg_id)
+            .unwrap_err();
+        assert_eq!(stale_error.code, StorageRpcErrorCode::StaleShardLocation);
 
         let refresh = server
             .refresh_control_plane_runtime_map(&mut authority, 12, 1_000, 1_003)
@@ -8766,6 +8876,23 @@ mod tests {
         assert_eq!(refresh.next_config().pg_routes.len(), 1);
         assert_eq!(refresh.next_config().pg_routes[0].state, PgState::Peering);
 
+        let installed_epoch = refresh.next_config().cluster_epoch;
+        let lease = server.install_control_plane_refresh(refresh).unwrap();
+        assert_eq!(lease.node_id(), node_id);
+        assert_eq!(server.config.cluster_epoch, installed_epoch);
+        assert_eq!(server.config.route_map_valid_until_ms(), None);
+        let peering_error = server
+            .connection_handler()
+            .validate_pg_route(node_id, installed_epoch, pg_id)
+            .unwrap_err();
+        assert_eq!(peering_error.code, StorageRpcErrorCode::InactivePgRoute);
+        let installed_heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
+        assert_eq!(installed_heartbeat.observed_epoch, installed_epoch);
+        assert_eq!(
+            installed_heartbeat.pg_observations[0].state,
+            PgState::Peering
+        );
+
         let observation = authority
             .snapshot()
             .node(node_id)
@@ -8773,10 +8900,7 @@ mod tests {
             .pg_observation(pg_id)
             .unwrap();
         assert_eq!(observation.state(), PgState::Peering);
-        assert_eq!(
-            observation.observed_epoch(),
-            refresh.runtime_map().cluster_epoch()
-        );
+        assert_eq!(observation.observed_epoch(), installed_epoch);
     }
 
     #[test]
@@ -11497,14 +11621,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_server_rejects_read_handle_acquire_for_wrong_route_epoch() {
+    fn storage_node_server_rejects_read_handle_acquire_for_stale_route_epoch() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
         config.pg_routes[0].cluster_epoch = ClusterEpoch::new(2).unwrap();
 
         let error = send_read_handle_acquire(config, test_location(1, 0, 7));
 
-        assert_eq!(error.code, StorageRpcErrorCode::WrongClusterEpoch);
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
     }
 
     #[test]
