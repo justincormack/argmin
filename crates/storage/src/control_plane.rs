@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::{ClusterEpoch, PgId, PgState};
 
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 32;
+const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -191,10 +192,13 @@ impl NodeControlRecord {
         self.pg_observations.values()
     }
 
-    fn can_serve_primary(&self, cluster_epoch: ClusterEpoch) -> bool {
+    fn can_serve_primary(&self, cluster_epoch: ClusterEpoch, now_ms: u64) -> bool {
         self.membership.can_serve_primary()
             && self.availability == NodeAvailabilityState::Healthy
             && self.last_observed_epoch == Some(cluster_epoch)
+            && self
+                .lease_deadline_ms
+                .is_some_and(|lease_deadline_ms| lease_deadline_ms > now_ms)
     }
 }
 
@@ -431,8 +435,7 @@ pub struct NodeHeartbeat {
     pub node_incarnation: u64,
     pub endpoint: String,
     pub observed_epoch: ClusterEpoch,
-    pub now_ms: u64,
-    pub lease_duration_ms: u64,
+    pub requested_lease_duration_ms: u64,
     pub pg_observations: Vec<NodePgHeartbeatObservation>,
 }
 
@@ -926,7 +929,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 state: record.state,
             });
         }
-        if self.deterministic_pg_primary(pg_id, record.acting_set()) != Some(primary) {
+        if self.deterministic_pg_primary(pg_id, record.acting_set(), now_ms) != Some(primary) {
             return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
                 pg_id: pg_id.get(),
                 node_id: primary.as_u32(),
@@ -956,13 +959,19 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     pub fn heartbeat(
         &mut self,
         heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
     ) -> Result<HeartbeatLease, ControlPlaneError> {
-        if heartbeat.lease_duration_ms == 0 {
+        if heartbeat.requested_lease_duration_ms == 0 {
             return Err(ControlPlaneError::InvalidLeaseDuration);
         }
-        let lease_deadline_ms = heartbeat
-            .now_ms
-            .checked_add(heartbeat.lease_duration_ms)
+        if heartbeat.requested_lease_duration_ms > MAX_HEARTBEAT_LEASE_MS {
+            return Err(ControlPlaneError::LeaseDurationTooLong {
+                requested_ms: heartbeat.requested_lease_duration_ms,
+                max_ms: MAX_HEARTBEAT_LEASE_MS,
+            });
+        }
+        let lease_deadline_ms = authority_now_ms
+            .checked_add(heartbeat.requested_lease_duration_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
         let current_epoch = self.snapshot.cluster_epoch;
 
@@ -994,7 +1003,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 authority_incarnation: self.snapshot.authority_incarnation,
                 cluster_epoch: current_epoch,
                 node_id: heartbeat.node_id,
-                lease_deadline_ms: record.lease_deadline_ms.unwrap_or(heartbeat.now_ms),
+                lease_deadline_ms: record.lease_deadline_ms.unwrap_or(authority_now_ms),
                 serving: false,
                 snapshot: self.snapshot.clone(),
             });
@@ -1029,7 +1038,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 affected_node = Some(heartbeat.node_id);
             }
             record.last_observed_epoch = Some(heartbeat.observed_epoch);
-            record.last_heartbeat_ms = Some(heartbeat.now_ms);
+            record.last_heartbeat_ms = Some(authority_now_ms);
             record.lease_deadline_ms = Some(lease_deadline_ms);
             record.pg_observations.clear();
             for observation in &heartbeat.pg_observations {
@@ -1039,7 +1048,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                         pg_id: observation.pg_id,
                         state: observation.state,
                         observed_epoch: heartbeat.observed_epoch,
-                        observed_at_ms: heartbeat.now_ms,
+                        observed_at_ms: authority_now_ms,
                         metadata_proof: observation.metadata_proof,
                     },
                 );
@@ -1052,10 +1061,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             next_snapshot.bump_epoch()?;
         }
         self.commit_snapshot(next_snapshot)?;
-        let serving = self
-            .snapshot
-            .node(heartbeat.node_id)
-            .is_some_and(|record| record.can_serve_primary(self.snapshot.cluster_epoch));
+        let serving = self.snapshot.node(heartbeat.node_id).is_some_and(|record| {
+            record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
+        });
         Ok(HeartbeatLease {
             authority_incarnation: self.snapshot.authority_incarnation,
             cluster_epoch: self.snapshot.cluster_epoch,
@@ -1145,12 +1153,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 current_epoch: self.snapshot.cluster_epoch,
             });
         }
-        if !record.can_serve_primary(self.snapshot.cluster_epoch) {
-            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
-                node_id: node_id.as_u32(),
-                cluster_epoch: self.snapshot.cluster_epoch,
-            });
-        }
         let lease_deadline_ms =
             record
                 .lease_deadline_ms
@@ -1164,6 +1166,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 node_id: node_id.as_u32(),
                 now_ms,
                 lease_deadline_ms: Some(lease_deadline_ms),
+            });
+        }
+        if !record.can_serve_primary(self.snapshot.cluster_epoch, now_ms) {
+            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: node_id.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
             });
         }
         Ok(NodeServiceAuthorization {
@@ -1215,12 +1223,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 current_incarnation: record.node_incarnation,
             });
         }
-        if !record.can_serve_primary(self.snapshot.cluster_epoch) {
-            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
-                node_id: node_id.as_u32(),
-                cluster_epoch: self.snapshot.cluster_epoch,
-            });
-        }
         let current_lease_deadline_ms =
             record
                 .lease_deadline_ms
@@ -1234,6 +1236,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 node_id: node_id.as_u32(),
                 now_ms,
                 lease_deadline_ms: Some(current_lease_deadline_ms),
+            });
+        }
+        if !record.can_serve_primary(self.snapshot.cluster_epoch, now_ms) {
+            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: node_id.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
             });
         }
         Ok(())
@@ -1266,7 +1274,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .filter(|primary| {
                 self.snapshot
                     .node(*primary)
-                    .is_some_and(|node| node.can_serve_primary(self.snapshot.cluster_epoch))
+                    .is_some_and(|node| node.can_serve_primary(self.snapshot.cluster_epoch, now_ms))
             })
             .ok_or(ControlPlaneError::PgHasNoServingPrimary {
                 pg_id: pg_id.get(),
@@ -1355,7 +1363,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .filter(|primary| {
                 self.snapshot
                     .node(*primary)
-                    .is_some_and(|node| node.can_serve_primary(self.snapshot.cluster_epoch))
+                    .is_some_and(|node| node.can_serve_primary(self.snapshot.cluster_epoch, now_ms))
             })
             .ok_or(ControlPlaneError::PgHasNoServingPrimary {
                 pg_id: pg_id.get(),
@@ -1373,7 +1381,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     }
 
     #[must_use]
-    pub fn serving_pg_primary(&self, pg_id: PgId) -> Option<NodeId> {
+    pub fn serving_pg_primary(&self, pg_id: PgId, now_ms: u64) -> Option<NodeId> {
         let record = self.snapshot.pgs.get(&pg_id)?;
         if record.state != PgState::Active {
             return None;
@@ -1381,19 +1389,24 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let primary = record.active_primary?;
         self.snapshot
             .node(primary)
-            .is_some_and(|node| node.can_serve_primary(self.snapshot.cluster_epoch))
+            .is_some_and(|node| node.can_serve_primary(self.snapshot.cluster_epoch, now_ms))
             .then_some(())?;
         primary_has_current_pg_state(&self.snapshot, pg_id, primary, PgState::Active)
             .then_some(primary)
     }
 
     #[must_use]
-    pub fn deterministic_pg_primary(&self, _pg_id: PgId, acting_set: &[NodeId]) -> Option<NodeId> {
+    pub fn deterministic_pg_primary(
+        &self,
+        _pg_id: PgId,
+        acting_set: &[NodeId],
+        now_ms: u64,
+    ) -> Option<NodeId> {
         acting_set.iter().copied().find(|node_id| {
             self.snapshot
                 .nodes
                 .get(node_id)
-                .is_some_and(|record| record.can_serve_primary(self.snapshot.cluster_epoch))
+                .is_some_and(|record| record.can_serve_primary(self.snapshot.cluster_epoch, now_ms))
         })
     }
 
@@ -1605,6 +1618,9 @@ pub enum ControlPlaneError {
 
     #[error("heartbeat lease duration must be positive")]
     InvalidLeaseDuration,
+
+    #[error("heartbeat lease duration {requested_ms}ms exceeds maximum {max_ms}ms")]
+    LeaseDurationTooLong { requested_ms: u64, max_ms: u64 },
 
     #[error("heartbeat lease deadline overflow")]
     LeaseDeadlineOverflow,
@@ -2320,11 +2336,7 @@ fn validate_pg_peering_observations(
                 node_id: node_id.as_u32(),
             });
         };
-        if !node.can_serve_primary(snapshot.cluster_epoch)
-            || node
-                .lease_deadline_ms
-                .is_none_or(|lease_deadline_ms| lease_deadline_ms <= now_ms)
-        {
+        if !node.can_serve_primary(snapshot.cluster_epoch, now_ms) {
             continue;
         }
         let observation =
@@ -2585,14 +2597,13 @@ mod tests {
         }
     }
 
-    fn heartbeat(node_id: u32, observed_epoch: ClusterEpoch, now_ms: u64) -> NodeHeartbeat {
+    fn heartbeat(node_id: u32, observed_epoch: ClusterEpoch, _now_ms: u64) -> NodeHeartbeat {
         NodeHeartbeat {
             node_id: NodeId::new(node_id),
             node_incarnation: 10 + u64::from(node_id),
             endpoint: format!("node-{node_id}.sock"),
             observed_epoch,
-            now_ms,
-            lease_duration_ms: 100,
+            requested_lease_duration_ms: 100,
             pg_observations: Vec::new(),
         }
     }
@@ -2603,22 +2614,19 @@ mod tests {
         now_ms: u64,
     ) -> HeartbeatLease {
         let first = authority
-            .heartbeat(heartbeat(
-                node_id,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat(node_id, authority.snapshot().cluster_epoch(), now_ms),
                 now_ms,
-            ))
+            )
             .unwrap();
         if first.serving() {
             first
         } else {
             authority
-                .heartbeat(heartbeat_from_record(
-                    authority,
-                    node_id,
-                    first.cluster_epoch(),
+                .heartbeat(
+                    heartbeat_from_record(authority, node_id, first.cluster_epoch(), now_ms + 1),
                     now_ms + 1,
-                ))
+                )
                 .unwrap()
         }
     }
@@ -2627,10 +2635,10 @@ mod tests {
         authority: &SingleAuthorityControlPlane<S>,
         node_id: u32,
         observed_epoch: ClusterEpoch,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> NodeHeartbeat {
         let record = authority.snapshot().node(NodeId::new(node_id)).unwrap();
-        let mut heartbeat = heartbeat(node_id, observed_epoch, now_ms);
+        let mut heartbeat = heartbeat(node_id, observed_epoch, _now_ms);
         heartbeat.node_incarnation = record.node_incarnation();
         heartbeat.endpoint = record.endpoint().to_owned();
         heartbeat
@@ -2654,7 +2662,7 @@ mod tests {
             state,
             metadata_proof: PgMetadataProof::empty(),
         }];
-        authority.heartbeat(heartbeat).unwrap()
+        authority.heartbeat(heartbeat, now_ms).unwrap()
     }
 
     fn node_incarnation<S: ControlPlaneStore>(
@@ -2683,7 +2691,10 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         let first_lease = authority
-            .heartbeat(heartbeat(1, authority.snapshot().cluster_epoch(), 1_000))
+            .heartbeat(
+                heartbeat(1, authority.snapshot().cluster_epoch(), 1_000),
+                1_000,
+            )
             .unwrap();
 
         let restarted = SingleAuthorityControlPlane::open(store).unwrap();
@@ -2960,7 +2971,7 @@ mod tests {
             .unwrap();
         let membership_epoch = authority.snapshot().cluster_epoch();
         let lease = authority
-            .heartbeat(heartbeat(3, membership_epoch, 2_000))
+            .heartbeat(heartbeat(3, membership_epoch, 2_000), 2_000)
             .unwrap();
 
         let persisted = store.load().unwrap().unwrap();
@@ -2996,19 +3007,19 @@ mod tests {
             .set_node_membership(NodeId::new(4), NodeMembershipState::Active)
             .unwrap();
         let first = authority
-            .heartbeat(heartbeat(4, authority.snapshot().cluster_epoch(), 100))
+            .heartbeat(heartbeat(4, authority.snapshot().cluster_epoch(), 100), 100)
             .unwrap();
 
         let mut stale = heartbeat(4, first.cluster_epoch(), 200);
         stale.node_incarnation -= 1;
         assert!(matches!(
-            authority.heartbeat(stale),
+            authority.heartbeat(stale, 200),
             Err(ControlPlaneError::StaleNodeIncarnation { node_id: 4, .. })
         ));
 
         let mut restarted_node = heartbeat(4, first.cluster_epoch(), 300);
         restarted_node.node_incarnation += 1;
-        let fenced = authority.heartbeat(restarted_node).unwrap();
+        let fenced = authority.heartbeat(restarted_node, 300).unwrap();
         assert!(fenced.cluster_epoch() > first.cluster_epoch());
         assert!(!fenced.serving());
         assert_eq!(
@@ -3021,12 +3032,10 @@ mod tests {
         );
 
         let caught_up = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                4,
-                fenced.cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 4, fenced.cluster_epoch(), 400),
                 400,
-            ))
+            )
             .unwrap();
         assert!(caught_up.serving());
     }
@@ -3044,7 +3053,7 @@ mod tests {
 
         let mut moved = heartbeat(5, serving.cluster_epoch(), 200);
         moved.endpoint = "node-5-new.sock".to_owned();
-        let changed = authority.heartbeat(moved).unwrap();
+        let changed = authority.heartbeat(moved, 200).unwrap();
         assert!(changed.cluster_epoch() > serving.cluster_epoch());
         assert!(!changed.serving());
         assert_eq!(
@@ -3056,21 +3065,19 @@ mod tests {
             "node-5-new.sock"
         );
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(5)]),
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(5)], 200),
             None
         );
 
         let caught_up = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                5,
-                changed.cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 5, changed.cluster_epoch(), 300),
                 300,
-            ))
+            )
             .unwrap();
         assert!(caught_up.serving());
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(5)]),
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(5)], 300),
             Some(NodeId::new(5))
         );
     }
@@ -3116,7 +3123,7 @@ mod tests {
         assert_eq!(pg.pg_id(), PgId::new(7));
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
-        assert_eq!(authority.serving_pg_primary(PgId::new(7)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(7), 1), None);
 
         let persisted = store.load().unwrap().unwrap();
         let persisted_pg = persisted.pg(PgId::new(7)).unwrap();
@@ -3137,23 +3144,21 @@ mod tests {
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 1_002),
                 1_002,
-            ))
+            )
             .unwrap();
         authority
             .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
-        assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(8), 1_002), None);
 
         assert!(matches!(
             authority.set_pg_state(PgId::new(8), PgState::Active),
             Err(ControlPlaneError::ActivePgRequiresPeeringComplete { pg_id: 8 })
         ));
-        assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(8), 1_002), None);
         for node_id in [1, 2] {
             heartbeat_with_pg_observation(
                 &mut authority,
@@ -3190,18 +3195,16 @@ mod tests {
                 2_050,
             )
             .unwrap();
-        assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(8), 2_050), None);
         heartbeat_with_pg_observation(&mut authority, 1, 8, PgState::Active, 3_001);
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                2,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 3_002),
                 3_002,
-            ))
+            )
             .unwrap();
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(8)),
+            authority.serving_pg_primary(PgId::new(8), 3_002),
             Some(NodeId::new(1))
         );
     }
@@ -3247,7 +3250,7 @@ mod tests {
         );
 
         heartbeat_with_pg_observation(&mut authority, 2, 20, PgState::Active, 3_001);
-        assert_eq!(authority.serving_pg_primary(PgId::new(20)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(20), 3_001), None);
         assert!(matches!(
             authority.complete_pg_peering(
                 PgId::new(20),
@@ -3264,7 +3267,7 @@ mod tests {
 
         heartbeat_with_pg_observation(&mut authority, 1, 20, PgState::Active, 3_003);
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(20)),
+            authority.serving_pg_primary(PgId::new(20), 3_003),
             Some(NodeId::new(1))
         );
         authority
@@ -3334,12 +3337,10 @@ mod tests {
             .set_pg_acting_set(PgId::new(12), vec![NodeId::new(1)])
             .unwrap();
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000),
                 2_000,
-            ))
+            )
             .unwrap();
 
         assert!(matches!(
@@ -3399,12 +3400,10 @@ mod tests {
             .set_pg_state(PgId::new(15), PgState::Degraded)
             .unwrap();
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000),
                 2_000,
-            ))
+            )
             .unwrap();
 
         assert!(matches!(
@@ -3444,14 +3443,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(authority.serving_pg_primary(PgId::new(16)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(16), 2_010), None);
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_020),
                 2_020,
-            ))
+            )
             .unwrap();
         assert!(matches!(
             authority.authorize_pg_primary_service(
@@ -3469,7 +3466,7 @@ mod tests {
         ));
 
         heartbeat_with_pg_observation(&mut authority, 1, 16, PgState::Peering, 2_030);
-        assert_eq!(authority.serving_pg_primary(PgId::new(16)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(16), 2_030), None);
         assert!(matches!(
             authority.authorize_pg_primary_service(
                 PgId::new(16),
@@ -3488,7 +3485,7 @@ mod tests {
 
         heartbeat_with_pg_observation(&mut authority, 1, 16, PgState::Active, 2_050);
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(16)),
+            authority.serving_pg_primary(PgId::new(16), 2_050),
             Some(NodeId::new(1))
         );
         authority
@@ -3570,8 +3567,8 @@ mod tests {
 
         let mut shorter_lease =
             heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 152);
-        shorter_lease.lease_duration_ms = 5;
-        authority.heartbeat(shorter_lease).unwrap();
+        shorter_lease.requested_lease_duration_ms = 5;
+        authority.heartbeat(shorter_lease, 152).unwrap();
         assert!(authorized.lease_deadline_ms() > 157);
         assert!(matches!(
             authority.validate_node_service_authorization(&authorized, 157),
@@ -3595,12 +3592,10 @@ mod tests {
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 1_002),
                 1_002,
-            ))
+            )
             .unwrap();
         authority
             .set_pg_acting_set(PgId::new(10), vec![NodeId::new(1), NodeId::new(2)])
@@ -3640,12 +3635,10 @@ mod tests {
             .unwrap();
         heartbeat_with_pg_observation(&mut authority, 1, 10, PgState::Active, 3_001);
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                2,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 3_002),
                 3_002,
-            ))
+            )
             .unwrap();
         let node_one_incarnation = authority
             .snapshot()
@@ -3786,12 +3779,15 @@ mod tests {
         ] {
             authority.set_pg_state(PgId::new(14), state).unwrap();
             authority
-                .heartbeat(heartbeat_from_record(
-                    &authority,
-                    1,
-                    authority.snapshot().cluster_epoch(),
+                .heartbeat(
+                    heartbeat_from_record(
+                        &authority,
+                        1,
+                        authority.snapshot().cluster_epoch(),
+                        4_000,
+                    ),
                     4_000,
-                ))
+                )
                 .unwrap();
             for operation in operations {
                 assert!(matches!(
@@ -3852,13 +3848,13 @@ mod tests {
 
         let mut shorter_lease =
             heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 3_061);
-        shorter_lease.lease_duration_ms = 5;
+        shorter_lease.requested_lease_duration_ms = 5;
         shorter_lease.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(17),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
         }];
-        authority.heartbeat(shorter_lease).unwrap();
+        authority.heartbeat(shorter_lease, 3_061).unwrap();
         assert!(authorization.lease_deadline_ms() > 3_066);
         assert!(matches!(
             authority.validate_pg_operation_authorization(&authorization, 3_066),
@@ -3902,20 +3898,22 @@ mod tests {
             .set_node_membership(NodeId::new(6), NodeMembershipState::Active)
             .unwrap();
         let stale_epoch = ClusterEpoch::INITIAL;
-        let lease = authority.heartbeat(heartbeat(6, stale_epoch, 100)).unwrap();
+        let lease = authority
+            .heartbeat(heartbeat(6, stale_epoch, 100), 100)
+            .unwrap();
         assert!(!lease.serving());
         assert_eq!(lease.snapshot().cluster_epoch(), lease.cluster_epoch());
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(6)]),
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(6)], 100),
             None
         );
 
         let caught_up = authority
-            .heartbeat(heartbeat(6, lease.cluster_epoch(), 200))
+            .heartbeat(heartbeat(6, lease.cluster_epoch(), 200), 200)
             .unwrap();
         assert!(!caught_up.serving());
         let final_lease = authority
-            .heartbeat(heartbeat(6, caught_up.cluster_epoch(), 300))
+            .heartbeat(heartbeat(6, caught_up.cluster_epoch(), 300), 300)
             .unwrap();
         assert!(final_lease.serving());
     }
@@ -3944,7 +3942,7 @@ mod tests {
                 state_digest: 11,
             },
         }];
-        authority.heartbeat(heartbeat).unwrap();
+        authority.heartbeat(heartbeat, 2_000).unwrap();
 
         let observation = authority
             .snapshot()
@@ -4021,7 +4019,9 @@ mod tests {
                 state: PgState::Peering,
                 metadata_proof,
             }];
-            authority.heartbeat(heartbeat).unwrap();
+            authority
+                .heartbeat(heartbeat, 2_000 + u64::from(node_id))
+                .unwrap();
         }
         assert!(matches!(
             authority.complete_pg_peering(
@@ -4046,7 +4046,7 @@ mod tests {
             state: PgState::Peering,
             metadata_proof: matching_proof,
         }];
-        authority.heartbeat(heartbeat).unwrap();
+        authority.heartbeat(heartbeat, 2_060).unwrap();
         authority
             .complete_pg_peering(
                 PgId::new(19),
@@ -4082,7 +4082,7 @@ mod tests {
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
         }];
-        let response = authority.heartbeat(stale).unwrap();
+        let response = authority.heartbeat(stale, 2_000).unwrap();
         assert!(!response.serving());
         assert!(authority
             .snapshot()
@@ -4122,7 +4122,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            authority.heartbeat(duplicate),
+            authority.heartbeat(duplicate, 2_000),
             Err(ControlPlaneError::DuplicatePgObservation {
                 node_id: 1,
                 pg_id: 17
@@ -4137,7 +4137,7 @@ mod tests {
             metadata_proof: PgMetadataProof::empty(),
         }];
         assert!(matches!(
-            authority.heartbeat(unknown),
+            authority.heartbeat(unknown, 2_001),
             Err(ControlPlaneError::UnknownPg { pg_id: 99 })
         ));
 
@@ -4149,7 +4149,7 @@ mod tests {
             metadata_proof: PgMetadataProof::empty(),
         }];
         assert!(matches!(
-            authority.heartbeat(wrong_node),
+            authority.heartbeat(wrong_node, 2_002),
             Err(ControlPlaneError::PgObservationNotInActingSet {
                 node_id: 2,
                 pg_id: 17
@@ -4176,7 +4176,7 @@ mod tests {
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
         }];
-        authority.heartbeat(heartbeat).unwrap();
+        authority.heartbeat(heartbeat, 2_000).unwrap();
         assert!(authority
             .snapshot()
             .node(NodeId::new(1))
@@ -4235,7 +4235,7 @@ mod tests {
             state: PgState::Peering,
             metadata_proof,
         }];
-        authority.heartbeat(heartbeat).unwrap();
+        authority.heartbeat(heartbeat, 2_000).unwrap();
         assert!(authority
             .snapshot()
             .node(NodeId::new(1))
@@ -4283,7 +4283,7 @@ mod tests {
         let serving = heartbeat_until_serving(&mut authority, 7, 100);
         assert!(serving.serving());
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(7)]),
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(7)], 100),
             Some(NodeId::new(7))
         );
 
@@ -4292,7 +4292,7 @@ mod tests {
         let mut stale = heartbeat(7, stale_epoch, 200);
         stale.node_incarnation = before.node_incarnation() + 1;
         stale.endpoint = "stale-node-7.sock".to_owned();
-        let stale_response = authority.heartbeat(stale).unwrap();
+        let stale_response = authority.heartbeat(stale, 200).unwrap();
         assert!(!stale_response.serving());
         assert_eq!(stale_response.cluster_epoch(), serving.cluster_epoch());
 
@@ -4303,7 +4303,7 @@ mod tests {
         assert_eq!(after.last_heartbeat_ms(), before.last_heartbeat_ms());
         assert_eq!(after.lease_deadline_ms(), before.lease_deadline_ms());
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(7)]),
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(7)], 200),
             Some(NodeId::new(7))
         );
     }
@@ -4317,7 +4317,7 @@ mod tests {
             .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
             .unwrap();
         let healthy_epoch = authority
-            .heartbeat(heartbeat(2, authority.snapshot().cluster_epoch(), 100))
+            .heartbeat(heartbeat(2, authority.snapshot().cluster_epoch(), 100), 100)
             .unwrap()
             .cluster_epoch();
 
@@ -4334,12 +4334,12 @@ mod tests {
 
         let unavailable_epoch = authority.snapshot().cluster_epoch();
         let recovered = authority
-            .heartbeat(heartbeat(2, unavailable_epoch, 500))
+            .heartbeat(heartbeat(2, unavailable_epoch, 500), 500)
             .unwrap();
         assert!(recovered.cluster_epoch() > unavailable_epoch);
         assert!(!recovered.serving());
         let serving = authority
-            .heartbeat(heartbeat(2, recovered.cluster_epoch(), 600))
+            .heartbeat(heartbeat(2, recovered.cluster_epoch(), 600), 600)
             .unwrap();
         assert!(serving.serving());
         assert_eq!(
@@ -4370,17 +4370,15 @@ mod tests {
             .set_node_membership(NodeId::new(2), NodeMembershipState::Out)
             .unwrap();
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                3,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 3, authority.snapshot().cluster_epoch(), 2_000),
                 2_000,
-            ))
+            )
             .unwrap();
 
         let acting_set = [NodeId::new(1), NodeId::new(2), NodeId::new(3)];
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(7), &acting_set),
+            authority.deterministic_pg_primary(PgId::new(7), &acting_set, 2_000),
             Some(NodeId::new(3))
         );
     }
@@ -4401,16 +4399,18 @@ mod tests {
         assert!(node_one.serving());
         assert!(node_two.serving());
         let node_one_current = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 1_002),
                 1_002,
-            ))
+            )
             .unwrap();
         assert!(node_one_current.serving());
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(1), NodeId::new(2)]),
+            authority.deterministic_pg_primary(
+                PgId::new(1),
+                &[NodeId::new(1), NodeId::new(2)],
+                1_002,
+            ),
             Some(NodeId::new(1))
         );
         authority
@@ -4435,15 +4435,13 @@ mod tests {
             .unwrap();
         heartbeat_with_pg_observation(&mut authority, 1, 9, PgState::Active, 1_011);
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                2,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 1_012),
                 1_012,
-            ))
+            )
             .unwrap();
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(9)),
+            authority.serving_pg_primary(PgId::new(9), 1_012),
             Some(NodeId::new(1))
         );
 
@@ -4474,10 +4472,14 @@ mod tests {
             None
         );
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(1), NodeId::new(2)]),
+            authority.deterministic_pg_primary(
+                PgId::new(1),
+                &[NodeId::new(1), NodeId::new(2)],
+                1_112,
+            ),
             None
         );
-        assert_eq!(authority.serving_pg_primary(PgId::new(9)), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(9), 1_112), None);
 
         let repeated = authority.expire_heartbeat_leases(9_999).unwrap();
         assert_eq!(repeated.expired_nodes(), &[]);
@@ -4511,12 +4513,10 @@ mod tests {
         assert_eq!(expiry.expired_nodes(), &[NodeId::new(3)]);
 
         let stale_after_expiry = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                3,
-                serving.cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 3, serving.cluster_epoch(), 1_200),
                 1_200,
-            ))
+            )
             .unwrap();
         assert!(!stale_after_expiry.serving());
         assert_eq!(stale_after_expiry.cluster_epoch(), expiry.cluster_epoch());
@@ -4530,27 +4530,23 @@ mod tests {
         );
 
         let recovered = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                3,
-                stale_after_expiry.cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 3, stale_after_expiry.cluster_epoch(), 1_300),
                 1_300,
-            ))
+            )
             .unwrap();
         assert!(recovered.cluster_epoch() > stale_after_expiry.cluster_epoch());
         assert!(!recovered.serving());
 
         let caught_up = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                3,
-                recovered.cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 3, recovered.cluster_epoch(), 1_400),
                 1_400,
-            ))
+            )
             .unwrap();
         assert!(caught_up.serving());
         assert_eq!(
-            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(3)]),
+            authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(3)], 1_400),
             Some(NodeId::new(3))
         );
     }
@@ -4581,15 +4577,13 @@ mod tests {
             .unwrap();
         heartbeat_with_pg_observation(&mut authority, 1, 13, PgState::Active, 1_070);
         authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                2,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 1_080),
                 1_080,
-            ))
+            )
             .unwrap();
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(13)),
+            authority.serving_pg_primary(PgId::new(13), 1_080),
             Some(NodeId::new(1))
         );
 
@@ -4628,32 +4622,41 @@ mod tests {
             node_one_deadline + 3,
         );
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(13)),
+            authority.serving_pg_primary(PgId::new(13), node_one_deadline + 3),
             Some(NodeId::new(2))
         );
 
         let recovered = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                authority.snapshot().cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(
+                    &authority,
+                    1,
+                    authority.snapshot().cluster_epoch(),
+                    node_one_deadline + 4,
+                ),
                 node_one_deadline + 4,
-            ))
+            )
             .unwrap();
         assert!(!recovered.serving());
         assert_eq!(
             authority.snapshot().pg(PgId::new(13)).unwrap().state(),
             PgState::Peering
         );
-        assert_eq!(authority.serving_pg_primary(PgId::new(13)), None);
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(13), node_one_deadline + 4),
+            None
+        );
 
         let caught_up = authority
-            .heartbeat(heartbeat_from_record(
-                &authority,
-                1,
-                recovered.cluster_epoch(),
+            .heartbeat(
+                heartbeat_from_record(
+                    &authority,
+                    1,
+                    recovered.cluster_epoch(),
+                    node_one_deadline + 5,
+                ),
                 node_one_deadline + 5,
-            ))
+            )
             .unwrap();
         assert!(caught_up.serving());
         assert_eq!(
@@ -4690,12 +4693,10 @@ mod tests {
         let failing_store = FailingStore::new(committed.clone());
         let mut restarted = SingleAuthorityControlPlane::open(failing_store).unwrap();
         assert!(restarted
-            .heartbeat(heartbeat_from_record(
-                &restarted,
-                12,
-                restarted.snapshot().cluster_epoch(),
-                1_001,
-            ))
+            .heartbeat(
+                heartbeat_from_record(&restarted, 12, restarted.snapshot().cluster_epoch(), 1_001,),
+                1_001
+            )
             .unwrap()
             .serving());
         let visible_before_failure = restarted.snapshot().clone();
@@ -4709,7 +4710,7 @@ mod tests {
         ));
         assert_eq!(restarted.snapshot(), &visible_before_failure);
         assert_eq!(
-            restarted.deterministic_pg_primary(PgId::new(1), &[NodeId::new(12)]),
+            restarted.deterministic_pg_primary(PgId::new(1), &[NodeId::new(12)], 1_001),
             Some(NodeId::new(12))
         );
     }
@@ -4720,7 +4721,7 @@ mod tests {
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         assert!(matches!(
-            authority.heartbeat(heartbeat(9, ClusterEpoch::INITIAL, 1)),
+            authority.heartbeat(heartbeat(9, ClusterEpoch::INITIAL, 1), 1),
             Err(ControlPlaneError::UnknownNode { node_id: 9 })
         ));
 
@@ -4728,7 +4729,7 @@ mod tests {
             .set_node_membership(NodeId::new(9), NodeMembershipState::Removed)
             .unwrap();
         assert!(matches!(
-            authority.heartbeat(heartbeat(9, authority.snapshot().cluster_epoch(), 2)),
+            authority.heartbeat(heartbeat(9, authority.snapshot().cluster_epoch(), 2), 2),
             Err(ControlPlaneError::NodeCannotReceiveLease { node_id: 9, .. })
         ));
 
@@ -4736,11 +4737,82 @@ mod tests {
             .set_node_membership(NodeId::new(10), NodeMembershipState::Active)
             .unwrap();
         let mut invalid = heartbeat(10, authority.snapshot().cluster_epoch(), 3);
-        invalid.lease_duration_ms = 0;
+        invalid.requested_lease_duration_ms = 0;
         assert!(matches!(
-            authority.heartbeat(invalid),
+            authority.heartbeat(invalid, 3),
             Err(ControlPlaneError::InvalidLeaseDuration)
         ));
+    }
+
+    #[test]
+    fn heartbeat_rejects_overlong_lease_duration() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(10), NodeMembershipState::Active)
+            .unwrap();
+
+        let mut invalid = heartbeat(10, authority.snapshot().cluster_epoch(), 3);
+        invalid.requested_lease_duration_ms = MAX_HEARTBEAT_LEASE_MS + 1;
+        assert!(matches!(
+            authority.heartbeat(invalid, 3),
+            Err(ControlPlaneError::LeaseDurationTooLong {
+                requested_ms,
+                max_ms,
+            }) if requested_ms == MAX_HEARTBEAT_LEASE_MS + 1
+                && max_ms == MAX_HEARTBEAT_LEASE_MS
+        ));
+    }
+
+    #[test]
+    fn primary_selection_requires_unexpired_authority_lease() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(42), NodeMembershipState::Active)
+            .unwrap();
+        let serving = heartbeat_until_serving(&mut authority, 42, 1_000);
+        assert!(serving.serving());
+        assert_eq!(
+            authority.deterministic_pg_primary(
+                PgId::new(1),
+                &[NodeId::new(42)],
+                serving.lease_deadline_ms() - 1,
+            ),
+            Some(NodeId::new(42))
+        );
+        assert_eq!(
+            authority.deterministic_pg_primary(
+                PgId::new(1),
+                &[NodeId::new(42)],
+                serving.lease_deadline_ms(),
+            ),
+            None
+        );
+
+        authority
+            .set_pg_acting_set(PgId::new(21), vec![NodeId::new(42)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 42, 21, PgState::Peering, 1_010);
+        authority
+            .complete_pg_peering(
+                PgId::new(21),
+                NodeId::new(42),
+                node_incarnation(&authority, 42),
+                1_020,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 42, 21, PgState::Active, 1_030);
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(21), active.lease_deadline_ms() - 1),
+            Some(NodeId::new(42))
+        );
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(21), active.lease_deadline_ms()),
+            None
+        );
     }
 
     #[test]
