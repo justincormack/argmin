@@ -7085,6 +7085,19 @@ Status:
   current node lease deadlines, active PG state, deterministic primary
   assignment, current primary PG observation, and the expected operation class
   before applying work that started under an earlier view.
+- Added the same revalidation surface for issued node-service authorization
+  tokens, so non-PG node work can re-check authority incarnation, epoch, node
+  incarnation, and both captured and current lease deadlines before completing.
+- Added an explicit metadata proof to current-epoch PG heartbeat observations.
+  Peering completion now requires every currently serving acting-set member that
+  participates in the transition to report `Peering` with the same applied
+  metadata log index/hash/state digest before the authority can persist
+  `Active`. This is the first control-plane hook for durable command-log
+  reconstruction proof; later repair/backfill work can replace the placeholder
+  proof source with storage-node computed replica state. The persisted
+  control-plane state format now writes this proof as version 5 while preserving
+  read compatibility for version 4 PG observations by treating missing proof
+  fields as the empty proof.
 
 Exit criteria:
 

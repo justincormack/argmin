@@ -360,6 +360,7 @@ pub struct NodePgObservationRecord {
     state: PgState,
     observed_epoch: ClusterEpoch,
     observed_at_ms: u64,
+    metadata_proof: PgMetadataProof,
 }
 
 impl NodePgObservationRecord {
@@ -382,12 +383,36 @@ impl NodePgObservationRecord {
     pub fn observed_at_ms(&self) -> u64 {
         self.observed_at_ms
     }
+
+    #[must_use]
+    pub fn metadata_proof(&self) -> PgMetadataProof {
+        self.metadata_proof
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodePgHeartbeatObservation {
     pub pg_id: PgId,
     pub state: PgState,
+    pub metadata_proof: PgMetadataProof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgMetadataProof {
+    pub applied_log_index: u64,
+    pub applied_log_hash: u64,
+    pub state_digest: u64,
+}
+
+impl PgMetadataProof {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            applied_log_index: 0,
+            applied_log_hash: 0,
+            state_digest: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +573,18 @@ impl PgPrimaryAuthorization {
     #[must_use]
     pub fn lease_deadline_ms(&self) -> u64 {
         self.lease_deadline_ms
+    }
+}
+
+impl From<PgPrimaryAuthorization> for NodeServiceAuthorization {
+    fn from(authorization: PgPrimaryAuthorization) -> Self {
+        Self {
+            authority_incarnation: authorization.authority_incarnation,
+            cluster_epoch: authorization.cluster_epoch,
+            node_id: authorization.primary_node_id,
+            node_incarnation: authorization.primary_node_incarnation,
+            lease_deadline_ms: authorization.lease_deadline_ms,
+        }
     }
 }
 
@@ -984,6 +1021,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                         state: observation.state,
                         observed_epoch: heartbeat.observed_epoch,
                         observed_at_ms: heartbeat.now_ms,
+                        metadata_proof: observation.metadata_proof,
                     },
                 );
             }
@@ -1118,6 +1156,70 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         })
     }
 
+    pub fn validate_node_service_authorization(
+        &self,
+        authorization: &NodeServiceAuthorization,
+        now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        if authorization.authority_incarnation() != self.snapshot.authority_incarnation {
+            return Err(ControlPlaneError::StaleAuthorityIncarnation {
+                authority_incarnation: authorization.authority_incarnation(),
+                current_authority_incarnation: self.snapshot.authority_incarnation,
+            });
+        }
+        if authorization.cluster_epoch() != self.snapshot.cluster_epoch {
+            return Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch: authorization.cluster_epoch(),
+                current_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        if authorization.lease_deadline_ms() <= now_ms {
+            return Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: authorization.node_id().as_u32(),
+                now_ms,
+                lease_deadline_ms: Some(authorization.lease_deadline_ms()),
+            });
+        }
+
+        let node_id = authorization.node_id();
+        let record = self
+            .snapshot
+            .nodes
+            .get(&node_id)
+            .ok_or(ControlPlaneError::UnknownNode {
+                node_id: node_id.as_u32(),
+            })?;
+        if record.node_incarnation != authorization.node_incarnation() {
+            return Err(ControlPlaneError::NodeIncarnationMismatch {
+                node_id: node_id.as_u32(),
+                sender_incarnation: authorization.node_incarnation(),
+                current_incarnation: record.node_incarnation,
+            });
+        }
+        if !record.can_serve_primary(self.snapshot.cluster_epoch) {
+            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: node_id.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        let current_lease_deadline_ms =
+            record
+                .lease_deadline_ms
+                .ok_or(ControlPlaneError::NodeLeaseExpired {
+                    node_id: node_id.as_u32(),
+                    now_ms,
+                    lease_deadline_ms: None,
+                })?;
+        if current_lease_deadline_ms <= now_ms {
+            return Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: node_id.as_u32(),
+                now_ms,
+                lease_deadline_ms: Some(current_lease_deadline_ms),
+            });
+        }
+        Ok(())
+    }
+
     pub fn authorize_pg_primary_service(
         &self,
         pg_id: PgId,
@@ -1208,63 +1310,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 actual: authorization.operation(),
             });
         }
-        if authorization.authority_incarnation() != self.snapshot.authority_incarnation {
-            return Err(ControlPlaneError::StaleAuthorityIncarnation {
-                authority_incarnation: authorization.authority_incarnation(),
-                current_authority_incarnation: self.snapshot.authority_incarnation,
-            });
-        }
-        if authorization.cluster_epoch() != self.snapshot.cluster_epoch {
-            return Err(ControlPlaneError::StaleAuthorizationEpoch {
-                cluster_epoch: authorization.cluster_epoch(),
-                current_epoch: self.snapshot.cluster_epoch,
-            });
-        }
-        if authorization.lease_deadline_ms() <= now_ms {
-            return Err(ControlPlaneError::NodeLeaseExpired {
-                node_id: authorization.primary_node_id().as_u32(),
-                now_ms,
-                lease_deadline_ms: Some(authorization.lease_deadline_ms()),
-            });
-        }
+        self.validate_node_service_authorization(&authorization.primary().into(), now_ms)?;
 
         let primary_node_id = authorization.primary_node_id();
-        let record =
-            self.snapshot
-                .nodes
-                .get(&primary_node_id)
-                .ok_or(ControlPlaneError::UnknownNode {
-                    node_id: primary_node_id.as_u32(),
-                })?;
-        if record.node_incarnation != authorization.primary_node_incarnation() {
-            return Err(ControlPlaneError::NodeIncarnationMismatch {
-                node_id: primary_node_id.as_u32(),
-                sender_incarnation: authorization.primary_node_incarnation(),
-                current_incarnation: record.node_incarnation,
-            });
-        }
-        if !record.can_serve_primary(self.snapshot.cluster_epoch) {
-            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
-                node_id: primary_node_id.as_u32(),
-                cluster_epoch: self.snapshot.cluster_epoch,
-            });
-        }
-        let current_lease_deadline_ms =
-            record
-                .lease_deadline_ms
-                .ok_or(ControlPlaneError::NodeLeaseExpired {
-                    node_id: primary_node_id.as_u32(),
-                    now_ms,
-                    lease_deadline_ms: None,
-                })?;
-        if current_lease_deadline_ms <= now_ms {
-            return Err(ControlPlaneError::NodeLeaseExpired {
-                node_id: primary_node_id.as_u32(),
-                now_ms,
-                lease_deadline_ms: Some(current_lease_deadline_ms),
-            });
-        }
-
         let pg_id = authorization.pg_id();
         let pg = self
             .snapshot
@@ -1459,6 +1507,17 @@ pub enum ControlPlaneError {
     },
 
     #[error(
+        "node {node_id} reported PG {pg_id} metadata proof {actual:?} in cluster epoch {cluster_epoch}, expected {expected:?}"
+    )]
+    PgPeeringMetadataProofMismatch {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        expected: PgMetadataProof,
+        actual: PgMetadataProof,
+    },
+
+    #[error(
         "PG {pg_id} primary node {node_id} has not reported active state in cluster epoch {cluster_epoch}"
     )]
     PgPrimaryMissingActiveObservation {
@@ -1536,7 +1595,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=4\n");
+    out.push_str("version=5\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -1610,12 +1669,15 @@ fn format_pg_record(record: &PgControlRecord) -> String {
 
 fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
     format!(
-        "{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{}",
         node_id.as_u32(),
         record.pg_id.get(),
         pg_state_as_str(record.state),
         record.observed_epoch.get(),
-        record.observed_at_ms
+        record.observed_at_ms,
+        record.metadata_proof.applied_log_index,
+        record.metadata_proof.applied_log_hash,
+        record.metadata_proof.state_digest
     )
 }
 
@@ -1683,14 +1745,18 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
                 return Err(parse_error(line_number, "duplicate history node record"));
             }
         } else if let Some(value) = line.strip_prefix("history_node_pg=") {
-            if matches!(version, Some(2 | 3)) {
+            let state_version = version.ok_or_else(|| {
+                parse_error(line_number, "version must precede PG observation records")
+            })?;
+            if matches!(state_version, 2 | 3) {
                 return Err(parse_error(
                     line_number,
                     "PG observation records require control-plane state version 4",
                 ));
             }
             parsed_pg_observations = true;
-            let (epoch, node_id, observation) = parse_history_node_pg_record(line_number, value)?;
+            let (epoch, node_id, observation) =
+                parse_history_node_pg_record(line_number, value, state_version)?;
             let history_record = history.get_mut(&epoch).ok_or_else(|| {
                 parse_error(line_number, "history node PG references unknown epoch")
             })?;
@@ -1738,14 +1804,17 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
                 return Err(parse_error(line_number, "duplicate node record"));
             }
         } else if let Some(value) = line.strip_prefix("node_pg=") {
-            if matches!(version, Some(2 | 3)) {
+            let state_version = version.ok_or_else(|| {
+                parse_error(line_number, "version must precede PG observation records")
+            })?;
+            if matches!(state_version, 2 | 3) {
                 return Err(parse_error(
                     line_number,
                     "PG observation records require control-plane state version 4",
                 ));
             }
             parsed_pg_observations = true;
-            let (node_id, observation) = parse_node_pg_record(line_number, value)?;
+            let (node_id, observation) = parse_node_pg_record(line_number, value, state_version)?;
             let node = nodes
                 .get_mut(&node_id)
                 .ok_or_else(|| parse_error(line_number, "node PG references unknown node"))?;
@@ -1771,7 +1840,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if !matches!(version, 2..=4) {
+    if !matches!(version, 2..=5) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -1972,13 +2041,14 @@ fn parse_history_node_record(
 fn parse_history_node_pg_record(
     line: usize,
     value: &str,
+    state_version: u64,
 ) -> Result<(ClusterEpoch, NodeId, NodePgObservationRecord), ControlPlaneError> {
     let (epoch, record) = value
         .split_once(',')
         .ok_or_else(|| parse_error(line, "history node PG record must start with epoch"))?;
     let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history node PG epoch")?)
         .ok_or_else(|| parse_error(line, "history node PG epoch must be nonzero"))?;
-    let (node_id, record) = parse_node_pg_record(line, record)?;
+    let (node_id, record) = parse_node_pg_record(line, record, state_version)?;
     Ok((epoch, node_id, record))
 }
 
@@ -1997,13 +2067,29 @@ fn parse_history_pg_record(
 fn parse_node_pg_record(
     line: usize,
     value: &str,
+    state_version: u64,
 ) -> Result<(NodeId, NodePgObservationRecord), ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 5 {
-        return Err(parse_error(
-            line,
-            "node PG observation record must have five fields",
-        ));
+    match (state_version, fields.len()) {
+        (4, 5) | (5, 8) => {}
+        (4, _) => {
+            return Err(parse_error(
+                line,
+                "version 4 node PG observation record must have five fields",
+            ));
+        }
+        (5, _) => {
+            return Err(parse_error(
+                line,
+                "version 5 node PG observation record must have eight fields",
+            ));
+        }
+        _ => {
+            return Err(parse_error(
+                line,
+                "PG observation records require control-plane state version 4",
+            ));
+        }
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
     let pg_id = PgId::new(parse_u32(line, fields[1], "PG id")?);
@@ -2011,6 +2097,15 @@ fn parse_node_pg_record(
     let observed_epoch = ClusterEpoch::new(parse_u64(line, fields[3], "observed epoch")?)
         .ok_or_else(|| parse_error(line, "observed epoch must be nonzero"))?;
     let observed_at_ms = parse_u64(line, fields[4], "observed at")?;
+    let metadata_proof = if state_version >= 5 {
+        PgMetadataProof {
+            applied_log_index: parse_u64(line, fields[5], "applied log index")?,
+            applied_log_hash: parse_u64(line, fields[6], "applied log hash")?,
+            state_digest: parse_u64(line, fields[7], "state digest")?,
+        }
+    } else {
+        PgMetadataProof::empty()
+    };
     Ok((
         node_id,
         NodePgObservationRecord {
@@ -2018,6 +2113,7 @@ fn parse_node_pg_record(
             state,
             observed_epoch,
             observed_at_ms,
+            metadata_proof,
         },
     ))
 }
@@ -2165,6 +2261,7 @@ fn validate_pg_peering_observations(
     acting_set: &[NodeId],
     now_ms: u64,
 ) -> Result<(), ControlPlaneError> {
+    let mut expected_proof = None;
     for node_id in acting_set {
         let Some(node) = snapshot.nodes.get(node_id) else {
             return Err(ControlPlaneError::UnknownActingSetNode {
@@ -2200,6 +2297,19 @@ fn validate_pg_peering_observations(
                 cluster_epoch: snapshot.cluster_epoch,
                 state: observation.state,
             });
+        }
+        match expected_proof {
+            Some(expected) if observation.metadata_proof != expected => {
+                return Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                    pg_id: pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                    expected,
+                    actual: observation.metadata_proof,
+                });
+            }
+            Some(_) => {}
+            None => expected_proof = Some(observation.metadata_proof),
         }
     }
     Ok(())
@@ -2490,6 +2600,7 @@ mod tests {
         heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(pg_id),
             state,
+            metadata_proof: PgMetadataProof::empty(),
         }];
         authority.heartbeat(heartbeat).unwrap()
     }
@@ -2728,7 +2839,7 @@ mod tests {
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,peering,2,100\n",
+                "node_pg=1,7,peering,2,100,0,0,0\n",
                 "pg=7,peering,1\n",
             ),
         )
@@ -2748,12 +2859,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=4\n",
+                "version=5\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node=2,active,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
-                "node_pg=2,7,peering,2,100\n",
+                "node_pg=2,7,peering,2,100,0,0,0\n",
                 "pg=7,peering,1\n",
             ),
         )
@@ -2773,11 +2884,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=4\n",
+                "version=5\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,peering,2,100\n",
+                "node_pg=1,7,peering,2,100,0,0,0\n",
                 "pg=7,peering,1\n",
             ),
         )
@@ -2788,6 +2899,32 @@ mod tests {
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "node PG observation epoch must match current cluster epoch"
         ));
+    }
+
+    #[test]
+    fn file_backed_authority_loads_version_four_pg_observations_without_metadata_proof() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=4\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node_pg=1,7,peering,2,100\n",
+                "pg=7,peering,1\n",
+            ),
+        )
+        .unwrap();
+        let snapshot = FileControlPlaneStore::new(path).load().unwrap().unwrap();
+        let observation = snapshot
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(7))
+            .unwrap();
+        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(observation.metadata_proof(), PgMetadataProof::empty());
     }
 
     #[test]
@@ -3283,30 +3420,33 @@ mod tests {
         let serving = heartbeat_until_serving(&mut authority, 1, 100);
         assert!(serving.serving());
         let record = authority.snapshot().node(NodeId::new(1)).unwrap();
+        let node_incarnation = record.node_incarnation();
+        let lease_deadline_ms = record.lease_deadline_ms().unwrap();
 
         let authorized = authority
             .authorize_node_service(
                 NodeId::new(1),
-                record.node_incarnation(),
+                node_incarnation,
                 serving.cluster_epoch(),
                 150,
             )
             .unwrap();
         assert_eq!(authorized.node_id(), NodeId::new(1));
+        assert_eq!(authorized.node_incarnation(), node_incarnation);
         assert_eq!(authorized.cluster_epoch(), serving.cluster_epoch());
         assert_eq!(
             authorized.authority_incarnation(),
             authority.snapshot().authority_incarnation()
         );
-        assert_eq!(
-            authorized.lease_deadline_ms(),
-            record.lease_deadline_ms().unwrap()
-        );
+        assert_eq!(authorized.lease_deadline_ms(), lease_deadline_ms);
+        authority
+            .validate_node_service_authorization(&authorized, 151)
+            .unwrap();
 
         assert!(matches!(
             authority.authorize_node_service(
                 NodeId::new(1),
-                record.node_incarnation() + 1,
+                node_incarnation + 1,
                 serving.cluster_epoch(),
                 150,
             ),
@@ -3315,7 +3455,7 @@ mod tests {
         assert!(matches!(
             authority.authorize_node_service(
                 NodeId::new(1),
-                record.node_incarnation(),
+                node_incarnation,
                 ClusterEpoch::INITIAL,
                 150,
             ),
@@ -3324,11 +3464,29 @@ mod tests {
         assert!(matches!(
             authority.authorize_node_service(
                 NodeId::new(1),
-                record.node_incarnation(),
+                node_incarnation,
                 serving.cluster_epoch(),
-                record.lease_deadline_ms().unwrap(),
+                lease_deadline_ms,
             ),
             Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
+        ));
+        assert!(matches!(
+            authority.validate_node_service_authorization(&authorized, lease_deadline_ms),
+            Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
+        ));
+
+        let mut shorter_lease =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 152);
+        shorter_lease.lease_duration_ms = 5;
+        authority.heartbeat(shorter_lease).unwrap();
+        assert!(authorized.lease_deadline_ms() > 157);
+        assert!(matches!(
+            authority.validate_node_service_authorization(&authorized, 157),
+            Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: 1,
+                lease_deadline_ms: Some(157),
+                ..
+            })
         ));
     }
 
@@ -3605,6 +3763,7 @@ mod tests {
         shorter_lease.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(17),
             state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
         }];
         authority.heartbeat(shorter_lease).unwrap();
         assert!(authorization.lease_deadline_ms() > 3_066);
@@ -3686,6 +3845,11 @@ mod tests {
         heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(15),
             state: PgState::Peering,
+            metadata_proof: PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 10,
+                state_digest: 11,
+            },
         }];
         authority.heartbeat(heartbeat).unwrap();
 
@@ -3702,16 +3866,102 @@ mod tests {
             authority.snapshot().cluster_epoch()
         );
         assert_eq!(observation.observed_at_ms(), 2_000);
-        let persisted = store.load().unwrap().unwrap();
         assert_eq!(
-            persisted
-                .node(NodeId::new(1))
-                .unwrap()
-                .pg_observation(PgId::new(15))
-                .unwrap()
-                .state(),
-            PgState::Peering
+            observation.metadata_proof(),
+            PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 10,
+                state_digest: 11,
+            }
         );
+        let persisted = store.load().unwrap().unwrap();
+        let persisted_observation = persisted
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(15))
+            .unwrap();
+        assert_eq!(persisted_observation.state(), PgState::Peering);
+        assert_eq!(
+            persisted_observation.metadata_proof(),
+            PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 10,
+                state_digest: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn complete_pg_peering_requires_matching_metadata_proofs() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(19), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        let matching_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let different_proof = PgMetadataProof {
+            applied_log_index: 41,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        for (node_id, metadata_proof) in [(1, matching_proof), (2, different_proof)] {
+            let mut heartbeat = heartbeat_from_record(
+                &authority,
+                node_id,
+                authority.snapshot().cluster_epoch(),
+                2_000 + u64::from(node_id),
+            );
+            heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: PgId::new(19),
+                state: PgState::Peering,
+                metadata_proof,
+            }];
+            authority.heartbeat(heartbeat).unwrap();
+        }
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(19),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                pg_id: 19,
+                node_id: 2,
+                expected,
+                actual,
+                ..
+            }) if expected == matching_proof && actual == different_proof
+        ));
+
+        let mut heartbeat =
+            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 2_060);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Peering,
+            metadata_proof: matching_proof,
+        }];
+        authority.heartbeat(heartbeat).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(19),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_070,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -3737,6 +3987,7 @@ mod tests {
         stale.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(16),
             state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
         }];
         let response = authority.heartbeat(stale).unwrap();
         assert!(!response.serving());
@@ -3769,10 +4020,12 @@ mod tests {
             NodePgHeartbeatObservation {
                 pg_id: PgId::new(17),
                 state: PgState::Peering,
+                metadata_proof: PgMetadataProof::empty(),
             },
             NodePgHeartbeatObservation {
                 pg_id: PgId::new(17),
                 state: PgState::Peering,
+                metadata_proof: PgMetadataProof::empty(),
             },
         ];
         assert!(matches!(
@@ -3788,6 +4041,7 @@ mod tests {
         unknown.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(99),
             state: PgState::Peering,
+            metadata_proof: PgMetadataProof::empty(),
         }];
         assert!(matches!(
             authority.heartbeat(unknown),
@@ -3799,6 +4053,7 @@ mod tests {
         wrong_node.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(17),
             state: PgState::Peering,
+            metadata_proof: PgMetadataProof::empty(),
         }];
         assert!(matches!(
             authority.heartbeat(wrong_node),
@@ -3826,6 +4081,7 @@ mod tests {
         heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(18),
             state: PgState::Peering,
+            metadata_proof: PgMetadataProof::empty(),
         }];
         authority.heartbeat(heartbeat).unwrap();
         assert!(authority
