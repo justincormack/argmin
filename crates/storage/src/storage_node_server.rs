@@ -674,6 +674,18 @@ impl StorageNodeServer {
         }
     }
 
+    pub fn control_plane_heartbeat(
+        &self,
+        node_incarnation: u64,
+        requested_lease_duration_ms: u64,
+    ) -> Result<NodeHeartbeat, StorageNodeServerError> {
+        self.config.control_plane_heartbeat(
+            &self._node,
+            node_incarnation,
+            requested_lease_duration_ms,
+        )
+    }
+
     fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
         let session_guard = self.acquire_session();
         let (mut stream, _) =
@@ -8106,6 +8118,43 @@ mod tests {
             config.control_plane_heartbeat(&node, 12, 2_000),
             Err(StorageNodeServerError::SocketPathNotUtf8 { path }) if path == config.socket_path
         ));
+    }
+
+    #[test]
+    fn storage_node_server_builds_control_plane_heartbeat() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let heartbeat = server.control_plane_heartbeat(12, 2_000).unwrap();
+
+        assert_eq!(heartbeat.node_id, config.node_id);
+        assert_eq!(heartbeat.node_incarnation, 12);
+        assert_eq!(heartbeat.endpoint, config.socket_path.to_str().unwrap());
+        assert_eq!(heartbeat.observed_epoch, config.cluster_epoch);
+        assert_eq!(heartbeat.requested_lease_duration_ms, 2_000);
+        assert_eq!(heartbeat.pg_observations.len(), 1);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Active);
+        let metadata_state = {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.metadata_command_replica_state().unwrap()
+        };
+        assert_eq!(
+            heartbeat.pg_observations[0]
+                .metadata_proof
+                .applied_log_index,
+            metadata_state.applied_log_index
+        );
+        assert_eq!(
+            heartbeat.pg_observations[0].metadata_proof.applied_log_hash,
+            metadata_state.applied_log_hash
+        );
+        assert_eq!(
+            heartbeat.pg_observations[0].metadata_proof.state_digest,
+            metadata_state.state_digest
+        );
     }
 
     #[test]

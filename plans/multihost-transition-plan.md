@@ -7135,6 +7135,9 @@ Status:
   heartbeat from the installed PG routes and local durable PG state, rejecting
   route epoch mismatches and non-UTF8 endpoints instead of advertising stale PG
   state or a lossy route identity.
+- Exposed the same heartbeat construction from a running `StorageNodeServer`, so
+  the future heartbeat loop can use the server's installed config and opened
+  local PG stores directly instead of reconstructing process state externally.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary
