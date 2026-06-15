@@ -386,6 +386,17 @@ pub enum ShardIoError {
         current_epoch: ClusterEpoch,
     },
 
+    #[error(
+        "runtime route map for shard operation on local node {node_id} PG {pg_id} epoch {cluster_epoch} expired at {valid_until_ms}; current time is {now_ms}"
+    )]
+    RouteMapExpired {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        valid_until_ms: u64,
+        now_ms: u64,
+    },
+
     #[error("shard location references unknown local node {node_id} for PG {pg_id} in epoch {cluster_epoch}")]
     NodeNotFound {
         node_id: u32,
@@ -654,6 +665,16 @@ pub enum ClusterBuildError {
         pg_id: u32,
         operation_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "runtime route map for payload placement PG {pg_id} epoch {cluster_epoch} expired at {valid_until_ms}; current time is {now_ms}"
+    )]
+    RouteMapExpired {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        valid_until_ms: u64,
+        now_ms: u64,
     },
 
     #[error("PG {pg_id} is not present in cluster epoch {cluster_epoch}")]

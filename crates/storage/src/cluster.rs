@@ -7025,6 +7025,16 @@ fn cluster_build_error_to_store(error: ClusterBuildError) -> StoreError {
             operation_epoch,
             current_epoch,
         },
+        ClusterBuildError::RouteMapExpired {
+            pg_id: _,
+            cluster_epoch,
+            valid_until_ms,
+            now_ms,
+        } => StoreError::RouteMapExpired {
+            cluster_epoch,
+            valid_until_ms,
+            now_ms,
+        },
         other => StoreError::Io {
             context: "place payload shards",
             source: std::io::Error::other(other.to_string()),
@@ -7066,6 +7076,17 @@ fn shard_io_error_to_store(error: ShardIoError) -> StoreError {
             pg_id,
             location_epoch,
             current_epoch,
+        },
+        ShardIoError::RouteMapExpired {
+            node_id: _,
+            pg_id: _,
+            cluster_epoch,
+            valid_until_ms,
+            now_ms,
+        } => StoreError::RouteMapExpired {
+            cluster_epoch,
+            valid_until_ms,
+            now_ms,
         },
         ShardIoError::NodeNotFound {
             node_id,

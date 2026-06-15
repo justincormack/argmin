@@ -1590,6 +1590,44 @@ impl LocalClusterMap {
         self.require_route_map_valid_at(crate::clock::current_time_millis())
     }
 
+    fn require_route_map_valid_now_for_placement(
+        &self,
+        pg_id: PgId,
+    ) -> Result<(), ClusterBuildError> {
+        let now_ms = crate::clock::current_time_millis();
+        match self.route_map_valid_until_ms {
+            Some(valid_until_ms) if valid_until_ms <= now_ms => {
+                Err(ClusterBuildError::RouteMapExpired {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.epoch,
+                    valid_until_ms,
+                    now_ms,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn require_route_map_valid_now_for_shard_io(
+        &self,
+        pg_id: PgId,
+        node_id: NodeId,
+    ) -> Result<(), ShardIoError> {
+        let now_ms = crate::clock::current_time_millis();
+        match self.route_map_valid_until_ms {
+            Some(valid_until_ms) if valid_until_ms <= now_ms => {
+                Err(ShardIoError::RouteMapExpired {
+                    node_id: node_id.as_u32(),
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.epoch,
+                    valid_until_ms,
+                    now_ms,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn metadata_primary_node_id(&self) -> NodeId {
         self.metadata_primary_node_id
     }
@@ -3067,6 +3105,7 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
+        self.require_route_map_valid_now_for_placement(pg_id)?;
         Ok(())
     }
 
@@ -3093,6 +3132,7 @@ impl LocalClusterMap {
         pg_id: PgId,
         node_id: NodeId,
     ) -> Result<&LocalPgRoute, ShardIoError> {
+        self.require_route_map_valid_now_for_shard_io(pg_id, node_id)?;
         let route = self.pg_routes.get(&pg_id).ok_or(ShardIoError::PgNotFound {
             node_id: node_id.as_u32(),
             pg_id: pg_id.get(),
@@ -41835,6 +41875,100 @@ mod tests {
                 current_epoch,
             } if operation_epoch == ClusterEpoch::new(2).unwrap()
                 && current_epoch == ClusterEpoch::INITIAL
+        ));
+    }
+
+    #[test]
+    fn expired_route_maps_reject_payload_placement_and_shard_io() {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        let data_pg_id = DataPgId::new(PgId::new(0));
+        map.route_map_valid_until_ms =
+            Some(crate::clock::current_time_millis().saturating_add(60_000));
+
+        let location = map
+            .place_payload_shards(ClusterEpoch::INITIAL, data_pg_id, ec_shape, b"payload-key")
+            .unwrap()[0];
+        let key = ShardKey::new(&[61; 16], 1, location.shard_index().get());
+        let ack = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, b"payload")
+            .unwrap();
+        assert_eq!(
+            map.read_payload_shard(ClusterEpoch::INITIAL, location, &key, ack)
+                .unwrap(),
+            b"payload"
+        );
+
+        let expired_at = crate::clock::current_time_millis();
+        map.route_map_valid_until_ms = Some(expired_at);
+        let err = map
+            .place_payload_shards(ClusterEpoch::INITIAL, data_pg_id, ec_shape, b"payload-key")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterBuildError::RouteMapExpired {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if valid_until_ms == expired_at && now_ms >= expired_at
+        ));
+
+        let err = map
+            .write_payload_shard(ClusterEpoch::INITIAL, location, &key, b"blocked")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShardIoError::RouteMapExpired {
+                node_id,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if node_id == location.node_id().as_u32()
+                && valid_until_ms == expired_at
+                && now_ms >= expired_at
+        ));
+
+        let err = map
+            .read_payload_shard(ClusterEpoch::INITIAL, location, &key, ack)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShardIoError::RouteMapExpired {
+                node_id,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if node_id == location.node_id().as_u32()
+                && valid_until_ms == expired_at
+                && now_ms >= expired_at
+        ));
+
+        let err = map
+            .delete_payload_shard(ClusterEpoch::INITIAL, location, &key)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShardIoError::RouteMapExpired {
+                node_id,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms,
+                now_ms,
+            } if node_id == location.node_id().as_u32()
+                && valid_until_ms == expired_at
+                && now_ms >= expired_at
         ));
     }
 

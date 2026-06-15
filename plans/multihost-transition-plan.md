@@ -7174,6 +7174,8 @@ Status:
 - Wired the runtime-map validity bound into metadata PG routing. Expired
   control-plane-derived maps now fail closed before selecting metadata
   primaries, acting sets, or accepting replica metadata commands.
+- Wired the same validity bound into payload placement and shard IO routing, so
+  expired maps cannot keep placing, writing, reading, or deleting payload shards.
 - Added the first direct authority-to-local-runtime install bridge. A frontend
   topology-only `LocalClusterMap` can now be built from a
   `ClusterRuntimeMapSnapshot`, preserving the authority epoch, all exported PG
