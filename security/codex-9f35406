@@ -1,0 +1,140 @@
+Control-plane nodes can self-issue unbounded leases
+Link: https://chatgpt.com/codex/cloud/security/findings/383c26685b5c8191b816568ba676d2ec?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 9f35406
+Author: justin@specialbusservice.com
+Created: 15/06/2026, 12:53:57
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit [`f5324608d187cf81c6fcf605e220d3c03125bdc7`](https://github.com/justincormack/argmin/commit/f5324608d187cf81c6fcf605e220d3c03125bdc7) (`Bound control-plane heartbeat leases`).
+
+The control-plane authority now owns heartbeat time: `NodeHeartbeat` no longer carries caller-supplied `now_ms`, and `SingleAuthorityControlPlane::heartbeat` takes an authority-provided timestamp when issuing leases. Heartbeat lease duration is now an explicit request capped by `MAX_HEARTBEAT_LEASE_MS`, with overlong requests rejected. Primary serving and deterministic primary selection now require an unexpired lease at the supplied authority time, and regression tests cover both overlong lease rejection and expired-lease primary exclusion.
+
+Verification for the fix:
+- `cargo test -p storage control_plane -- --nocapture`
+- `cargo clippy -p storage --all-targets --all-features -- -D warnings`
+- `git diff --check`
+
+# Summary
+Introduced: the new `control_plane` module trusts heartbeat-provided timestamps and durations and does not enforce lease expiry when deciding whether a node can serve as primary.
+The commit introduces `NodeHeartbeat` with caller-controlled `now_ms` and `lease_duration_ms`. `SingleAuthorityControlPlane::heartbeat` computes the lease deadline directly from those values, only rejecting zero duration or arithmetic overflow, then persists and returns that deadline. There is no authority-side clock use, configured maximum lease duration, or expiry check in `NodeControlRecord::can_serve_primary` / `deterministic_pg_primary`. As a result, a node that can send heartbeats for a registered node ID can request a very large lease deadline and continue to be considered healthy/current-epoch for primary selection after it should have expired. In a multihost deployment this undermines the lease/fencing invariant and can permit stale primaries or split-brain writes, risking object/metadata corruption and availability loss. The currently checked-out S3 binary does not appear to expose this module over HTTP yet, but the committed control-plane primitive itself is unsafe for its intended authority role.
+
+# Validation
+## Rubric
+- [x] Confirm `NodeHeartbeat` lets the heartbeat caller provide both timestamp and lease duration.
+- [x] Confirm `heartbeat` computes and stores the lease deadline from those caller-controlled values with no authority clock or maximum lease duration.
+- [x] Confirm huge non-overflowing durations are accepted.
+- [x] Confirm `can_serve_primary` and `deterministic_pg_primary` have no deadline/current-time expiry check.
+- [x] Demonstrate dynamically that an already-expired-looking deadline can still produce `serving=true` and primary selection.
+## Report
+Validated the finding against commit 9f354065d280203c01847c4ba05bc83dcbe66542. Static review of crates/storage/src/control_plane.rs confirms NodeHeartbeat exposes caller-controlled now_ms and lease_duration_ms at lines 237-243; heartbeat computes lease_deadline_ms as heartbeat.now_ms.checked_add(heartbeat.lease_duration_ms) and only rejects zero/overflow at lines 464-470; it persists last_heartbeat_ms and lease_deadline_ms directly at lines 526-528; can_serve_primary checks only membership, Healthy availability, and observed epoch at lines 182-186; deterministic_pg_primary delegates to can_serve_primary with no current-time or deadline parameter at lines 548-555. Dynamic PoC was added as crates/storage/tests/control_plane_lease_poc.rs and run with `cargo test -p storage --test control_plane_lease_poc -- --nocapture --test-threads=1`. Output showed: `lease_deadline_ms=1 serving=true selected_primary=Some(NodeId(42))`, proving a node with a caller-supplied 1ms deadline is still considered serving and selected as primary. The same PoC showed `requested_now_ms=1000 requested_duration_ms=18446744073709550615 accepted_deadline_ms=18446744073709551615`, proving lease duration is capped only by u64 overflow, not by authority policy. LLDB was used non-interactively on the test binary; at control_plane.rs:471 it showed heartbeat.now_ms=0, heartbeat.lease_duration_ms=1, and computed lease_deadline_ms=1 on both heartbeats, with the call stack entering from the PoC. Valgrind was attempted but is not installed in the container (`bash: command not found: valgrind`). No native memory crash is expected because this is an authorization/lease-fencing logic flaw, not memory corruption.
+
+# Evidence
+crates/storage/src/control_plane.rs (L182 to 186)
+  Note: `can_serve_primary` checks membership, availability, and observed epoch but does not check whether `lease_deadline_ms` has expired.
+```
+    fn can_serve_primary(&self, cluster_epoch: ClusterEpoch) -> bool {
+        self.membership.can_serve_primary()
+            && self.availability == NodeAvailabilityState::Healthy
+            && self.last_observed_epoch == Some(cluster_epoch)
+    }
+```
+
+crates/storage/src/control_plane.rs (L237 to 243)
+  Note: `NodeHeartbeat` exposes both `now_ms` and `lease_duration_ms` as caller-provided fields, making the authority depend on node-supplied time and requested lease length.
+```
+pub struct NodeHeartbeat {
+    pub node_id: NodeId,
+    pub node_incarnation: u64,
+    pub endpoint: String,
+    pub observed_epoch: ClusterEpoch,
+    pub now_ms: u64,
+    pub lease_duration_ms: u64,
+```
+
+crates/storage/src/control_plane.rs (L464 to 470)
+  Note: The heartbeat path only rejects zero lease duration and arithmetic overflow; it computes the deadline from untrusted heartbeat fields with no authority-side clock or maximum duration.
+```
+        if heartbeat.lease_duration_ms == 0 {
+            return Err(ControlPlaneError::InvalidLeaseDuration);
+        }
+        let lease_deadline_ms = heartbeat
+            .now_ms
+            .checked_add(heartbeat.lease_duration_ms)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+```
+
+crates/storage/src/control_plane.rs (L526 to 528)
+  Note: The authority persists the node-supplied heartbeat time and derived lease deadline, allowing arbitrarily long valid-looking leases to be stored.
+```
+            record.last_observed_epoch = Some(heartbeat.observed_epoch);
+            record.last_heartbeat_ms = Some(heartbeat.now_ms);
+            record.lease_deadline_ms = Some(lease_deadline_ms);
+```
+
+crates/storage/src/control_plane.rs (L548 to 555)
+  Note: `deterministic_pg_primary` delegates to `can_serve_primary` and has no current-time parameter or lease-expiration enforcement, so expired leases do not prevent primary selection.
+```
+    #[must_use]
+    pub fn deterministic_pg_primary(&self, _pg_id: PgId, acting_set: &[NodeId]) -> Option<NodeId> {
+        acting_set.iter().copied().find(|node_id| {
+            self.snapshot
+                .nodes
+                .get(node_id)
+                .is_some_and(|record| record.can_serve_primary(self.snapshot.cluster_epoch))
+        })
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from high to ignore for current-scope security triage. The code-level claim is valid and validated, but the high severity depends on a future multihost control-plane exposure. Repository evidence shows argmin-s3 starts only existing roles, remote routing is static/configuration-based, storage nodes bind private Unix sockets, and grep found no current call path from HTTP or storage RPC into SingleAuthorityControlPlane/NodeHeartbeat. Without an in-scope attacker-reachable surface, the current probability is effectively zero even though the future-design impact would be serious.
+## Likelihood
+ignore - Direct exploitation is not possible from the current argmin-s3 HTTP server or storage-node Unix RPC because SingleAuthorityControlPlane::heartbeat is not wired into any runtime entrypoint. Exploitation would require future integration or an out-of-repository caller.
+## Impact
+ignore - The primitive could have high integrity/availability impact if later used as the authoritative multihost lease/fencing mechanism, because stale primary selection can corrupt object metadata or availability. In this checkout, no current runtime path uses it, so there is no demonstrated current product impact.
+## Assumptions
+- The in-scope deployed product is the argmin-s3 runtime and workspace code as currently wired in this checkout, not hypothetical future consumers of the public storage crate API.
+- No out-of-repository deployment wrapper or custom RPC service exposes crates/storage/src/control_plane.rs.
+- Repository artifacts are authoritative for exposure; no Kubernetes, Terraform, Docker, or ingress manifests were present in the checkout.
+- A caller must be able to invoke SingleAuthorityControlPlane::heartbeat with a registered node_id.
+- The new control_plane module must be integrated into a live control-plane RPC or process path.
+- The affected node must have Active or Draining membership and report the current cluster epoch.
+- For material impact, multihost primary selection must rely on deterministic_pg_primary/can_serve_primary.
+## Path
+Current: attacker/client -> argmin-s3 HTTP/storage paths -X-> control_plane::heartbeat
+Future-only: registered node -> heartbeat(now_ms,duration) -> stored unbounded lease -> primary selection without expiry -> stale primary/split brain
+## Path evidence
+- `crates/storage/src/control_plane.rs:237-243` - NodeHeartbeat exposes caller-controlled now_ms and lease_duration_ms.
+- `crates/storage/src/control_plane.rs:464-470` - heartbeat rejects only zero duration and arithmetic overflow, then computes the deadline from caller-provided fields.
+- `crates/storage/src/control_plane.rs:526-528` - The authority persists the caller-supplied heartbeat time and derived lease deadline.
+- `crates/storage/src/control_plane.rs:182-186` - can_serve_primary checks membership, Healthy availability, and observed epoch but not lease expiry.
+- `crates/storage/src/control_plane.rs:548-555` - deterministic_pg_primary delegates to can_serve_primary without a current-time or lease-deadline check.
+- `crates/storage/src/lib.rs:28-31` - control_plane is a public storage module, so the primitive is part of the crate API, but this alone does not make it runtime reachable.
+- `crates/argmin-s3/src/main.rs:135-146` - The binary process roles dispatch to storage-node, combined, frontend, or legacy-local paths; none constructs the new control-plane authority.
+- `crates/argmin-s3/src/main.rs:213-221` - Storage-node routing is configured statically with active PG routes and primary_node_id NodeId(0), not via deterministic_pg_primary.
+- `crates/argmin-s3/src/main.rs:281-307` - Remote frontend builds topology from configured epoch/socket maps and Unix storage-node clients, not from the new control-plane authority.
+- `crates/storage/src/storage_node_server.rs:529-546` - The storage-node service binds a Unix domain socket, not a network control-plane heartbeat endpoint.
+- `crates/storage/src/storage_node_server.rs:7698-7723` - The storage-node socket directory must be private, limiting storage RPC exposure to local/internal users.
+- `plans/multihost-transition-plan.md:7022-7031` - The plan describes the new control-plane authority as the first Phase 11 slice and intentionally single-authority/future distributed work, supporting that this is foundation work rather than fully wired runtime exposure.
+## Narrative
+The underlying lease-fencing bug is real: NodeHeartbeat includes caller-supplied time and duration, heartbeat stores now_ms + lease_duration_ms with only zero/overflow checks, and primary selection does not check expiry. The validation PoC demonstrates the primitive behavior. The severity should not remain high for the current repository state because this primitive is not reachable from argmin-s3 HTTP routes or the storage-node Unix RPC; current multihost configuration still uses static cluster epochs/routes and primary NodeId(0). Thus this is a serious design defect to fix before control-plane exposure, but it is not an exploitable current security vulnerability in the checked-out product.
+## Controls
+- HTTP S3 requests are routed then authenticated with SigV4 before dispatch, except OPTIONS CORS preflight.
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000, although operators can configure another address.
+- Storage-node RPC uses Unix domain sockets rather than TCP.
+- Storage-node socket paths must be absolute and their parent directory must be private.
+- Frontend credentials and SSE wrapping keys are supplied through environment variables.
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH.
+- No current control-plane heartbeat transport, route, or authorization layer exists for NodeHeartbeat.
+## Blindspots
+- Static-only review cannot see external/downstream applications that may import the public storage crate and expose control_plane themselves.
+- No deployment manifests were present, so exposure is inferred from code defaults and configuration handling rather than live infrastructure.
+- The validation PoC exercised the library primitive directly, not through a normal runtime attacker surface.
+- Future Phase 11 commits may wire this module into a real control-plane transport, which would require re-rating.
