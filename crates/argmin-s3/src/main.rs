@@ -224,6 +224,7 @@ fn build_storage_node_process_config(
     Ok(StorageNodeProcessConfig {
         node_id,
         cluster_epoch,
+        route_map_valid_until_ms: None,
         data_dir: Path::new(&node_data_dir).to_path_buf(),
         default_ec_shape: EcShape {
             k: ec_config.data_shards,
