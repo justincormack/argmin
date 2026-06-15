@@ -9,7 +9,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::control_plane::{ClusterRuntimeMapSnapshot, NodeHeartbeat, PgRouteSnapshot};
+use crate::control_plane::{
+    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatSink, HeartbeatLease,
+    NodeHeartbeat, PgRouteSnapshot,
+};
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
@@ -566,6 +569,8 @@ pub enum StorageNodeServerError {
     ResponsePayload { message: String },
     #[error("storage-node active session limit {limit} is exhausted")]
     TooManyActiveSessions { limit: usize },
+    #[error("control-plane heartbeat failed: {0}")]
+    ControlPlane(#[from] ControlPlaneError),
 }
 
 pub fn validate_storage_node_process_configs(
@@ -684,6 +689,20 @@ impl StorageNodeServer {
             node_incarnation,
             requested_lease_duration_ms,
         )
+    }
+
+    pub fn heartbeat_control_plane(
+        &self,
+        control_plane: &mut impl ControlPlaneHeartbeatSink,
+        node_incarnation: u64,
+        requested_lease_duration_ms: u64,
+        authority_now_ms: u64,
+    ) -> Result<HeartbeatLease, StorageNodeServerError> {
+        let heartbeat =
+            self.control_plane_heartbeat(node_incarnation, requested_lease_duration_ms)?;
+        control_plane
+            .submit_node_heartbeat(heartbeat, authority_now_ms)
+            .map_err(StorageNodeServerError::from)
     }
 
     fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
@@ -8220,7 +8239,11 @@ mod tests {
         assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
         let proof = heartbeat.pg_observations[0].metadata_proof;
 
-        authority.heartbeat(heartbeat, 1_003).unwrap();
+        let lease = server
+            .heartbeat_control_plane(&mut authority, 12, 1_000, 1_003)
+            .unwrap();
+        assert_eq!(lease.node_id(), node_id);
+        assert_eq!(lease.cluster_epoch(), runtime_map.cluster_epoch());
 
         let observation = authority
             .snapshot()

@@ -7142,6 +7142,10 @@ Status:
   map derived from the authority can configure a storage-node server, the server
   can build a current-epoch heartbeat from local durable PG state, and the
   authority persists that PG observation for peering.
+- Added a small heartbeat sink interface for submitting node heartbeats. The
+  single-authority control plane implements it today, and `StorageNodeServer`
+  can submit through the interface so the later Phase 12 authority can replace
+  the sink without changing storage-node heartbeat construction.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary

@@ -743,6 +743,14 @@ impl HeartbeatLeaseExpiry {
     }
 }
 
+pub trait ControlPlaneHeartbeatSink {
+    fn submit_node_heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<HeartbeatLease, ControlPlaneError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeServiceAuthorization {
     authority_incarnation: AuthorityIncarnation,
@@ -1650,6 +1658,16 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         self.store.save(&next_snapshot)?;
         self.snapshot = next_snapshot;
         Ok(())
+    }
+}
+
+impl<S: ControlPlaneStore> ControlPlaneHeartbeatSink for SingleAuthorityControlPlane<S> {
+    fn submit_node_heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<HeartbeatLease, ControlPlaneError> {
+        self.heartbeat(heartbeat, authority_now_ms)
     }
 }
 
