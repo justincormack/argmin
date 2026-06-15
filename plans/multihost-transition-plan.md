@@ -7094,10 +7094,10 @@ Status:
   metadata log index/hash/state digest before the authority can persist
   `Active`. This is the first control-plane hook for durable command-log
   reconstruction proof; later repair/backfill work can replace the placeholder
-  proof source with storage-node computed replica state. The persisted
-  control-plane state format now writes this proof as version 5 while preserving
-  read compatibility for version 4 PG observations by treating missing proof
-  fields as the empty proof.
+  proof source with storage-node computed replica state. Because the
+  control-plane store is still pre-release, the persisted state loader now
+  accepts only the current version 6 format rather than carrying compatibility
+  for earlier Phase 11 scratch formats.
 - Fixed the restart epoch-bump path to clear current PG observations just like
   ordinary epoch changes. Restart still records the previous map in history, so
   stale-route diagnostics retain the pre-restart observations, but the newly
@@ -7109,6 +7109,11 @@ Status:
   PG remains `Active`. Because the control-plane store is still pre-release, the
   loader now accepts only the current version 6 format rather than carrying
   compatibility for earlier Phase 11 scratch formats.
+- Added a pure runtime-routing snapshot view derived from the durable
+  control-plane state. The exported route for an `Active` PG uses the persisted
+  `active_primary`, requires that primary to still have a current heartbeat
+  lease and current-epoch `Active` PG observation, and fails closed for `Peering`
+  or stale-primary state instead of re-running dynamic primary selection.
 
 Exit criteria:
 

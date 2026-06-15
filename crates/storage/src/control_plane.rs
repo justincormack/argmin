@@ -261,6 +261,58 @@ impl ClusterControlSnapshot {
             .find(|record| record.cluster_epoch == epoch)
     }
 
+    pub fn active_pg_route(
+        &self,
+        pg_id: PgId,
+        now_ms: u64,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state != PgState::Active {
+            return Err(ControlPlaneError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+                state: record.state,
+            });
+        }
+        let primary = record
+            .active_primary
+            .filter(|primary| record.acting_set.contains(primary))
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            })?;
+        let primary_record = self
+            .node(primary)
+            .ok_or(ControlPlaneError::UnknownActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            })?;
+        if !primary_record.can_serve_primary(self.cluster_epoch, now_ms) {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        }
+        validate_pg_primary_active_observation(self, pg_id, primary)?;
+        Ok(PgRouteSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            primary_node_id: primary,
+            acting_set: record.acting_set.clone(),
+            state: PgState::Active,
+        })
+    }
+
+    pub fn active_pg_routes(&self, now_ms: u64) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+        self.pgs
+            .values()
+            .filter(|record| record.state == PgState::Active)
+            .map(|record| self.active_pg_route(record.pg_id, now_ms))
+            .collect()
+    }
+
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
         self.authority_incarnation = self.authority_incarnation.next()?;
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
@@ -287,6 +339,42 @@ impl ClusterControlSnapshot {
         self.history
             .push(ClusterMapHistoryRecord::from_snapshot(previous));
         prune_cluster_map_history(&mut self.history);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgRouteSnapshot {
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    primary_node_id: NodeId,
+    acting_set: Vec<NodeId>,
+    state: PgState,
+}
+
+impl PgRouteSnapshot {
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn primary_node_id(&self) -> NodeId {
+        self.primary_node_id
+    }
+
+    #[must_use]
+    pub fn acting_set(&self) -> &[NodeId] {
+        &self.acting_set
+    }
+
+    #[must_use]
+    pub fn state(&self) -> PgState {
+        self.state
     }
 }
 
@@ -3278,6 +3366,114 @@ mod tests {
                 3_004,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn active_pg_route_requires_bound_primary_and_active_observation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(21), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 21, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(21),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            authority.snapshot().active_pg_route(PgId::new(21), 2_002),
+            Err(ControlPlaneError::PgHasNoServingPrimary { pg_id: 21, .. })
+        ));
+
+        heartbeat_with_pg_observation(&mut authority, 1, 21, PgState::Active, 2_003);
+        let route = authority
+            .snapshot()
+            .active_pg_route(PgId::new(21), 2_004)
+            .unwrap();
+        assert_eq!(route.cluster_epoch(), authority.snapshot().cluster_epoch());
+        assert_eq!(route.pg_id(), PgId::new(21));
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+        assert_eq!(route.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(
+            authority.snapshot().active_pg_routes(2_004).unwrap(),
+            vec![route]
+        );
+    }
+
+    #[test]
+    fn active_pg_route_fails_closed_for_peering_pg() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(22), vec![NodeId::new(1)])
+            .unwrap();
+
+        assert!(matches!(
+            authority.snapshot().active_pg_route(PgId::new(22), 1_001),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 22,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+        assert!(authority
+            .snapshot()
+            .active_pg_routes(1_001)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn active_pg_route_fails_closed_after_primary_lease_expiry() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(23), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 23, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(23),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 23, PgState::Active, 2_002);
+        let lease_deadline = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+
+        assert!(matches!(
+            authority
+                .snapshot()
+                .active_pg_route(PgId::new(23), lease_deadline),
+            Err(ControlPlaneError::PgHasNoServingPrimary { pg_id: 23, .. })
+        ));
     }
 
     #[test]
