@@ -1,0 +1,156 @@
+Restart can persist stale PG observations and brick state
+Link: https://chatgpt.com/codex/cloud/security/findings/6092396d3b588191ac3502c526c8cda4?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Resolution
+Fixed in commit `45993585 Clear PG observations on authority restart`.
+
+The finding was valid as a Phase 11 control-plane reliability defect. The
+restart epoch-bump path now clears current PG observations, matching ordinary
+epoch-change behavior, while preserving the pre-restart observations in
+cluster-map history for diagnostics. The fix includes a regression test that
+plants a valid current-epoch PG observation, restarts once, verifies the current
+map no longer persists stale observations, and then restarts again successfully.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 301ea7d
+Author: justin@specialbusservice.com
+Created: 15/06/2026, 14:45:36
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The new pg_observations field is cleared in bump_epoch but the existing restart path bump_authority_after_restart was not updated to clear it despite also changing cluster_epoch. The newly added load validation then rejects the state produced by the restart path.
+This commit adds current-epoch PG observations and validates on load that every current node_pg observation's observed_epoch equals the current cluster_epoch. Normal epoch changes clear node pg_observations, but bump_authority_after_restart also increments the cluster epoch and does not clear them. SingleAuthorityControlPlane::open loads an otherwise valid state, clones it to history, calls bump_authority_after_restart, then saves the bumped snapshot. If the loaded state contains any current node_pg observation, the saved current snapshot has cluster_epoch incremented while node_pg observed_epoch remains the old epoch. The first restart succeeds but writes invalid state; a later open/load rejects it with 'node PG observation epoch must match current cluster epoch'. A valid heartbeat from a node in a PG acting set can therefore plant PG observations that make subsequent control-plane restarts fail, causing a persistent availability issue until the state file is manually repaired.
+
+# Validation
+## Rubric
+- [x] A valid current-epoch heartbeat can plant a current node_pg observation through the public control-plane API.
+- [x] Normal epoch changes clear pg_observations, but the restart epoch bump does not.
+- [x] SingleAuthorityControlPlane::open applies the restart bump and saves the bumped snapshot.
+- [x] The saved snapshot contains a current node_pg record with old observed_epoch and a newer cluster_epoch.
+- [x] A later open/load rejects that persisted state with `node PG observation epoch must match current cluster epoch`.
+## Report
+Validated the finding with a targeted Rust integration PoC. Code review confirmed the logic chain: crates/storage/src/control_plane.rs:260-263 bump_authority_after_restart increments cluster_epoch but does not clear node pg_observations, while crates/storage/src/control_plane.rs:266-270 bump_epoch does clear them. SingleAuthorityControlPlane::open loads an existing snapshot, calls bump_authority_after_restart, then saves it at crates/storage/src/control_plane.rs:678-687. format_snapshot persists current node_pg records at crates/storage/src/control_plane.rs:1363-1369. parse_snapshot invokes validate_current_pg_observations at crates/storage/src/control_plane.rs:1583-1584, which rejects any current observation whose observed_epoch differs from current cluster_epoch at crates/storage/src/control_plane.rs:1645-1655.
+
+I added crates/storage/tests/poc_restart_pg_observations.rs. The test uses the public API to create an active node, set PG 15's acting set to that node, send a current-epoch heartbeat carrying NodePgHeartbeatObservation, perform one restart, inspect the saved state, then perform a second restart. The first restart succeeds and writes invalid state. cargo test output shows the persisted state after first restart contains cluster_epoch=5 while the current node_pg line remains node_pg=1,15,peering,4,2000. The second open fails with: control-plane state parse error at line 14: node PG observation epoch must match current cluster epoch. The PoC deliberately panics on this failure, causing cargo test to exit 101.
+
+Crash command output excerpt: persisted state after first restart includes `cluster_epoch=5` and `node_pg=1,15,peering,4,2000`; panic at crates/storage/tests/poc_restart_pg_observations.rs:117:9: `second restart failed because first restart persisted stale node_pg: control-plane state parse error at line 14: node PG observation epoch must match current cluster epoch`.
+
+Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`, exit 127). I also ran LLDB non-interactively; it stopped at the PoC panic and produced a backtrace showing frame #2 in poc_restart_pg_observations::restart_after_pg_observation_persists_unloadable_state at poc_restart_pg_observations.rs:117:9.
+
+# Evidence
+crates/storage/src/control_plane.rs (L1363 to 1369)
+  Note: format_snapshot writes current node_pg records from the stale pg_observations map after the restart bump.
+```
+    for record in snapshot.nodes.values() {
+        out.push_str(&format!("node={}\n", format_node_record(record)));
+        for observation in record.pg_observations.values() {
+            out.push_str(&format!(
+                "node_pg={}\n",
+                format_node_pg_record(record.node_id, observation)
+            ));
+```
+
+crates/storage/src/control_plane.rs (L1583 to 1584)
+  Note: parse_snapshot validates current PG observations on load.
+```
+    validate_current_pgs(&pgs, &pg_lines, &nodes)?;
+    validate_current_pg_observations(&nodes, &node_pg_lines, &pgs, cluster_epoch)?;
+```
+
+crates/storage/src/control_plane.rs (L1645 to 1655)
+  Note: the validator rejects any current node_pg observation whose observed_epoch differs from the current cluster_epoch, which is exactly the invalid state saved after restart.
+```
+    for node in nodes.values() {
+        for observation in node.pg_observations.values() {
+            let line = node_pg_lines
+                .get(&(node.node_id, observation.pg_id))
+                .copied()
+                .unwrap_or(0);
+            if observation.observed_epoch != current_epoch {
+                return Err(parse_error(
+                    line,
+                    "node PG observation epoch must match current cluster epoch",
+                ));
+```
+
+crates/storage/src/control_plane.rs (L260 to 270)
+  Note: bump_authority_after_restart increments cluster_epoch but does not clear pg_observations, while the normal bump_epoch path does clear them.
+```
+    fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
+        self.authority_incarnation = self.authority_incarnation.next()?;
+        self.cluster_epoch = next_epoch(self.cluster_epoch)?;
+        Ok(())
+    }
+
+    fn bump_epoch(&mut self) -> Result<(), ControlPlaneError> {
+        self.cluster_epoch = next_epoch(self.cluster_epoch)?;
+        for record in self.nodes.values_mut() {
+            record.pg_observations.clear();
+        }
+```
+
+crates/storage/src/control_plane.rs (L678 to 687)
+  Note: open() applies the restart epoch bump to loaded state and then saves it, so stale current pg_observations are persisted after a restart.
+```
+    pub fn open(store: S) -> Result<Self, ControlPlaneError> {
+        let loaded = store.load()?;
+        let loaded_existing_state = loaded.is_some();
+        let mut snapshot = loaded.unwrap_or_else(ClusterControlSnapshot::empty);
+        if loaded_existing_state {
+            let previous_snapshot = snapshot.clone();
+            snapshot.bump_authority_after_restart()?;
+            snapshot.record_history_from(&previous_snapshot);
+        }
+        store.save(&snapshot)?;
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from medium to ignore for current security triage. The bug itself is real and can brick a SingleAuthorityControlPlane state file when called directly, but static service mapping shows the main argmin-s3 product does not instantiate or expose SingleAuthorityControlPlane, FileControlPlaneStore, NodeHeartbeat, or NodePgHeartbeatObservation outside crates/storage/src/control_plane.rs. The exposed runtime surfaces are the S3 HTTP listener and a storage-node Unix socket, neither of which routes to this heartbeat path. Because the issue is presently a dormant/internal reliability defect rather than an attacker-reachable vulnerability under the supplied threat model, probability x impact for the deployed product is below reportable security severity.
+## Likelihood
+ignore - The state-machine bug is easy to trigger with direct Rust API access, as shown by prior validation, but no in-repository service path accepts attacker-controlled NodeHeartbeat/NodePgHeartbeatObservation. Exploitation requires an unimplemented/future wrapper or an out-of-scope internal caller plus restarts.
+## Impact
+ignore - If an application exposed this control-plane API to a malicious or compromised storage node, the impact would be persistent availability loss of that control plane until manual state repair. In the current argmin-s3 runtime, the API appears dormant and unreachable from the documented S3 HTTP and storage-node RPC surfaces, so there is no demonstrated security impact to the main product.
+## Assumptions
+- Static analysis is limited to repository artifacts in /workspace/argmin; no deployed environment, external library consumers, or reverse-proxy configuration was inspected.
+- Repository grep found no in-product caller or RPC/HTTP route for storage::control_plane::SingleAuthorityControlPlane or NodeHeartbeat outside crates/storage/src/control_plane.rs.
+- The prior validation PoC is treated as evidence that the state-machine bug is real when the Rust control-plane API is called directly, but that does not by itself prove reachability from the argmin-s3 service.
+- A caller must be able to invoke SingleAuthorityControlPlane::heartbeat with a valid current-epoch NodeHeartbeat containing pg_observations.
+- The heartbeat node must already be a known node and in the observed PG acting set.
+- The control plane must subsequently be restarted once to persist the stale node_pg observation and restarted or opened again to hit load-time validation failure.
+- For the current repository product binary, an additional unproven precondition is an external or future wrapper exposing this control-plane API, because argmin-s3 does not wire it into HTTP or storage-node RPC.
+## Path
+Direct/internal CP API caller -> valid NodeHeartbeat(pg_observations) -> stored node_pg(epoch=N) -> restart open() bumps cluster_epoch to N+1 without clearing -> save stale node_pg -> next open() validation failure -> CP unavailable
+## Path evidence
+- `crates/storage/src/control_plane.rs:260-270` - bump_authority_after_restart increments cluster_epoch but does not clear pg_observations, while bump_epoch does clear them.
+- `crates/storage/src/control_plane.rs:677-688` - SingleAuthorityControlPlane::open loads existing state, applies the restart bump, and saves the snapshot.
+- `crates/storage/src/control_plane.rs:873-970` - heartbeat accepts current-epoch node heartbeats, validates observations, and stores each pg_observation with the heartbeat observed_epoch.
+- `crates/storage/src/control_plane.rs:1363-1370` - format_snapshot persists current node pg_observations as node_pg records.
+- `crates/storage/src/control_plane.rs:1583-1655` - parse_snapshot validates current PG observations and rejects observed_epoch values that do not match the current cluster_epoch.
+- `crates/storage/src/control_plane.rs:1923-1950` - PG heartbeat observations are constrained to known PGs in the node's acting set, meaning an attacker would need valid/internal node-like control-plane access even if the API were exposed.
+- `crates/storage/src/lib.rs:22-30` - control_plane is a public storage module, but the crate description says the implemented v1 storage layer is single-node/single-process.
+- `crates/argmin-s3/src/main.rs:135-147` - main product roles are StorageNode, Combined, Frontend, and LegacyLocal; no SingleAuthorityControlPlane role is wired here.
+- `crates/argmin-s3/src/main.rs:246-259` - legacy local frontend opens a StorageCluster directly, not the affected control-plane API.
+- `crates/argmin-s3/src/main.rs:277-304` - remote frontend builds a LocalClusterMap from configured epoch and Unix storage-node sockets, not SingleAuthorityControlPlane.
+- `crates/argmin-s3/src/main.rs:358-437` - the only TCP service exposed by argmin-s3 is the S3 HTTP/HTTPS frontend listener.
+- `crates/storage/src/storage_node_server.rs:529-575` - the storage-node service binds a local UnixListener and serves storage RPC, not the affected control-plane heartbeat API.
+- `crates/argmin-s3/src/config.rs:91-118` - configuration documents default HTTP listen address 127.0.0.1:9000 and storage-node socket configuration; no control-plane network endpoint is documented.
+- `crates/argmin-s3/src/config.rs:144-159` - frontend credentials and encryption keys are loaded from environment variables; no secret values are present in the repository evidence.
+## Narrative
+The underlying bug is valid: heartbeat stores current-epoch pg_observations, restart open() increments cluster_epoch without clearing them, the formatter persists node_pg records, and the parser rejects any current node_pg whose observed_epoch differs from cluster_epoch. However, static service mapping did not find a route from the main argmin-s3 HTTP listener or the storage-node Unix-socket RPC server to this control-plane API. The current product instead opens LocalClusterMap/StorageCluster from config and storage nodes bind Unix sockets. Because exploitation requires direct/internal Rust API access or a future wrapper not present in the repository, this should not retain medium security severity for the current threat model, despite being a real reliability bug in dormant/transition control-plane code.
+## Controls
+- SigV4 authentication protects the S3 HTTP frontend, but the affected control-plane API is not reachable through that frontend.
+- Storage-node RPC uses Unix-domain sockets rather than an exposed TCP port in the inspected implementation.
+- validate_pg_heartbeat_observations requires observed PGs to exist and include the heartbeat node in the acting set.
+- Exploit effect requires an operational restart sequence; a single heartbeat alone does not immediately fail the control plane.
+- No Kubernetes ingress, load balancer, or cloud identity manifests were found in the inspected repository paths.
+## Blindspots
+- External crates or downstream deployments could use the public storage::control_plane API even though this repository's argmin-s3 binary does not.
+- No runtime deployment manifests, systemd units, container images, reverse-proxy configs, or private forks were available to prove how operators expose services.
+- Static grep cannot prove absence of dynamic or generated callers outside the repository checkout.
+- The prior validation PoC demonstrates direct API behavior, but this attack-path pass did not rerun tests.
