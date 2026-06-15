@@ -7038,6 +7038,13 @@ Status:
   derived from the durable PG map plus node availability/observed-epoch state,
   and node expiry or removal moves affected active PGs back to `Peering` in the
   same durable epoch transition.
+- Added explicit control-plane authorization helpers for serving nodes and PG
+  primaries. Callers can now fail closed unless the sender has the current epoch,
+  matching node incarnation, unexpired lease, healthy/observed map state, and an
+  active PG where the sender is the deterministic primary. PG primary
+  authorization returns the validated node lease deadline so callers can bound
+  primary work, and PG peering completion uses the same lease-aware validation
+  before persisting `Active`.
 
 Exit criteria:
 

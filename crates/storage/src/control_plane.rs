@@ -358,6 +358,72 @@ impl HeartbeatLeaseExpiry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeServiceAuthorization {
+    authority_incarnation: AuthorityIncarnation,
+    cluster_epoch: ClusterEpoch,
+    node_id: NodeId,
+    lease_deadline_ms: u64,
+}
+
+impl NodeServiceAuthorization {
+    #[must_use]
+    pub fn authority_incarnation(&self) -> AuthorityIncarnation {
+        self.authority_incarnation
+    }
+
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn lease_deadline_ms(&self) -> u64 {
+        self.lease_deadline_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgPrimaryAuthorization {
+    authority_incarnation: AuthorityIncarnation,
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    primary_node_id: NodeId,
+    lease_deadline_ms: u64,
+}
+
+impl PgPrimaryAuthorization {
+    #[must_use]
+    pub fn authority_incarnation(&self) -> AuthorityIncarnation {
+        self.authority_incarnation
+    }
+
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn primary_node_id(&self) -> NodeId {
+        self.primary_node_id
+    }
+
+    #[must_use]
+    pub fn lease_deadline_ms(&self) -> u64 {
+        self.lease_deadline_ms
+    }
+}
+
 pub trait ControlPlaneStore {
     fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError>;
     fn save(&self, snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError>;
@@ -596,6 +662,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         pg_id: PgId,
         primary: NodeId,
+        node_incarnation: u64,
+        now_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let record = self
             .snapshot
@@ -607,6 +675,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 node_id: primary.as_u32(),
             });
         }
+        self.authorize_node_service(
+            primary,
+            node_incarnation,
+            self.snapshot.cluster_epoch,
+            now_ms,
+        )?;
         if self.deterministic_pg_primary(pg_id, record.acting_set()) != Some(primary) {
             return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
                 pg_id: pg_id.get(),
@@ -757,6 +831,117 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         })
     }
 
+    pub fn authorize_node_service(
+        &self,
+        node_id: NodeId,
+        node_incarnation: u64,
+        observed_epoch: ClusterEpoch,
+        now_ms: u64,
+    ) -> Result<NodeServiceAuthorization, ControlPlaneError> {
+        let record = self
+            .snapshot
+            .nodes
+            .get(&node_id)
+            .ok_or(ControlPlaneError::UnknownNode {
+                node_id: node_id.as_u32(),
+            })?;
+        if matches!(
+            record.membership,
+            NodeMembershipState::Out | NodeMembershipState::Removed
+        ) {
+            return Err(ControlPlaneError::NodeCannotReceiveLease {
+                node_id: node_id.as_u32(),
+                membership: record.membership,
+            });
+        }
+        if node_incarnation != record.node_incarnation {
+            return Err(ControlPlaneError::NodeIncarnationMismatch {
+                node_id: node_id.as_u32(),
+                sender_incarnation: node_incarnation,
+                current_incarnation: record.node_incarnation,
+            });
+        }
+        if observed_epoch != self.snapshot.cluster_epoch {
+            return Err(ControlPlaneError::StaleNodeObservedEpoch {
+                node_id: node_id.as_u32(),
+                observed_epoch,
+                current_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        if !record.can_serve_primary(self.snapshot.cluster_epoch) {
+            return Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: node_id.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        let lease_deadline_ms =
+            record
+                .lease_deadline_ms
+                .ok_or(ControlPlaneError::NodeLeaseExpired {
+                    node_id: node_id.as_u32(),
+                    now_ms,
+                    lease_deadline_ms: None,
+                })?;
+        if lease_deadline_ms <= now_ms {
+            return Err(ControlPlaneError::NodeLeaseExpired {
+                node_id: node_id.as_u32(),
+                now_ms,
+                lease_deadline_ms: Some(lease_deadline_ms),
+            });
+        }
+        Ok(NodeServiceAuthorization {
+            authority_incarnation: self.snapshot.authority_incarnation,
+            cluster_epoch: self.snapshot.cluster_epoch,
+            node_id,
+            lease_deadline_ms,
+        })
+    }
+
+    pub fn authorize_pg_primary_service(
+        &self,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        node_incarnation: u64,
+        observed_epoch: ClusterEpoch,
+        now_ms: u64,
+    ) -> Result<PgPrimaryAuthorization, ControlPlaneError> {
+        let node_authorization =
+            self.authorize_node_service(primary_node_id, node_incarnation, observed_epoch, now_ms)?;
+        let record = self
+            .snapshot
+            .pgs
+            .get(&pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state != PgState::Active {
+            return Err(ControlPlaneError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+                state: record.state,
+            });
+        }
+        let serving_primary = self
+            .deterministic_pg_primary(pg_id, record.acting_set())
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            })?;
+        if serving_primary != primary_node_id {
+            return Err(ControlPlaneError::NodeNotPgPrimary {
+                pg_id: pg_id.get(),
+                node_id: primary_node_id.as_u32(),
+                primary_node_id: serving_primary.as_u32(),
+                cluster_epoch: self.snapshot.cluster_epoch,
+            });
+        }
+        Ok(PgPrimaryAuthorization {
+            authority_incarnation: self.snapshot.authority_incarnation,
+            cluster_epoch: self.snapshot.cluster_epoch,
+            pg_id,
+            primary_node_id,
+            lease_deadline_ms: node_authorization.lease_deadline_ms(),
+        })
+    }
+
     #[must_use]
     pub fn serving_pg_primary(&self, pg_id: PgId) -> Option<NodeId> {
         let record = self.snapshot.pgs.get(&pg_id)?;
@@ -824,6 +1009,60 @@ pub enum ControlPlaneError {
 
     #[error("node {node_id} is not serving current epoch as PG {pg_id} primary")]
     PgPrimaryNotServingCurrentEpoch { pg_id: u32, node_id: u32 },
+
+    #[error(
+        "node {node_id} incarnation {sender_incarnation} does not match current incarnation {current_incarnation}"
+    )]
+    NodeIncarnationMismatch {
+        node_id: u32,
+        sender_incarnation: u64,
+        current_incarnation: u64,
+    },
+
+    #[error("node {node_id} observed epoch {observed_epoch}, current epoch is {current_epoch}")]
+    StaleNodeObservedEpoch {
+        node_id: u32,
+        observed_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error("node {node_id} is not serving cluster epoch {cluster_epoch}")]
+    NodeNotServingCurrentEpoch {
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "node {node_id} lease expired at {lease_deadline_ms:?}; authorization time is {now_ms}"
+    )]
+    NodeLeaseExpired {
+        node_id: u32,
+        now_ms: u64,
+        lease_deadline_ms: Option<u64>,
+    },
+
+    #[error("PG {pg_id} is {state} in cluster epoch {cluster_epoch}, not active")]
+    PgNotActive {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+
+    #[error("PG {pg_id} has no serving primary in cluster epoch {cluster_epoch}")]
+    PgHasNoServingPrimary {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "node {node_id} is not PG {pg_id} primary in cluster epoch {cluster_epoch}; primary is {primary_node_id}"
+    )]
+    NodeNotPgPrimary {
+        pg_id: u32,
+        node_id: u32,
+        primary_node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
 
     #[error("removed node {node_id} cannot rejoin")]
     RemovedNodeCannotRejoin { node_id: u32 },
@@ -1270,6 +1509,17 @@ mod tests {
         heartbeat
     }
 
+    fn node_incarnation<S: ControlPlaneStore>(
+        authority: &SingleAuthorityControlPlane<S>,
+        node_id: u32,
+    ) -> u64 {
+        authority
+            .snapshot()
+            .node(NodeId::new(node_id))
+            .unwrap()
+            .node_incarnation()
+    }
+
     #[test]
     fn file_backed_authority_restarts_with_never_reused_epoch_and_incarnation() {
         let tmp = test_util::tempdir();
@@ -1531,13 +1781,6 @@ mod tests {
             authority.set_pg_state(PgId::new(8), PgState::Active),
             Err(ControlPlaneError::ActivePgRequiresPeeringComplete { pg_id: 8 })
         ));
-        assert!(matches!(
-            authority.complete_pg_peering(PgId::new(8), NodeId::new(2)),
-            Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
-                pg_id: 8,
-                node_id: 2
-            })
-        ));
         assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
         for node_id in [1, 2] {
             authority
@@ -1550,14 +1793,31 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            authority.complete_pg_peering(PgId::new(8), NodeId::new(99)),
+            authority.complete_pg_peering(
+                PgId::new(8),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                2_050,
+            ),
+            Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
+                pg_id: 8,
+                node_id: 2
+            })
+        ));
+        assert!(matches!(
+            authority.complete_pg_peering(PgId::new(8), NodeId::new(99), 99, 2_050),
             Err(ControlPlaneError::PgPrimaryNotInActingSet {
                 pg_id: 8,
                 node_id: 99
             })
         ));
         authority
-            .complete_pg_peering(PgId::new(8), NodeId::new(1))
+            .complete_pg_peering(
+                PgId::new(8),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            )
             .unwrap();
         assert_eq!(authority.serving_pg_primary(PgId::new(8)), None);
         for node_id in [1, 2] {
@@ -1574,6 +1834,246 @@ mod tests {
             authority.serving_pg_primary(PgId::new(8)),
             Some(NodeId::new(1))
         );
+    }
+
+    #[test]
+    fn complete_pg_peering_requires_unexpired_primary_lease() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(11), vec![NodeId::new(1)])
+            .unwrap();
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                1_050,
+            ))
+            .unwrap();
+        let lease_deadline = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(11),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                lease_deadline,
+            ),
+            Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
+        ));
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(11)).unwrap().state(),
+            PgState::Peering
+        );
+
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                lease_deadline + 1,
+            ))
+            .unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(11),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                lease_deadline + 2,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn node_service_authorization_requires_current_epoch_incarnation_and_lease() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let serving = heartbeat_until_serving(&mut authority, 1, 100);
+        assert!(serving.serving());
+        let record = authority.snapshot().node(NodeId::new(1)).unwrap();
+
+        let authorized = authority
+            .authorize_node_service(
+                NodeId::new(1),
+                record.node_incarnation(),
+                serving.cluster_epoch(),
+                150,
+            )
+            .unwrap();
+        assert_eq!(authorized.node_id(), NodeId::new(1));
+        assert_eq!(authorized.cluster_epoch(), serving.cluster_epoch());
+        assert_eq!(
+            authorized.authority_incarnation(),
+            authority.snapshot().authority_incarnation()
+        );
+        assert_eq!(
+            authorized.lease_deadline_ms(),
+            record.lease_deadline_ms().unwrap()
+        );
+
+        assert!(matches!(
+            authority.authorize_node_service(
+                NodeId::new(1),
+                record.node_incarnation() + 1,
+                serving.cluster_epoch(),
+                150,
+            ),
+            Err(ControlPlaneError::NodeIncarnationMismatch { node_id: 1, .. })
+        ));
+        assert!(matches!(
+            authority.authorize_node_service(
+                NodeId::new(1),
+                record.node_incarnation(),
+                ClusterEpoch::INITIAL,
+                150,
+            ),
+            Err(ControlPlaneError::StaleNodeObservedEpoch { node_id: 1, .. })
+        ));
+        assert!(matches!(
+            authority.authorize_node_service(
+                NodeId::new(1),
+                record.node_incarnation(),
+                serving.cluster_epoch(),
+                record.lease_deadline_ms().unwrap(),
+            ),
+            Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn pg_primary_authorization_fails_closed_for_peering_and_wrong_primary() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .heartbeat(heartbeat_from_record(
+                &authority,
+                1,
+                authority.snapshot().cluster_epoch(),
+                1_002,
+            ))
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(10), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        for node_id in [1, 2] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    2_000 + u64::from(node_id),
+                ))
+                .unwrap();
+        }
+        let node_one_incarnation = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .node_incarnation();
+        assert!(matches!(
+            authority.authorize_pg_primary_service(
+                PgId::new(10),
+                NodeId::new(1),
+                node_one_incarnation,
+                authority.snapshot().cluster_epoch(),
+                2_050,
+            ),
+            Err(ControlPlaneError::PgNotActive { pg_id: 10, .. })
+        ));
+
+        authority
+            .complete_pg_peering(
+                PgId::new(10),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            )
+            .unwrap();
+        for node_id in [1, 2] {
+            authority
+                .heartbeat(heartbeat_from_record(
+                    &authority,
+                    node_id,
+                    authority.snapshot().cluster_epoch(),
+                    3_000 + u64::from(node_id),
+                ))
+                .unwrap();
+        }
+        let node_one_incarnation = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .node_incarnation();
+        let node_two_incarnation = authority
+            .snapshot()
+            .node(NodeId::new(2))
+            .unwrap()
+            .node_incarnation();
+        let authorized = authority
+            .authorize_pg_primary_service(
+                PgId::new(10),
+                NodeId::new(1),
+                node_one_incarnation,
+                authority.snapshot().cluster_epoch(),
+                3_050,
+            )
+            .unwrap();
+        assert_eq!(authorized.pg_id(), PgId::new(10));
+        assert_eq!(authorized.primary_node_id(), NodeId::new(1));
+        assert_eq!(
+            authorized.cluster_epoch(),
+            authority.snapshot().cluster_epoch()
+        );
+        assert_eq!(
+            authorized.authority_incarnation(),
+            authority.snapshot().authority_incarnation()
+        );
+        assert_eq!(
+            authorized.lease_deadline_ms(),
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms()
+                .unwrap()
+        );
+
+        assert!(matches!(
+            authority.authorize_pg_primary_service(
+                PgId::new(10),
+                NodeId::new(2),
+                node_two_incarnation,
+                authority.snapshot().cluster_epoch(),
+                3_050,
+            ),
+            Err(ControlPlaneError::NodeNotPgPrimary {
+                pg_id: 10,
+                node_id: 2,
+                primary_node_id: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1758,7 +2258,12 @@ mod tests {
                 .unwrap();
         }
         authority
-            .complete_pg_peering(PgId::new(9), NodeId::new(1))
+            .complete_pg_peering(
+                PgId::new(9),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                1_050,
+            )
             .unwrap();
         for node_id in [1, 2] {
             authority
