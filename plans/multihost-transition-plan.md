@@ -6098,6 +6098,30 @@ Status:
 
 ### Phase 10.9: Multihost Stabilization Gate
 
+Status: complete.
+
+Closeout summary:
+
+- The old broad failure patterns from multihost UAT and soak runs no longer
+  reproduce: widespread slowdown cascades, expected-contention HTTP 500s,
+  storage RPC/transport EOFs, and SDK operation-attempt timeouts have been
+  replaced by bounded request work, typed retryable contention, typed overload,
+  and permanent diagnostics.
+- The request-path unbounded-work audit is closed. Public request paths found
+  during Phase 10.9 now either consume `RequestWorkBudget`, use typed capacity
+  admission/backoff, or hand longer work to durable background ownership; the
+  storage-cluster boundary checker rejects production regressions back to the
+  known unbudgeted helper shapes.
+- The strict overload validation gate is now `./scripts/uat-forced-overload`.
+  It constrains multihost storage-RPC admission, keeps the SDK
+  operation-attempt timeout fixed at 30s by default, requires observable
+  overload/contention pressure, and fails if pressure escapes as HTTP 500,
+  storage RPC errors, transport EOF, connection refusal, panic, or SDK timeout.
+- Detailed per-PG/adaptive tuning, production SLO policy, and workload-specific
+  capacity weights remain deferred until Phase 11 or the production
+  backpressure plan has a more representative workload benchmark than the
+  bucket-delete-heavy S3 test suite.
+
 Before continuing into failure, peering, repair, and migration work, stabilize
 the Phase 10 multihost request path. Recent UAT runs have exposed three related
 problems:
@@ -6133,6 +6157,15 @@ capacity weights, and production SLO policy belong in
 representative production-style harness exists.
 
 Work items:
+
+Closeout classification: items 1-3, the fixed/static admission and bounded-work
+pieces of item 4, the required implementation-order pieces for Phase 10.9 in
+item 5, and the UAT observability/forced-overload gate in item 6 are complete
+for this stabilization gate. The remaining broader capacity-policy bullets in
+items 4-5 are deliberately deferred to Phase 11 or
+[`production-backpressure-plan.md`](production-backpressure-plan.md), where they
+can be tuned against a production-realistic workload rather than the local S3
+test harness.
 
 1. error semantics audit
    - enumerate every storage/coordinator error family that can cross into HTTP:
@@ -6543,10 +6576,10 @@ Exit criteria:
    moved behind durable background ownership with tests
 7. Phase 11 starts only after this stabilization gate is closed
 
-Status:
+Status: complete.
 
 - Started Phase 10.9 with the error semantics audit in
-  [`phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md).
+  [`completed/phase-10-9-error-semantics-audit.md`](completed/phase-10-9-error-semantics-audit.md).
   The first slice classifies expected metadata-command contention, stale object
   generation reservations, stale bucket metadata command generations, current
   RPC/overload gaps, and the request mappers that still need follow-up tests or
@@ -6609,7 +6642,7 @@ Status:
   ownership controls, and the create-bucket RPC/config payload now carries the
   required ownership mode.
 - Closed the mapper-audit slice in
-  [`phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md)
+  [`completed/phase-10-9-error-semantics-audit.md`](completed/phase-10-9-error-semantics-audit.md)
   after adding typed storage-RPC resource exhaustion mapping to `SlowDown`,
   preserving shard-delete-in-progress as internal/recoverable only, and adding
   drift guardrails for object-PG mappers, bucket snapshot mappers,
@@ -6884,6 +6917,13 @@ Status:
   refusal, panic, or SDK operation-attempt timeout. This gate proves bounded
   S3-shaped behavior; detailed per-PG/adaptive admission tuning remains deferred
   until Phase 11 or until a more production-realistic workload benchmark exists.
+- Closed Phase 10.9. The phase now has central error-semantics guardrails,
+  permanent race diagnostics, fixed/static storage-RPC admission classes,
+  bounded request-work budgets for the audited request paths, repeated
+  multihost UAT soak coverage for the previous failure classes, and the strict
+  forced-overload validation wrapper. Remaining capacity-policy tuning is not a
+  Phase 10.9 blocker and should proceed only with a production-realistic
+  benchmark or in the production backpressure plan.
 
 ## Phase 11: Failure, Peering, Repair, And Migration
 
