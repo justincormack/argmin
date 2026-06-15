@@ -2796,20 +2796,14 @@ fn test_bucket_list_return_data_versioning() {
                     .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("enable bucket versioning")
             .await
             .unwrap();
 
         let key_names = ["bar", "baz", "foo"];
         for key in &key_names {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(*key)
-                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
-                .send()
-                .await
-                .unwrap();
+            s3_tests::put_object_retrying_operation_aborted(client, &bucket, key, b"data".to_vec())
+                .await;
         }
 
         // Gather expected metadata from HeadObject.
@@ -2827,7 +2821,7 @@ fn test_bucket_list_return_data_versioning() {
         let resp = client
             .list_object_versions()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("list object versions")
             .await
             .unwrap();
         let versions = resp.versions();
