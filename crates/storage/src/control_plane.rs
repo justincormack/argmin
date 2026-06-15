@@ -782,6 +782,13 @@ pub trait ControlPlaneHeartbeatRuntimeMapSource {
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>;
 }
 
+pub trait ControlPlaneRuntimeMapSource {
+    fn runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeServiceAuthorization {
     authority_incarnation: AuthorityIncarnation,
@@ -1713,6 +1720,15 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         let lease = self.heartbeat(heartbeat, authority_now_ms)?;
         let runtime_map = lease.snapshot().runtime_map(authority_now_ms)?;
         Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
+    }
+}
+
+impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityControlPlane<S> {
+    fn runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.snapshot.runtime_map(authority_now_ms)
     }
 }
 
@@ -3960,6 +3976,65 @@ mod tests {
     }
 
     #[test]
+    fn storage_cluster_refreshes_from_control_plane_runtime_map() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+
+        let peering_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &peering_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        assert_eq!(
+            cluster.local_pg_route(PgId::new(31)).unwrap().state(),
+            PgState::Peering
+        );
+        assert_eq!(cluster.route_map_valid_until_ms(), None);
+
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_003);
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map(&authority, 2_004)
+            .unwrap();
+        assert_eq!(
+            refreshed.cluster_epoch(),
+            authority.snapshot().cluster_epoch()
+        );
+        assert_eq!(
+            refreshed.local_pg_route(PgId::new(31)).unwrap().state(),
+            PgState::Active
+        );
+        assert_eq!(
+            refreshed.route_map_valid_until_ms(),
+            authority
+                .snapshot()
+                .runtime_map(2_004)
+                .unwrap()
+                .valid_until_ms()
+        );
+        assert!(refreshed.route_map_valid_until_ms().is_some());
+    }
+
+    #[test]
     fn runtime_node_routes_build_unix_storage_client_configs() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -4006,6 +4081,33 @@ mod tests {
         assert_eq!(
             configured.rpc_control_admission_wait_timeout(),
             std::time::Duration::from_millis(300)
+        );
+
+        let settings = crate::cluster::LocalUnixStorageNodeClientAdmissionSettings::new(
+            23,
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_millis(500),
+        );
+        let [ref refreshed_config] =
+            crate::StorageCluster::unix_storage_node_client_configs_from_runtime_map(
+                &runtime_map,
+                settings,
+            )
+            .try_into()
+            .unwrap();
+        assert_eq!(refreshed_config.node_id(), NodeId::new(1));
+        assert_eq!(
+            refreshed_config.socket_path(),
+            std::path::Path::new("node-1.sock")
+        );
+        assert_eq!(refreshed_config.rpc_admission_limit(), 23);
+        assert_eq!(
+            refreshed_config.rpc_admission_wait_timeout(),
+            std::time::Duration::from_millis(400)
+        );
+        assert_eq!(
+            refreshed_config.rpc_control_admission_wait_timeout(),
+            std::time::Duration::from_millis(500)
         );
     }
 

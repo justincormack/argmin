@@ -7183,6 +7183,12 @@ Status:
   storage-node clients from absolute runtime endpoints, while preserving the
   authority route-map validity deadline and exposing the same fail-closed
   validity check at the cluster boundary.
+- Added a frontend replacement-handle refresh boundary. A `StorageCluster` can
+  now ask an authority runtime-map source for the current map and rebuild a
+  validated replacement cluster handle, preserving the existing immutable handle
+  model while giving the later dynamic route-refresh loop a safe swap point.
+  Unix storage-node client rebuilds take explicit RPC admission settings so
+  forced-overload limits and wait-timeout tuning cannot be reset by refresh.
 - Added the matching storage-node process config bridge. A storage node can now
   derive its startup PG set, route table, cluster epoch, and socket endpoint
   from a `ClusterRuntimeMapSnapshot`, filtering the authority route view to only

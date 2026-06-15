@@ -73,6 +73,13 @@ pub struct LocalUnixStorageNodeClientConfig {
     rpc_control_admission_wait_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalUnixStorageNodeClientAdmissionSettings {
+    rpc_admission_limit: usize,
+    rpc_admission_wait_timeout: Duration,
+    rpc_control_admission_wait_timeout: Duration,
+}
+
 impl LocalUnixShardNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -142,6 +149,20 @@ impl LocalUnixStorageNodeClientConfig {
         }
     }
 
+    pub fn with_rpc_admission_settings(
+        node_id: NodeId,
+        socket_path: impl Into<PathBuf>,
+        settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Self {
+        Self {
+            node_id,
+            socket_path: socket_path.into(),
+            rpc_admission_limit: settings.rpc_admission_limit,
+            rpc_admission_wait_timeout: settings.rpc_admission_wait_timeout,
+            rpc_control_admission_wait_timeout: settings.rpc_control_admission_wait_timeout,
+        }
+    }
+
     pub fn with_rpc_admission_from_runtime_node_route(
         node: &NodeRouteSnapshot,
         rpc_admission_limit: usize,
@@ -155,6 +176,13 @@ impl LocalUnixStorageNodeClientConfig {
             rpc_admission_wait_timeout,
             rpc_control_admission_wait_timeout,
         )
+    }
+
+    pub fn with_rpc_admission_settings_from_runtime_node_route(
+        node: &NodeRouteSnapshot,
+        settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Self {
+        Self::with_rpc_admission_settings(node.node_id(), node.endpoint(), settings)
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -174,6 +202,40 @@ impl LocalUnixStorageNodeClientConfig {
     }
 
     pub fn rpc_control_admission_wait_timeout(&self) -> Duration {
+        self.rpc_control_admission_wait_timeout
+    }
+}
+
+impl LocalUnixStorageNodeClientAdmissionSettings {
+    pub const DEFAULT: Self = Self {
+        rpc_admission_limit: LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT,
+        rpc_admission_wait_timeout:
+            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+        rpc_control_admission_wait_timeout:
+            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+    };
+
+    pub fn new(
+        rpc_admission_limit: usize,
+        rpc_admission_wait_timeout: Duration,
+        rpc_control_admission_wait_timeout: Duration,
+    ) -> Self {
+        Self {
+            rpc_admission_limit,
+            rpc_admission_wait_timeout,
+            rpc_control_admission_wait_timeout,
+        }
+    }
+
+    pub fn rpc_admission_limit(self) -> usize {
+        self.rpc_admission_limit
+    }
+
+    pub fn rpc_admission_wait_timeout(self) -> Duration {
+        self.rpc_admission_wait_timeout
+    }
+
+    pub fn rpc_control_admission_wait_timeout(self) -> Duration {
         self.rpc_control_admission_wait_timeout
     }
 }

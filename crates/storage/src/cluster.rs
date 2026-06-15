@@ -13,11 +13,14 @@ pub use local::{
     LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixObjectGenerationMetadataNodeClientConfig,
     LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
-    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
+    LocalUnixStorageNodeClientConfig,
 };
 use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 
-use crate::control_plane::ClusterRuntimeMapSnapshot;
+use crate::control_plane::{
+    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
+};
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::CommitDirectPutObjectCommand;
@@ -801,6 +804,14 @@ impl ReleasedObjectPayloadLease {
 }
 
 /// Cluster-shaped storage handle.
+#[derive(Debug, thiserror::Error)]
+pub enum StorageClusterRuntimeMapRefreshError {
+    #[error("control-plane runtime map refresh failed: {0}")]
+    ControlPlane(#[from] ControlPlaneError),
+    #[error("refreshed runtime map did not build a storage cluster: {0}")]
+    Build(#[from] ClusterBuildError),
+}
+
 #[derive(Clone)]
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
@@ -1891,17 +1902,77 @@ impl StorageCluster {
         runtime_map: &ClusterRuntimeMapSnapshot,
         default_ec_shape: EcShape,
     ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_unix_storage_node_client_admission_settings(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+        )
+    }
+
+    pub fn unix_storage_node_client_configs_from_runtime_map(
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Vec<LocalUnixStorageNodeClientConfig> {
+        runtime_map
+            .nodes()
+            .iter()
+            .map(|node| {
+                LocalUnixStorageNodeClientConfig::with_rpc_admission_settings_from_runtime_node_route(
+                    node,
+                    admission_settings,
+                )
+            })
+            .collect()
+    }
+
+    pub fn from_runtime_map_with_unix_storage_node_client_admission_settings(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
             metadata_primary_node_id,
             runtime_map,
             default_ec_shape,
         )?;
-        let storage_node_configs = runtime_map
-            .nodes()
-            .iter()
-            .map(LocalUnixStorageNodeClientConfig::from_runtime_node_route);
+        let storage_node_configs = Self::unix_storage_node_client_configs_from_runtime_map(
+            runtime_map,
+            admission_settings,
+        );
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
         Self::from_local_map(Arc::new(local_map))
+    }
+
+    pub fn refresh_from_control_plane_runtime_map(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+    ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
+        let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
+        Ok(Self::from_runtime_map(
+            self.metadata_node_id(),
+            &runtime_map,
+            self.default_payload_ec_shape(),
+        )?)
+    }
+
+    pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
+        let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
+        Ok(
+            Self::from_runtime_map_with_unix_storage_node_client_admission_settings(
+                self.metadata_node_id(),
+                &runtime_map,
+                self.default_payload_ec_shape(),
+                admission_settings,
+            )?,
+        )
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
