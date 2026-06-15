@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -646,6 +646,20 @@ pub enum StorageNodeServerError {
         current: Vec<u32>,
         candidate: Vec<u32>,
     },
+    #[error(
+        "storage-node runtime refresh attempted epoch downgrade from {current} to {candidate}"
+    )]
+    RuntimeRefreshEpochDowngrade {
+        current: ClusterEpoch,
+        candidate: ClusterEpoch,
+    },
+    #[error(
+        "storage-node runtime refresh reduced same-epoch route-map validity from {current:?} to {candidate:?}"
+    )]
+    RuntimeRefreshValidityRegression {
+        current: Option<u64>,
+        candidate: Option<u64>,
+    },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(
@@ -744,7 +758,7 @@ pub fn validate_storage_node_process_configs(
 }
 
 pub struct StorageNodeServer {
-    config: StorageNodeProcessConfig,
+    config: RwLock<StorageNodeProcessConfig>,
     _data_dir_lock: StorageNodeDataDirLock,
     _node: Arc<SharedStorageNode>,
     listener: UnixListener,
@@ -772,7 +786,7 @@ impl StorageNodeServer {
             }
         })?;
         Ok(Self {
-            config,
+            config: RwLock::new(config),
             _data_dir_lock: data_dir_lock,
             _node: Arc::new(node),
             listener,
@@ -789,7 +803,7 @@ impl StorageNodeServer {
                 .accept()
                 .map_err(|source| StorageNodeServerError::Io {
                     context: "accept storage-node connection",
-                    path: self.config.socket_path.clone(),
+                    path: self.config_snapshot().socket_path,
                     source,
                 })?;
         self.connection_handler()
@@ -807,7 +821,7 @@ impl StorageNodeServer {
         node_incarnation: u64,
         requested_lease_duration_ms: u64,
     ) -> Result<NodeHeartbeat, StorageNodeServerError> {
-        self.config.control_plane_heartbeat(
+        self.config_snapshot().control_plane_heartbeat(
             &self._node,
             node_incarnation,
             requested_lease_duration_ms,
@@ -841,13 +855,14 @@ impl StorageNodeServer {
             .refresh_node_heartbeat(heartbeat, authority_now_ms)
             .map_err(StorageNodeServerError::from)?;
         let (lease, runtime_map) = refresh.into_parts();
+        let current_config = self.config_snapshot();
         let next_config = StorageNodeProcessConfig::from_runtime_map(
-            self.config.node_id,
-            self.config.data_dir.clone(),
-            self.config.default_ec_shape,
+            current_config.node_id,
+            current_config.data_dir.clone(),
+            current_config.default_ec_shape,
             &runtime_map,
         )?;
-        next_config.validate_runtime_refresh_from(&self.config)?;
+        next_config.validate_runtime_refresh_from(&current_config)?;
         Ok(StorageNodeControlPlaneRefresh {
             lease,
             runtime_map,
@@ -856,7 +871,7 @@ impl StorageNodeServer {
     }
 
     pub fn refresh_and_install_control_plane_runtime_map(
-        &mut self,
+        &self,
         control_plane: &mut impl ControlPlaneHeartbeatRuntimeMapSource,
         node_incarnation: u64,
         requested_lease_duration_ms: u64,
@@ -872,7 +887,7 @@ impl StorageNodeServer {
     }
 
     pub fn install_control_plane_refresh(
-        &mut self,
+        &self,
         refresh: StorageNodeControlPlaneRefresh,
     ) -> Result<HeartbeatLease, StorageNodeServerError> {
         let (lease, _runtime_map, next_config) = refresh.into_parts();
@@ -881,18 +896,36 @@ impl StorageNodeServer {
     }
 
     pub fn install_control_plane_runtime_config(
-        &mut self,
+        &self,
         next_config: StorageNodeProcessConfig,
     ) -> Result<(), StorageNodeServerError> {
         validate_process_config_route_table(&next_config)?;
-        next_config.validate_runtime_refresh_from(&self.config)?;
-        if next_config.pg_ids != self.config.pg_ids {
+        let mut current_config = self.config.write().unwrap_or_else(|e| e.into_inner());
+        next_config.validate_runtime_refresh_from(&current_config)?;
+        if next_config.pg_ids != current_config.pg_ids {
             return Err(StorageNodeServerError::RuntimeRefreshPgSetChanged {
-                current: self.config.pg_ids.clone(),
-                candidate: next_config.pg_ids,
+                current: current_config.pg_ids.clone(),
+                candidate: next_config.pg_ids.clone(),
             });
         }
-        self.config = next_config;
+        if next_config.cluster_epoch < current_config.cluster_epoch {
+            return Err(StorageNodeServerError::RuntimeRefreshEpochDowngrade {
+                current: current_config.cluster_epoch,
+                candidate: next_config.cluster_epoch,
+            });
+        }
+        if next_config.cluster_epoch == current_config.cluster_epoch
+            && route_map_validity_regressed(
+                current_config.route_map_valid_until_ms,
+                next_config.route_map_valid_until_ms,
+            )
+        {
+            return Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
+                current: current_config.route_map_valid_until_ms,
+                candidate: next_config.route_map_valid_until_ms,
+            });
+        }
+        *current_config = next_config;
         Ok(())
     }
 
@@ -903,7 +936,7 @@ impl StorageNodeServer {
                 .accept()
                 .map_err(|source| StorageNodeServerError::Io {
                     context: "accept storage-node connection",
-                    path: self.config.socket_path.clone(),
+                    path: self.config_snapshot().socket_path,
                     source,
                 })?;
         let handler = self.connection_handler();
@@ -917,11 +950,18 @@ impl StorageNodeServer {
 
     fn connection_handler(&self) -> StorageNodeConnectionHandler {
         StorageNodeConnectionHandler {
-            config: self.config.clone(),
+            config: self.config_snapshot(),
             node: Arc::clone(&self._node),
             read_handles: Arc::clone(&self.read_handles),
             metadata_command_locks: self.metadata_command_locks.clone(),
         }
+    }
+
+    fn config_snapshot(&self) -> StorageNodeProcessConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn acquire_session(&self) -> StorageNodeActiveSessionGuard {
@@ -8014,7 +8054,7 @@ fn object_metadata_command_build_error_outcome(
 
 impl Drop for StorageNodeServer {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.config.socket_path);
+        let _ = fs::remove_file(&self.config_snapshot().socket_path);
     }
 }
 
@@ -8129,6 +8169,14 @@ fn validate_process_config_route_table(
         }
     }
     Ok(())
+}
+
+fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
+    match (current, candidate) {
+        (None, Some(_)) => true,
+        (Some(current), Some(candidate)) => candidate < current,
+        _ => false,
+    }
 }
 
 fn validate_socket_directory(socket_path: &Path) -> Result<(), StorageNodeServerError> {
@@ -8557,7 +8605,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
-        let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
         let mut candidate = config.clone();
         candidate.pg_ids = vec![0, 1];
         candidate.pg_routes.push(test_route(1));
@@ -8576,7 +8624,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
-        let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
         let mut candidate = config.clone();
         candidate.cluster_epoch = ClusterEpoch::new(2).unwrap();
 
@@ -8588,6 +8636,47 @@ mod tests {
                 config_epoch,
             }) if route_epoch == ClusterEpoch::new(1).unwrap()
                 && config_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_epoch_downgrade() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut stale = config.clone();
+        stale.cluster_epoch = ClusterEpoch::new(1).unwrap();
+        stale.pg_routes[0].cluster_epoch = stale.cluster_epoch;
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(stale),
+            Err(StorageNodeServerError::RuntimeRefreshEpochDowngrade {
+                current,
+                candidate,
+            }) if current == ClusterEpoch::new(2).unwrap()
+                && candidate == ClusterEpoch::new(1).unwrap()
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_same_epoch_validity_regression() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_valid_until_ms = Some(5_000);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut stale = config.clone();
+        stale.route_map_valid_until_ms = Some(4_000);
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(stale),
+            Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
+                current: Some(5_000),
+                candidate: Some(4_000),
+            })
         ));
     }
 
@@ -8851,7 +8940,7 @@ mod tests {
         .unwrap();
         let mut config = config;
         config.route_map_valid_until_ms = Some(1);
-        let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
         let stale_error = server
             .connection_handler()
             .validate_pg_route(node_id, runtime_map.cluster_epoch(), pg_id)
@@ -8879,8 +8968,9 @@ mod tests {
         let installed_epoch = refresh.next_config().cluster_epoch;
         let lease = server.install_control_plane_refresh(refresh).unwrap();
         assert_eq!(lease.node_id(), node_id);
-        assert_eq!(server.config.cluster_epoch, installed_epoch);
-        assert_eq!(server.config.route_map_valid_until_ms(), None);
+        let installed_config = server.config_snapshot();
+        assert_eq!(installed_config.cluster_epoch, installed_epoch);
+        assert_eq!(installed_config.route_map_valid_until_ms(), None);
         let peering_error = server
             .connection_handler()
             .validate_pg_route(node_id, installed_epoch, pg_id)

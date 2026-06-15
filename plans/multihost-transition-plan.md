@@ -7219,6 +7219,13 @@ Status:
   authority runtime map, and install it for future sessions while preserving
   process identity and rejecting in-place PG-set changes until dynamic PG-store
   open/close is implemented.
+- Made the installed storage-node route config replaceable through shared
+  server access. Connection handlers still receive an immutable config snapshot
+  for each session, while the heartbeat refresh path can install a validated
+  next map for later sessions without requiring exclusive ownership of the
+  running server. Installs are monotonic under the config write lock: older
+  epochs and same-epoch route-map validity regressions are rejected so racing
+  heartbeat refreshes cannot roll a node back to an obsolete map.
 
 Exit criteria:
 
