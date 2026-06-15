@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::control_plane::{
-    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatSink, HeartbeatLease,
-    NodeHeartbeat, PgRouteSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
+    ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PgRouteSnapshot,
 };
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
@@ -259,6 +259,41 @@ pub struct StorageNodeProcessConfig {
     pub pg_ids: Vec<u32>,
     pub socket_path: PathBuf,
     pub pg_routes: Vec<StorageNodePgRoute>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageNodeControlPlaneRefresh {
+    lease: HeartbeatLease,
+    runtime_map: ClusterRuntimeMapSnapshot,
+    next_config: StorageNodeProcessConfig,
+}
+
+impl StorageNodeControlPlaneRefresh {
+    #[must_use]
+    pub fn lease(&self) -> &HeartbeatLease {
+        &self.lease
+    }
+
+    #[must_use]
+    pub fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
+        &self.runtime_map
+    }
+
+    #[must_use]
+    pub fn next_config(&self) -> &StorageNodeProcessConfig {
+        &self.next_config
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        HeartbeatLease,
+        ClusterRuntimeMapSnapshot,
+        StorageNodeProcessConfig,
+    ) {
+        (self.lease, self.runtime_map, self.next_config)
+    }
 }
 
 impl StorageNodeProcessConfig {
@@ -703,6 +738,32 @@ impl StorageNodeServer {
         control_plane
             .submit_node_heartbeat(heartbeat, authority_now_ms)
             .map_err(StorageNodeServerError::from)
+    }
+
+    pub fn refresh_control_plane_runtime_map(
+        &self,
+        control_plane: &mut impl ControlPlaneHeartbeatRuntimeMapSource,
+        node_incarnation: u64,
+        requested_lease_duration_ms: u64,
+        authority_now_ms: u64,
+    ) -> Result<StorageNodeControlPlaneRefresh, StorageNodeServerError> {
+        let heartbeat =
+            self.control_plane_heartbeat(node_incarnation, requested_lease_duration_ms)?;
+        let refresh = control_plane
+            .refresh_node_heartbeat(heartbeat, authority_now_ms)
+            .map_err(StorageNodeServerError::from)?;
+        let (lease, runtime_map) = refresh.into_parts();
+        let next_config = StorageNodeProcessConfig::from_runtime_map(
+            self.config.node_id,
+            self.config.data_dir.clone(),
+            self.config.default_ec_shape,
+            &runtime_map,
+        )?;
+        Ok(StorageNodeControlPlaneRefresh {
+            lease,
+            runtime_map,
+            next_config,
+        })
     }
 
     fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
@@ -8255,6 +8316,91 @@ mod tests {
         assert_eq!(observation.observed_epoch(), runtime_map.cluster_epoch());
         assert_eq!(observation.observed_at_ms(), 1_003);
         assert_eq!(observation.metadata_proof(), proof);
+    }
+
+    #[test]
+    fn storage_node_refreshes_control_plane_runtime_map_candidate() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let second = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        assert!(second.serving());
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let refresh = server
+            .refresh_control_plane_runtime_map(&mut authority, 12, 1_000, 1_003)
+            .unwrap();
+        assert_eq!(refresh.lease().node_id(), node_id);
+        assert_eq!(
+            refresh.lease().cluster_epoch(),
+            refresh.runtime_map().cluster_epoch()
+        );
+        assert_eq!(refresh.next_config().node_id, node_id);
+        assert_eq!(
+            refresh.next_config().cluster_epoch,
+            refresh.runtime_map().cluster_epoch()
+        );
+        assert_eq!(refresh.next_config().data_dir, config.data_dir);
+        assert_eq!(refresh.next_config().pg_ids, vec![pg_id.get()]);
+        assert_eq!(refresh.next_config().pg_routes.len(), 1);
+        assert_eq!(refresh.next_config().pg_routes[0].state, PgState::Peering);
+
+        let observation = authority
+            .snapshot()
+            .node(node_id)
+            .unwrap()
+            .pg_observation(pg_id)
+            .unwrap();
+        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(
+            observation.observed_epoch(),
+            refresh.runtime_map().cluster_epoch()
+        );
     }
 
     #[test]

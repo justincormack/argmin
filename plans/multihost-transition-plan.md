@@ -7146,6 +7146,11 @@ Status:
   single-authority control plane implements it today, and `StorageNodeServer`
   can submit through the interface so the later Phase 12 authority can replace
   the sink without changing storage-node heartbeat construction.
+- Added a one-shot heartbeat/runtime-map refresh boundary. A storage-node server
+  can now submit its local heartbeat through an authority interface, receive the
+  post-heartbeat runtime map from the same authority view, and build the next
+  validated process config that a later heartbeat loop can install or restart
+  into.
 - Added a topology-only local cluster constructor that accepts supplied PG
   routes and validates the route set against the configured epoch, PG set, and
   local node set before exposing it. This is the fail-closed install boundary

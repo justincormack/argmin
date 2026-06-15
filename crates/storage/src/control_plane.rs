@@ -751,6 +751,37 @@ pub trait ControlPlaneHeartbeatSink {
     ) -> Result<HeartbeatLease, ControlPlaneError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneHeartbeatRefresh {
+    lease: HeartbeatLease,
+    runtime_map: ClusterRuntimeMapSnapshot,
+}
+
+impl ControlPlaneHeartbeatRefresh {
+    #[must_use]
+    pub fn lease(&self) -> &HeartbeatLease {
+        &self.lease
+    }
+
+    #[must_use]
+    pub fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
+        &self.runtime_map
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (HeartbeatLease, ClusterRuntimeMapSnapshot) {
+        (self.lease, self.runtime_map)
+    }
+}
+
+pub trait ControlPlaneHeartbeatRuntimeMapSource {
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeServiceAuthorization {
     authority_incarnation: AuthorityIncarnation,
@@ -1668,6 +1699,20 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatSink for SingleAuthorityControlP
         authority_now_ms: u64,
     ) -> Result<HeartbeatLease, ControlPlaneError> {
         self.heartbeat(heartbeat, authority_now_ms)
+    }
+}
+
+impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
+    for SingleAuthorityControlPlane<S>
+{
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let lease = self.heartbeat(heartbeat, authority_now_ms)?;
+        let runtime_map = lease.snapshot().runtime_map(authority_now_ms)?;
+        Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
     }
 }
 
