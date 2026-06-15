@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use ec::{EcConfig, ErasureCodec};
@@ -810,6 +810,20 @@ pub enum StorageClusterRuntimeMapRefreshError {
     ControlPlane(#[from] ControlPlaneError),
     #[error("refreshed runtime map did not build a storage cluster: {0}")]
     Build(#[from] ClusterBuildError),
+    #[error(
+        "refreshed runtime map would downgrade storage cluster epoch from {current} to {candidate}"
+    )]
+    EpochDowngrade {
+        current: ClusterEpoch,
+        candidate: ClusterEpoch,
+    },
+    #[error(
+        "refreshed runtime map reduced same-epoch route-map validity from {current:?} to {candidate:?}"
+    )]
+    ValidityRegression {
+        current: Option<u64>,
+        candidate: Option<u64>,
+    },
 }
 
 #[derive(Clone)]
@@ -818,6 +832,92 @@ pub struct StorageCluster {
     operation_epoch: ClusterEpoch,
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[derive(Clone)]
+pub struct StorageClusterRuntimeMapHandle {
+    cluster: Arc<RwLock<Arc<StorageCluster>>>,
+}
+
+impl StorageClusterRuntimeMapHandle {
+    pub fn new(initial: Arc<StorageCluster>) -> Self {
+        Self {
+            cluster: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<StorageCluster> {
+        self.cluster
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn install(
+        &self,
+        candidate: Arc<StorageCluster>,
+    ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        let mut current = self
+            .cluster
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if candidate.cluster_epoch() < current.cluster_epoch() {
+            return Err(StorageClusterRuntimeMapRefreshError::EpochDowngrade {
+                current: current.cluster_epoch(),
+                candidate: candidate.cluster_epoch(),
+            });
+        }
+        if candidate.cluster_epoch() == current.cluster_epoch()
+            && route_map_validity_regressed(
+                current.route_map_valid_until_ms(),
+                candidate.route_map_valid_until_ms(),
+            )
+        {
+            return Err(StorageClusterRuntimeMapRefreshError::ValidityRegression {
+                current: current.route_map_valid_until_ms(),
+                candidate: candidate.route_map_valid_until_ms(),
+            });
+        }
+        *current = candidate;
+        Ok(())
+    }
+
+    pub fn refresh_from_control_plane_runtime_map(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+    ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError> {
+        let candidate = self
+            .current()
+            .refresh_from_control_plane_runtime_map(control_plane, authority_now_ms)?;
+        self.install(Arc::clone(&candidate))?;
+        Ok(candidate)
+    }
+
+    pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError> {
+        let candidate = self
+            .current()
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                control_plane,
+                authority_now_ms,
+                admission_settings,
+            )?;
+        self.install(Arc::clone(&candidate))?;
+        Ok(candidate)
+    }
+}
+
+fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
+    match (current, candidate) {
+        (None, Some(_)) => true,
+        (Some(current), Some(candidate)) => candidate < current,
+        _ => false,
+    }
 }
 
 pub(super) struct DurableBucketWriteReservation {

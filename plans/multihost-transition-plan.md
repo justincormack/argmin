@@ -7192,8 +7192,11 @@ Status:
   now ask an authority runtime-map source for the current map and rebuild a
   validated replacement cluster handle, preserving the existing immutable handle
   model while giving the later dynamic route-refresh loop a safe swap point.
-  Unix storage-node client rebuilds take explicit RPC admission settings so
-  forced-overload limits and wait-timeout tuning cannot be reset by refresh.
+  The shared frontend runtime-map handle installs refreshed clusters under a
+  monotonic fence, so racing refreshes cannot roll a frontend back to an older
+  epoch or a same-epoch map with reduced route-map validity. Unix storage-node
+  client rebuilds take explicit RPC admission settings so forced-overload
+  limits and wait-timeout tuning cannot be reset by refresh.
 - Added the matching storage-node process config bridge. A storage node can now
   derive its startup PG set, route table, cluster epoch, and socket endpoint
   from a `ClusterRuntimeMapSnapshot`, filtering the authority route view to only

@@ -46,7 +46,7 @@ pub use cluster::{
     BucketWriteSnapshotAction, LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, ReleasedObjectPayloadLease,
-    ShardLocation, StorageCluster,
+    ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
