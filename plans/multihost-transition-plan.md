@@ -7127,6 +7127,13 @@ Status:
   and current active observation, while `Peering` and other non-active PGs are
   exported as non-active routes so runtime maps can reject unsafe work with
   `PgNotActive` instead of losing the PG as an unknown route.
+- Added a control-plane runtime-map snapshot that bundles the all-PG route view
+  with the advertised endpoints and node incarnations for every node referenced
+  by those routes. The authority still stays transport-neutral, but the snapshot
+  now fails closed if a routed node has not advertised an endpoint. Active route
+  snapshots carry the primary lease deadline, and the runtime map exposes the
+  minimum active-route deadline as its `valid_until_ms` so later install/serve
+  paths know when the map must stop routing unsafe work.
 
 Exit criteria:
 

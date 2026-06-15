@@ -295,6 +295,9 @@ impl ClusterControlSnapshot {
                 cluster_epoch: self.cluster_epoch,
             });
         }
+        let primary_lease_deadline_ms = primary_record
+            .lease_deadline_ms
+            .expect("serving primary must have a lease deadline");
         validate_pg_primary_active_observation(self, pg_id, primary)?;
         Ok(PgRouteSnapshot {
             cluster_epoch: self.cluster_epoch,
@@ -302,6 +305,7 @@ impl ClusterControlSnapshot {
             primary_node_id: primary,
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
+            primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
         })
     }
 
@@ -339,6 +343,7 @@ impl ClusterControlSnapshot {
             primary_node_id: primary,
             acting_set: record.acting_set.clone(),
             state: record.state,
+            primary_lease_deadline_ms: None,
         })
     }
 
@@ -347,6 +352,44 @@ impl ClusterControlSnapshot {
             .values()
             .map(|record| self.pg_route(record.pg_id, now_ms))
             .collect()
+    }
+
+    pub fn runtime_map(&self, now_ms: u64) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let pg_routes = self.pg_routes(now_ms)?;
+        let mut routed_node_ids = BTreeSet::new();
+        for route in &pg_routes {
+            routed_node_ids.extend(route.acting_set().iter().copied());
+        }
+        let mut nodes = Vec::with_capacity(routed_node_ids.len());
+        for node_id in routed_node_ids {
+            let node = self
+                .node(node_id)
+                .ok_or(ControlPlaneError::UnknownActingSetNode {
+                    pg_id: 0,
+                    node_id: node_id.as_u32(),
+                })?;
+            if node.endpoint.is_empty() {
+                return Err(ControlPlaneError::NodeEndpointMissing {
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: self.cluster_epoch,
+                });
+            }
+            nodes.push(NodeRouteSnapshot {
+                node_id,
+                node_incarnation: node.node_incarnation,
+                endpoint: node.endpoint.clone(),
+            });
+        }
+        let valid_until_ms = pg_routes
+            .iter()
+            .filter_map(PgRouteSnapshot::primary_lease_deadline_ms)
+            .min();
+        Ok(ClusterRuntimeMapSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            valid_until_ms,
+            nodes,
+            pg_routes,
+        })
     }
 
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
@@ -385,6 +428,7 @@ pub struct PgRouteSnapshot {
     primary_node_id: NodeId,
     acting_set: Vec<NodeId>,
     state: PgState,
+    primary_lease_deadline_ms: Option<u64>,
 }
 
 impl PgRouteSnapshot {
@@ -411,6 +455,65 @@ impl PgRouteSnapshot {
     #[must_use]
     pub fn state(&self) -> PgState {
         self.state
+    }
+
+    #[must_use]
+    pub fn primary_lease_deadline_ms(&self) -> Option<u64> {
+        self.primary_lease_deadline_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRouteSnapshot {
+    node_id: NodeId,
+    node_incarnation: u64,
+    endpoint: String,
+}
+
+impl NodeRouteSnapshot {
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn node_incarnation(&self) -> u64 {
+        self.node_incarnation
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRuntimeMapSnapshot {
+    cluster_epoch: ClusterEpoch,
+    valid_until_ms: Option<u64>,
+    nodes: Vec<NodeRouteSnapshot>,
+    pg_routes: Vec<PgRouteSnapshot>,
+}
+
+impl ClusterRuntimeMapSnapshot {
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn valid_until_ms(&self) -> Option<u64> {
+        self.valid_until_ms
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> &[NodeRouteSnapshot] {
+        &self.nodes
+    }
+
+    #[must_use]
+    pub fn pg_routes(&self) -> &[PgRouteSnapshot] {
+        &self.pg_routes
     }
 }
 
@@ -1630,6 +1733,12 @@ pub enum ControlPlaneError {
 
     #[error("node {node_id} is not serving cluster epoch {cluster_epoch}")]
     NodeNotServingCurrentEpoch {
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error("node {node_id} has no advertised endpoint in cluster epoch {cluster_epoch}")]
+    NodeEndpointMissing {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
     },
@@ -3442,6 +3551,14 @@ mod tests {
         assert_eq!(route.acting_set(), &[NodeId::new(1)]);
         assert_eq!(route.state(), PgState::Active);
         assert_eq!(
+            route.primary_lease_deadline_ms(),
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms()
+        );
+        assert_eq!(
             authority.snapshot().active_pg_routes(2_004).unwrap(),
             vec![route.clone()]
         );
@@ -3510,6 +3627,7 @@ mod tests {
         assert_eq!(route.primary_node_id(), NodeId::new(2));
         assert_eq!(route.acting_set(), &[NodeId::new(2), NodeId::new(1)]);
         assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.primary_lease_deadline_ms(), None);
         assert_eq!(
             authority.snapshot().pg_routes(1_001).unwrap(),
             vec![route.clone()]
@@ -3533,6 +3651,133 @@ mod tests {
                 state: PgState::Peering,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn runtime_map_exports_pg_routes_with_routed_node_endpoints() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(25), vec![NodeId::new(2), NodeId::new(1)])
+            .unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+        assert_eq!(
+            runtime_map.cluster_epoch(),
+            authority.snapshot().cluster_epoch()
+        );
+        assert_eq!(runtime_map.valid_until_ms(), None);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        let route = &runtime_map.pg_routes()[0];
+        assert_eq!(route.pg_id(), PgId::new(25));
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.primary_node_id(), NodeId::new(2));
+        assert_eq!(route.acting_set(), &[NodeId::new(2), NodeId::new(1)]);
+        assert_eq!(
+            runtime_map
+                .nodes()
+                .iter()
+                .map(NodeRouteSnapshot::node_id)
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(1), NodeId::new(2)]
+        );
+        assert_eq!(runtime_map.nodes()[0].endpoint(), "node-1.sock");
+        assert_eq!(runtime_map.nodes()[1].endpoint(), "node-2.sock");
+        assert_eq!(
+            runtime_map.nodes()[0].node_incarnation(),
+            node_incarnation(&authority, 1)
+        );
+    }
+
+    #[test]
+    fn runtime_map_valid_until_is_minimum_active_primary_lease_deadline() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(27), vec![NodeId::new(1)])
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(28), vec![NodeId::new(2)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 27, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(27),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 27, PgState::Active, 2_002);
+        heartbeat_with_pg_observation(&mut authority, 2, 28, PgState::Peering, 3_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(28),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                3_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 2, 28, PgState::Active, 3_002);
+        heartbeat_with_pg_observation(&mut authority, 1, 27, PgState::Active, 3_003);
+
+        let node_1_deadline = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        let node_2_deadline = authority
+            .snapshot()
+            .node(NodeId::new(2))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        assert!(node_2_deadline < node_1_deadline);
+
+        let runtime_map = authority.snapshot().runtime_map(3_004).unwrap();
+        assert_eq!(runtime_map.valid_until_ms(), Some(node_2_deadline));
+        assert_eq!(
+            runtime_map
+                .pg_routes()
+                .iter()
+                .filter(|route| route.state() == PgState::Active)
+                .map(PgRouteSnapshot::primary_lease_deadline_ms)
+                .collect::<Vec<_>>(),
+            vec![Some(node_1_deadline), Some(node_2_deadline)]
+        );
+    }
+
+    #[test]
+    fn runtime_map_requires_endpoints_for_routed_nodes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(26), vec![NodeId::new(1)])
+            .unwrap();
+
+        assert!(matches!(
+            authority.snapshot().runtime_map(1_000),
+            Err(ControlPlaneError::NodeEndpointMissing { node_id: 1, .. })
         ));
     }
 
