@@ -27,6 +27,7 @@
 /// All IO is synchronous. Single-node, single-process for v1-minimal.
 pub mod clock;
 pub mod cluster;
+pub mod control_plane;
 pub mod error;
 pub(crate) mod metadata_command;
 pub mod node;

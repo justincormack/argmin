@@ -7016,6 +7016,19 @@ Work items:
     about request bounding and retry quality; treat the latter as evidence
     about distributed correctness.
 
+Status:
+
+- Started Phase 11 with the control-plane authority foundation in
+  `crates/storage/src/control_plane.rs`. The first slice defines durable
+  membership states, temporary availability states, authority incarnations,
+  heartbeat lease requests/responses, a file-backed single-authority store, and
+  deterministic PG primary selection from an agreed map. The file-backed
+  authority persists the epoch/map/incarnation tuple before issuing leases and
+  bumps both authority incarnation and cluster epoch on restart so previous
+  authority instances cannot reuse fencing tokens. This is intentionally still
+  single-authority; Phase 12 can replace the store/authority implementation
+  behind the same control-plane boundary with replicated consensus.
+
 Exit criteria:
 
 1. stale primaries cannot accept writes after an epoch change
