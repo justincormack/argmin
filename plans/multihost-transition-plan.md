@@ -7317,6 +7317,14 @@ Status:
   private directory creation, frontend bootstrap, runtime-map refresh, and
   storage-node bootstrap without depending on the checkout path being shorter
   than the platform `sun_path` limit.
+- Added the first real multihost control-plane correctness smoke:
+  `./scripts/uat-s3-tests --smoke control-plane-runtime-map`. The smoke starts a
+  separate single-authority control-plane manager, two storage-node processes,
+  and a frontend process that bootstraps and refreshes routing only through
+  `ARGMIN_CONTROL_PLANE_SOCKET_PATH`; it then runs an S3 probe, restarts one
+  storage node, waits for heartbeat/peering refresh, and runs a second S3
+  probe. This is intentionally a narrow process/runtime-map wiring smoke, not
+  the later full distributed-correctness soak.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition

@@ -21,7 +21,8 @@ Options:
   --topology NAME        Test topology: multihost or local (default: multihost)
   --repeat N            Repeat the selected s3-tests command N times (default: 1)
   --smoke NAME           Run a focused smoke instead of the full suite:
-                         storage-node-restart, storage-node-kill-fails-closed
+                         storage-node-restart, storage-node-kill-fails-closed,
+                         control-plane-runtime-map
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
@@ -132,10 +133,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed)
+    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map)
         ;;
     *)
-        die "--smoke must be storage-node-restart or storage-node-kill-fails-closed"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, or control-plane-runtime-map"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -170,6 +171,15 @@ if [[ "$smoke" == "storage-node-restart" || "$smoke" == "storage-node-kill-fails
     export ARGMIN_EC_M=0
     export ARGMIN_LOCAL_NODE_COUNT=1
     export ARGMIN_PG_COUNT=1
+fi
+if [[ "$smoke" == "control-plane-runtime-map" ]]; then
+    export ARGMIN_EC_K=1
+    export ARGMIN_EC_M=1
+    export ARGMIN_LOCAL_NODE_COUNT=2
+    export ARGMIN_PG_COUNT=2
+    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-1000}"
 fi
 if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
@@ -259,6 +269,8 @@ frontend_pid=""
 frontend_log=""
 metrics_sampler_pid=""
 slowdown_summary_printed=0
+control_plane_state_path=""
+control_plane_socket_path=""
 
 print_command() {
     printf '+'
@@ -282,22 +294,44 @@ start_process() {
 
 start_storage_node() {
     local node_id="$1"
-    local socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
-    local node_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")"
-    local node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
+    local socket_path
+    local node_data_dir
+    local node_log
+    socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+    node_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")"
+    node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
+    local control_plane_env=()
+    if [[ -n "$control_plane_socket_path" ]]; then
+        control_plane_env=(ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path")
+    fi
     start_process "storage-node-$node_id" "$node_log" env \
         -u ARGMIN_STORAGE_NODE_SOCKETS \
         ARGMIN_PROCESS_ROLE=storage-node \
         ARGMIN_STORAGE_NODE_ID="$node_id" \
         ARGMIN_STORAGE_NODE_DATA_DIR="$node_data_dir" \
         ARGMIN_STORAGE_NODE_SOCKET_PATH="$socket_path" \
+        "${control_plane_env[@]}" \
         ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
         ARGMIN_DATA_DIR="$data_dir" \
         ARGMIN_LISTEN_ADDR="$listen_addr" \
         "${server_cmd[@]}"
     local index=$((${#server_pids[@]} - 1))
-    storage_node_pids[$node_id]="${server_pids[$index]}"
-    storage_node_logs[$node_id]="${server_logs[$index]}"
+    storage_node_pids[node_id]="${server_pids[$index]}"
+    storage_node_logs[node_id]="${server_logs[$index]}"
+}
+
+start_control_plane() {
+    control_plane_state_path="$data_dir/control-plane.state"
+    control_plane_socket_path="$sockets_dir/control-plane.sock"
+    local control_plane_log="$logs_dir/control-plane.log"
+    start_process "control-plane" "$control_plane_log" env \
+        ARGMIN_PROCESS_ROLE=control-plane \
+        ARGMIN_CONTROL_PLANE_STATE_PATH="$control_plane_state_path" \
+        ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path" \
+        ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
+        ARGMIN_DATA_DIR="$data_dir/control-plane" \
+        ARGMIN_LISTEN_ADDR="$listen_addr" \
+        "${server_cmd[@]}"
 }
 
 wait_for_process() {
@@ -316,7 +350,8 @@ wait_for_storage_node_socket() {
     local node_id="$1"
     local pid="${storage_node_pids[$node_id]}"
     local log_path="${storage_node_logs[$node_id]}"
-    local socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
+    local socket_path
+    socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
     for ((attempt = 0; attempt < 200; attempt++)); do
         wait_for_process "$pid" "$log_path" "storage-node-$node_id"
         if [[ -S "$socket_path" ]] && grep -q "storage-node $node_id listening" "$log_path"; then
@@ -326,6 +361,21 @@ wait_for_storage_node_socket() {
     done
     cat "$log_path" >&2 || true
     die "storage-node-$node_id did not become ready at $socket_path"
+}
+
+wait_for_control_plane_socket() {
+    local pid="${server_pids[$((${#server_pids[@]} - 1))]}"
+    local log_path="${server_logs[$((${#server_logs[@]} - 1))]}"
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        wait_for_process "$pid" "$log_path" "control-plane"
+        if [[ -S "$control_plane_socket_path" ]] \
+            && grep -q "control-plane manager using state" "$log_path"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    cat "$log_path" >&2 || true
+    die "control-plane did not become ready at $control_plane_socket_path"
 }
 
 restart_storage_node() {
@@ -617,6 +667,11 @@ else
         echo "${socket_entries[*]}"
     )"
 
+    if [[ "$smoke" == "control-plane-runtime-map" ]]; then
+        start_control_plane
+        wait_for_control_plane_socket
+    fi
+
     for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
         start_storage_node "$node_id"
     done
@@ -626,17 +681,32 @@ else
     done
 
     frontend_log="$logs_dir/frontend.log"
-    start_process "frontend" "$frontend_log" env \
-        -u ARGMIN_STORAGE_NODE_ID \
-        -u ARGMIN_STORAGE_NODE_DATA_DIR \
-        -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
-        ARGMIN_PROCESS_ROLE=frontend \
-        ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
-        ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
-        ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \
-        ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
-        ARGMIN_DATA_DIR="$data_dir/frontend" \
-        "${server_cmd[@]}"
+    if [[ "$smoke" == "control-plane-runtime-map" ]]; then
+        start_process "frontend" "$frontend_log" env \
+            -u ARGMIN_STORAGE_NODE_ID \
+            -u ARGMIN_STORAGE_NODE_DATA_DIR \
+            -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
+            -u ARGMIN_STORAGE_NODE_SOCKETS \
+            ARGMIN_PROCESS_ROLE=frontend \
+            ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
+            ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
+            ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \
+            ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path" \
+            ARGMIN_DATA_DIR="$data_dir/frontend" \
+            "${server_cmd[@]}"
+    else
+        start_process "frontend" "$frontend_log" env \
+            -u ARGMIN_STORAGE_NODE_ID \
+            -u ARGMIN_STORAGE_NODE_DATA_DIR \
+            -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
+            ARGMIN_PROCESS_ROLE=frontend \
+            ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
+            ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
+            ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \
+            ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
+            ARGMIN_DATA_DIR="$data_dir/frontend" \
+            "${server_cmd[@]}"
+    fi
 fi
 
 frontend_index=$((${#server_pids[@]} - 1))
@@ -755,6 +825,12 @@ elif [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     run_nextest "pre-kill s3-tests smoke" test_object_default_content_type
     kill_storage_node 0
     run_nextest_expect_failure "post-kill s3-tests smoke" test_object_read_not_exist
+elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
+    sleep 1
+    run_nextest "control-plane runtime-map pre-restart s3-tests smoke" test_object_default_content_type
+    restart_storage_node 0
+    sleep 1
+    run_nextest "control-plane runtime-map post-restart s3-tests smoke" test_object_read_not_exist
 else
     run_nextest "s3-tests" "${cargo_args[@]}"
 fi
