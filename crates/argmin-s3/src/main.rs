@@ -1005,6 +1005,10 @@ mod tests {
         NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
     };
 
+    fn short_unix_socket_test_dir(name: &str) -> PathBuf {
+        Path::new("/tmp").join(format!("as3-{}-{name}", std::process::id()))
+    }
+
     fn test_server_config() -> ServerConfig {
         ServerConfig {
             process_role: ProcessRole::StorageNode,
@@ -1080,12 +1084,9 @@ mod tests {
 
     #[test]
     fn control_plane_socket_bind_creates_private_missing_directory() {
-        let tmp = std::env::temp_dir().join(format!(
-            "argmin-control-plane-socket-private-test-{}",
-            std::process::id()
-        ));
+        let tmp = short_unix_socket_test_dir("cppriv");
         let _ = std::fs::remove_dir_all(&tmp);
-        let socket_path = tmp.join("nested").join("control-plane.sock");
+        let socket_path = tmp.join("n").join("cp.sock");
 
         let listener = bind_control_plane_socket(&socket_path).unwrap();
 
@@ -1101,14 +1102,11 @@ mod tests {
 
     #[test]
     fn control_plane_socket_bind_rejects_public_directory() {
-        let tmp = std::env::temp_dir().join(format!(
-            "argmin-control-plane-socket-public-test-{}",
-            std::process::id()
-        ));
+        let tmp = short_unix_socket_test_dir("cppub");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let socket_path = tmp.join("control-plane.sock");
+        let socket_path = tmp.join("cp.sock");
 
         let error = bind_control_plane_socket(&socket_path).unwrap_err();
 
@@ -1392,14 +1390,11 @@ mod tests {
 
     #[test]
     fn remote_frontend_storage_cluster_can_bootstrap_from_control_plane_socket() {
-        let tmp = std::env::temp_dir().join(format!(
-            "argmin-control-plane-frontend-bootstrap-test-{}",
-            std::process::id()
-        ));
+        let tmp = short_unix_socket_test_dir("fb");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let socket_path = tmp.join("control-plane.sock");
-        let endpoint = tmp.join("node-0.sock");
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
         let server = serve_one_control_plane_runtime_map(
             socket_path.clone(),
             NodeId::new(0),
@@ -1432,14 +1427,11 @@ mod tests {
 
     #[test]
     fn remote_frontend_control_plane_bootstrap_uses_routed_metadata_primary() {
-        let tmp = std::env::temp_dir().join(format!(
-            "argmin-control-plane-frontend-nonzero-primary-test-{}",
-            std::process::id()
-        ));
+        let tmp = short_unix_socket_test_dir("fnz");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let socket_path = tmp.join("control-plane.sock");
-        let endpoint = tmp.join("node-3.sock");
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n3.sock");
         let server = serve_one_control_plane_runtime_map(
             socket_path.clone(),
             NodeId::new(3),
@@ -1472,14 +1464,11 @@ mod tests {
 
     #[test]
     fn remote_frontend_control_plane_refresh_loop_updates_bootstrap_map() {
-        let tmp = std::env::temp_dir().join(format!(
-            "argmin-control-plane-frontend-refresh-test-{}",
-            std::process::id()
-        ));
+        let tmp = short_unix_socket_test_dir("fr");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let socket_path = tmp.join("control-plane.sock");
-        let endpoint = tmp.join("node-0.sock");
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
         let server = serve_frontend_control_plane_runtime_map_refresh(
             socket_path.clone(),
             NodeId::new(0),
@@ -1536,14 +1525,11 @@ mod tests {
 
     #[test]
     fn storage_node_process_config_can_bootstrap_from_control_plane_socket() {
-        let tmp = std::env::temp_dir().join(format!(
-            "argmin-control-plane-storage-bootstrap-test-{}",
-            std::process::id()
-        ));
+        let tmp = short_unix_socket_test_dir("sb");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let socket_path = tmp.join("control-plane.sock");
-        let endpoint = tmp.join("node-0.sock");
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
         let server = serve_one_control_plane_runtime_map(
             socket_path.clone(),
             NodeId::new(0),
