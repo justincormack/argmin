@@ -7349,6 +7349,13 @@ Status:
   peering metadata proof. After the authority completes peering, a storage node
   cannot replace its PG observation with `Active` unless the heartbeat carries
   the same log-index/hash/state-digest proof that was accepted for that PG.
+- Extended that accepted-proof invariant to active-primary service/export,
+  storage-node refresh-map export, and persisted-state load validation.
+  Runtime-map active routes, storage-node refresh routes outside the explicit
+  just-activated handoff, PG-operation authorization, and serving-primary
+  selection now fail closed if the bound primary's current Active observation
+  does not match the PG's accepted peering proof, and version 7 state files
+  reject current Active observations with a mismatched proof.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition

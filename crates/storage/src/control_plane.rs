@@ -322,6 +322,7 @@ impl ClusterControlSnapshot {
         &self,
         pg_id: PgId,
         now_ms: u64,
+        just_activated: bool,
     ) -> Result<PgRouteSnapshot, ControlPlaneError> {
         let record = self
             .pg(pg_id)
@@ -365,6 +366,9 @@ impl ClusterControlSnapshot {
                 pg_id: pg_id.get(),
                 cluster_epoch: self.cluster_epoch,
             });
+        }
+        if !just_activated {
+            validate_pg_primary_active_observation(self, pg_id, primary)?;
         }
         Ok(PgRouteSnapshot {
             cluster_epoch: self.cluster_epoch,
@@ -418,12 +422,17 @@ impl ClusterControlSnapshot {
         &self,
         pg_id: PgId,
         now_ms: u64,
+        just_activated_pgs: &BTreeSet<PgId>,
     ) -> Result<PgRouteSnapshot, ControlPlaneError> {
         let record = self
             .pg(pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
         if record.state == PgState::Active {
-            return self.active_pg_route_for_storage_node_refresh(pg_id, now_ms);
+            return self.active_pg_route_for_storage_node_refresh(
+                pg_id,
+                now_ms,
+                just_activated_pgs.contains(&pg_id),
+            );
         }
         self.pg_route(pg_id, now_ms)
     }
@@ -438,10 +447,13 @@ impl ClusterControlSnapshot {
     fn pg_routes_for_storage_node_refresh(
         &self,
         now_ms: u64,
+        just_activated_pgs: &BTreeSet<PgId>,
     ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         self.pgs
             .values()
-            .map(|record| self.pg_route_for_storage_node_refresh(record.pg_id, now_ms))
+            .map(|record| {
+                self.pg_route_for_storage_node_refresh(record.pg_id, now_ms, just_activated_pgs)
+            })
             .collect()
     }
 
@@ -453,8 +465,9 @@ impl ClusterControlSnapshot {
     fn runtime_map_for_storage_node_refresh(
         &self,
         now_ms: u64,
+        just_activated_pgs: &BTreeSet<PgId>,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms)?;
+        let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms, just_activated_pgs)?;
         self.runtime_map_from_pg_routes(pg_routes)
     }
 
@@ -1960,15 +1973,16 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
         let node_id = heartbeat.node_id;
         let mut lease = self.heartbeat(heartbeat, authority_now_ms)?;
-        if !self
+        let just_activated_pgs: BTreeSet<PgId> = self
             .complete_ready_pg_peerings(authority_now_ms)?
-            .is_empty()
-        {
+            .into_iter()
+            .collect();
+        if !just_activated_pgs.is_empty() {
             lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
         }
         let runtime_map = self
             .snapshot
-            .runtime_map_for_storage_node_refresh(authority_now_ms)?;
+            .runtime_map_for_storage_node_refresh(authority_now_ms, &just_activated_pgs)?;
         Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
     }
 }
@@ -3310,6 +3324,17 @@ fn validate_current_pg_observations(
                     "node PG observation references PG outside node acting set",
                 ));
             }
+            if pg.state == PgState::Active && observation.state == PgState::Active {
+                let Some(expected) = pg.active_metadata_proof else {
+                    return Err(parse_error(line, "active PG is missing metadata proof"));
+                };
+                if observation.metadata_proof != expected {
+                    return Err(parse_error(
+                        line,
+                        "active node PG observation metadata proof does not match PG active proof",
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -3753,6 +3778,10 @@ fn primary_has_current_pg_state(
     primary: NodeId,
     expected_state: PgState,
 ) -> bool {
+    let expected_active_proof = snapshot
+        .pgs
+        .get(&pg_id)
+        .and_then(|pg| pg.active_metadata_proof);
     snapshot
         .nodes
         .get(&primary)
@@ -3760,6 +3789,8 @@ fn primary_has_current_pg_state(
         .is_some_and(|observation| {
             observation.observed_epoch == snapshot.cluster_epoch
                 && observation.state == expected_state
+                && (expected_state != PgState::Active
+                    || Some(observation.metadata_proof) == expected_active_proof)
         })
 }
 
@@ -3768,6 +3799,13 @@ fn validate_pg_primary_active_observation(
     pg_id: PgId,
     primary: NodeId,
 ) -> Result<(), ControlPlaneError> {
+    let pg = snapshot
+        .pgs
+        .get(&pg_id)
+        .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+    let expected_proof = pg
+        .active_metadata_proof
+        .ok_or(ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() })?;
     let Some(node) = snapshot.nodes.get(&primary) else {
         return Err(ControlPlaneError::UnknownNode {
             node_id: primary.as_u32(),
@@ -3793,6 +3831,15 @@ fn validate_pg_primary_active_observation(
             node_id: primary.as_u32(),
             cluster_epoch: snapshot.cluster_epoch,
             state: observation.state,
+        });
+    }
+    if observation.metadata_proof != expected_proof {
+        return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+            cluster_epoch: snapshot.cluster_epoch,
+            expected: expected_proof,
+            actual: observation.metadata_proof,
         });
     }
     Ok(())
@@ -4648,6 +4695,31 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_authority_rejects_active_pg_observation_with_mismatched_proof() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=7\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node_pg=1,7,active,2,100,9,10,12\n",
+                "pg=7,active,1,1,9,10,11\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message
+                    == "active node PG observation metadata proof does not match PG active proof"
+        ));
+    }
+
+    #[test]
     fn heartbeat_lease_is_issued_after_persisted_epoch_map_tuple() {
         let tmp = test_util::tempdir();
         let store_path = tmp.path().join("control-plane.state");
@@ -5154,6 +5226,125 @@ mod tests {
         assert_eq!(storage_node_route.primary_node_id, route.primary_node_id());
         assert_eq!(storage_node_route.acting_set, route.acting_set());
         assert_eq!(storage_node_route.state, route.state());
+    }
+
+    #[test]
+    fn active_primary_service_requires_current_observation_metadata_proof() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(22), vec![NodeId::new(1)])
+            .unwrap();
+
+        let accepted_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let mut peering_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Peering,
+            metadata_proof: accepted_proof,
+        }];
+        authority.heartbeat(peering_heartbeat, 2_000).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(22),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+
+        let mut active_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_020);
+        active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Active,
+            metadata_proof: accepted_proof,
+        }];
+        authority.heartbeat(active_heartbeat, 2_020).unwrap();
+        assert!(authority
+            .snapshot()
+            .active_pg_route(PgId::new(22), 2_030)
+            .is_ok());
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(22), 2_030),
+            Some(NodeId::new(1))
+        );
+        assert!(authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(22),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                authority.snapshot().cluster_epoch(),
+                2_030,
+            )
+            .is_ok());
+
+        let mismatched_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        authority
+            .snapshot
+            .nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .pg_observations
+            .get_mut(&PgId::new(22))
+            .unwrap()
+            .metadata_proof = mismatched_proof;
+
+        assert_eq!(authority.serving_pg_primary(PgId::new(22), 2_031), None);
+        assert!(matches!(
+            authority.snapshot().active_pg_route(PgId::new(22), 2_031),
+            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                pg_id: 22,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == accepted_proof && actual == mismatched_proof
+        ));
+        assert!(matches!(
+            authority
+                .snapshot()
+                .runtime_map_for_storage_node_refresh(2_031, &BTreeSet::new()),
+            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                pg_id: 22,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == accepted_proof && actual == mismatched_proof
+        ));
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(22),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                authority.snapshot().cluster_epoch(),
+                2_031,
+            ),
+            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                pg_id: 22,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == accepted_proof && actual == mismatched_proof
+        ));
     }
 
     #[test]
