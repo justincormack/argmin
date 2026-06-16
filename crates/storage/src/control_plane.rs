@@ -1127,6 +1127,59 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn bootstrap_initial_cluster_map(
+        &mut self,
+        nodes: Vec<(NodeId, String)>,
+        pg_ids: Vec<PgId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        if self.snapshot.nodes().next().is_some() || self.snapshot.pgs().next().is_some() {
+            return Err(ControlPlaneError::BootstrapRequiresEmptyState);
+        }
+        if nodes.is_empty() {
+            return Err(ControlPlaneError::EmptyActingSet { pg_id: 0 });
+        }
+
+        let mut unique_nodes = BTreeSet::new();
+        let mut node_ids = Vec::with_capacity(nodes.len());
+        for (node_id, endpoint) in &nodes {
+            if !unique_nodes.insert(*node_id) {
+                return Err(ControlPlaneError::DuplicateActingSetNode {
+                    pg_id: 0,
+                    node_id: node_id.as_u32(),
+                });
+            }
+            if endpoint.is_empty() {
+                return Err(ControlPlaneError::NodeEndpointMissing {
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: self.snapshot.cluster_epoch(),
+                });
+            }
+            node_ids.push(*node_id);
+        }
+
+        let mut unique_pgs = BTreeSet::new();
+        for pg_id in &pg_ids {
+            if !unique_pgs.insert(*pg_id) {
+                return Err(ControlPlaneError::DuplicateBootstrapPg { pg_id: pg_id.get() });
+            }
+        }
+
+        let mut next_snapshot = self.snapshot.clone();
+        for (node_id, endpoint) in nodes {
+            let mut record = NodeControlRecord::new(node_id, NodeMembershipState::Active);
+            record.endpoint = endpoint;
+            next_snapshot.nodes.insert(node_id, record);
+        }
+        for pg_id in pg_ids {
+            next_snapshot
+                .pgs
+                .insert(pg_id, PgControlRecord::new(pg_id, node_ids.clone()));
+        }
+        next_snapshot.bump_epoch()?;
+        self.commit_snapshot(next_snapshot)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn set_pg_acting_set(
         &mut self,
         pg_id: PgId,
@@ -2454,6 +2507,12 @@ pub enum ControlPlaneError {
 
     #[error("PG {pg_id} acting set repeats node {node_id}")]
     DuplicateActingSetNode { pg_id: u32, node_id: u32 },
+
+    #[error("control-plane bootstrap repeats PG {pg_id}")]
+    DuplicateBootstrapPg { pg_id: u32 },
+
+    #[error("control-plane bootstrap requires empty state")]
+    BootstrapRequiresEmptyState,
 
     #[error("node {node_id} heartbeat repeats PG {pg_id} observation")]
     DuplicatePgObservation { node_id: u32, pg_id: u32 },
@@ -4378,6 +4437,60 @@ mod tests {
         assert_eq!(persisted_pg.state(), PgState::Peering);
         assert_eq!(persisted_pg.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
         assert!(std::fs::metadata(store_path).unwrap().is_file());
+    }
+
+    #[test]
+    fn bootstrap_initial_cluster_map_persists_nodes_and_pg_routes_atomically() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+
+        let snapshot = authority
+            .bootstrap_initial_cluster_map(
+                vec![
+                    (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+                    (NodeId::new(4), "/tmp/node-4.sock".to_owned()),
+                ],
+                vec![PgId::new(0), PgId::new(3)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            snapshot
+                .nodes()
+                .map(NodeControlRecord::node_id)
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(2), NodeId::new(4)]
+        );
+        assert_eq!(
+            snapshot
+                .nodes()
+                .map(NodeControlRecord::endpoint)
+                .collect::<Vec<_>>(),
+            vec!["/tmp/node-2.sock", "/tmp/node-4.sock"]
+        );
+        for pg_id in [0, 3] {
+            let pg = snapshot.pg(PgId::new(pg_id)).unwrap();
+            assert_eq!(pg.acting_set(), &[NodeId::new(2), NodeId::new(4)]);
+            assert_eq!(pg.state(), PgState::Peering);
+        }
+        assert_eq!(
+            snapshot
+                .runtime_map(1_000)
+                .unwrap()
+                .nodes()
+                .iter()
+                .map(NodeRouteSnapshot::endpoint)
+                .collect::<Vec<_>>(),
+            vec!["/tmp/node-2.sock", "/tmp/node-4.sock"]
+        );
+        assert!(matches!(
+            authority.bootstrap_initial_cluster_map(
+                vec![(NodeId::new(5), "/tmp/node-5.sock".to_owned())],
+                vec![PgId::new(7)]
+            ),
+            Err(ControlPlaneError::BootstrapRequiresEmptyState)
+        ));
     }
 
     #[test]

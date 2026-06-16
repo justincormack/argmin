@@ -108,7 +108,7 @@ impl ServerConfig {
     ///   `ARGMIN_PG_COUNT` (16)
     ///   `ARGMIN_STORAGE_CLUSTER_EPOCH` (1)
     ///   `ARGMIN_STORAGE_PG_IDS` (all PGs in `0..ARGMIN_PG_COUNT`)
-    ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for static frontend/combined routing)
+    ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for static frontend/combined routing, optional initial control-plane bootstrap membership)
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` (1024)
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` (250)
     ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)

@@ -7276,6 +7276,14 @@ Status:
   admission settings. Live frontend coordinator handle swapping remains a
   separate boundary because current coordinators own an immutable
   `Arc<StorageCluster>`.
+- Added fresh-state control-plane bootstrap from the existing
+  `ARGMIN_STORAGE_NODE_SOCKETS` and PG configuration. When a manager opens an
+  empty authority state and a storage-node socket map is present, it persists
+  the initial active node membership and PG acting sets in one atomic authority
+  commit before serving the Unix control-plane socket. The configured socket
+  endpoints are persisted for pre-heartbeat runtime-map bootstrap, while
+  serving eligibility still requires heartbeat/incarnation/observed-epoch/PG
+  observation fencing.
 
 Exit criteria:
 

@@ -261,8 +261,12 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         std::process::exit(1);
     });
     let store = FileControlPlaneStore::new(state_path);
-    let authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
         eprintln!("failed to open control-plane state {state_path}: {error}");
+        std::process::exit(1);
+    });
+    bootstrap_empty_control_plane(&mut authority, config).unwrap_or_else(|error| {
+        eprintln!("failed to bootstrap control-plane state: {error}");
         std::process::exit(1);
     });
     let authority = Arc::new(Mutex::new(authority));
@@ -313,6 +317,41 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
+}
+
+fn bootstrap_empty_control_plane(
+    authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+    config: &ServerConfig,
+) -> Result<(), String> {
+    if authority.snapshot().nodes().next().is_some() {
+        return Ok(());
+    }
+    if config.storage_node_sockets.is_empty() {
+        return Ok(());
+    }
+
+    let nodes: Vec<(NodeId, String)> = config
+        .storage_node_sockets
+        .iter()
+        .map(|entry| (NodeId::new(entry.node_id), entry.socket_path.clone()))
+        .collect();
+    let pg_ids: Vec<storage::PgId> = config
+        .storage_pg_ids
+        .iter()
+        .copied()
+        .map(storage::PgId::new)
+        .collect();
+    let node_count = nodes.len();
+    authority
+        .bootstrap_initial_cluster_map(nodes, pg_ids)
+        .map_err(|error| error.to_string())?;
+    eprintln!(
+        "control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
+        node_count,
+        config.storage_pg_ids.len(),
+        authority.snapshot().cluster_epoch()
+    );
+    Ok(())
 }
 
 fn spawn_control_plane_rpc_worker(
@@ -929,6 +968,7 @@ async fn run_frontend_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage::control_plane::NodeMembershipState;
 
     fn test_server_config() -> ServerConfig {
         ServerConfig {
@@ -1039,6 +1079,88 @@ mod tests {
 
         assert!(error.contains("must be private"), "{error}");
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn control_plane_bootstrap_initializes_empty_state_from_storage_node_sockets() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-bootstrap-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = FileControlPlaneStore::new(tmp.join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let mut config = test_server_config();
+        config.storage_pg_ids = vec![0, 3];
+        config.storage_node_sockets = vec![
+            config::ConfiguredStorageNodeSocket {
+                node_id: 2,
+                socket_path: tmp.join("node-2.sock").display().to_string(),
+            },
+            config::ConfiguredStorageNodeSocket {
+                node_id: 4,
+                socket_path: tmp.join("node-4.sock").display().to_string(),
+            },
+        ];
+
+        bootstrap_empty_control_plane(&mut authority, &config).unwrap();
+
+        assert_eq!(
+            authority
+                .snapshot()
+                .nodes()
+                .map(|node| node.node_id())
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(2), NodeId::new(4)]
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .runtime_map(1_000)
+                .unwrap()
+                .nodes()
+                .iter()
+                .map(|node| node.endpoint().to_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                tmp.join("node-2.sock").display().to_string(),
+                tmp.join("node-4.sock").display().to_string(),
+            ]
+        );
+        for pg_id in [0, 3] {
+            let pg = authority.snapshot().pg(storage::PgId::new(pg_id)).unwrap();
+            assert_eq!(pg.acting_set(), &[NodeId::new(2), NodeId::new(4)]);
+            assert_eq!(pg.state(), PgState::Peering);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn control_plane_bootstrap_does_not_rewrite_existing_state() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-bootstrap-existing-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = FileControlPlaneStore::new(tmp.join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(7), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let mut config = test_server_config();
+        config.storage_pg_ids = vec![0];
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: tmp.join("node-1.sock").display().to_string(),
+        }];
+
+        bootstrap_empty_control_plane(&mut authority, &config).unwrap();
+
+        assert_eq!(authority.snapshot(), &before);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
