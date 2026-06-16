@@ -7356,6 +7356,12 @@ Status:
   selection now fail closed if the bound primary's current Active observation
   does not match the PG's accepted peering proof, and version 7 state files
   reject current Active observations with a mismatched proof.
+- Tightened existing-node membership changes to fence active service before the
+  new epoch is exposed. Any membership transition now moves affected Active PGs
+  back to `Peering`, not only transitions to `Out` or `Removed`; regressions
+  cover Active-to-`Joining` and Active-to-`Draining` so non-serving joins and
+  draining handoff both require current-epoch peering before unsafe service can
+  resume.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition

@@ -1181,13 +1181,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             }
             Some(record) => {
                 record.membership = membership;
+                affected_node = Some(node_id);
                 if matches!(
                     membership,
                     NodeMembershipState::Out | NodeMembershipState::Removed
                 ) {
                     record.availability = NodeAvailabilityState::Unavailable;
                     record.lease_deadline_ms = None;
-                    affected_node = Some(node_id);
                 }
                 changed = true;
             }
@@ -8215,6 +8215,163 @@ mod tests {
         authority
             .validate_pg_operation_authorization(&new_authorization, 2_017)
             .unwrap();
+    }
+
+    #[test]
+    fn membership_change_to_joining_forces_active_pg_to_peering() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(23), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 23, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(23),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 1, 23, PgState::Active, 2_002);
+        let active_epoch = active.cluster_epoch();
+        let authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(23),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                active_epoch,
+                2_003,
+            )
+            .unwrap();
+
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Joining)
+            .unwrap();
+        let joining_epoch = authority.snapshot().cluster_epoch();
+        assert!(joining_epoch > active_epoch);
+        let pg = authority.snapshot().pg(PgId::new(23)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.active_primary(), None);
+        assert_eq!(pg.active_metadata_proof(), None);
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(&authorization, 2_004),
+            Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch,
+                current_epoch,
+            }) if cluster_epoch == active_epoch && current_epoch == joining_epoch
+        ));
+
+        let joining_lease = authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, joining_epoch, 2_005),
+                2_005,
+            )
+            .unwrap();
+        assert!(!joining_lease.serving());
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(23),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                joining_epoch,
+                2_006,
+            ),
+            Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: 1,
+                cluster_epoch,
+            }) if cluster_epoch == joining_epoch
+        ));
+    }
+
+    #[test]
+    fn membership_change_to_draining_forces_repeering_before_service() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(24), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(24),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Active, 2_002);
+        let active_epoch = active.cluster_epoch();
+
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Draining)
+            .unwrap();
+        let draining_epoch = authority.snapshot().cluster_epoch();
+        assert!(draining_epoch > active_epoch);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(24)).unwrap().state(),
+            PgState::Peering
+        );
+        let draining_lease = authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, draining_epoch, 2_003),
+                2_003,
+            )
+            .unwrap();
+        assert!(
+            draining_lease.serving(),
+            "draining nodes can still serve after observing the new map"
+        );
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(24),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                draining_epoch,
+                2_004,
+            ),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 24,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+
+        heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Peering, 2_005);
+        authority
+            .complete_pg_peering(
+                PgId::new(24),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_006,
+            )
+            .unwrap();
+        let active_again =
+            heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Active, 2_007);
+        let authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(24),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                active_again.cluster_epoch(),
+                2_008,
+            )
+            .unwrap();
+        assert_eq!(authorization.primary_node_id(), NodeId::new(1));
     }
 
     #[test]
