@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{ClusterEpoch, PgId, PgState};
 
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 32;
-const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
+pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);

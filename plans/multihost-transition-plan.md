@@ -7247,9 +7247,7 @@ Status:
   on the bound `StorageNodeServer`, so process wiring advances the counter only
   after the server owns the data-directory lock, and the bound server serializes
   same-process callers around the read/modify/write. This provides the
-  production fencing input for the heartbeat loop; the remaining process wiring
-  should call it once during storage-node startup and then pass the returned
-  incarnation to the refresh loop.
+  production fencing input for the heartbeat loop.
 - Added the first process boundary for the single-authority manager. The
   `argmin-s3` binary now has a `control-plane` role that requires
   `ARGMIN_CONTROL_PLANE_STATE_PATH`, takes a sibling interprocess lock before
@@ -7264,10 +7262,20 @@ Status:
   threads with socket IO deadlines before taking the authority mutex, and
   bounds each accept batch so lease expiry cannot be starved by a continuous RPC
   stream. The transport-neutral `UnixControlPlaneClient` implements the existing
-  runtime-map and heartbeat refresh traits, so storage-node and frontend refresh
-  loops can talk to the manager process without opening the authority state file
-  themselves. The remaining process wiring step is to instantiate those clients
-  from storage-node/frontend roles and start the existing refresh loops.
+  runtime-map and heartbeat refresh traits, so storage-node and frontend
+  processes can talk to the manager process without opening the authority state
+  file themselves.
+- Wired `ARGMIN_CONTROL_PLANE_SOCKET_PATH` into storage-node and frontend
+  process startup. Storage-node processes can now bootstrap their installed
+  route map from the authority, advance their durable node incarnation after
+  binding the data directory, and keep submitting heartbeat/runtime-map refresh
+  RPCs on the existing refresh loop using configurable refresh and heartbeat
+  lease intervals. Frontend processes can bootstrap their initial storage
+  cluster from the authority runtime map without a static
+  `ARGMIN_STORAGE_NODE_SOCKETS` map, preserving configured Unix storage-node RPC
+  admission settings. Live frontend coordinator handle swapping remains a
+  separate boundary because current coordinators own an immutable
+  `Arc<StorageCluster>`.
 
 Exit criteria:
 

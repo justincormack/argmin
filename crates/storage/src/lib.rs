@@ -45,10 +45,10 @@ pub mod types;
 pub use cluster::{
     BucketWriteSnapshotAction, LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
-    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, ReleasedObjectPayloadLease,
-    ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopSuccess,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
+    ObjectPayloadLease, ReleasedObjectPayloadLease, ShardLocation, StorageCluster,
+    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{

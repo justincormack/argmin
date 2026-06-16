@@ -24,14 +24,17 @@ use server_core::sse::{
 };
 use storage::control_plane::{
     build_control_plane_unix_response, read_control_plane_unix_request,
-    write_control_plane_unix_response, FileControlPlaneStore, SingleAuthorityControlPlane,
+    write_control_plane_unix_response, ControlPlaneRuntimeMapSource, FileControlPlaneStore,
+    SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use storage::storage_node_server::{
-    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+    StorageNodeControlPlaneRefreshLoop, StorageNodePgRoute, StorageNodeProcessConfig,
+    StorageNodeServer,
 };
 use storage::{
-    CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap, LocalUnixStorageNodeClientConfig,
-    NodeId, PgState, StorageCluster,
+    CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
+    StorageCluster,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -495,7 +498,9 @@ fn cleanup_stale_control_plane_socket(socket_path: &Path) -> Result<(), String> 
 }
 
 fn run_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> ! {
-    let server = bind_storage_node_process(config, ec_config);
+    let server = Arc::new(bind_storage_node_process(config, ec_config));
+    let _control_plane_refresh_loop =
+        maybe_spawn_storage_node_control_plane_refresh_loop(Arc::clone(&server), config);
     if let Err(error) = server.serve_forever() {
         eprintln!("storage-node server failed: {error}");
         std::process::exit(1);
@@ -507,8 +512,11 @@ fn start_storage_node_process(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> std::thread::JoinHandle<()> {
-    let server = bind_storage_node_process(config, ec_config);
+    let server = Arc::new(bind_storage_node_process(config, ec_config));
+    let control_plane_refresh_loop =
+        maybe_spawn_storage_node_control_plane_refresh_loop(Arc::clone(&server), config);
     std::thread::spawn(move || {
+        let _control_plane_refresh_loop = control_plane_refresh_loop;
         if let Err(error) = server.serve_forever() {
             eprintln!("storage-node server failed: {error}");
             std::process::exit(1);
@@ -521,27 +529,65 @@ fn bind_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> Sto
         eprintln!("storage-node configuration error: {e}");
         std::process::exit(1);
     });
+    let node_id = storage_config.node_id;
+    let socket_path = storage_config.socket_path.clone();
     let server = StorageNodeServer::bind(storage_config).unwrap_or_else(|e| {
         eprintln!("failed to start storage-node server: {e}");
         std::process::exit(1);
     });
     eprintln!(
         "argmin-s3 storage-node {} listening on {}",
-        config
-            .storage_node_id
-            .expect("storage role must have node id"),
-        config
-            .storage_node_socket_path
-            .as_deref()
-            .expect("storage role must have socket path")
+        node_id.as_u32(),
+        socket_path.display()
     );
     server
+}
+
+fn maybe_spawn_storage_node_control_plane_refresh_loop(
+    server: Arc<StorageNodeServer>,
+    config: &ServerConfig,
+) -> Option<StorageNodeControlPlaneRefreshLoop> {
+    let socket_path = config.control_plane_socket_path.as_deref()?;
+    let node_incarnation = server
+        .advance_control_plane_node_incarnation()
+        .unwrap_or_else(|error| {
+            eprintln!("failed to advance storage-node control-plane incarnation: {error}");
+            std::process::exit(1);
+        });
+    let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
+        .unwrap_or_else(|_| {
+            eprintln!("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large");
+            std::process::exit(1);
+        });
+    let loop_handle = server
+        .spawn_control_plane_refresh_loop(
+            UnixControlPlaneClient::new(socket_path),
+            node_incarnation,
+            lease_ms,
+            config.control_plane_refresh_interval,
+            storage::clock::current_time_millis,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to start storage-node control-plane refresh loop: {error}");
+            std::process::exit(1);
+        });
+    eprintln!(
+        "argmin-s3 storage-node control-plane refresh using {} (incarnation {}, refresh {} ms, lease {} ms)",
+        socket_path,
+        node_incarnation,
+        config.control_plane_refresh_interval.as_millis(),
+        config.control_plane_heartbeat_lease_duration.as_millis()
+    );
+    Some(loop_handle)
 }
 
 fn build_storage_node_process_config(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> Result<StorageNodeProcessConfig, String> {
+    if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
+        return build_control_plane_storage_node_process_config(config, ec_config, socket_path);
+    }
     let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
         .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
     let pg_ids = config.storage_pg_ids.clone();
@@ -581,6 +627,52 @@ fn build_storage_node_process_config(
         socket_path: Path::new(&socket_path).to_path_buf(),
         pg_routes,
     })
+}
+
+fn build_control_plane_storage_node_process_config(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+    control_plane_socket_path: &str,
+) -> Result<StorageNodeProcessConfig, String> {
+    let node_id = NodeId::new(
+        config
+            .storage_node_id
+            .ok_or_else(|| "ARGMIN_STORAGE_NODE_ID is required for storage roles".to_string())?,
+    );
+    let node_data_dir = config
+        .storage_node_data_dir
+        .clone()
+        .unwrap_or_else(|| format!("{}/node-{:04}", config.data_dir, node_id.as_u32()));
+    let runtime_map =
+        UnixControlPlaneClient::new(control_plane_socket_path)
+            .runtime_map_snapshot(storage::clock::current_time_millis())
+            .map_err(|error| {
+                format!(
+                    "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
+                )
+            })?;
+    let node_config = StorageNodeProcessConfig::from_runtime_map(
+        node_id,
+        Path::new(&node_data_dir).to_path_buf(),
+        EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        },
+        &runtime_map,
+    )
+    .map_err(|error| error.to_string())?;
+    let configured_socket_path = config.storage_node_socket_path.as_deref().ok_or_else(|| {
+        "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string()
+    })?;
+    if node_config.socket_path != Path::new(configured_socket_path) {
+        return Err(format!(
+            "ARGMIN_STORAGE_NODE_SOCKET_PATH {} must match control-plane endpoint {} for node {}",
+            configured_socket_path,
+            node_config.socket_path.display(),
+            node_id.as_u32()
+        ));
+    }
+    Ok(node_config)
 }
 
 async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
@@ -626,6 +718,9 @@ fn build_remote_frontend_storage_cluster(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> Result<Arc<StorageCluster>, String> {
+    if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
+        return build_control_plane_frontend_storage_cluster(config, ec_config, socket_path);
+    }
     let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
         .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
     let ec_shape = storage::EcShape {
@@ -653,6 +748,50 @@ fn build_remote_frontend_storage_cluster(
         }))
         .map_err(|e| e.to_string())?;
     StorageCluster::from_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
+}
+
+fn build_control_plane_frontend_storage_cluster(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+    control_plane_socket_path: &str,
+) -> Result<Arc<StorageCluster>, String> {
+    let runtime_map =
+        UnixControlPlaneClient::new(control_plane_socket_path)
+            .runtime_map_snapshot(storage::clock::current_time_millis())
+            .map_err(|error| {
+                format!(
+                    "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
+                )
+            })?;
+    let metadata_primary_node_id = runtime_map
+        .nodes()
+        .first()
+        .map(|node| node.node_id())
+        .ok_or_else(|| {
+            format!(
+                "control-plane runtime map from {control_plane_socket_path} has no routed nodes"
+            )
+        })?;
+    StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
+        metadata_primary_node_id,
+        &runtime_map,
+        EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        },
+        unix_storage_node_client_admission_settings(config),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn unix_storage_node_client_admission_settings(
+    config: &ServerConfig,
+) -> LocalUnixStorageNodeClientAdmissionSettings {
+    LocalUnixStorageNodeClientAdmissionSettings::new(
+        config.storage_node_rpc_admission_limit,
+        config.storage_node_rpc_admission_wait_timeout,
+        config.storage_node_rpc_control_admission_wait_timeout,
+    )
 }
 
 async fn run_frontend_server(
@@ -813,6 +952,8 @@ mod tests {
             control_plane_state_path: None,
             control_plane_socket_path: None,
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
+            control_plane_refresh_interval: std::time::Duration::from_millis(250),
+            control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(1000),
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
             ec_k: 4,
@@ -965,6 +1106,169 @@ mod tests {
             !tmp.join("frontend").exists(),
             "frontend-only cluster construction must not open placeholder PG directories"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn serve_one_control_plane_runtime_map(
+        socket_path: PathBuf,
+        node_id: NodeId,
+        endpoint: String,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            use storage::control_plane::{
+                handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeHeartbeat,
+                NodeMembershipState,
+            };
+            use storage::PgId;
+
+            let state_path = socket_path.with_extension("state");
+            let store = FileControlPlaneStore::new(state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .set_pg_acting_set(PgId::new(0), vec![node_id])
+                .unwrap();
+            for now_ms in 1_000..1_004 {
+                let observed_epoch = authority.snapshot().cluster_epoch();
+                let lease = authority
+                    .submit_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id,
+                            node_incarnation: 1,
+                            endpoint: endpoint.clone(),
+                            observed_epoch,
+                            requested_lease_duration_ms: 1_000,
+                            pg_observations: Vec::new(),
+                        },
+                        now_ms,
+                    )
+                    .unwrap();
+                if lease.serving() {
+                    break;
+                }
+                assert!(now_ms < 1_003, "authority did not grant serving lease");
+            }
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_001).unwrap();
+        })
+    }
+
+    #[test]
+    fn remote_frontend_storage_cluster_can_bootstrap_from_control_plane_socket() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-frontend-bootstrap-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let endpoint = tmp.join("node-0.sock");
+        let server = serve_one_control_plane_runtime_map(
+            socket_path.clone(),
+            NodeId::new(0),
+            endpoint.display().to_string(),
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.local_node_count = 1;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = None;
+        config.storage_node_socket_path = None;
+        config.storage_node_sockets.clear();
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+
+        let cluster = build_remote_frontend_storage_cluster(&config, &ec_config).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(cluster.local_node_count(), 1);
+        assert_eq!(
+            cluster
+                .local_pg_route(storage::PgId::new(0))
+                .unwrap()
+                .state(),
+            PgState::Peering
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn remote_frontend_control_plane_bootstrap_uses_routed_metadata_primary() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-frontend-nonzero-primary-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let endpoint = tmp.join("node-3.sock");
+        let server = serve_one_control_plane_runtime_map(
+            socket_path.clone(),
+            NodeId::new(3),
+            endpoint.display().to_string(),
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.local_node_count = 4;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = None;
+        config.storage_node_socket_path = None;
+        config.storage_node_sockets.clear();
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+
+        let cluster = build_remote_frontend_storage_cluster(&config, &ec_config).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(cluster.local_node_count(), 1);
+        assert_eq!(
+            cluster
+                .local_pg_route(storage::PgId::new(0))
+                .unwrap()
+                .primary_node_id(),
+            NodeId::new(3)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn storage_node_process_config_can_bootstrap_from_control_plane_socket() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-storage-bootstrap-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let endpoint = tmp.join("node-0.sock");
+        let server = serve_one_control_plane_runtime_map(
+            socket_path.clone(),
+            NodeId::new(0),
+            endpoint.display().to_string(),
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::StorageNode;
+        config.local_node_count = 1;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = Some(0);
+        config.storage_node_data_dir = Some(tmp.join("node-0-data").display().to_string());
+        config.storage_node_socket_path = Some(endpoint.display().to_string());
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+
+        let node_config = build_storage_node_process_config(&config, &ec_config).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(node_config.node_id, NodeId::new(0));
+        assert_eq!(node_config.socket_path, endpoint);
+        assert_eq!(node_config.pg_ids, vec![0]);
+        assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

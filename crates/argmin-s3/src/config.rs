@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use storage::control_plane::MAX_HEARTBEAT_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,8 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_state_path: Option<String>,
     pub(crate) control_plane_socket_path: Option<String>,
     pub(crate) control_plane_lease_scan_interval: Duration,
+    pub(crate) control_plane_refresh_interval: Duration,
+    pub(crate) control_plane_heartbeat_lease_duration: Duration,
     pub(crate) storage_cluster_epoch: u64,
     pub(crate) storage_pg_ids: Vec<u32>,
     pub(crate) ec_k: u8,
@@ -105,13 +108,15 @@ impl ServerConfig {
     ///   `ARGMIN_PG_COUNT` (16)
     ///   `ARGMIN_STORAGE_CLUSTER_EPOCH` (1)
     ///   `ARGMIN_STORAGE_PG_IDS` (all PGs in `0..ARGMIN_PG_COUNT`)
-    ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for frontend/combined)
+    ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for static frontend/combined routing)
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` (1024)
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` (250)
     ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
     ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
-    ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role)
+    ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role, optional dynamic route source for frontend/storage roles)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
+    ///   `ARGMIN_CONTROL_PLANE_REFRESH_MS` (250)
+    ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (1000)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
@@ -270,6 +275,17 @@ impl ServerConfig {
             .parse()
             .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS: {e}"))?;
         let control_plane_lease_scan_interval = Duration::from_millis(control_plane_lease_scan_ms);
+        let control_plane_refresh_ms: u64 = get("ARGMIN_CONTROL_PLANE_REFRESH_MS")
+            .unwrap_or_else(|| "250".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_REFRESH_MS: {e}"))?;
+        let control_plane_refresh_interval = Duration::from_millis(control_plane_refresh_ms);
+        let control_plane_heartbeat_lease_ms: u64 = get("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS")
+            .unwrap_or_else(|| "1000".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS: {e}"))?;
+        let control_plane_heartbeat_lease_duration =
+            Duration::from_millis(control_plane_heartbeat_lease_ms);
         let stream_read_chunk_size: usize = get("ARGMIN_STREAM_READ_CHUNK_SIZE")
             .unwrap_or_else(|| server_core::coordinator::INTERNAL_SEGMENT_SIZE.to_string())
             .parse()
@@ -300,7 +316,7 @@ impl ServerConfig {
         let storage_node_sockets = parse_storage_node_sockets(
             get("ARGMIN_STORAGE_NODE_SOCKETS"),
             local_node_count,
-            process_role.uses_remote_frontend_routing(),
+            process_role.uses_remote_frontend_routing() && control_plane_socket_path.is_none(),
         )?;
         if process_role.has_storage_node() {
             let storage_node_id = storage_node_id.ok_or_else(|| {
@@ -316,7 +332,7 @@ impl ServerConfig {
                     "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string(),
                 );
             }
-            if process_role.uses_remote_frontend_routing() {
+            if process_role.uses_remote_frontend_routing() && control_plane_socket_path.is_none() {
                 let storage_node_socket_path = storage_node_socket_path
                     .as_deref()
                     .expect("storage role socket path was validated");
@@ -384,6 +400,23 @@ impl ServerConfig {
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
         }
+        if control_plane_refresh_interval.is_zero() {
+            return Err("ARGMIN_CONTROL_PLANE_REFRESH_MS must be > 0".to_string());
+        }
+        if control_plane_heartbeat_lease_duration.is_zero() {
+            return Err("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be > 0".to_string());
+        }
+        if control_plane_heartbeat_lease_duration < control_plane_refresh_interval {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be >= ARGMIN_CONTROL_PLANE_REFRESH_MS"
+                    .to_string(),
+            );
+        }
+        if control_plane_heartbeat_lease_ms > MAX_HEARTBEAT_LEASE_MS {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be <= {MAX_HEARTBEAT_LEASE_MS}"
+            ));
+        }
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
@@ -445,6 +478,8 @@ impl ServerConfig {
             control_plane_state_path,
             control_plane_socket_path,
             control_plane_lease_scan_interval,
+            control_plane_refresh_interval,
+            control_plane_heartbeat_lease_duration,
             storage_cluster_epoch,
             storage_pg_ids,
             ec_k,
@@ -857,6 +892,14 @@ mod tests {
             Duration::from_millis(250)
         );
         assert_eq!(
+            cfg.control_plane_refresh_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            cfg.control_plane_heartbeat_lease_duration,
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
             cfg.stream_read_chunk_size,
             server_core::coordinator::INTERNAL_SEGMENT_SIZE
         );
@@ -897,6 +940,8 @@ mod tests {
                 "/tmp/control-plane.sock",
             ),
             ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
+            ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "200"),
+            ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "900"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
@@ -921,6 +966,14 @@ mod tests {
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(125)
+        );
+        assert_eq!(
+            cfg.control_plane_refresh_interval,
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            cfg.control_plane_heartbeat_lease_duration,
+            Duration::from_millis(900)
         );
         assert_eq!(cfg.local_node_count, 12);
         assert_eq!(cfg.ec_k, 8);
@@ -1045,8 +1098,35 @@ mod tests {
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(250)
         );
+        assert_eq!(
+            cfg.control_plane_refresh_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            cfg.control_plane_heartbeat_lease_duration,
+            Duration::from_millis(1000)
+        );
         assert_eq!(cfg.account_id, "");
         assert_eq!(cfg.storage_node_id, None);
+    }
+
+    #[test]
+    fn process_role_frontend_can_use_control_plane_socket_without_static_node_sockets() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::Frontend);
+        assert_eq!(
+            cfg.control_plane_socket_path.as_deref(),
+            Some("/tmp/argmin-control-plane.sock")
+        );
+        assert!(cfg.storage_node_sockets.is_empty());
     }
 
     #[test]
@@ -1212,6 +1292,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.process_role, ProcessRole::Combined);
+    }
+
+    #[test]
+    fn process_role_combined_can_use_control_plane_socket_without_static_node_sockets() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "combined"),
+            ("ARGMIN_STORAGE_NODE_ID", "1"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/node-1.sock"),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::Combined);
+        assert_eq!(
+            cfg.control_plane_socket_path.as_deref(),
+            Some("/tmp/argmin-control-plane.sock")
+        );
+        assert!(cfg.storage_node_sockets.is_empty());
     }
 
     #[test]
@@ -1652,6 +1753,48 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_refresh_interval_zero() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_REFRESH_MS",
+            "0",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_REFRESH_MS must be > 0"));
+    }
+
+    #[test]
+    fn control_plane_heartbeat_lease_duration_zero() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS",
+            "0",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be > 0"));
+    }
+
+    #[test]
+    fn control_plane_heartbeat_lease_duration_must_cover_refresh_interval() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "1000"),
+            ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "500"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains(
+            "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be >= ARGMIN_CONTROL_PLANE_REFRESH_MS"
+        ));
+    }
+
+    #[test]
+    fn control_plane_heartbeat_lease_duration_must_not_exceed_authority_cap() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS",
+            "10001",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be <= 10000"));
+    }
+
+    #[test]
     fn invalid_storage_node_rpc_admission_limit() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
             "ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT",
@@ -1689,6 +1832,26 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS"));
+    }
+
+    #[test]
+    fn invalid_control_plane_refresh_interval() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_REFRESH_MS",
+            "not_a_number",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_REFRESH_MS"));
+    }
+
+    #[test]
+    fn invalid_control_plane_heartbeat_lease_duration() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS",
+            "not_a_number",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS"));
     }
 
     #[test]
