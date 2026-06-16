@@ -1,0 +1,207 @@
+Dynamic frontend routes expire without refresh
+Link: https://chatgpt.com/codex/cloud/security/findings/5ef9cad969ec81918d9f29900cc26140?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: f504bfa
+Author: justin@specialbusservice.com
+Created: 16/06/2026, 10:42:56
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Resolution
+Fixed by commit b6c176a6 (`Continue phase 11 runtime map refresh`). The frontend startup path now wraps the bootstrap `StorageCluster` in `StorageClusterRuntimeMapHandle`, starts a frontend control-plane runtime-map refresh loop when `ARGMIN_CONTROL_PLANE_SOCKET_PATH` is configured, and constructs frontend coordinators from the shared handle rather than from immutable one-shot `Arc<StorageCluster>` clones. The refresh loop preserves configured Unix storage-node RPC admission settings and updates the handle as control-plane runtime maps advance.
+
+Additional regression coverage was added in `remote_frontend_control_plane_refresh_loop_updates_bootstrap_map`: the test bootstraps a dynamic frontend from a peering control-plane runtime map, then serves an active map to the frontend refresh loop and verifies that the same frontend runtime-map handle advances to `PgState::Active`. This pins the `argmin-s3` boundary that was missing in the original vulnerable commit.
+
+# Summary
+Introduced an availability regression for control-plane-routed frontends. Static frontend routing is unaffected, but the newly enabled dynamic frontend path can become unusable after the initial heartbeat lease window, which defaults to 1000 ms and is capped at 10000 ms.
+The commit lets frontend/combined roles omit static ARGMIN_STORAGE_NODE_SOCKETS when ARGMIN_CONTROL_PLANE_SOCKET_PATH is set, and builds the frontend StorageCluster from a one-time control-plane runtime map snapshot. That runtime map includes valid_until_ms derived from primary lease deadlines. The resulting StorageCluster is then cloned directly into immutable Coordinator instances, with no StorageClusterRuntimeMapHandle or refresh loop retained for the frontend. Once the initial valid_until_ms is reached, LocalClusterMap rejects metadata routing and payload placement with RouteMapExpired, so normal S3 operations through a dynamic frontend fail until the process is restarted or otherwise rebuilt. Storage nodes get a refresh loop in this commit, but frontends do not.
+
+# Validation
+## Rubric
+- [x] Confirm the commit enables the affected deployment mode: frontend/combined roles can use ARGMIN_CONTROL_PLANE_SOCKET_PATH without static ARGMIN_STORAGE_NODE_SOCKETS.
+- [x] Confirm the dynamic frontend path fetches a single control-plane runtime-map snapshot and constructs StorageCluster from it.
+- [x] Confirm control-plane runtime maps for Active PGs include finite valid_until_ms derived from primary lease deadlines.
+- [x] Confirm the StorageCluster/LocalClusterMap rejects use after valid_until_ms with RouteMapExpired.
+- [x] Confirm frontend startup does not retain StorageClusterRuntimeMapHandle or spawn a refresh loop, while storage-node control-plane startup does.
+## Report
+Validated the availability regression. I added a targeted PoC unit test to argmin-s3 that exercises the actual dynamic frontend startup path: it serves one active control-plane runtime-map snapshot over a Unix socket, calls build_remote_frontend_storage_cluster(), waits past the snapshot lease deadline, then checks the resulting frontend StorageCluster. The reproduction command `cargo test -p argmin-s3 remote_frontend_control_plane_cluster_expires_without_refresh -- --nocapture` passed while printing: `frontend one-shot runtime map valid_until_ms=1781603863571, now_ms=1781603863442` and then `after initial lease window frontend cluster returns: runtime route map for cluster epoch 5 expired at 1781603863571; current time is 1781603863597`. This confirms the dynamic frontend cluster becomes expired after the initial lease window. I also ran an existing storage-layer test, `cargo test -p storage runtime_map_builds_storage_cluster_with_validity_bound -- --nocapture`, which passed and asserts that StorageCluster::from_runtime_map carries valid_until_ms and returns StoreError::RouteMapExpired at the deadline. Debugger evidence: lldb breakpoint at `argmin_s3::build_control_plane_frontend_storage_cluster` stopped at crates/argmin-s3/src/main.rs:759, called from `build_remote_frontend_storage_cluster` at main.rs:722; a second breakpoint stopped at `storage::cluster::local::LocalClusterMap::require_route_map_valid_at` at crates/storage/src/cluster/local.rs:1579, called from `StorageCluster::require_route_map_valid_at` at crates/storage/src/cluster.rs:2285 with now_ms greater than the printed valid_until_ms. Code evidence matches the suspected finding: config permits frontend/combined roles to omit static sockets when a control-plane socket exists at crates/argmin-s3/src/config.rs:316-320; dynamic frontend startup fetches exactly one UnixControlPlaneClient runtime-map snapshot and builds a StorageCluster from it at crates/argmin-s3/src/main.rs:721-784; frontend coordinators receive only cloned Arc<StorageCluster> values at main.rs:820-842, with no StorageClusterRuntimeMapHandle or refresh loop retained; storage-node startup does have a control-plane refresh loop at main.rs:546-578. The runtime map is lease-bounded because ClusterControlSnapshot::runtime_map sets valid_until_ms from the minimum primary lease deadline at crates/storage/src/control_plane.rs:388-395, and LocalClusterMap rejects expired maps with StoreError::RouteMapExpired at crates/storage/src/cluster/local.rs:1578-1582. Crash/valgrind/ASan attempts: this is not a memory-safety crash bug, so the direct PoC did not crash but reproduced the availability failure. `valgrind --version` failed with command not found. `RUSTFLAGS='-Z sanitizer=address' cargo test ... --no-run` failed because the stable compiler rejects `-Z sanitizer=address` without nightly.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L316 to 320)
+  Note: Frontend/combined roles no longer require static storage-node sockets when a control-plane socket is configured, enabling the affected dynamic frontend path.
+```
+        let storage_node_sockets = parse_storage_node_sockets(
+            get("ARGMIN_STORAGE_NODE_SOCKETS"),
+            local_node_count,
+            process_role.uses_remote_frontend_routing() && control_plane_socket_path.is_none(),
+        )?;
+```
+
+crates/argmin-s3/src/main.rs (L717 to 784)
+  Note: The frontend dynamic path fetches exactly one control-plane runtime map snapshot and immediately builds a StorageCluster from it.
+```
+fn build_remote_frontend_storage_cluster(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<Arc<StorageCluster>, String> {
+    if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
+        return build_control_plane_frontend_storage_cluster(config, ec_config, socket_path);
+    }
+    let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
+        .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let mut local_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        NodeId::new(0),
+        node_ids,
+        &config.storage_pg_ids,
+        ec_shape,
+        cluster_epoch,
+    )
+    .map_err(|e| e.to_string())?;
+    local_map
+        .install_unix_storage_node_clients(config.storage_node_sockets.iter().map(|entry| {
+            LocalUnixStorageNodeClientConfig::with_rpc_admission(
+                NodeId::new(entry.node_id),
+                entry.socket_path.clone(),
+                config.storage_node_rpc_admission_limit,
+                config.storage_node_rpc_admission_wait_timeout,
+                config.storage_node_rpc_control_admission_wait_timeout,
+            )
+        }))
+        .map_err(|e| e.to_string())?;
+    StorageCluster::from_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
+}
+
+fn build_control_plane_frontend_storage_cluster(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+    control_plane_socket_path: &str,
+) -> Result<Arc<StorageCluster>, String> {
+    let runtime_map =
+        UnixControlPlaneClient::new(control_plane_socket_path)
+            .runtime_map_snapshot(storage::clock::current_time_millis())
+            .map_err(|error| {
+                format!(
+                    "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
+                )
+            })?;
+    let metadata_primary_node_id = runtime_map
+        .nodes()
+        .first()
+        .map(|node| node.node_id())
+        .ok_or_else(|| {
+            format!(
+                "control-plane runtime map from {control_plane_socket_path} has no routed nodes"
+            )
+        })?;
+    StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
+        metadata_primary_node_id,
+        &runtime_map,
+        EcShape {
+            k: ec_config.data_shards,
+            m: ec_config.parity_shards,
+        },
+        unix_storage_node_client_admission_settings(config),
+    )
+    .map_err(|error| error.to_string())
+```
+
+crates/argmin-s3/src/main.rs (L820 to 842)
+  Note: Each Coordinator receives a clone of the same immutable Arc<StorageCluster>; no runtime-map handle or frontend refresh loop is installed.
+```
+    // Build frontend pool sharing the same storage cluster handle.
+    let mut frontends = Vec::with_capacity(config.workers as usize);
+    for _ in 0..config.workers {
+        let coordinator =
+            Coordinator::new_with_managed_key_provider_for_storage_cluster_with_background_worker_mode(
+                Arc::clone(&storage_cluster),
+                config.region.clone(),
+                sse_c_validator.clone(),
+                managed_key_provider.clone(),
+                background_worker_mode,
+            );
+        let coordinator = match coordinator {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to create coordinator: {e}");
+                std::process::exit(1);
+            }
+        };
+        frontends.push(HttpFrontend {
+            coordinator,
+            credentials: build_credential_store(&config),
+            host_id: Arc::<str>::from(host_id.clone()),
+        });
+```
+
+crates/storage/src/cluster/local.rs (L1578 to 1590)
+  Note: LocalClusterMap rejects use of an expired runtime map with RouteMapExpired.
+```
+    pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
+        match self.route_map_valid_until_ms {
+            Some(valid_until_ms) if valid_until_ms <= now_ms => Err(StoreError::RouteMapExpired {
+                cluster_epoch: self.epoch,
+                valid_until_ms,
+                now_ms,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    fn require_route_map_valid_now(&self) -> Result<(), StoreError> {
+        self.require_route_map_valid_at(crate::clock::current_time_millis())
+```
+
+crates/storage/src/cluster/local.rs (L2605 to 2618)
+  Note: Metadata routing checks route-map freshness before selecting the PG primary, so normal S3 metadata operations fail after the one-time frontend map expires.
+```
+    pub(crate) fn metadata_pg_primary_node(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&LocalNodeStore, StoreError> {
+        if operation_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+        self.require_route_map_valid_now()?;
+```
+
+crates/storage/src/cluster/local.rs (L3100 to 3109)
+  Note: Payload placement also checks route-map freshness, extending the outage to object data operations.
+```
+    ) -> Result<(), ClusterBuildError> {
+        if operation_epoch != self.epoch {
+            return Err(ClusterBuildError::StalePayloadPlacement {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+        self.require_route_map_valid_now_for_placement(pg_id)?;
+        Ok(())
+```
+
+crates/storage/src/control_plane.rs (L388 to 395)
+  Note: Control-plane runtime maps carry valid_until_ms based on the minimum active primary lease deadline, so snapshots are intentionally time-limited.
+```
+        let valid_until_ms = pg_routes
+            .iter()
+            .filter_map(PgRouteSnapshot::primary_lease_deadline_ms)
+            .min();
+        Ok(ClusterRuntimeMapSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            valid_until_ms,
+            nodes,
+```

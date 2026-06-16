@@ -1001,7 +1001,9 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage::control_plane::NodeMembershipState;
+    use storage::control_plane::{
+        NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
+    };
 
     fn test_server_config() -> ServerConfig {
         ServerConfig {
@@ -1311,6 +1313,83 @@ mod tests {
         })
     }
 
+    fn serve_frontend_control_plane_runtime_map_refresh(
+        socket_path: PathBuf,
+        node_id: NodeId,
+        endpoint: String,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            use storage::control_plane::{
+                handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeHeartbeat,
+            };
+            use storage::PgId;
+
+            let state_path = socket_path.with_extension("state");
+            let store = FileControlPlaneStore::new(state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .set_pg_acting_set(PgId::new(0), vec![node_id])
+                .unwrap();
+
+            let peering_observation = NodePgHeartbeatObservation {
+                pg_id: PgId::new(0),
+                state: PgState::Peering,
+                metadata_proof: PgMetadataProof::empty(),
+            };
+            for now_ms in 1_000..1_004 {
+                let observed_epoch = authority.snapshot().cluster_epoch();
+                let lease = authority
+                    .submit_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id,
+                            node_incarnation: 1,
+                            endpoint: endpoint.clone(),
+                            observed_epoch,
+                            requested_lease_duration_ms: 1_000,
+                            pg_observations: vec![peering_observation],
+                        },
+                        now_ms,
+                    )
+                    .unwrap();
+                if lease.serving() {
+                    break;
+                }
+                assert!(now_ms < 1_003, "authority did not grant serving lease");
+            }
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_001).unwrap();
+
+            authority
+                .complete_pg_peering(PgId::new(0), node_id, 1, 1_002)
+                .unwrap();
+            authority
+                .submit_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 1,
+                        endpoint,
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        pg_observations: vec![NodePgHeartbeatObservation {
+                            pg_id: PgId::new(0),
+                            state: PgState::Active,
+                            metadata_proof: PgMetadataProof::empty(),
+                        }],
+                    },
+                    1_003,
+                )
+                .unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_004).unwrap();
+        })
+    }
+
     #[test]
     fn remote_frontend_storage_cluster_can_bootstrap_from_control_plane_socket() {
         let tmp = std::env::temp_dir().join(format!(
@@ -1388,6 +1467,70 @@ mod tests {
                 .primary_node_id(),
             NodeId::new(3)
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn remote_frontend_control_plane_refresh_loop_updates_bootstrap_map() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-frontend-refresh-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let endpoint = tmp.join("node-0.sock");
+        let server = serve_frontend_control_plane_runtime_map_refresh(
+            socket_path.clone(),
+            NodeId::new(0),
+            endpoint.display().to_string(),
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.local_node_count = 1;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = None;
+        config.storage_node_socket_path = None;
+        config.storage_node_sockets.clear();
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+        config.control_plane_refresh_interval = std::time::Duration::from_millis(5);
+
+        let cluster = build_remote_frontend_storage_cluster(&config, &ec_config).unwrap();
+        assert_eq!(
+            cluster
+                .local_pg_route(storage::PgId::new(0))
+                .unwrap()
+                .state(),
+            PgState::Peering
+        );
+
+        let handle = StorageClusterRuntimeMapHandle::new(cluster);
+        let mut refresh_loop =
+            maybe_spawn_frontend_control_plane_refresh_loop(handle.clone(), &config).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if handle
+                .current()
+                .local_pg_route(storage::PgId::new(0))
+                .unwrap()
+                .state()
+                == PgState::Active
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "frontend refresh loop did not install active runtime map: {:?}",
+                refresh_loop.status()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(refresh_loop.status().successes > 0);
+        refresh_loop.stop();
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
