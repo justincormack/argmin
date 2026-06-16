@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn metadata_command_recovery_single_flight_waits_for_matching_command() {
+    let runtime_state = Arc::new(LocalClusterRuntimeState::new());
+    let pg_id = PgId::new(1);
+    let bucket = BucketName::new("single-flight-pending-command").unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    let recovery = runtime_state.join_metadata_command_recovery(pg_id, &command);
+    let MetadataCommandRecoveryAdmission::Leader(leader_guard) = recovery else {
+        panic!("first recovery caller should lead the single-flight");
+    };
+
+    let waiter_state = Arc::clone(&runtime_state);
+    let waiter_command = command.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let admission = waiter_state.join_metadata_command_recovery(pg_id, &waiter_command);
+        tx.send(matches!(
+            admission,
+            MetadataCommandRecoveryAdmission::Waited { .. }
+        ))
+        .unwrap();
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "second recovery caller should wait while the leader is active"
+    );
+    drop(leader_guard);
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "second recovery caller should return as a waiter after the leader finishes"
+    );
+    waiter.join().unwrap();
+}
+
+#[test]
+fn metadata_command_recovery_single_flight_wait_is_bounded() {
+    let runtime_state = Arc::new(LocalClusterRuntimeState::new());
+    let pg_id = PgId::new(1);
+    let bucket = BucketName::new("single-flight-timeout-pending-command").unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    let recovery = runtime_state.join_metadata_command_recovery(pg_id, &command);
+    let MetadataCommandRecoveryAdmission::Leader(_leader_guard) = recovery else {
+        panic!("first recovery caller should lead the single-flight");
+    };
+
+    let timed_out = runtime_state.join_metadata_command_recovery(pg_id, &command);
+    assert!(
+        matches!(timed_out, MetadataCommandRecoveryAdmission::TimedOut { .. }),
+        "waiter should return a bounded timeout while the leader remains active"
+    );
+}
+
+#[test]
 fn stale_duplicate_metadata_command_index_is_reissued_before_apply() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
