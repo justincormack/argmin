@@ -7331,6 +7331,10 @@ Status:
   authorizations being rejected after lease expiry moves a PG back to
   `Peering`, and storage-node route-map expiry rejecting new unsafe work while
   still allowing cleanup/release route validation for already-held resources.
+  The set now also covers the storage-node heartbeat refresh path after a lease
+  expiry epoch transition: a node reporting its stale Active route receives the
+  current Peering map and a non-serving lease, not an Active route backed by the
+  expired lease.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition

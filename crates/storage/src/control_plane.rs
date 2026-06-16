@@ -7613,6 +7613,73 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_refresh_after_epoch_transition_cannot_keep_stale_active_route() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(19), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 19, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(19),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 1, 19, PgState::Active, 2_002);
+        let active_epoch = active.cluster_epoch();
+        let active_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let active_valid_until_ms = active_map.valid_until_ms().unwrap();
+        assert_eq!(active_map.pg_routes()[0].state(), PgState::Active);
+
+        let expiry = authority
+            .expire_heartbeat_leases(active_valid_until_ms)
+            .unwrap();
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
+        assert!(expiry.cluster_epoch() > active_epoch);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(19)).unwrap().state(),
+            PgState::Peering
+        );
+
+        let mut stale_active_heartbeat =
+            heartbeat_from_record(&authority, 1, active_epoch, active_valid_until_ms + 1);
+        stale_active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+        }];
+        let refresh = authority
+            .refresh_node_heartbeat(stale_active_heartbeat, active_valid_until_ms + 1)
+            .unwrap();
+
+        assert!(!refresh.lease().serving());
+        assert_eq!(refresh.lease().cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            refresh.runtime_map().cluster_epoch(),
+            expiry.cluster_epoch()
+        );
+        assert_eq!(
+            refresh.runtime_map().pg_routes()[0].state(),
+            PgState::Peering
+        );
+        assert_eq!(
+            refresh.runtime_map().pg_routes()[0].primary_lease_deadline_ms(),
+            None
+        );
+        let record = authority.snapshot().node(NodeId::new(1)).unwrap();
+        assert_eq!(record.availability(), NodeAvailabilityState::Unavailable);
+        assert_eq!(record.last_observed_epoch(), Some(active_epoch));
+    }
+
+    #[test]
     fn failed_expiry_persist_does_not_expose_uncommitted_epoch_or_map() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
