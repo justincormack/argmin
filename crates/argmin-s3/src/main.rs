@@ -4,9 +4,15 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
+use std::time::Duration;
 
 use auth::{AccountIdentity, CredentialRecord, CredentialStore, SecretKey};
 use ec::EcConfig;
@@ -16,7 +22,10 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
-use storage::control_plane::{FileControlPlaneStore, SingleAuthorityControlPlane};
+use storage::control_plane::{
+    build_control_plane_unix_response, read_control_plane_unix_request,
+    write_control_plane_unix_response, FileControlPlaneStore, SingleAuthorityControlPlane,
+};
 use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
 };
@@ -32,9 +41,13 @@ use server_http::http::HttpFrontend;
 
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
+const CONTROL_PLANE_ACCEPT_BATCH_LIMIT: usize = 32;
+const CONTROL_PLANE_RPC_WORKER_LIMIT: usize = 64;
+const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
+    fn getuid() -> u32;
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -231,25 +244,56 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         .control_plane_state_path
         .as_deref()
         .expect("control-plane role requires state path");
+    let socket_path = config
+        .control_plane_socket_path
+        .as_deref()
+        .expect("control-plane role requires socket path");
     let _state_lock =
         acquire_control_plane_state_lock(Path::new(state_path)).unwrap_or_else(|error| {
             eprintln!("{error}");
             std::process::exit(1);
         });
+    let listener = bind_control_plane_socket(Path::new(socket_path)).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
     let store = FileControlPlaneStore::new(state_path);
-    let mut authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
+    let authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
         eprintln!("failed to open control-plane state {state_path}: {error}");
         std::process::exit(1);
     });
+    let authority = Arc::new(Mutex::new(authority));
+    let active_rpc_workers = Arc::new(AtomicUsize::new(0));
     eprintln!(
-        "argmin-s3 control-plane manager using state {} (lease scan {} ms)",
+        "argmin-s3 control-plane manager using state {} on {} (lease scan {} ms)",
         state_path,
+        socket_path,
         config.control_plane_lease_scan_interval.as_millis()
     );
 
     loop {
+        for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    spawn_control_plane_rpc_worker(
+                        stream,
+                        Arc::clone(&authority),
+                        Arc::clone(&active_rpc_workers),
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    eprintln!("control-plane socket accept failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         let now_ms = storage::clock::current_time_millis();
-        match authority.expire_heartbeat_leases(now_ms) {
+        let expiry = authority
+            .lock()
+            .expect("control-plane authority mutex poisoned")
+            .expire_heartbeat_leases(now_ms);
+        match expiry {
             Ok(expiry) if !expiry.expired_nodes().is_empty() => {
                 eprintln!(
                     "control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
@@ -265,6 +309,188 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             }
         }
         thread::sleep(config.control_plane_lease_scan_interval);
+    }
+}
+
+fn spawn_control_plane_rpc_worker(
+    mut stream: UnixStream,
+    authority: Arc<Mutex<SingleAuthorityControlPlane<FileControlPlaneStore>>>,
+    active_rpc_workers: Arc<AtomicUsize>,
+) {
+    match active_rpc_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        (active < CONTROL_PLANE_RPC_WORKER_LIMIT).then_some(active + 1)
+    }) {
+        Ok(_) => {}
+        Err(_) => {
+            eprintln!("control-plane RPC rejected: worker limit reached");
+            return;
+        }
+    }
+    thread::spawn(move || {
+        let _guard = ControlPlaneRpcWorkerGuard {
+            active_rpc_workers: Arc::clone(&active_rpc_workers),
+        };
+        if let Err(error) = stream.set_read_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT)) {
+            eprintln!("control-plane RPC failed to set read timeout: {error}");
+            return;
+        }
+        if let Err(error) = stream.set_write_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT)) {
+            eprintln!("control-plane RPC failed to set write timeout: {error}");
+            return;
+        }
+        let request = match read_control_plane_unix_request(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("control-plane RPC request read failed: {error}");
+                return;
+            }
+        };
+        let now_ms = storage::clock::current_time_millis();
+        let response = {
+            let mut authority = authority
+                .lock()
+                .expect("control-plane authority mutex poisoned");
+            build_control_plane_unix_response(&mut *authority, request, now_ms)
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("control-plane RPC response build failed: {error}");
+                return;
+            }
+        };
+        if let Err(error) = write_control_plane_unix_response(&mut stream, response) {
+            eprintln!("control-plane RPC response failed: {error}");
+        }
+    });
+}
+
+struct ControlPlaneRpcWorkerGuard {
+    active_rpc_workers: Arc<AtomicUsize>,
+}
+
+impl Drop for ControlPlaneRpcWorkerGuard {
+    fn drop(&mut self) {
+        self.active_rpc_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn bind_control_plane_socket(socket_path: &Path) -> Result<UnixListener, String> {
+    if !socket_path.is_absolute() {
+        return Err(format!(
+            "ARGMIN_CONTROL_PLANE_SOCKET_PATH {} must be absolute",
+            socket_path.display()
+        ));
+    }
+    let parent = socket_path.parent().ok_or_else(|| {
+        format!(
+            "ARGMIN_CONTROL_PLANE_SOCKET_PATH {} is missing a parent directory",
+            socket_path.display()
+        )
+    })?;
+    socket_path.file_name().ok_or_else(|| {
+        format!(
+            "ARGMIN_CONTROL_PLANE_SOCKET_PATH {} is missing a file name",
+            socket_path.display()
+        )
+    })?;
+    let parent_existed = parent.exists();
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create control-plane socket directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    if !parent_existed {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "failed to make control-plane socket directory {} private: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    validate_control_plane_socket_directory(parent)?;
+    cleanup_stale_control_plane_socket(socket_path)?;
+    let listener = UnixListener::bind(socket_path).map_err(|error| {
+        format!(
+            "failed to bind control-plane socket {}: {error}",
+            socket_path.display()
+        )
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        format!(
+            "failed to set control-plane socket {} nonblocking: {error}",
+            socket_path.display()
+        )
+    })?;
+    Ok(listener)
+}
+
+fn validate_control_plane_socket_directory(parent: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(parent).map_err(|error| {
+        format!(
+            "failed to stat control-plane socket directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.is_dir() || mode & 0o077 != 0 {
+        return Err(format!(
+            "control-plane socket directory {} must be private; mode is {mode:o}",
+            parent.display()
+        ));
+    }
+    // SAFETY: getuid has no preconditions and does not mutate memory.
+    let uid = unsafe { getuid() };
+    if metadata.uid() != uid {
+        return Err(format!(
+            "control-plane socket directory {} must be owned by uid {uid}; owner is {}",
+            parent.display(),
+            metadata.uid()
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_control_plane_socket(socket_path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to stat control-plane socket {}: {error}",
+                socket_path.display()
+            ));
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(format!(
+            "control-plane socket path {} already exists and is not a socket",
+            socket_path.display()
+        ));
+    }
+    match UnixStream::connect(socket_path) {
+        Ok(_) => Err(format!(
+            "control-plane socket path {} is already in use",
+            socket_path.display()
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            fs::remove_file(socket_path).map_err(|error| {
+                format!(
+                    "failed to remove stale control-plane socket {}: {error}",
+                    socket_path.display()
+                )
+            })
+        }
+        Err(error) => Err(format!(
+            "failed to connect existing control-plane socket {}: {error}",
+            socket_path.display()
+        )),
     }
 }
 
@@ -585,6 +811,7 @@ mod tests {
             storage_node_rpc_control_admission_wait_timeout:
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             control_plane_state_path: None,
+            control_plane_socket_path: None,
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
@@ -632,6 +859,45 @@ mod tests {
 
         assert!(error.contains("already locked"), "{error}");
         drop(first);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn control_plane_socket_bind_creates_private_missing_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-socket-private-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let socket_path = tmp.join("nested").join("control-plane.sock");
+
+        let listener = bind_control_plane_socket(&socket_path).unwrap();
+
+        drop(listener);
+        let mode = std::fs::metadata(socket_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn control_plane_socket_bind_rejects_public_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-control-plane-socket-public-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+
+        let error = bind_control_plane_socket(&socket_path).unwrap_err();
+
+        assert!(error.contains("must be private"), "{error}");
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

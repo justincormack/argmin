@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::num::NonZeroU64;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use placement::NodeId;
 use thiserror::Error;
@@ -10,6 +12,9 @@ use crate::{ClusterEpoch, PgId, PgState};
 
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 32;
 const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
+const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
+const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -1732,6 +1737,688 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UnixControlPlaneClient {
+    socket_path: PathBuf,
+}
+
+impl UnixControlPlaneClient {
+    #[must_use]
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    fn send_request(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|source| ControlPlaneError::Io {
+                context: "connect control-plane socket",
+                source,
+            })?;
+        stream
+            .set_read_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT))
+            .map_err(|source| ControlPlaneError::Io {
+                context: "set control-plane client read timeout",
+                source,
+            })?;
+        stream
+            .set_write_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT))
+            .map_err(|source| ControlPlaneError::Io {
+                context: "set control-plane client write timeout",
+                source,
+            })?;
+        write_control_plane_rpc_frame(&mut stream, kind, payload)?;
+        let (response_kind, response_payload) = read_control_plane_rpc_frame(&mut stream)?;
+        if response_kind != kind {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "response kind {:?} did not match request kind {:?}",
+                    response_kind, kind
+                ),
+            });
+        }
+        decode_control_plane_rpc_response(response_payload)
+    }
+}
+
+impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
+    fn runtime_map_snapshot(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let payload = self.send_request(ControlPlaneRpcKind::RuntimeMapSnapshot, &[])?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+}
+
+impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        _authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_node_heartbeat(&mut payload, &heartbeat)?;
+        let payload = self.send_request(ControlPlaneRpcKind::RefreshNodeHeartbeat, &payload)?;
+        let mut reader = PayloadReader::new(&payload);
+        let lease = read_heartbeat_lease(&mut reader)?;
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
+    }
+}
+
+pub fn handle_control_plane_unix_stream<T>(
+    control_plane: &mut T,
+    stream: &mut UnixStream,
+    authority_now_ms: u64,
+) -> Result<(), ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+{
+    let request = read_control_plane_unix_request(stream)?;
+    let response = build_control_plane_unix_response(control_plane, request, authority_now_ms)?;
+    write_control_plane_unix_response(stream, response)
+}
+
+#[derive(Debug)]
+pub struct ControlPlaneRpcRequest {
+    kind: ControlPlaneRpcKind,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct ControlPlaneRpcResponse {
+    kind: ControlPlaneRpcKind,
+    payload: Vec<u8>,
+}
+
+pub fn read_control_plane_unix_request(
+    stream: &mut UnixStream,
+) -> Result<ControlPlaneRpcRequest, ControlPlaneError> {
+    let (kind, payload) = read_control_plane_rpc_frame(stream)?;
+    Ok(ControlPlaneRpcRequest { kind, payload })
+}
+
+pub fn build_control_plane_unix_response<T>(
+    control_plane: &mut T,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+{
+    let ControlPlaneRpcRequest { kind, payload } = request;
+    let response = match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.runtime_map_snapshot(authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            let mut reader = PayloadReader::new(&payload);
+            let heartbeat = read_node_heartbeat(&mut reader)?;
+            reader.finish()?;
+            match control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms) {
+                Ok(refresh) => {
+                    let mut response = Vec::new();
+                    write_heartbeat_lease(&mut response, refresh.lease())?;
+                    write_runtime_map_snapshot(&mut response, refresh.runtime_map())?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    let payload = encode_control_plane_rpc_response(response)?;
+    Ok(ControlPlaneRpcResponse { kind, payload })
+}
+
+pub fn write_control_plane_unix_response(
+    stream: &mut UnixStream,
+    response: ControlPlaneRpcResponse,
+) -> Result<(), ControlPlaneError> {
+    write_control_plane_rpc_frame(stream, response.kind, &response.payload)
+}
+
+pub fn respond_control_plane_unix_request<T>(
+    control_plane: &mut T,
+    stream: &mut UnixStream,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+) -> Result<(), ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+{
+    let response = build_control_plane_unix_response(control_plane, request, authority_now_ms)?;
+    write_control_plane_unix_response(stream, response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRpcKind {
+    RuntimeMapSnapshot = 1,
+    RefreshNodeHeartbeat = 2,
+}
+
+impl ControlPlaneRpcKind {
+    fn from_u16(value: u16) -> Result<Self, ControlPlaneError> {
+        match value {
+            1 => Ok(Self::RuntimeMapSnapshot),
+            2 => Ok(Self::RefreshNodeHeartbeat),
+            _ => Err(ControlPlaneError::RpcProtocol {
+                message: format!("unknown control-plane RPC kind {value}"),
+            }),
+        }
+    }
+}
+
+fn write_control_plane_rpc_frame(
+    stream: &mut UnixStream,
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) -> Result<(), ControlPlaneError> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| ControlPlaneError::RpcProtocol {
+        message: format!("control-plane RPC payload too large: {}", payload.len()),
+    })?;
+    stream
+        .write_all(CONTROL_PLANE_RPC_MAGIC)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "write control-plane RPC magic",
+            source,
+        })?;
+    let mut header = Vec::with_capacity(8);
+    write_u16(&mut header, 1);
+    write_u16(&mut header, kind as u16);
+    write_u32(&mut header, payload_len);
+    write_u64(
+        &mut header,
+        control_plane_rpc_frame_checksum(1, kind as u16, payload_len, payload),
+    );
+    stream
+        .write_all(&header)
+        .and_then(|()| stream.write_all(payload))
+        .map_err(|source| ControlPlaneError::Io {
+            context: "write control-plane RPC frame",
+            source,
+        })
+}
+
+fn read_control_plane_rpc_frame(
+    stream: &mut UnixStream,
+) -> Result<(ControlPlaneRpcKind, Vec<u8>), ControlPlaneError> {
+    let mut magic = vec![0; CONTROL_PLANE_RPC_MAGIC.len()];
+    stream
+        .read_exact(&mut magic)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "read control-plane RPC magic",
+            source,
+        })?;
+    if magic != CONTROL_PLANE_RPC_MAGIC {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "invalid control-plane RPC magic".to_owned(),
+        });
+    }
+    let mut header = [0; 16];
+    stream
+        .read_exact(&mut header)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "read control-plane RPC header",
+            source,
+        })?;
+    let mut reader = PayloadReader::new(&header);
+    let version = reader.read_u16()?;
+    if version != 1 {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("unsupported control-plane RPC version {version}"),
+        });
+    }
+    let kind = ControlPlaneRpcKind::from_u16(reader.read_u16()?)?;
+    let raw_kind = kind as u16;
+    let payload_len_u32 = reader.read_u32()?;
+    let payload_len =
+        usize::try_from(payload_len_u32).map_err(|_| ControlPlaneError::RpcProtocol {
+            message: "control-plane RPC payload length does not fit usize".to_owned(),
+        })?;
+    let expected_checksum = reader.read_u64()?;
+    reader.finish()?;
+    if payload_len > CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("control-plane RPC payload too large: {payload_len}"),
+        });
+    }
+    let mut payload = vec![0; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "read control-plane RPC payload",
+            source,
+        })?;
+    if control_plane_rpc_frame_checksum(version, raw_kind, payload_len_u32, &payload)
+        != expected_checksum
+    {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane RPC frame checksum mismatch".to_owned(),
+        });
+    }
+    Ok((kind, payload))
+}
+
+fn control_plane_rpc_frame_checksum(
+    version: u16,
+    raw_kind: u16,
+    payload_len: u32,
+    payload: &[u8],
+) -> u64 {
+    let mut hasher = checksum::crc64::Hasher::new();
+    hasher.update(CONTROL_PLANE_RPC_MAGIC);
+    hasher.update(&version.to_le_bytes());
+    hasher.update(&raw_kind.to_le_bytes());
+    hasher.update(&payload_len.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize()
+}
+
+fn encode_control_plane_rpc_response(
+    response: Result<Vec<u8>, ControlPlaneError>,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let mut payload = Vec::new();
+    match response {
+        Ok(response) => {
+            write_u8(&mut payload, 0);
+            write_bytes(&mut payload, &response)?;
+        }
+        Err(error) => {
+            write_u8(&mut payload, 1);
+            write_string(&mut payload, &error.to_string())?;
+        }
+    }
+    Ok(payload)
+}
+
+fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, ControlPlaneError> {
+    let mut reader = PayloadReader::new(&payload);
+    let status = reader.read_u8()?;
+    match status {
+        0 => {
+            let response = reader.read_bytes()?.to_vec();
+            reader.finish()?;
+            Ok(response)
+        }
+        1 => {
+            let message = reader.read_string()?.to_owned();
+            reader.finish()?;
+            Err(ControlPlaneError::RpcRemote { message })
+        }
+        _ => Err(ControlPlaneError::RpcProtocol {
+            message: format!("invalid control-plane RPC response status {status}"),
+        }),
+    }
+}
+
+fn write_node_heartbeat(
+    out: &mut Vec<u8>,
+    heartbeat: &NodeHeartbeat,
+) -> Result<(), ControlPlaneError> {
+    write_u32(out, heartbeat.node_id.as_u32());
+    write_u64(out, heartbeat.node_incarnation);
+    write_string(out, &heartbeat.endpoint)?;
+    write_u64(out, heartbeat.observed_epoch.get());
+    write_u64(out, heartbeat.requested_lease_duration_ms);
+    write_u32(
+        out,
+        len_as_u32(heartbeat.pg_observations.len(), "PG observations")?,
+    );
+    for observation in &heartbeat.pg_observations {
+        write_u32(out, observation.pg_id.get());
+        write_pg_state(out, observation.state);
+        write_pg_metadata_proof(out, observation.metadata_proof);
+    }
+    Ok(())
+}
+
+fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, ControlPlaneError> {
+    let node_id = NodeId::new(reader.read_u32()?);
+    let node_incarnation = reader.read_u64()?;
+    let endpoint = reader.read_string()?.to_owned();
+    let observed_epoch = read_cluster_epoch(reader, "heartbeat observed epoch")?;
+    let requested_lease_duration_ms = reader.read_u64()?;
+    let observation_count = reader.read_len("PG observations")?;
+    let mut pg_observations = Vec::with_capacity(observation_count);
+    for _ in 0..observation_count {
+        pg_observations.push(NodePgHeartbeatObservation {
+            pg_id: PgId::new(reader.read_u32()?),
+            state: read_pg_state(reader)?,
+            metadata_proof: read_pg_metadata_proof(reader)?,
+        });
+    }
+    Ok(NodeHeartbeat {
+        node_id,
+        node_incarnation,
+        endpoint,
+        observed_epoch,
+        requested_lease_duration_ms,
+        pg_observations,
+    })
+}
+
+fn write_heartbeat_lease(
+    out: &mut Vec<u8>,
+    lease: &HeartbeatLease,
+) -> Result<(), ControlPlaneError> {
+    write_u64(out, lease.authority_incarnation().get());
+    write_u64(out, lease.cluster_epoch().get());
+    write_u32(out, lease.node_id().as_u32());
+    write_u64(out, lease.lease_deadline_ms());
+    write_u8(out, u8::from(lease.serving()));
+    write_string(out, &format_snapshot(lease.snapshot()))
+}
+
+fn read_heartbeat_lease(
+    reader: &mut PayloadReader<'_>,
+) -> Result<HeartbeatLease, ControlPlaneError> {
+    let authority_incarnation = AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| {
+        ControlPlaneError::RpcProtocol {
+            message: "heartbeat lease authority incarnation must be nonzero".to_owned(),
+        }
+    })?;
+    let cluster_epoch = read_cluster_epoch(reader, "heartbeat lease cluster epoch")?;
+    let node_id = NodeId::new(reader.read_u32()?);
+    let lease_deadline_ms = reader.read_u64()?;
+    let serving = reader.read_bool()?;
+    let snapshot = parse_snapshot(reader.read_string()?)?;
+    Ok(HeartbeatLease {
+        authority_incarnation,
+        cluster_epoch,
+        node_id,
+        lease_deadline_ms,
+        serving,
+        snapshot,
+    })
+}
+
+fn write_runtime_map_snapshot(
+    out: &mut Vec<u8>,
+    snapshot: &ClusterRuntimeMapSnapshot,
+) -> Result<(), ControlPlaneError> {
+    write_u64(out, snapshot.cluster_epoch().get());
+    write_option_u64(out, snapshot.valid_until_ms());
+    write_u32(out, len_as_u32(snapshot.nodes().len(), "runtime nodes")?);
+    for node in snapshot.nodes() {
+        write_u32(out, node.node_id().as_u32());
+        write_u64(out, node.node_incarnation());
+        write_string(out, node.endpoint())?;
+    }
+    write_u32(out, len_as_u32(snapshot.pg_routes().len(), "PG routes")?);
+    for route in snapshot.pg_routes() {
+        write_u64(out, route.cluster_epoch().get());
+        write_u32(out, route.pg_id().get());
+        write_u32(out, route.primary_node_id().as_u32());
+        write_pg_state(out, route.state());
+        write_option_u64(out, route.primary_lease_deadline_ms());
+        write_u32(out, len_as_u32(route.acting_set().len(), "acting set")?);
+        for node_id in route.acting_set() {
+            write_u32(out, node_id.as_u32());
+        }
+    }
+    Ok(())
+}
+
+fn read_runtime_map_snapshot(
+    reader: &mut PayloadReader<'_>,
+) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+    let cluster_epoch = read_cluster_epoch(reader, "runtime map cluster epoch")?;
+    let valid_until_ms = reader.read_option_u64()?;
+    let node_count = reader.read_len("runtime nodes")?;
+    let mut nodes = Vec::with_capacity(node_count);
+    for _ in 0..node_count {
+        nodes.push(NodeRouteSnapshot {
+            node_id: NodeId::new(reader.read_u32()?),
+            node_incarnation: reader.read_u64()?,
+            endpoint: reader.read_string()?.to_owned(),
+        });
+    }
+    let route_count = reader.read_len("PG routes")?;
+    let mut pg_routes = Vec::with_capacity(route_count);
+    for _ in 0..route_count {
+        let route_epoch = read_cluster_epoch(reader, "PG route cluster epoch")?;
+        let pg_id = PgId::new(reader.read_u32()?);
+        let primary_node_id = NodeId::new(reader.read_u32()?);
+        let state = read_pg_state(reader)?;
+        let primary_lease_deadline_ms = reader.read_option_u64()?;
+        let acting_set_len = reader.read_len("PG route acting set")?;
+        let mut acting_set = Vec::with_capacity(acting_set_len);
+        for _ in 0..acting_set_len {
+            acting_set.push(NodeId::new(reader.read_u32()?));
+        }
+        pg_routes.push(PgRouteSnapshot {
+            cluster_epoch: route_epoch,
+            pg_id,
+            primary_node_id,
+            acting_set,
+            state,
+            primary_lease_deadline_ms,
+        });
+    }
+    Ok(ClusterRuntimeMapSnapshot {
+        cluster_epoch,
+        valid_until_ms,
+        nodes,
+        pg_routes,
+    })
+}
+
+fn write_pg_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
+    write_u64(out, proof.applied_log_index);
+    write_u64(out, proof.applied_log_hash);
+    write_u64(out, proof.state_digest);
+}
+
+fn read_pg_metadata_proof(
+    reader: &mut PayloadReader<'_>,
+) -> Result<PgMetadataProof, ControlPlaneError> {
+    Ok(PgMetadataProof {
+        applied_log_index: reader.read_u64()?,
+        applied_log_hash: reader.read_u64()?,
+        state_digest: reader.read_u64()?,
+    })
+}
+
+fn write_pg_state(out: &mut Vec<u8>, state: PgState) {
+    write_u8(
+        out,
+        match state {
+            PgState::Active => 1,
+            PgState::Peering => 2,
+            PgState::Degraded => 3,
+            PgState::Backfilling => 4,
+            PgState::Inconsistent => 5,
+        },
+    );
+}
+
+fn read_pg_state(reader: &mut PayloadReader<'_>) -> Result<PgState, ControlPlaneError> {
+    match reader.read_u8()? {
+        1 => Ok(PgState::Active),
+        2 => Ok(PgState::Peering),
+        3 => Ok(PgState::Degraded),
+        4 => Ok(PgState::Backfilling),
+        5 => Ok(PgState::Inconsistent),
+        state => Err(ControlPlaneError::RpcProtocol {
+            message: format!("invalid PG state code {state}"),
+        }),
+    }
+}
+
+fn read_cluster_epoch(
+    reader: &mut PayloadReader<'_>,
+    field: &'static str,
+) -> Result<ClusterEpoch, ControlPlaneError> {
+    ClusterEpoch::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
+        message: format!("{field} must be nonzero"),
+    })
+}
+
+fn write_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            write_u8(out, 1);
+            write_u64(out, value);
+        }
+        None => write_u8(out, 0),
+    }
+}
+
+fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), ControlPlaneError> {
+    write_bytes(out, value.as_bytes())
+}
+
+fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), ControlPlaneError> {
+    write_u32(out, len_as_u32(value.len(), "byte field")?);
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn write_u8(out: &mut Vec<u8>, value: u8) {
+    out.push(value);
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn len_as_u32(len: usize, field: &'static str) -> Result<u32, ControlPlaneError> {
+    u32::try_from(len).map_err(|_| ControlPlaneError::RpcProtocol {
+        message: format!("{field} length {len} exceeds u32::MAX"),
+    })
+}
+
+struct PayloadReader<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PayloadReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    fn finish(&self) -> Result<(), ControlPlaneError> {
+        if self.offset == self.payload.len() {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane RPC payload has {} trailing bytes",
+                    self.payload.len() - self.offset
+                ),
+            })
+        }
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], ControlPlaneError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: "control-plane RPC payload offset overflow".to_owned(),
+            })?;
+        let bytes =
+            self.payload
+                .get(self.offset..end)
+                .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                    message: "truncated control-plane RPC payload".to_owned(),
+                })?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ControlPlaneError> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ControlPlaneError> {
+        let bytes = self.read_exact(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ControlPlaneError> {
+        let bytes = self.read_exact(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ControlPlaneError> {
+        let bytes = self.read_exact(8)?;
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_bool(&mut self) -> Result<bool, ControlPlaneError> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(ControlPlaneError::RpcProtocol {
+                message: format!("invalid boolean value {value}"),
+            }),
+        }
+    }
+
+    fn read_option_u64(&mut self) -> Result<Option<u64>, ControlPlaneError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u64()?)),
+            value => Err(ControlPlaneError::RpcProtocol {
+                message: format!("invalid optional u64 tag {value}"),
+            }),
+        }
+    }
+
+    fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
+        usize::try_from(self.read_u32()?).map_err(|_| ControlPlaneError::RpcProtocol {
+            message: format!("{field} length does not fit usize"),
+        })
+    }
+
+    fn read_bytes(&mut self) -> Result<&'a [u8], ControlPlaneError> {
+        let len = self.read_len("byte field")?;
+        self.read_exact(len)
+    }
+
+    fn read_string(&mut self) -> Result<&'a str, ControlPlaneError> {
+        std::str::from_utf8(self.read_bytes()?).map_err(|source| ControlPlaneError::RpcProtocol {
+            message: format!("control-plane RPC string is not UTF-8: {source}"),
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
     #[error("{context}: {source}")]
@@ -1743,6 +2430,12 @@ pub enum ControlPlaneError {
 
     #[error("control-plane state parse error at line {line}: {message}")]
     Parse { line: usize, message: String },
+
+    #[error("control-plane RPC protocol error: {message}")]
+    RpcProtocol { message: String },
+
+    #[error("control-plane RPC remote error: {message}")]
+    RpcRemote { message: String },
 
     #[error("invalid {field} state {value:?}")]
     InvalidState { field: &'static str, value: String },
@@ -3017,6 +3710,218 @@ mod tests {
             .node(NodeId::new(node_id))
             .unwrap()
             .node_incarnation()
+    }
+
+    #[test]
+    fn unix_control_plane_client_fetches_runtime_map() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_until_serving_with_endpoint(
+            &mut authority,
+            1,
+            1_000,
+            "/tmp/argmin-node-1.sock".to_owned(),
+        );
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_001).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client.runtime_map_snapshot(0).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.nodes().len(), 1);
+        assert_eq!(runtime_map.nodes()[0].node_id(), NodeId::new(1));
+        assert_eq!(runtime_map.nodes()[0].endpoint(), "/tmp/argmin-node-1.sock");
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
+        assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Peering);
+    }
+
+    #[test]
+    fn unix_control_plane_client_refreshes_heartbeat_and_runtime_map_together() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_000).unwrap();
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let refresh = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 100,
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().node_id(), NodeId::new(1));
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_100);
+        assert!(!refresh.lease().serving());
+        assert_eq!(
+            refresh.lease().cluster_epoch(),
+            refresh.runtime_map().cluster_epoch()
+        );
+        assert_eq!(refresh.runtime_map().nodes().len(), 1);
+        assert_eq!(
+            refresh.runtime_map().nodes()[0].endpoint(),
+            "/tmp/argmin-node-1.sock"
+        );
+    }
+
+    #[test]
+    fn unix_control_plane_client_receives_framed_authority_error() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_000).unwrap();
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let error = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(99),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-node-99.sock".to_owned(),
+                    observed_epoch: ClusterEpoch::INITIAL,
+                    requested_lease_duration_ms: 100,
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcRemote { message } if message.contains("unknown node 99")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_corrupted_payload_checksum() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let payload = b"not a valid request";
+        writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
+        write_u16_to_stream(&mut writer, 1);
+        write_u16_to_stream(
+            &mut writer,
+            ControlPlaneRpcKind::RefreshNodeHeartbeat as u16,
+        );
+        write_u32_to_stream(&mut writer, payload.len() as u32);
+        write_u64_to_stream(&mut writer, 0);
+        writer.write_all(payload).unwrap();
+
+        let error = read_control_plane_unix_request(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_corrupted_header_checksum() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let payload = b"";
+        let checksum = control_plane_rpc_frame_checksum(
+            1,
+            ControlPlaneRpcKind::RuntimeMapSnapshot as u16,
+            payload.len() as u32,
+            payload,
+        );
+        writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
+        write_u16_to_stream(&mut writer, 1);
+        write_u16_to_stream(
+            &mut writer,
+            ControlPlaneRpcKind::RefreshNodeHeartbeat as u16,
+        );
+        write_u32_to_stream(&mut writer, payload.len() as u32);
+        write_u64_to_stream(&mut writer, checksum);
+
+        let error = read_control_plane_unix_request(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn unix_control_plane_client_rejects_corrupted_response_checksum() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let _request = read_control_plane_unix_request(&mut stream).unwrap();
+            let payload = [0u8];
+            stream.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
+            write_u16_to_stream(&mut stream, 1);
+            write_u16_to_stream(&mut stream, ControlPlaneRpcKind::RuntimeMapSnapshot as u16);
+            write_u32_to_stream(&mut stream, payload.len() as u32);
+            write_u64_to_stream(&mut stream, 0);
+            stream.write_all(&payload).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let error = client.runtime_map_snapshot(0).unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("checksum mismatch")
+        ));
+    }
+
+    fn write_u16_to_stream(stream: &mut UnixStream, value: u16) {
+        stream.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    fn write_u32_to_stream(stream: &mut UnixStream, value: u32) {
+        stream.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    fn write_u64_to_stream(stream: &mut UnixStream, value: u64) {
+        stream.write_all(&value.to_be_bytes()).unwrap();
     }
 
     #[test]

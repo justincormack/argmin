@@ -7254,10 +7254,20 @@ Status:
   `argmin-s3` binary now has a `control-plane` role that requires
   `ARGMIN_CONTROL_PLANE_STATE_PATH`, takes a sibling interprocess lock before
   opening the durable file-backed authority, and runs the heartbeat lease-expiry
-  scan loop as the single owner. Storage nodes must not independently open the
-  same authority state file; the next wiring step is the control-plane transport
-  endpoint that lets storage-node heartbeat loops and frontend runtime-map
-  refresh loops talk to this manager process.
+  scan loop as the single owner.
+- Added the first control-plane Unix transport endpoint. The `control-plane`
+  role now also requires `ARGMIN_CONTROL_PLANE_SOCKET_PATH`, binds that Unix
+  socket under the same single-authority state lock, and serves framed
+  runtime-map snapshot and heartbeat+runtime-map refresh RPCs. The
+  endpoint requires a private owner-owned socket directory, validates CRC64
+  frame checksums over the header and payload, reads requests on bounded worker
+  threads with socket IO deadlines before taking the authority mutex, and
+  bounds each accept batch so lease expiry cannot be starved by a continuous RPC
+  stream. The transport-neutral `UnixControlPlaneClient` implements the existing
+  runtime-map and heartbeat refresh traits, so storage-node and frontend refresh
+  loops can talk to the manager process without opening the authority state file
+  themselves. The remaining process wiring step is to instantiate those clients
+  from storage-node/frontend roles and start the existing refresh loops.
 
 Exit criteria:
 

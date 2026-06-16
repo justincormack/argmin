@@ -69,6 +69,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_admission_wait_timeout: Duration,
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
     pub(crate) control_plane_state_path: Option<String>,
+    pub(crate) control_plane_socket_path: Option<String>,
     pub(crate) control_plane_lease_scan_interval: Duration,
     pub(crate) storage_cluster_epoch: u64,
     pub(crate) storage_pg_ids: Vec<u32>,
@@ -109,6 +110,7 @@ impl ServerConfig {
     ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` (250)
     ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
     ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
+    ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
@@ -262,6 +264,7 @@ impl ServerConfig {
         let storage_node_rpc_control_admission_wait_timeout =
             Duration::from_millis(storage_node_rpc_control_admission_wait_ms);
         let control_plane_state_path = get("ARGMIN_CONTROL_PLANE_STATE_PATH");
+        let control_plane_socket_path = get("ARGMIN_CONTROL_PLANE_SOCKET_PATH");
         let control_plane_lease_scan_ms: u64 = get("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS")
             .unwrap_or_else(|| "250".to_string())
             .parse()
@@ -373,6 +376,11 @@ impl ServerConfig {
                 "ARGMIN_CONTROL_PLANE_STATE_PATH is required for control-plane role".to_string(),
             );
         }
+        if process_role == ProcessRole::ControlPlane && control_plane_socket_path.is_none() {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH is required for control-plane role".to_string(),
+            );
+        }
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
         }
@@ -435,6 +443,7 @@ impl ServerConfig {
             storage_node_rpc_admission_wait_timeout,
             storage_node_rpc_control_admission_wait_timeout,
             control_plane_state_path,
+            control_plane_socket_path,
             control_plane_lease_scan_interval,
             storage_cluster_epoch,
             storage_pg_ids,
@@ -842,6 +851,7 @@ mod tests {
             LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT
         );
         assert_eq!(cfg.control_plane_state_path, None);
+        assert_eq!(cfg.control_plane_socket_path, None);
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(250)
@@ -882,6 +892,10 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_STATE_PATH",
                 "/tmp/control-plane.state",
             ),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/control-plane.sock",
+            ),
             ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
             ("ARGMIN_EC_K", "8"),
@@ -899,6 +913,10 @@ mod tests {
         assert_eq!(
             cfg.control_plane_state_path.as_deref(),
             Some("/tmp/control-plane.state")
+        );
+        assert_eq!(
+            cfg.control_plane_socket_path.as_deref(),
+            Some("/tmp/control-plane.sock")
         );
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
@@ -973,10 +991,30 @@ mod tests {
 
     #[test]
     fn process_role_control_plane_requires_state_path() {
-        let err = ServerConfig::from_lookup(make_env(&[("ARGMIN_PROCESS_ROLE", "control-plane")]))
-            .unwrap_err();
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+        ]))
+        .unwrap_err();
 
         assert!(err.contains("ARGMIN_CONTROL_PLANE_STATE_PATH"));
+    }
+
+    #[test]
+    fn process_role_control_plane_requires_socket_path() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/argmin-control-plane.state",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_SOCKET_PATH"));
     }
 
     #[test]
@@ -987,6 +1025,10 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_STATE_PATH",
                 "/tmp/argmin-control-plane.state",
             ),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
         ]))
         .unwrap();
 
@@ -994,6 +1036,10 @@ mod tests {
         assert_eq!(
             cfg.control_plane_state_path.as_deref(),
             Some("/tmp/argmin-control-plane.state")
+        );
+        assert_eq!(
+            cfg.control_plane_socket_path.as_deref(),
+            Some("/tmp/argmin-control-plane.sock")
         );
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
