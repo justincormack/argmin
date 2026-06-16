@@ -314,6 +314,64 @@ impl ClusterControlSnapshot {
         })
     }
 
+    fn active_pg_route_for_storage_node_refresh(
+        &self,
+        pg_id: PgId,
+        now_ms: u64,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state != PgState::Active {
+            return Err(ControlPlaneError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+                state: record.state,
+            });
+        }
+        let primary = record
+            .active_primary
+            .filter(|primary| record.acting_set.contains(primary))
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            })?;
+        let primary_record = self
+            .node(primary)
+            .ok_or(ControlPlaneError::UnknownActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            })?;
+        if !primary_record.membership.can_serve_primary()
+            || primary_record.availability != NodeAvailabilityState::Healthy
+        {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        }
+        let Some(primary_lease_deadline_ms) = primary_record.lease_deadline_ms else {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        };
+        if primary_lease_deadline_ms <= now_ms {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(PgRouteSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            primary_node_id: primary,
+            acting_set: record.acting_set.clone(),
+            state: PgState::Active,
+            primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
+        })
+    }
+
     pub fn active_pg_routes(&self, now_ms: u64) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         self.pgs
             .values()
@@ -352,6 +410,20 @@ impl ClusterControlSnapshot {
         })
     }
 
+    fn pg_route_for_storage_node_refresh(
+        &self,
+        pg_id: PgId,
+        now_ms: u64,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state == PgState::Active {
+            return self.active_pg_route_for_storage_node_refresh(pg_id, now_ms);
+        }
+        self.pg_route(pg_id, now_ms)
+    }
+
     pub fn pg_routes(&self, now_ms: u64) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         self.pgs
             .values()
@@ -359,8 +431,33 @@ impl ClusterControlSnapshot {
             .collect()
     }
 
+    fn pg_routes_for_storage_node_refresh(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+        self.pgs
+            .values()
+            .map(|record| self.pg_route_for_storage_node_refresh(record.pg_id, now_ms))
+            .collect()
+    }
+
     pub fn runtime_map(&self, now_ms: u64) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let pg_routes = self.pg_routes(now_ms)?;
+        self.runtime_map_from_pg_routes(pg_routes)
+    }
+
+    fn runtime_map_for_storage_node_refresh(
+        &self,
+        now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms)?;
+        self.runtime_map_from_pg_routes(pg_routes)
+    }
+
+    fn runtime_map_from_pg_routes(
+        &self,
+        pg_routes: Vec<PgRouteSnapshot>,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut routed_node_ids = BTreeSet::new();
         for route in &pg_routes {
             routed_node_ids.extend(route.acting_set().iter().copied());
@@ -1292,6 +1389,53 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn complete_ready_pg_peerings(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Vec<PgId>, ControlPlaneError> {
+        let mut ready = Vec::new();
+        for record in self.snapshot.pgs.values() {
+            if record.state != PgState::Peering {
+                continue;
+            }
+            let Some(primary) =
+                self.deterministic_pg_primary(record.pg_id, record.acting_set(), now_ms)
+            else {
+                continue;
+            };
+            match validate_pg_peering_observations(
+                &self.snapshot,
+                record.pg_id,
+                record.acting_set(),
+                now_ms,
+            ) {
+                Ok(()) => ready.push((record.pg_id, primary)),
+                Err(
+                    ControlPlaneError::PgPeeringMissingObservation { .. }
+                    | ControlPlaneError::PgPeeringObservationNotPeering { .. }
+                    | ControlPlaneError::PgPeeringMetadataProofMismatch { .. },
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if ready.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut next_snapshot = self.snapshot.clone();
+        for (pg_id, primary) in &ready {
+            let record = next_snapshot
+                .pgs
+                .get_mut(pg_id)
+                .expect("ready PG must exist in cloned snapshot");
+            record.state = PgState::Active;
+            record.active_primary = Some(*primary);
+        }
+        next_snapshot.bump_epoch()?;
+        self.commit_snapshot(next_snapshot)?;
+        Ok(ready.into_iter().map(|(pg_id, _)| pg_id).collect())
+    }
+
     pub fn heartbeat(
         &mut self,
         heartbeat: NodeHeartbeat,
@@ -1406,6 +1550,27 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             node_id: heartbeat.node_id,
             lease_deadline_ms,
             serving,
+            snapshot: self.snapshot.clone(),
+        })
+    }
+
+    fn current_heartbeat_lease_for_node(
+        &self,
+        node_id: NodeId,
+        now_ms: u64,
+    ) -> Result<HeartbeatLease, ControlPlaneError> {
+        let record = self
+            .snapshot
+            .node(node_id)
+            .ok_or(ControlPlaneError::UnknownNode {
+                node_id: node_id.as_u32(),
+            })?;
+        Ok(HeartbeatLease {
+            authority_incarnation: self.snapshot.authority_incarnation,
+            cluster_epoch: self.snapshot.cluster_epoch,
+            node_id,
+            lease_deadline_ms: record.lease_deadline_ms.unwrap_or(now_ms),
+            serving: record.can_serve_primary(self.snapshot.cluster_epoch, now_ms),
             snapshot: self.snapshot.clone(),
         })
     }
@@ -1775,8 +1940,17 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         heartbeat: NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        let lease = self.heartbeat(heartbeat, authority_now_ms)?;
-        let runtime_map = lease.snapshot().runtime_map(authority_now_ms)?;
+        let node_id = heartbeat.node_id;
+        let mut lease = self.heartbeat(heartbeat, authority_now_ms)?;
+        if !self
+            .complete_ready_pg_peerings(authority_now_ms)?
+            .is_empty()
+        {
+            lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
+        }
+        let runtime_map = self
+            .snapshot
+            .runtime_map_for_storage_node_refresh(authority_now_ms)?;
         Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
     }
 }
@@ -4567,6 +4741,76 @@ mod tests {
         assert_eq!(
             authority.serving_pg_primary(PgId::new(8), 3_002),
             Some(NodeId::new(1))
+        );
+    }
+
+    #[test]
+    fn heartbeat_refresh_completes_ready_peering_for_storage_node_before_frontend_export() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(22), vec![NodeId::new(1)])
+            .unwrap();
+
+        let mut peering_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Peering,
+            metadata_proof: PgMetadataProof::empty(),
+        }];
+        let refresh = authority
+            .refresh_node_heartbeat(peering_heartbeat, 2_000)
+            .unwrap();
+
+        let pg = authority.snapshot().pg(PgId::new(22)).unwrap();
+        assert_eq!(pg.state(), PgState::Active);
+        assert_eq!(pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(
+            refresh.lease().cluster_epoch(),
+            authority.snapshot().cluster_epoch()
+        );
+        assert!(
+            !refresh.lease().serving(),
+            "peering completion bumps the epoch before the node observes it"
+        );
+        let storage_route = refresh
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(22))
+            .unwrap();
+        assert_eq!(storage_route.state(), PgState::Active);
+        assert!(matches!(
+            authority.snapshot().runtime_map(2_001),
+            Err(ControlPlaneError::PgHasNoServingPrimary { pg_id: 22, .. })
+        ));
+
+        let mut active_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_002);
+        active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+        }];
+        let refresh = authority
+            .refresh_node_heartbeat(active_heartbeat, 2_002)
+            .unwrap();
+        assert!(refresh.lease().serving());
+        let frontend_map = authority.snapshot().runtime_map(2_003).unwrap();
+        assert_eq!(
+            frontend_map
+                .pg_routes()
+                .iter()
+                .find(|route| route.pg_id() == PgId::new(22))
+                .unwrap()
+                .state(),
+            PgState::Active
         );
     }
 

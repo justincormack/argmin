@@ -7284,6 +7284,14 @@ Status:
   endpoints are persisted for pre-heartbeat runtime-map bootstrap, while
   serving eligibility still requires heartbeat/incarnation/observed-epoch/PG
   observation fencing.
+- Added the first automatic Peering-to-Active handoff for control-plane-backed
+  storage-node refresh. After a node heartbeat records matching current-epoch
+  Peering metadata proofs, the authority can batch-complete ready PGs, bump the
+  epoch once, and return a storage-node-only runtime map that contains the
+  newly Active routes so nodes can install them and heartbeat Active in the new
+  epoch. The normal frontend runtime-map export remains stricter and still
+  withholds Active routes until the bound primary has heartbeated Active for the
+  post-peering epoch.
 
 Exit criteria:
 

@@ -9289,25 +9289,38 @@ mod tests {
         assert_eq!(refresh.next_config().data_dir, config.data_dir);
         assert_eq!(refresh.next_config().pg_ids, vec![pg_id.get()]);
         assert_eq!(refresh.next_config().pg_routes.len(), 1);
-        assert_eq!(refresh.next_config().pg_routes[0].state, PgState::Peering);
+        assert_eq!(refresh.next_config().pg_routes[0].state, PgState::Active);
 
         let installed_epoch = refresh.next_config().cluster_epoch;
         let lease = server.install_control_plane_refresh(refresh).unwrap();
         assert_eq!(lease.node_id(), node_id);
+        assert!(
+            !lease.serving(),
+            "peering completion bumps the epoch before the node observes it"
+        );
         let installed_config = server.config_snapshot();
         assert_eq!(installed_config.cluster_epoch, installed_epoch);
-        assert_eq!(installed_config.route_map_valid_until_ms(), None);
-        let peering_error = server
-            .connection_handler()
-            .validate_pg_route(node_id, installed_epoch, pg_id)
-            .unwrap_err();
-        assert_eq!(peering_error.code, StorageRpcErrorCode::InactivePgRoute);
+        assert_eq!(installed_config.pg_routes[0].state, PgState::Active);
+        assert!(installed_config.route_map_valid_until_ms().is_some());
         let installed_heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
         assert_eq!(installed_heartbeat.observed_epoch, installed_epoch);
         assert_eq!(
             installed_heartbeat.pg_observations[0].state,
-            PgState::Peering
+            PgState::Active
         );
+        assert!(
+            authority
+                .snapshot()
+                .node(node_id)
+                .unwrap()
+                .pg_observation(pg_id)
+                .is_none(),
+            "peering completion clears observations until the node heartbeats the new epoch"
+        );
+        let active_lease = server
+            .heartbeat_control_plane(&mut authority, 12, 1_000, 1_004)
+            .unwrap();
+        assert!(active_lease.serving());
 
         let observation = authority
             .snapshot()
@@ -9315,7 +9328,7 @@ mod tests {
             .unwrap()
             .pg_observation(pg_id)
             .unwrap();
-        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(observation.state(), PgState::Active);
         assert_eq!(observation.observed_epoch(), installed_epoch);
     }
 
@@ -9400,10 +9413,10 @@ mod tests {
         }
 
         let installed_config = server.config_snapshot();
-        assert_eq!(installed_config.cluster_epoch, runtime_map.cluster_epoch());
-        assert_eq!(installed_config.route_map_valid_until_ms(), None);
+        assert!(installed_config.cluster_epoch > runtime_map.cluster_epoch());
+        assert!(installed_config.route_map_valid_until_ms().is_some());
         assert_eq!(installed_config.pg_routes.len(), 1);
-        assert_eq!(installed_config.pg_routes[0].state, PgState::Peering);
+        assert_eq!(installed_config.pg_routes[0].state, PgState::Active);
         assert_eq!(refresh_loop.status().failures, 0);
 
         refresh_loop.stop();
