@@ -7281,8 +7281,13 @@ Status:
   `Arc<StorageCluster>` from the handle at request/runtime entry points, so
   foreground request routing can advance monotonically without rebuilding
   coordinators or duplicating background workers on every lease extension.
-  Direct PUT, streaming append, and stream-part begin paths snapshot the current
-  cluster once for their multi-step storage operations.
+  Multi-step read, copy, direct PUT, streaming PUT/POST, UploadPart,
+  UploadPartCopy, CompleteMultipartUpload, and AbortMultipartUpload paths now
+  pin one request `Arc<StorageCluster>` across authorization, session creation,
+  append/body IO, finalize/commit, and abort/cleanup work. The production
+  streaming helper surface is biased toward explicit `_with_storage_node` calls
+  so HTTP contexts must carry the pinned request map, and regression tests
+  install replacement runtime maps at the previously vulnerable handoff points.
 - Added fresh-state control-plane bootstrap from the existing
   `ARGMIN_STORAGE_NODE_SOCKETS` and PG configuration. When a manager opens an
   empty authority state and a storage-node socket map is present, it persists
@@ -7299,6 +7304,18 @@ Status:
   epoch. The normal frontend runtime-map export remains stricter and still
   withholds Active routes until the bound primary has heartbeated Active for the
   post-peering epoch.
+- Hardened the control-plane Unix socket tests to use short `/tmp` socket paths
+  rather than the repository-relative temporary directory, so they keep covering
+  private directory creation, frontend bootstrap, runtime-map refresh, and
+  storage-node bootstrap without depending on the checkout path being shorter
+  than the platform `sun_path` limit.
+- Current remaining Phase 11 work is now concentrated in the distributed
+  correctness layers above the control-plane/runtime-map plumbing: a final
+  request runtime-map pinning audit for less common multi-step/background
+  paths, real command-log reconstruction during PG peering, deterministic
+  epoch-transition fault injection, shard repair, PG backfill/migration,
+  command-log retention/compaction implementation, and a small real-multihost
+  correctness soak separate from the single-host overload soak.
 
 Exit criteria:
 
