@@ -1,10 +1,11 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
+use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
+use aws_sdk_s3::primitives::{DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
-    BucketCannedAcl, Delete, ObjectIdentifier, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-    ObjectLockRetention, ObjectLockRetentionMode, ObjectOwnership, OwnershipControls,
-    OwnershipControlsRule,
+    BucketCannedAcl, Delete, DeletedObject, Error as DeleteObjectError, ObjectIdentifier,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode,
+    ObjectOwnership, OwnershipControls, OwnershipControlsRule,
 };
 use base64::Engine;
 use md5_legacy::Digest;
@@ -128,18 +129,113 @@ fn object_id(key: &str, version_id: &str) -> ObjectIdentifier {
         .unwrap()
 }
 
+fn configured_retry_timeout() -> Duration {
+    let timeout_secs = std::env::var("S3_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    Duration::from_secs(timeout_secs)
+}
+
 async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) -> String {
-    CTX.client()
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(body.to_vec()))
-        .send()
+    s3_tests::put_object_retrying_operation_aborted(CTX.client(), bucket, key, body.to_vec())
         .await
-        .unwrap()
         .version_id()
         .expect("expected version_id on object lock bucket")
         .to_string()
+}
+
+async fn delete_objects_with_bypass_retrying_operation_aborted(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    delete: Delete,
+) -> DeleteObjectsOutput {
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + configured_retry_timeout();
+    let quiet = delete.quiet();
+    let all_objects = delete.objects().to_vec();
+    let mut pending = all_objects.clone();
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    loop {
+        let request_delete = Delete::builder()
+            .set_objects(Some(pending.clone()))
+            .set_quiet(quiet)
+            .build()
+            .unwrap();
+
+        let response = s3_tests::retrying_operation_aborted(
+            "delete public object-lock objects with bypass",
+            || {
+                let request_delete = request_delete.clone();
+                client
+                    .delete_objects()
+                    .bucket(bucket)
+                    .delete(request_delete)
+                    .bypass_governance_retention(true)
+                    .customize()
+                    .mutate_request(|req| {
+                        let body = req.body().bytes().expect("DeleteObjects body in memory");
+                        let digest = md5_legacy::Md5::digest(body);
+                        let content_md5 =
+                            base64::engine::general_purpose::STANDARD.encode(&digest[..]);
+                        req.headers_mut().insert("content-md5", content_md5);
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        deleted.extend(response.deleted().iter().cloned());
+
+        let mut retry = Vec::new();
+        for error in response.errors() {
+            if matches!(error.code(), Some("OperationAborted" | "SlowDown"))
+                && Instant::now() < deadline
+            {
+                retry.push(matching_delete_object(&all_objects, error));
+            } else {
+                errors.push(error.clone());
+            }
+        }
+
+        if retry.is_empty() {
+            return build_delete_objects_output(deleted, errors);
+        }
+
+        pending = retry;
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+}
+
+fn matching_delete_object(
+    objects: &[ObjectIdentifier],
+    error: &DeleteObjectError,
+) -> ObjectIdentifier {
+    let key = error.key().unwrap_or_default();
+    let version_id = error.version_id();
+    objects
+        .iter()
+        .find(|object| object.key() == key && object.version_id() == version_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut builder = ObjectIdentifier::builder().key(key);
+            if let Some(version_id) = version_id {
+                builder = builder.version_id(version_id);
+            }
+            builder.build().unwrap()
+        })
+}
+
+fn build_delete_objects_output(
+    deleted: Vec<DeletedObject>,
+    errors: Vec<DeleteObjectError>,
+) -> DeleteObjectsOutput {
+    DeleteObjectsOutput::builder()
+        .set_deleted((!deleted.is_empty()).then_some(deleted))
+        .set_errors((!errors.is_empty()).then_some(errors))
+        .build()
 }
 
 async fn delete_version_with_bypass(bucket: &str, key: &str, version_id: &str) {
@@ -149,7 +245,7 @@ async fn delete_version_with_bypass(bucket: &str, key: &str, version_id: &str) {
         .key(key)
         .version_id(version_id)
         .bypass_governance_retention(true)
-        .send()
+        .send_retrying_operation_aborted("delete public object-lock version with bypass")
         .await
         .unwrap();
 }
@@ -190,7 +286,7 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
                 .bucket(bucket)
                 .key(marker.key().unwrap())
                 .version_id(marker.version_id().unwrap())
-                .send()
+                .send_retrying_operation_aborted("delete public object-lock delete marker")
                 .await
                 .unwrap();
         }
@@ -203,7 +299,7 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
                 .bucket(bucket)
                 .key(key)
                 .version_id(version_id)
-                .send()
+                .send_retrying_operation_aborted("head public object-lock version during cleanup")
                 .await
                 .unwrap();
 
@@ -214,7 +310,7 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
                     .key(key)
                     .version_id(version_id)
                     .legal_hold(legal_hold(ObjectLockLegalHoldStatus::Off))
-                    .send()
+                    .send_retrying_operation_aborted("clear public object-lock legal hold")
                     .await
                     .unwrap();
             }
@@ -225,7 +321,7 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
                 .key(key)
                 .version_id(version_id)
                 .bypass_governance_retention(true)
-                .send()
+                .send_retrying_operation_aborted("delete public object-lock version during cleanup")
                 .await;
 
             if delete.is_err() && err_status(&delete) == 403 {
@@ -249,19 +345,18 @@ fn test_object_lock_delete_object_bypass_requires_bucket_admin() {
         let alt_client = CTX.alt_client();
         let bucket = setup_public_write_object_lock_bucket().await;
 
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("plain")
-            .body(ByteStream::from_static(b"plain"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "plain",
+            b"plain".to_vec(),
+        )
+        .await;
         let delete_marker = alt_client
             .delete_object()
             .bucket(&bucket)
             .key("plain")
-            .send()
+            .send_retrying_operation_aborted("create public object-lock delete marker")
             .await
             .unwrap();
         assert_eq!(delete_marker.delete_marker(), Some(true));
@@ -277,7 +372,7 @@ fn test_object_lock_delete_object_bypass_requires_bucket_admin() {
                 ObjectLockRetentionMode::Governance,
                 future_date(GOVERNANCE_RETENTION_SECS),
             ))
-            .send()
+            .send_retrying_operation_aborted("put public object-lock retention")
             .await
             .unwrap();
 
@@ -287,7 +382,7 @@ fn test_object_lock_delete_object_bypass_requires_bucket_admin() {
             .key(key)
             .version_id(&version_id)
             .bypass_governance_retention(true)
-            .send()
+            .send_retrying_operation_aborted("attempt public object-lock bypass delete")
             .await;
         assert_eq!(err_status(&result), 403);
         assert_s3_err_code(&result, "AccessDenied");
@@ -417,7 +512,7 @@ fn test_object_lock_multi_delete_bypass_requires_bucket_admin() {
                 ObjectLockRetentionMode::Governance,
                 future_date(GOVERNANCE_RETENTION_SECS),
             ))
-            .send()
+            .send_retrying_operation_aborted("put public object-lock retention")
             .await
             .unwrap();
 
@@ -426,21 +521,9 @@ fn test_object_lock_multi_delete_bypass_requires_bucket_admin() {
             .objects(object_id(locked_key, &locked_version_id))
             .build()
             .unwrap();
-        let response = alt_client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
-            .bypass_governance_retention(true)
-            .customize()
-            .mutate_request(|req| {
-                let body = req.body().bytes().expect("DeleteObjects body in memory");
-                let digest = md5_legacy::Md5::digest(body);
-                let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
-                req.headers_mut().insert("content-md5", content_md5);
-            })
-            .send()
-            .await
-            .unwrap();
+        let response =
+            delete_objects_with_bypass_retrying_operation_aborted(alt_client, &bucket, delete)
+                .await;
 
         assert_eq!(
             response.deleted().len(),
