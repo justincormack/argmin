@@ -15,6 +15,10 @@ pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8;
+const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4;
+const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4;
+const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -2329,7 +2333,10 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
     let endpoint = reader.read_string()?.to_owned();
     let observed_epoch = read_cluster_epoch(reader, "heartbeat observed epoch")?;
     let requested_lease_duration_ms = reader.read_u64()?;
-    let observation_count = reader.read_len("PG observations")?;
+    let observation_count = reader.read_collection_len(
+        "PG observations",
+        CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN,
+    )?;
     let mut pg_observations = Vec::with_capacity(observation_count);
     for _ in 0..observation_count {
         pg_observations.push(NodePgHeartbeatObservation {
@@ -2415,7 +2422,8 @@ fn read_runtime_map_snapshot(
 ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
     let cluster_epoch = read_cluster_epoch(reader, "runtime map cluster epoch")?;
     let valid_until_ms = reader.read_option_u64()?;
-    let node_count = reader.read_len("runtime nodes")?;
+    let node_count =
+        reader.read_collection_len("runtime nodes", CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN)?;
     let mut nodes = Vec::with_capacity(node_count);
     for _ in 0..node_count {
         nodes.push(NodeRouteSnapshot {
@@ -2424,7 +2432,8 @@ fn read_runtime_map_snapshot(
             endpoint: reader.read_string()?.to_owned(),
         });
     }
-    let route_count = reader.read_len("PG routes")?;
+    let route_count =
+        reader.read_collection_len("PG routes", CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN)?;
     let mut pg_routes = Vec::with_capacity(route_count);
     for _ in 0..route_count {
         let route_epoch = read_cluster_epoch(reader, "PG route cluster epoch")?;
@@ -2432,7 +2441,10 @@ fn read_runtime_map_snapshot(
         let primary_node_id = NodeId::new(reader.read_u32()?);
         let state = read_pg_state(reader)?;
         let primary_lease_deadline_ms = reader.read_option_u64()?;
-        let acting_set_len = reader.read_len("PG route acting set")?;
+        let acting_set_len = reader.read_collection_len(
+            "PG route acting set",
+            CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN,
+        )?;
         let mut acting_set = Vec::with_capacity(acting_set_len);
         for _ in 0..acting_set_len {
             acting_set.push(NodeId::new(reader.read_u32()?));
@@ -2634,6 +2646,24 @@ impl<'a> PayloadReader<'a> {
         })
     }
 
+    fn read_collection_len(
+        &mut self,
+        field: &'static str,
+        min_item_len: usize,
+    ) -> Result<usize, ControlPlaneError> {
+        assert!(min_item_len > 0);
+        let len = self.read_len(field)?;
+        let max_items = self.remaining_len() / min_item_len;
+        if len > max_items {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{field} count {len} exceeds remaining control-plane RPC payload capacity {max_items}",
+                ),
+            });
+        }
+        Ok(len)
+    }
+
     fn read_bytes(&mut self) -> Result<&'a [u8], ControlPlaneError> {
         let len = self.read_len("byte field")?;
         self.read_exact(len)
@@ -2643,6 +2673,10 @@ impl<'a> PayloadReader<'a> {
         std::str::from_utf8(self.read_bytes()?).map_err(|source| ControlPlaneError::RpcProtocol {
             message: format!("control-plane RPC string is not UTF-8: {source}"),
         })
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.payload.len() - self.offset
     }
 }
 
@@ -4142,6 +4176,85 @@ mod tests {
             error,
             ControlPlaneError::RpcProtocol { message }
                 if message.contains("checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_oversized_heartbeat_observation_count_before_allocation() {
+        let mut payload = Vec::new();
+        write_u32(&mut payload, 1);
+        write_u64(&mut payload, 1);
+        write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_u64(&mut payload, 100);
+        write_u32(&mut payload, u32::MAX);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_node_heartbeat(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("PG observations count")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_oversized_runtime_node_count_before_allocation() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u32(&mut payload, u32::MAX);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime nodes count")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_oversized_runtime_route_count_before_allocation() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u32(&mut payload, 0);
+        write_u32(&mut payload, u32::MAX);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("PG routes count")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_oversized_runtime_acting_set_count_before_allocation() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u32(&mut payload, 0);
+        write_u32(&mut payload, 1);
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_u32(&mut payload, 7);
+        write_u32(&mut payload, 1);
+        write_pg_state(&mut payload, PgState::Active);
+        write_option_u64(&mut payload, None);
+        write_u32(&mut payload, u32::MAX);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("PG route acting set count")
         ));
     }
 
