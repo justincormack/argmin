@@ -1,0 +1,1836 @@
+use super::*;
+
+#[test]
+fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..5 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let key = ShardKey::new(&[0x55; 16], 11, 0);
+    let data_pg_id = DataPgId::new(PgId::new(0));
+
+    assert_eq!(client.node_id(), NodeId::new(7));
+    let ack = client
+        .write_placed_shard(data_pg_id, &key, b"remote payload")
+        .unwrap();
+    let read_back = client.read_placed_shard(data_pg_id, &key, ack).unwrap();
+    assert_eq!(read_back, b"remote payload");
+    client
+        .register_written_shard_acks(PgId::new(0), &[(&key, ack)])
+        .unwrap();
+    client
+        .validate_written_shard_acks(PgId::new(0), &[(&key, ack)])
+        .unwrap();
+    client.delete_placed_shard(data_pg_id, &key).unwrap();
+    server_thread.join().unwrap();
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened.read_shard_file(0, &key),
+        Err(StoreError::NotFound)
+    ));
+    let pg = reopened.get_pg(0).unwrap();
+    pg.validate_written_shard_ack(&key, ack).unwrap();
+}
+
+#[test]
+fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let first = test_metadata_command(0, 1);
+    let applied = test_metadata_command(0, 2);
+    let pending = test_metadata_command(0, 3);
+    let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+    let applied_hashes;
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        pg.record_metadata_command_abandoned(7, &first).unwrap();
+        pg.apply_metadata_command_and_record(7, &applied).unwrap();
+        applied_hashes = pg
+            .applied_metadata_command_log_entry_hashes(7, &applied)
+            .unwrap()
+            .unwrap();
+        pg.try_insert_pending_metadata_command_slot(7, &pending, Some(&bucket))
+            .unwrap();
+    }
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..9 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let state =
+        MetadataCommandNodeClient::metadata_command_replica_state(&client, PgId::new(0)).unwrap();
+    let max_log_index = MetadataCommandNodeClient::max_metadata_command_log_index(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+    )
+    .unwrap();
+    let pending_read = MetadataCommandNodeClient::pending_metadata_command_envelope(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let replay_state =
+        MetadataCommandNodeClient::validate_metadata_command_replay_state_preserving_pending_slot(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+    let remote_hashes = MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(
+        &client,
+        PgId::new(0),
+        &applied,
+    )
+    .unwrap();
+    let matching = MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
+        &client,
+        PgId::new(0),
+        &applied,
+        applied_hashes.0,
+    )
+    .unwrap();
+    let abandoned =
+        MetadataCommandNodeClient::metadata_command_abandoned(&client, PgId::new(0), &first)
+            .unwrap();
+    let next_conflict = MetadataCommandNodeClient::next_metadata_command_id_at_least(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+        MetadataCommandLogIndex::new(5).unwrap(),
+    )
+    .unwrap_err();
+    let acceptance =
+        MetadataCommandNodeClient::metadata_command_acceptance(&client, PgId::new(0), &applied)
+            .unwrap();
+
+    assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(state.applied_log_index, 2);
+    assert_eq!(max_log_index, 2);
+    assert_eq!(pending_read.command_bytes(), pending.command_bytes());
+    assert_eq!(replay_state.applied_log_index, 2);
+    assert_eq!(remote_hashes, Some(applied_hashes));
+    assert!(matching);
+    assert!(abandoned);
+    assert!(matches!(
+        next_conflict,
+        StoreError::MetadataCommandLogConflict {
+            pg_id: 0,
+            log_index: 3,
+            ..
+        }
+    ));
+    assert_eq!(acceptance, MetadataCommandAcceptance::AlreadyApplied);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_storage_node_client_applies_metadata_command_idempotently() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+
+    let applied = MetadataCommandNodeClient::apply_metadata_command_and_record(
+        &client,
+        PgId::new(0),
+        &command,
+    )
+    .unwrap();
+    let retried = MetadataCommandNodeClient::apply_metadata_command_and_record(
+        &client,
+        PgId::new(0),
+        &command,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(applied.applied_log_index, 1);
+    assert_eq!(retried.applied_log_index, 1);
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let state = reopened
+        .get_pg(0)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    assert_eq!(state.applied_log_index, 1);
+}
+
+#[test]
+fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..5 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+    let replacement = test_metadata_command(0, 2);
+    let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+
+    MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+        &client,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+    )
+    .unwrap();
+    MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+        &client,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+    )
+    .unwrap();
+    assert!(
+        MetadataCommandNodeClient::replace_pending_metadata_command_slot_for_reissue(
+            &client,
+            PgId::new(0),
+            &command,
+            &replacement,
+            Some(&bucket),
+        )
+        .unwrap()
+    );
+    assert!(
+        MetadataCommandNodeClient::replace_pending_metadata_command_slot_for_reissue(
+            &client,
+            PgId::new(0),
+            &command,
+            &replacement,
+            Some(&bucket),
+        )
+        .unwrap(),
+        "replacing after a lost response should be idempotent"
+    );
+    let conflict = MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+        &client,
+        PgId::new(0),
+        &test_metadata_command(0, 3),
+        Some(&bucket),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        conflict,
+        StoreError::MetadataCommandPendingConflict {
+            pg_id: 0,
+            existing_log_index: 2,
+            candidate_log_index: 3,
+            ..
+        }
+    ));
+    server_thread.join().unwrap();
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pending = reopened
+        .get_pg(0)
+        .unwrap()
+        .pending_metadata_command_envelope(7, ClusterEpoch::new(1).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.command_bytes(), replacement.command_bytes());
+}
+
+#[test]
+fn unix_storage_node_client_inserts_bucket_control_pending_slot_idempotently() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+    let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+
+    assert!(
+        MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+            &client,
+            PgId::new(0),
+            &command,
+            &bucket,
+        )
+        .unwrap()
+    );
+    assert!(
+        MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+            &client,
+            PgId::new(0),
+            &command,
+            &bucket,
+        )
+        .unwrap(),
+        "retrying after a lost response should observe the existing exact slot"
+    );
+    server_thread.join().unwrap();
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pending = reopened
+        .get_pg(0)
+        .unwrap()
+        .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.command_bytes, command.command_bytes());
+    assert_eq!(pending.scope_bucket.as_ref(), Some(&bucket));
+}
+
+#[test]
+fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let command = test_metadata_command(0, 1);
+    let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+            .unwrap();
+        pg.record_metadata_command_abandoned(7, &command).unwrap();
+    }
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    assert!(
+        MetadataCommandNodeClient::remove_pending_metadata_command_slot(
+            &client,
+            PgId::new(0),
+            &command
+        )
+        .unwrap()
+    );
+    assert!(
+        !MetadataCommandNodeClient::remove_pending_metadata_command_slot(
+            &client,
+            PgId::new(0),
+            &command
+        )
+        .unwrap()
+    );
+    server_thread.join().unwrap();
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    assert!(reopened
+        .get_pg(0)
+        .unwrap()
+        .pending_metadata_command_envelope(7, ClusterEpoch::new(1).unwrap())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn unix_storage_node_client_records_abandoned_metadata_command_idempotently() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+
+    let first = MetadataCommandNodeClient::record_metadata_command_abandoned(
+        &client,
+        PgId::new(0),
+        &command,
+    )
+    .unwrap();
+    let second = MetadataCommandNodeClient::record_metadata_command_abandoned(
+        &client,
+        PgId::new(0),
+        &command,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(first, second);
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    assert!(reopened
+        .get_pg(0)
+        .unwrap()
+        .metadata_command_abandoned(7, &command)
+        .unwrap());
+}
+
+#[test]
+fn unix_storage_node_client_rejects_mismatched_next_id_conflict_response() {
+    fn next_id_error_from_fake_response(
+        outcome: StorageRpcMetadataCommandNextIdOutcome,
+    ) -> StoreError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = encode_metadata_command_next_id_response(
+                &StorageRpcMetadataCommandNextIdResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+
+        let err = MetadataCommandNodeClient::next_metadata_command_id_at_least(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        )
+        .unwrap_err();
+
+        join.join().unwrap();
+        err
+    }
+
+    let wrong_route =
+        next_id_error_from_fake_response(StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        });
+    assert!(matches!(
+        wrong_route,
+        StoreError::StorageRpc {
+            operation: "decode metadata command next id response",
+            ..
+        }
+    ));
+
+    let zero_index =
+        next_id_error_from_fake_response(StorageRpcMetadataCommandNextIdOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 0,
+        });
+    assert!(matches!(
+        zero_index,
+        StoreError::StorageRpc {
+            operation: "decode metadata command next id response",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unix_storage_node_client_preserves_pending_slot_log_conflict() {
+    fn pending_insert_error_from_fake_response(
+        outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome,
+    ) -> StoreError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = crate::storage_rpc::encode_metadata_command_pending_slot_insert_response(
+                &crate::storage_rpc::StorageRpcMetadataCommandPendingSlotInsertResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+
+        let err = MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+            &client,
+            PgId::new(0),
+            &test_metadata_command(0, 1),
+            Some(&crate::tests::bucket_name("metadata-rpc-bucket")),
+        )
+        .unwrap_err();
+
+        join.join().unwrap();
+        err
+    }
+
+    let conflict = pending_insert_error_from_fake_response(
+        StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        conflict,
+        StoreError::MetadataCommandLogConflict {
+            pg_id: 0,
+            log_index: 1,
+            ..
+        }
+    ));
+
+    let wrong_route = pending_insert_error_from_fake_response(
+        StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        wrong_route,
+        StoreError::StorageRpc {
+            operation: "decode metadata command pending slot insert response",
+            ..
+        }
+    ));
+
+    let zero_index = pending_insert_error_from_fake_response(
+        StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 0,
+        },
+    );
+    assert!(matches!(
+        zero_index,
+        StoreError::StorageRpc {
+            operation: "decode metadata command pending slot insert response",
+            ..
+        }
+    ));
+}
+
+fn metadata_command_session_result_from_fake_response<R>(
+    target_payload: Vec<u8>,
+    call: impl FnOnce(Box<dyn MetadataCommandNodeClient>) -> R,
+) -> R {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("sock").join("storage.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let acquire = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            acquire.kind,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire
+        );
+        let acquire_response = StorageRpcFrame {
+            request_id: acquire.request_id,
+            kind: acquire.kind,
+            payload: encode_storage_rpc_success_response(&[]),
+        };
+        write_storage_rpc_frame_to(&mut stream, &acquire_response).unwrap();
+
+        let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+        let response = StorageRpcFrame {
+            request_id: request.request_id,
+            kind: request.kind,
+            payload: encode_storage_rpc_success_response(&target_payload),
+        };
+        write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+
+        let release = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            release.kind,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease
+        );
+        let release_response = StorageRpcFrame {
+            request_id: release.request_id,
+            kind: release.kind,
+            payload: encode_storage_rpc_success_response(&[]),
+        };
+        write_storage_rpc_frame_to(&mut stream, &release_response).unwrap();
+    });
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let session = MetadataCommandNodeClient::open_metadata_command_critical_section(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+    )
+    .unwrap();
+
+    let result = call(session);
+    join.join().unwrap();
+    result
+}
+
+#[test]
+fn unix_storage_node_session_rejects_malformed_log_conflicts() {
+    let command = test_metadata_command(0, 1);
+
+    let pending_payload = encode_metadata_command_pending_slot_insert_response(
+        &StorageRpcMetadataCommandPendingSlotInsertResponse {
+            outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        },
+    );
+    let pending_error =
+        metadata_command_session_result_from_fake_response(pending_payload, |session| {
+            session
+                .try_insert_pending_metadata_command_slot(
+                    PgId::new(0),
+                    &command,
+                    Some(&crate::tests::bucket_name("metadata-rpc-bucket")),
+                )
+                .unwrap_err()
+        });
+    assert!(matches!(
+        pending_error,
+        StoreError::StorageRpc {
+            operation: "decode metadata command pending slot insert response",
+            ..
+        }
+    ));
+
+    let bucket_control_payload = encode_metadata_command_bool_outcome_response(
+        &StorageRpcMetadataCommandBoolOutcomeResponse {
+            outcome: StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        },
+    );
+    let bucket_control_error =
+        metadata_command_session_result_from_fake_response(bucket_control_payload, |session| {
+            session
+                .try_insert_bucket_control_pending_metadata_command_slot(
+                    PgId::new(0),
+                    &command,
+                    &crate::tests::bucket_name("metadata-rpc-bucket"),
+                )
+                .unwrap_err()
+        });
+    assert!(matches!(
+        bucket_control_error,
+        StoreError::StorageRpc {
+            operation: "decode metadata command bucket-control pending slot insert response",
+            ..
+        }
+    ));
+
+    let acceptance_payload =
+        encode_metadata_command_acceptance_response(&StorageRpcMetadataCommandAcceptanceResponse {
+            outcome: StorageRpcMetadataCommandAcceptanceOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 0,
+            },
+        });
+    let acceptance_error =
+        metadata_command_session_result_from_fake_response(acceptance_payload, |session| {
+            session
+                .metadata_command_acceptance(PgId::new(0), &command)
+                .unwrap_err()
+        });
+    assert!(matches!(
+        acceptance_error,
+        StoreError::StorageRpc {
+            operation: "decode metadata command acceptance response",
+            ..
+        }
+    ));
+
+    let hashes_payload = encode_metadata_command_applied_hashes_response(
+        &StorageRpcMetadataCommandAppliedHashesResponse {
+            outcome: StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        },
+    );
+    let hashes_error =
+        metadata_command_session_result_from_fake_response(hashes_payload, |session| {
+            session
+                .applied_metadata_command_log_entry_hashes(PgId::new(0), &command)
+                .unwrap_err()
+        });
+    assert!(matches!(
+        hashes_error,
+        StoreError::StorageRpc {
+            operation: "decode metadata command applied hashes response",
+            ..
+        }
+    ));
+
+    let apply_payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        },
+    );
+    let apply_error =
+        metadata_command_session_result_from_fake_response(apply_payload, |session| {
+            session
+                .apply_metadata_command_and_record(PgId::new(0), &command)
+                .unwrap_err()
+        });
+    assert!(matches!(
+        apply_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+
+    let abandoned_payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 0,
+            },
+        },
+    );
+    let abandoned_error =
+        metadata_command_session_result_from_fake_response(abandoned_payload, |session| {
+            session
+                .record_metadata_command_abandoned(PgId::new(0), &command)
+                .unwrap_err()
+        });
+    assert!(matches!(
+        abandoned_error,
+        StoreError::StorageRpc {
+            operation: "decode metadata command record abandoned response",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unix_storage_node_client_preserves_applied_hash_log_conflict() {
+    fn applied_hashes_error_from_fake_response(
+        outcome: StorageRpcMetadataCommandAppliedHashesOutcome,
+    ) -> StoreError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = encode_metadata_command_applied_hashes_response(
+                &StorageRpcMetadataCommandAppliedHashesResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+
+        let err = MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(
+            &client,
+            PgId::new(0),
+            &test_metadata_command(0, 1),
+        )
+        .unwrap_err();
+
+        join.join().unwrap();
+        err
+    }
+
+    let conflict = applied_hashes_error_from_fake_response(
+        StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        conflict,
+        StoreError::MetadataCommandLogConflict {
+            pg_id: 0,
+            log_index: 1,
+            ..
+        }
+    ));
+
+    let wrong_route = applied_hashes_error_from_fake_response(
+        StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        wrong_route,
+        StoreError::StorageRpc {
+            operation: "decode metadata command applied hashes response",
+            ..
+        }
+    ));
+
+    let zero_index = applied_hashes_error_from_fake_response(
+        StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 0,
+        },
+    );
+    assert!(matches!(
+        zero_index,
+        StoreError::StorageRpc {
+            operation: "decode metadata command applied hashes response",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unix_storage_node_client_preserves_record_abandoned_log_conflict() {
+    fn record_abandoned_error_from_fake_response(
+        outcome: StorageRpcMetadataCommandStateOutcome,
+    ) -> StoreError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = encode_metadata_command_state_outcome_response(
+                &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+
+        let err = MetadataCommandNodeClient::record_metadata_command_abandoned(
+            &client,
+            PgId::new(0),
+            &test_metadata_command(0, 1),
+        )
+        .unwrap_err();
+
+        join.join().unwrap();
+        err
+    }
+
+    let conflict = record_abandoned_error_from_fake_response(
+        StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        conflict,
+        StoreError::MetadataCommandLogConflict {
+            pg_id: 0,
+            log_index: 1,
+            ..
+        }
+    ));
+
+    let wrong_route = record_abandoned_error_from_fake_response(
+        StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        wrong_route,
+        StoreError::StorageRpc {
+            operation: "decode metadata command record abandoned response",
+            ..
+        }
+    ));
+
+    let zero_index = record_abandoned_error_from_fake_response(
+        StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 0,
+        },
+    );
+    assert!(matches!(
+        zero_index,
+        StoreError::StorageRpc {
+            operation: "decode metadata command record abandoned response",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unix_storage_node_client_preserves_apply_metadata_command_log_conflict() {
+    fn apply_error_from_fake_response(
+        outcome: StorageRpcMetadataCommandStateOutcome,
+    ) -> BucketSnapshotLoadError {
+        apply_error_from_fake_response_for_command(outcome, test_metadata_command(0, 1))
+    }
+
+    fn apply_error_from_fake_response_for_command(
+        outcome: StorageRpcMetadataCommandStateOutcome,
+        command: MetadataCommandEnvelope,
+    ) -> BucketSnapshotLoadError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = encode_metadata_command_state_outcome_response(
+                &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+
+        let err = MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap_err();
+
+        join.join().unwrap();
+        err
+    }
+
+    let conflict =
+        apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        });
+    assert!(matches!(
+        conflict,
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            pg_id: 0,
+            log_index: 1,
+            ..
+        })
+    ));
+
+    let wrong_route =
+        apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        });
+    assert!(matches!(
+        wrong_route,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+
+    let zero_index =
+        apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 0,
+        });
+    assert!(matches!(
+        zero_index,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+
+    let stale_version = apply_error_from_fake_response(
+        StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+            version_id: VersionId::from_u64(7),
+        },
+    );
+    assert!(matches!(
+        stale_version,
+        BucketSnapshotLoadError::Metadata(MetadataError::ObjectVersionReservationConflict {
+            version_id
+        }) if version_id == VersionId::from_u64(7)
+    ));
+
+    let bucket = crate::tests::bucket_name("stale-bucket-rpc");
+    let stale_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+            bucket.clone(),
+            BucketSubresourceMutation::Delete {
+                kind: BucketSubresourceKind::Cors,
+            },
+            11,
+        )),
+    );
+    let stale_bucket = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+            name: bucket.clone(),
+            bucket_execution_generation: 11,
+        },
+        stale_command.clone(),
+    );
+    assert!(matches!(
+        stale_bucket,
+        BucketSnapshotLoadError::Metadata(MetadataError::StaleBucketMetadataCommand {
+            ref name,
+            bucket_execution_generation: 11,
+        }) if name == &bucket
+    ));
+
+    let stale_bucket_mismatch = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+            name: crate::tests::bucket_name("wrong-stale-bucket-rpc"),
+            bucket_execution_generation: 11,
+        },
+        stale_command,
+    );
+    assert!(matches!(
+        stale_bucket_mismatch,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+
+    let object_bucket = crate::tests::bucket_name("stale-object-rpc");
+    let object_key = crate::tests::object_key("object");
+    let stale_object_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket: object_bucket.clone(),
+            key: object_key.clone(),
+            version_id: VersionId::from_u64(7),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence: 3,
+            last_modified_millis: 123,
+            stale_payload: None,
+            bucket_write_reservation: test_bucket_write_reservation_proof(
+                object_bucket.clone(),
+                &object_key,
+            ),
+        }),
+    );
+    let stale_object = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+            bucket: object_bucket.clone(),
+            key: object_key.clone(),
+            write_sequence: 3,
+            generation_id: None,
+        },
+        stale_object_command.clone(),
+    );
+    assert!(matches!(
+        stale_object,
+        BucketSnapshotLoadError::Metadata(MetadataError::StaleObjectWriteCommand {
+            ref bucket,
+            ref key,
+            write_sequence: 3,
+            generation_id: None,
+        }) if bucket == &object_bucket && key == &object_key
+    ));
+
+    let stale_delete_marker_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+            bucket: object_bucket.clone(),
+            key: object_key.clone(),
+            version_id: VersionId::Null,
+            target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 5 },
+            bucket_write_reservation: test_bucket_write_reservation_proof(
+                object_bucket.clone(),
+                &object_key,
+            ),
+        })),
+    );
+    let stale_delete_marker = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+            bucket: object_bucket.clone(),
+            key: object_key.clone(),
+            write_sequence: 5,
+            generation_id: None,
+        },
+        stale_delete_marker_command.clone(),
+    );
+    assert!(matches!(
+        stale_delete_marker,
+        BucketSnapshotLoadError::Metadata(MetadataError::StaleObjectWriteCommand {
+            ref bucket,
+            ref key,
+            write_sequence: 5,
+            generation_id: None,
+        }) if bucket == &object_bucket && key == &object_key
+    ));
+
+    let stale_delete_marker_generation_mismatch = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+            bucket: object_bucket.clone(),
+            key: object_key.clone(),
+            write_sequence: 5,
+            generation_id: Some(GenerationId::MIN),
+        },
+        stale_delete_marker_command,
+    );
+    assert!(matches!(
+        stale_delete_marker_generation_mismatch,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+
+    let stale_object_mismatch = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+            bucket: object_bucket,
+            key: object_key,
+            write_sequence: 4,
+            generation_id: None,
+        },
+        stale_object_command,
+    );
+    assert!(matches!(
+        stale_object_mismatch,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+
+    let impossible_stale_bucket = apply_error_from_fake_response(
+        StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+            name: bucket,
+            bucket_execution_generation: 11,
+        },
+    );
+    assert!(matches!(
+        impossible_stale_bucket,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            operation: "decode metadata command apply and record response",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unix_storage_node_client_preserves_bucket_control_pending_slot_log_conflict() {
+    fn bucket_control_error_from_fake_response(
+        outcome: StorageRpcMetadataCommandBoolOutcome,
+    ) -> StoreError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = encode_metadata_command_bool_outcome_response(
+                &StorageRpcMetadataCommandBoolOutcomeResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+
+        let err =
+            MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+                &client,
+                PgId::new(0),
+                &test_metadata_command(0, 1),
+                &crate::tests::bucket_name("metadata-rpc-bucket"),
+            )
+            .unwrap_err();
+
+        join.join().unwrap();
+        err
+    }
+
+    let conflict = bucket_control_error_from_fake_response(
+        StorageRpcMetadataCommandBoolOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        conflict,
+        StoreError::MetadataCommandLogConflict {
+            pg_id: 0,
+            log_index: 1,
+            ..
+        }
+    ));
+
+    let wrong_route = bucket_control_error_from_fake_response(
+        StorageRpcMetadataCommandBoolOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 1,
+        },
+    );
+    assert!(matches!(
+        wrong_route,
+        StoreError::StorageRpc {
+            operation: "decode metadata command bucket-control pending slot insert response",
+            ..
+        }
+    ));
+
+    let zero_index = bucket_control_error_from_fake_response(
+        StorageRpcMetadataCommandBoolOutcome::LogConflict {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 0,
+        },
+    );
+    assert!(matches!(
+        zero_index,
+        StoreError::StorageRpc {
+            operation: "decode metadata command bucket-control pending slot insert response",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unix_storage_node_client_preserves_bool_metadata_command_log_conflicts() {
+    fn bool_metadata_error_from_fake_response(
+        kind: StorageRpcMessageKind,
+        outcome: StorageRpcMetadataCommandBoolOutcome,
+    ) -> StoreError {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            let payload = encode_metadata_command_bool_outcome_response(
+                &StorageRpcMetadataCommandBoolOutcomeResponse { outcome },
+            );
+            let response = StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            };
+            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+        });
+        let client =
+            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+        let command = test_metadata_command(0, 1);
+
+        let err = match kind {
+            StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
+                MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
+                    &client,
+                    PgId::new(0),
+                    &command,
+                    0,
+                )
+                .unwrap_err()
+            }
+            StorageRpcMessageKind::MetadataCommandAbandoned => {
+                MetadataCommandNodeClient::metadata_command_abandoned(
+                    &client,
+                    PgId::new(0),
+                    &command,
+                )
+                .unwrap_err()
+            }
+            _ => panic!("unsupported bool metadata command test kind"),
+        };
+
+        join.join().unwrap();
+        err
+    }
+
+    for kind in [
+        StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
+        StorageRpcMessageKind::MetadataCommandAbandoned,
+    ] {
+        let conflict = bool_metadata_error_from_fake_response(
+            kind,
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        );
+        assert!(matches!(
+            conflict,
+            StoreError::MetadataCommandLogConflict {
+                pg_id: 0,
+                log_index: 1,
+                ..
+            }
+        ));
+
+        let wrong_route = bool_metadata_error_from_fake_response(
+            kind,
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 1,
+            },
+        );
+        assert!(matches!(
+            wrong_route,
+            StoreError::StorageRpc {
+                operation: "decode metadata command matching applied response"
+                    | "decode metadata command abandoned response",
+                ..
+            }
+        ));
+
+        let zero_index = bool_metadata_error_from_fake_response(
+            kind,
+            StorageRpcMetadataCommandBoolOutcome::LogConflict {
+                node_id: 7,
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                log_index: 0,
+            },
+        );
+        assert!(matches!(
+            zero_index,
+            StoreError::StorageRpc {
+                operation: "decode metadata command matching applied response"
+                    | "decode metadata command abandoned response",
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn unix_storage_node_client_read_into_requires_full_shard_buffer() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            server.accept_one().unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let key = ShardKey::new(&[0x56; 16], 12, 0);
+    let data_pg_id = DataPgId::new(PgId::new(0));
+    let ack = client
+        .write_placed_shard(data_pg_id, &key, b"remote payload")
+        .unwrap();
+
+    let mut short = vec![0; ack.stored_size as usize - 1];
+    let err =
+        PlacedShardNodeClient::read_placed_shard_into(&client, data_pg_id, &key, ack, &mut short)
+            .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            operation: "shard read range",
+            ref message,
+            ..
+        } if message.contains("expected")
+    ));
+    let ranged = client
+        .read_placed_shard_range(data_pg_id, &key, ack, 0, short.len() as u64)
+        .unwrap();
+    assert_eq!(ranged, b"remote payloa");
+    drop(client);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_storage_node_read_handle_session_is_idempotent_and_disconnect_releases() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_for_thread = Arc::clone(&server);
+    let server_thread = thread::spawn(move || server_for_thread.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let location = crate::cluster::ShardLocation::new(
+        config.cluster_epoch,
+        DataPgId::new(PgId::new(0)),
+        crate::ShardIndex::new(0),
+        config.node_id,
+    );
+    let key = ShardKey::new(&[0x55; 16], 55, 0);
+    let mut session = client.open_read_handle_session().unwrap();
+
+    assert_eq!(
+        session
+            .acquire_read_handles("read-op", vec![(location, key.clone())])
+            .unwrap(),
+        vec![location]
+    );
+    assert_eq!(
+        session
+            .acquire_read_handles("read-op", vec![(location, key.clone())])
+            .unwrap(),
+        vec![location]
+    );
+    assert_eq!(server.read_handle_count(location), 1);
+    session.release_read_handles("read-op").unwrap();
+    session.release_read_handles("read-op").unwrap();
+    assert_eq!(server.read_handle_count(location), 0);
+    session
+        .acquire_read_handles("read-op-disconnect", vec![(location, key)])
+        .unwrap();
+    assert_eq!(server.read_handle_count(location), 1);
+    drop(session);
+    server_thread.join().unwrap();
+    assert_eq!(server.read_handle_count(location), 0);
+}
+
+#[test]
+fn unix_storage_node_delete_fails_while_read_handle_active() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..4)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let key = ShardKey::new(&[0x66; 16], 12, 0);
+    let data_pg_id = DataPgId::new(PgId::new(0));
+    let location = crate::cluster::ShardLocation::new(
+        config.cluster_epoch,
+        data_pg_id,
+        key.shard_index(),
+        config.node_id,
+    );
+    let mut session = client.open_read_handle_session().unwrap();
+
+    client
+        .write_placed_shard(data_pg_id, &key, b"protected payload")
+        .unwrap();
+    session
+        .acquire_read_handles("protected-read", vec![(location, key.clone())])
+        .unwrap();
+    assert_eq!(server.read_handle_count(location), 1);
+
+    let err = client.delete_placed_shard(data_pg_id, &key).unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StorageRpcResourceExhausted {
+            operation: "shard delete",
+            ref message,
+            ..
+        } if message.contains("active read handles")
+    ));
+
+    session.release_read_handles("protected-read").unwrap();
+    assert_eq!(server.read_handle_count(location), 0);
+    client.delete_placed_shard(data_pg_id, &key).unwrap();
+    drop(session);
+    for join in server_threads {
+        join.join().unwrap();
+    }
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened.read_shard_file(0, &key),
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[test]
+fn unix_storage_node_rpc_admission_exhaustion_is_typed_before_connect() {
+    let client =
+        test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
+    let _held = client
+        .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+        .unwrap();
+    let before = observability::metrics_snapshot();
+
+    let err = client
+        .rpc_request_result(StorageRpcMessageKind::ShardWrite, Vec::new())
+        .unwrap_err();
+    let after = observability::metrics_snapshot();
+    assert!(matches!(
+        err,
+        StoreError::StorageRpcResourceExhausted {
+            node_id: 7,
+            operation: "shard write",
+            ref message,
+        } if message.contains("admission limit 1")
+    ));
+    assert!(after.storage_rpc_admission_total > before.storage_rpc_admission_total);
+    assert!(after.storage_rpc_admission_timeout_total > before.storage_rpc_admission_timeout_total);
+}
+
+#[test]
+fn unix_storage_node_rpc_admission_wait_metric_records_released_capacity() {
+    let client = Arc::new(test_unix_storage_node_client_with_rpc_admission_timeout(
+        1,
+        Duration::from_secs(1),
+    ));
+    let held = client
+        .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+        .unwrap();
+    let before = observability::metrics_snapshot();
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+    let client_for_thread = Arc::clone(&client);
+    let join = thread::spawn(move || {
+        attempt_tx.send(()).unwrap();
+        client_for_thread.acquire_rpc_admission(StorageRpcMessageKind::ShardWrite)
+    });
+
+    attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    drop(held);
+    let permit = join.join().unwrap().unwrap();
+    drop(permit);
+    let after = observability::metrics_snapshot();
+
+    assert!(after.storage_rpc_admission_total > before.storage_rpc_admission_total);
+    assert!(after.storage_rpc_admission_wait_total > before.storage_rpc_admission_wait_total);
+    assert!(after.storage_rpc_admission_wait_us_total > before.storage_rpc_admission_wait_us_total);
+}
+
+#[test]
+fn unix_storage_node_rpc_admission_is_shared_by_node_and_socket() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("missing.sock");
+    let rpc_admission = shared_unix_storage_node_rpc_admission_with_wait_timeout(
+        NodeId::new(7),
+        &socket_path,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    );
+    let client_a = UnixStorageNodeClient::with_rpc_admission(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        socket_path.clone(),
+        Arc::clone(&rpc_admission),
+    );
+    let client_b =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let _held = client_a
+        .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+        .unwrap();
+
+    let err = client_b
+        .rpc_request_result(StorageRpcMessageKind::ShardWrite, Vec::new())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StorageRpcResourceExhausted {
+            node_id: 7,
+            operation: "shard write",
+            ref message,
+        } if message.contains("admission limit")
+    ));
+}
+
+#[test]
+fn unix_storage_node_shard_write_admission_exhausts_before_socket_write() {
+    let client =
+        test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
+    let _held = client
+        .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+        .unwrap();
+    let key = ShardKey::new(&[0x55; 16], 55, 0);
+    let err = client
+        .write_placed_shard(DataPgId::new(PgId::new(0)), &key, &[0x5a; 4096])
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StoreError::StorageRpcResourceExhausted {
+            node_id: 7,
+            operation: "shard write",
+            ref message,
+        } if message.contains("admission limit 1")
+    ));
+}
+
+#[test]
+fn unix_storage_node_read_handle_session_admission_exhausts_before_connect() {
+    let client =
+        test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
+    let _held = client
+        .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+        .unwrap();
+    let err = match client.open_read_handle_session() {
+        Ok(_) => panic!("read-handle session admission unexpectedly succeeded"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        StoreError::StorageRpcResourceExhausted {
+            node_id: 7,
+            operation: "read handles acquire",
+            ref message,
+        } if message.contains("admission limit 1")
+    ));
+}
+
+#[test]
+fn unix_storage_node_metadata_session_admission_exhausts_before_connect() {
+    let client =
+        test_unix_storage_node_client_with_rpc_admission_timeout(1, Duration::from_millis(10));
+    let _held = client
+        .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
+        .unwrap();
+    let err = match client.open_metadata_command_critical_section(PgId::new(0)) {
+        Ok(_) => panic!("metadata-command session admission unexpectedly succeeded"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        StoreError::StorageRpcResourceExhausted {
+            node_id: 7,
+            operation: "metadata command PG lock acquire",
+            ref message,
+        } if message.contains("admission limit 1")
+    ));
+}
+
+#[test]
+fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("sock").join("storage.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+        let mismatched_location = crate::cluster::ShardLocation::new(
+            ClusterEpoch::new(1).unwrap(),
+            DataPgId::new(PgId::new(0)),
+            crate::ShardIndex::new(1),
+            NodeId::new(7),
+        );
+        let payload = encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
+            locations: vec![mismatched_location],
+        })
+        .unwrap();
+        let response = StorageRpcFrame {
+            request_id: request.request_id,
+            kind: request.kind,
+            payload: encode_storage_rpc_success_response(&payload),
+        };
+        write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+    });
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let requested_location = crate::cluster::ShardLocation::new(
+        ClusterEpoch::new(1).unwrap(),
+        DataPgId::new(PgId::new(0)),
+        crate::ShardIndex::new(0),
+        NodeId::new(7),
+    );
+    let mut session = client.open_read_handle_session().unwrap();
+
+    let err = session
+        .acquire_read_handles(
+            "read-op",
+            vec![(
+                requested_location,
+                ShardKey::new(&[0x77; 16], 77, requested_location.shard_index().get()),
+            )],
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            operation: "validate read handle acquire response",
+            ..
+        }
+    ));
+    drop(session);
+    join.join().unwrap();
+}
