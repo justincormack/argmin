@@ -668,6 +668,7 @@ pub struct PgControlRecord {
     state: PgState,
     acting_set: Vec<NodeId>,
     active_primary: Option<NodeId>,
+    active_metadata_proof: Option<PgMetadataProof>,
 }
 
 impl PgControlRecord {
@@ -677,6 +678,7 @@ impl PgControlRecord {
             state: PgState::Peering,
             acting_set,
             active_primary: None,
+            active_metadata_proof: None,
         }
     }
 
@@ -698,6 +700,11 @@ impl PgControlRecord {
     #[must_use]
     pub fn active_primary(&self) -> Option<NodeId> {
         self.active_primary
+    }
+
+    #[must_use]
+    pub fn active_metadata_proof(&self) -> Option<PgMetadataProof> {
+        self.active_metadata_proof
     }
 }
 
@@ -1295,6 +1302,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 record.acting_set = acting_set;
                 record.state = PgState::Peering;
                 record.active_primary = None;
+                record.active_metadata_proof = None;
                 changed = true;
             }
             None => {
@@ -1327,6 +1335,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         if record.state != state {
             record.state = state;
             record.active_primary = None;
+            record.active_metadata_proof = None;
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
         }
@@ -1379,7 +1388,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 state: record.state,
             });
         }
-        validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
+        let active_metadata_proof =
+            validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
 
         let mut next_snapshot = self.snapshot.clone();
         let record = next_snapshot
@@ -1388,6 +1398,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .expect("PG record validated before peering completion");
         record.state = PgState::Active;
         record.active_primary = Some(primary);
+        record.active_metadata_proof = Some(active_metadata_proof);
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
@@ -1413,7 +1424,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 record.acting_set(),
                 now_ms,
             ) {
-                Ok(()) => ready.push((record.pg_id, primary)),
+                Ok(active_metadata_proof) => {
+                    ready.push((record.pg_id, primary, active_metadata_proof))
+                }
                 Err(
                     ControlPlaneError::PgPeeringMissingObservation { .. }
                     | ControlPlaneError::PgPeeringObservationNotPeering { .. }
@@ -1427,17 +1440,18 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
 
         let mut next_snapshot = self.snapshot.clone();
-        for (pg_id, primary) in &ready {
+        for (pg_id, primary, active_metadata_proof) in &ready {
             let record = next_snapshot
                 .pgs
                 .get_mut(pg_id)
                 .expect("ready PG must exist in cloned snapshot");
             record.state = PgState::Active;
             record.active_primary = Some(*primary);
+            record.active_metadata_proof = Some(*active_metadata_proof);
         }
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
-        Ok(ready.into_iter().map(|(pg_id, _)| pg_id).collect())
+        Ok(ready.into_iter().map(|(pg_id, _, _)| pg_id).collect())
     }
 
     pub fn heartbeat(
@@ -2921,7 +2935,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=6\n");
+    out.push_str("version=7\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -2985,12 +2999,24 @@ fn format_node_record(record: &NodeControlRecord) -> String {
 }
 
 fn format_pg_record(record: &PgControlRecord) -> String {
+    let (active_log_index, active_log_hash, active_state_digest) =
+        match record.active_metadata_proof {
+            Some(proof) => (
+                option_u64(Some(proof.applied_log_index)),
+                option_u64(Some(proof.applied_log_hash)),
+                option_u64(Some(proof.state_digest)),
+            ),
+            None => (option_u64(None), option_u64(None), option_u64(None)),
+        };
     format!(
-        "{},{},{},{}",
+        "{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
-        option_u32(record.active_primary.map(NodeId::as_u32))
+        option_u32(record.active_primary.map(NodeId::as_u32)),
+        active_log_index,
+        active_log_hash,
+        active_state_digest
     )
 }
 
@@ -3074,10 +3100,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             let state_version = version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
             })?;
-            if state_version != 6 {
+            if state_version != 7 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 6 required",
+                    "control-plane state version 7 required",
                 ));
             }
             let (epoch, node_id, observation) = parse_history_node_pg_record(line_number, value)?;
@@ -3115,10 +3141,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             let state_version = version.ok_or_else(|| {
                 parse_error(line_number, "version must precede history PG records")
             })?;
-            if state_version != 6 {
+            if state_version != 7 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 6 required",
+                    "control-plane state version 7 required",
                 ));
             }
             let (epoch, record) = parse_history_pg_record(line_number, value)?;
@@ -3140,10 +3166,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             let state_version = version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
             })?;
-            if state_version != 6 {
+            if state_version != 7 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 6 required",
+                    "control-plane state version 7 required",
                 ));
             }
             let (node_id, observation) = parse_node_pg_record(line_number, value)?;
@@ -3161,10 +3187,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
         } else if let Some(value) = line.strip_prefix("pg=") {
             let state_version = version
                 .ok_or_else(|| parse_error(line_number, "version must precede PG records"))?;
-            if state_version != 6 {
+            if state_version != 7 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 6 required",
+                    "control-plane state version 7 required",
                 ));
             }
             let record = parse_pg_record(line_number, value)?;
@@ -3180,7 +3206,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if version != 6 {
+    if version != 7 {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -3454,34 +3480,65 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
 
 fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 4 {
-        return Err(parse_error(line, "PG record must have four fields"));
+    if fields.len() != 7 {
+        return Err(parse_error(line, "PG record must have seven fields"));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
     let state = pg_state_from_str(fields[1])?;
     let acting_set = parse_node_list(line, fields[2])?;
     let active_primary = parse_option_u32(line, fields[3], "active primary")?.map(NodeId::new);
+    let active_log_index = parse_option_u64(line, fields[4], "active applied log index")?;
+    let active_log_hash = parse_option_u64(line, fields[5], "active applied log hash")?;
+    let active_state_digest = parse_option_u64(line, fields[6], "active state digest")?;
+    let active_metadata_proof = match (active_log_index, active_log_hash, active_state_digest) {
+        (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
+            Some(PgMetadataProof {
+                applied_log_index,
+                applied_log_hash,
+                state_digest,
+            })
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(parse_error(
+                line,
+                "active PG metadata proof fields must be all present or all absent",
+            ));
+        }
+    };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
     }
-    match (state, active_primary) {
-        (PgState::Active, None) => {
+    match (state, active_primary, active_metadata_proof) {
+        (PgState::Active, None, _) => {
             return Err(parse_error(
                 line,
                 "active PG record requires active primary",
             ));
         }
-        (PgState::Active, Some(primary)) if !acting_set.contains(&primary) => {
+        (PgState::Active, Some(_), None) => {
+            return Err(parse_error(
+                line,
+                "active PG record requires active metadata proof",
+            ));
+        }
+        (PgState::Active, Some(primary), Some(_)) if !acting_set.contains(&primary) => {
             return Err(parse_error(line, "active PG primary must be in acting set"));
         }
-        (PgState::Active, Some(_)) => {}
-        (_, Some(_)) => {
+        (PgState::Active, Some(_), Some(_)) => {}
+        (_, Some(_), _) => {
             return Err(parse_error(
                 line,
                 "non-active PG record must not have active primary",
             ));
         }
-        (_, None) => {}
+        (_, None, Some(_)) => {
+            return Err(parse_error(
+                line,
+                "non-active PG record must not have active metadata proof",
+            ));
+        }
+        (_, None, None) => {}
     }
     let mut unique_nodes = BTreeSet::new();
     for node_id in &acting_set {
@@ -3494,6 +3551,7 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         state,
         acting_set,
         active_primary,
+        active_metadata_proof,
     })
 }
 
@@ -3604,7 +3662,7 @@ fn validate_pg_peering_observations(
     pg_id: PgId,
     acting_set: &[NodeId],
     now_ms: u64,
-) -> Result<(), ControlPlaneError> {
+) -> Result<PgMetadataProof, ControlPlaneError> {
     let mut expected_proof = None;
     for node_id in acting_set {
         let Some(node) = snapshot.nodes.get(node_id) else {
@@ -3652,7 +3710,11 @@ fn validate_pg_peering_observations(
             None => expected_proof = Some(observation.metadata_proof),
         }
     }
-    Ok(())
+    expected_proof.ok_or(ControlPlaneError::PgPeeringMissingObservation {
+        pg_id: pg_id.get(),
+        node_id: 0,
+        cluster_epoch: snapshot.cluster_epoch,
+    })
 }
 
 fn primary_has_current_pg_state(
@@ -3729,6 +3791,7 @@ fn mark_pgs_peering_for_nodes(
         {
             record.state = PgState::Peering;
             record.active_primary = None;
+            record.active_metadata_proof = None;
             peering_pgs.push(record.pg_id);
         }
     }
@@ -4314,7 +4377,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_authority_rejects_pre_v6_state() {
+    fn file_backed_authority_rejects_pre_v7_state() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
@@ -4389,7 +4452,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=6\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-\n",
+            "version=7\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-,-,-,-\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -4407,11 +4470,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=6\n",
+                "version=7\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "pg=7,active,1:99,1\n",
+                "pg=7,active,1:99,1,1,2,3\n",
             ),
         )
         .unwrap();
@@ -4446,7 +4509,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=6\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
+            "version=7\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -4464,12 +4527,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=6\n",
+                "version=7\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
                 "history_node=2,1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1:2,-\n",
+                "history_pg=2,7,peering,1:2,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -4493,7 +4556,7 @@ mod tests {
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0\n",
-                "pg=7,peering,1,-\n",
+                "pg=7,peering,1,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -4501,7 +4564,7 @@ mod tests {
         assert!(matches!(
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
-                if message == "control-plane state version 6 required"
+                if message == "control-plane state version 7 required"
         ));
     }
 
@@ -4512,13 +4575,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=6\n",
+                "version=7\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node=2,active,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
                 "node_pg=2,7,peering,2,100,0,0,0\n",
-                "pg=7,peering,1,-\n",
+                "pg=7,peering,1,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -4537,12 +4600,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=6\n",
+                "version=7\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0\n",
-                "pg=7,peering,1,-\n",
+                "pg=7,peering,1,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -6788,7 +6851,7 @@ mod tests {
     fn complete_pg_peering_requires_matching_metadata_proofs() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         for node_id in [1, 2] {
             authority
                 .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
@@ -6857,6 +6920,13 @@ mod tests {
                 2_070,
             )
             .unwrap();
+        let active_pg = authority.snapshot().pg(PgId::new(19)).unwrap();
+        assert_eq!(active_pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(active_pg.active_metadata_proof(), Some(matching_proof));
+        let persisted = store.load().unwrap().unwrap();
+        let persisted_pg = persisted.pg(PgId::new(19)).unwrap();
+        assert_eq!(persisted_pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(persisted_pg.active_metadata_proof(), Some(matching_proof));
     }
 
     #[test]

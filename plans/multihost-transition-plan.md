@@ -7096,18 +7096,18 @@ Status:
   reconstruction proof; later repair/backfill work can replace the placeholder
   proof source with storage-node computed replica state. Because the
   control-plane store is still pre-release, the persisted state loader now
-  accepts only the current version 6 format rather than carrying compatibility
+  accepts only the current version 7 format rather than carrying compatibility
   for earlier Phase 11 scratch formats.
 - Fixed the restart epoch-bump path to clear current PG observations just like
   ordinary epoch changes. Restart still records the previous map in history, so
   stale-route diagnostics retain the pre-restart observations, but the newly
   persisted current map cannot contain node observations from the old epoch.
 - Bound `Active` PG records to the primary that completed peering. The
-  authority now persists the active primary in the version 6 control-plane state
+  authority now persists the active primary in the current control-plane state
   format, clears that binding whenever a PG returns to `Peering`, and fails
   closed rather than dynamically selecting a different acting-set member while a
   PG remains `Active`. Because the control-plane store is still pre-release, the
-  loader now accepts only the current version 6 format rather than carrying
+  loader now accepts only the current version 7 format rather than carrying
   compatibility for earlier Phase 11 scratch formats.
 - Added a pure runtime-routing snapshot view derived from the durable
   control-plane state. The exported route for an `Active` PG uses the persisted
@@ -7340,6 +7340,11 @@ Status:
   fenced by the epoch bump, both old and new primaries fail closed while the PG
   is `Peering`, and only the replacement primary can receive and validate a new
   operation authorization after current-epoch peering proof completes.
+- Made the accepted peering metadata proof durable in the authoritative PG
+  record. `Active` PGs now persist the proof that was validated during peering
+  alongside the bound active primary, while any transition back to `Peering`
+  clears both. The control-plane state format is now version 7 and rejects
+  active PG records that lack a complete active metadata proof.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition
