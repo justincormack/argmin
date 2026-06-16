@@ -541,7 +541,7 @@ fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), S
 
 /// The HTTP frontend that handles incoming requests.
 pub struct HttpFrontend {
-    pub coordinator: Coordinator,
+    pub coordinator: Arc<Coordinator>,
     pub credentials: CredentialStore,
     pub host_id: Arc<str>,
 }
@@ -6019,7 +6019,7 @@ mod tests {
         .unwrap();
         let credentials = auth::CredentialStore::new();
         HttpFrontend {
-            coordinator,
+            coordinator: Arc::new(coordinator),
             credentials,
             host_id: Arc::<str>::from("host-id"),
         }

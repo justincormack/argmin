@@ -875,7 +875,7 @@ async fn run_frontend_server(
             }
         };
         frontends.push(HttpFrontend {
-            coordinator,
+            coordinator: Arc::new(coordinator),
             credentials: build_credential_store(&config),
             host_id: Arc::<str>::from(host_id.clone()),
         });

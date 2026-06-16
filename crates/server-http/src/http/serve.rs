@@ -4448,7 +4448,7 @@ mod tests {
             auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
         );
         Arc::new(HttpFrontend {
-            coordinator,
+            coordinator: Arc::new(coordinator),
             credentials,
             host_id: Arc::<str>::from("host-id"),
         })

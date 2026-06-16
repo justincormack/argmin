@@ -7276,6 +7276,13 @@ Status:
   admission settings. Live frontend coordinator handle swapping remains a
   separate boundary because current coordinators own an immutable
   `Arc<StorageCluster>`.
+- Started preparing that frontend swap boundary by making each HTTP frontend
+  hold its coordinator through `Arc<Coordinator>`. Request handling still uses a
+  coherent immutable coordinator per request, but the process layer no longer
+  requires the HTTP frontend to own the coordinator by value. The remaining live
+  frontend work is to add a monotonic coordinator-handle install loop that
+  rebuilds coordinators from the refreshed `StorageClusterRuntimeMapHandle`
+  without leaking or duplicating background workers.
 - Added fresh-state control-plane bootstrap from the existing
   `ARGMIN_STORAGE_NODE_SOCKETS` and PG configuration. When a manager opens an
   empty authority state and a storage-node socket map is present, it persists
