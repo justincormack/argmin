@@ -214,20 +214,30 @@ impl Coordinator {
 
     fn authorize_delete_object_impl(
         &self,
+        storage_node: &Arc<StorageCluster>,
         object: &ObjectVersionRequest<'_>,
         bypass_governance: bool,
     ) -> Result<AuthorizedDeleteObject, ServerError> {
-        let bucket_handle = self.load_bucket_handle_for_object_policy_read(
+        let bucket_handle = self.load_bucket_handle_for_object_policy_read_with_storage_node(
+            storage_node,
             object.bucket_name_typed(),
             object.expected_bucket_owner(),
         )?;
         match ObjectAuthLoadedBucketHandle::classify(&bucket_handle) {
-            ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => {
-                self.authorize_delete_object_impl_boe(object, bypass_governance, bucket_handle)
-            }
-            ObjectAuthLoadedBucketHandle::NonBoe(bucket_handle) => {
-                self.authorize_delete_object_impl_non_boe(object, bypass_governance, bucket_handle)
-            }
+            ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => self
+                .authorize_delete_object_impl_boe(
+                    storage_node,
+                    object,
+                    bypass_governance,
+                    bucket_handle,
+                ),
+            ObjectAuthLoadedBucketHandle::NonBoe(bucket_handle) => self
+                .authorize_delete_object_impl_non_boe(
+                    storage_node,
+                    object,
+                    bypass_governance,
+                    bucket_handle,
+                ),
         }
     }
 
@@ -1525,18 +1535,6 @@ impl Coordinator {
         self.load_bucket_handle_for_bucket_read(req, BucketHandleRequest::new())
     }
 
-    pub(super) fn load_bucket_handle_for_object_policy_read(
-        &self,
-        bucket: &BucketName,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<LoadedBucketHandle, ServerError> {
-        self.load_bucket_handle_for_object_policy_read_with_storage_node(
-            &self.storage_node(),
-            bucket,
-            expected_bucket_owner,
-        )
-    }
-
     pub(super) fn load_bucket_handle_for_object_policy_read_with_storage_node(
         &self,
         storage_node: &Arc<StorageCluster>,
@@ -1638,6 +1636,7 @@ impl Coordinator {
             .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
     }
 
+    #[cfg(test)]
     pub(super) fn with_bucket_write_handle_for<R, T>(
         &self,
         req: &R,
@@ -1767,8 +1766,9 @@ impl Coordinator {
         Ok(bucket)
     }
 
-    fn authorize_loaded_bucket_write_action_for<R>(
+    fn authorize_loaded_bucket_write_action_for_storage_node<R>(
         &self,
+        storage_node: &Arc<StorageCluster>,
         req: &R,
         action: auth::PolicyAction,
         default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
@@ -1776,7 +1776,8 @@ impl Coordinator {
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
-        self.with_bucket_write_handle_for(
+        self.with_bucket_write_handle_for_storage_node(
+            storage_node,
             req,
             BucketHandleRequest::new()
                 .requiring_policy_view()
@@ -1801,8 +1802,9 @@ impl Coordinator {
         )
     }
 
-    fn authorize_loaded_bucket_write_policy_action_for<R>(
+    fn authorize_loaded_bucket_write_policy_action_for_storage_node<R>(
         &self,
+        storage_node: &Arc<StorageCluster>,
         req: &R,
         action: auth::PolicyAction,
         default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
@@ -1810,7 +1812,8 @@ impl Coordinator {
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
-        self.with_bucket_write_handle_for(
+        self.with_bucket_write_handle_for_storage_node(
+            storage_node,
             req,
             BucketHandleRequest::new()
                 .requiring_policy_view()
@@ -1837,19 +1840,26 @@ impl Coordinator {
         )
     }
 
-    fn authorize_loaded_bucket_owner_account_admin_write_for<R>(
+    fn authorize_loaded_bucket_owner_account_admin_write_for_storage_node<R>(
         &self,
+        storage_node: &Arc<StorageCluster>,
         req: &R,
     ) -> Result<LoadedBucketHandle, ServerError>
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
-        self.with_bucket_write_handle_for(req, BucketHandleRequest::new(), |bucket| {
-            if !Self::requester_can_bucket_owner_account_admin(req.requester(), bucket.bucket()) {
-                return Err(ServerError::AccessDenied);
-            }
-            Ok(bucket)
-        })
+        self.with_bucket_write_handle_for_storage_node(
+            storage_node,
+            req,
+            BucketHandleRequest::new(),
+            |bucket| {
+                if !Self::requester_can_bucket_owner_account_admin(req.requester(), bucket.bucket())
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(bucket)
+            },
+        )
     }
 
     fn authorize_loaded_bucket_policy_action_for(

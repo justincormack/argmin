@@ -9,7 +9,10 @@ use storage::{
 };
 
 #[cfg(test)]
-use super::{should_probe_bucket_mutation_write, trusted_bucket_name};
+use super::{
+    maybe_run_bucket_mutation_storage_node_capture_hook, should_probe_bucket_mutation_write,
+    trusted_bucket_name,
+};
 use super::{
     AuthorizedDeleteBucket, AuthorizedHeadBucket, AuthorizedListBuckets, AuthorizedPutBucketAcl,
     BucketCreateOutcome, BucketRequest, BucketSummary, BucketTagControlRequest, Coordinator,
@@ -90,7 +93,9 @@ impl Coordinator {
             req.object_lock_enabled
         );
         let authorized = self.authorize_create_bucket(req)?;
-        let create_outcome = self.create_bucket_with_acl_grants_for(
+        let storage_node = self.storage_node();
+        let create_outcome = self.create_bucket_with_acl_grants_for_storage_node(
+            &storage_node,
             &authorized.owner,
             &authorized.name,
             authorized.acl_grants,
@@ -113,7 +118,10 @@ impl Coordinator {
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self.unchecked_active_bucket_summary_for(&authorized.name)?;
+                let existing = self.unchecked_active_bucket_summary_for_storage_node(
+                    &storage_node,
+                    &authorized.name,
+                )?;
                 if !Self::is_bucket_owner_enforced(existing.ownership_controls.as_ref()) {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
@@ -122,7 +130,7 @@ impl Coordinator {
                     &authorized.owner,
                     &authorized.acl,
                 )?;
-                self.apply_authorized_bucket_acl_update(&authorized_acl)
+                self.apply_authorized_bucket_acl_update(&storage_node, &authorized_acl)
             }
         }
     }
@@ -220,7 +228,8 @@ impl Coordinator {
         acl_grants: AclGrants,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
-        self.create_bucket_with_acl_grants_for(
+        self.create_bucket_with_acl_grants_for_storage_node(
+            &self.storage_node(),
             owner,
             &trusted_bucket_name(name),
             acl_grants,
@@ -229,8 +238,9 @@ impl Coordinator {
         )
     }
 
-    fn create_bucket_with_acl_grants_for(
+    fn create_bucket_with_acl_grants_for_storage_node(
         &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         owner: &OwnerIdentity,
         name: &BucketName,
         acl_grants: AclGrants,
@@ -249,8 +259,7 @@ impl Coordinator {
             default_retention: None,
         };
         loop {
-            match self
-                .storage_node()
+            match storage_node
                 .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
                     name: name.as_str(),
                     owner_principal: owner.principal.as_str(),
@@ -285,7 +294,7 @@ impl Coordinator {
                                 "bucket_create_finalize_deleting_start",
                                 Some(format_args!("bucket={:?}", name)),
                             );
-                            match self.storage_node().try_finalize_bucket_delete(name) {
+                            match storage_node.try_finalize_bucket_delete(name) {
                                 Ok(
                                     storage::BucketDeleteFinalizeOutcome::Finalized
                                     | storage::BucketDeleteFinalizeOutcome::NotFound,
@@ -377,11 +386,12 @@ impl Coordinator {
             "bucket_delete_authorize_start",
             format!("bucket={:?}", req.name),
         );
+        let storage_node = self.storage_node();
         let AuthorizedDeleteBucket {
             name,
             bucket_execution_generation,
             bucket_incarnation_generation,
-        } = match self.authorize_delete_bucket(req) {
+        } = match self.authorize_delete_bucket_with_storage_node(&storage_node, req) {
             Ok(authorized) => {
                 let _ = observability::emit_flight_event(
                     TRACE_TARGET,
@@ -429,7 +439,7 @@ impl Coordinator {
                 request_started.elapsed().as_micros()
             ),
         );
-        if let Err(err) = self.storage_node().begin_bucket_delete_if_current(
+        if let Err(err) = storage_node.begin_bucket_delete_if_current(
             &name,
             bucket_execution_generation,
             bucket_incarnation_generation,
@@ -467,7 +477,7 @@ impl Coordinator {
             ),
         );
         self.remove_bucket_fast_path(&name);
-        self.read_runtime()
+        self.read_runtime_for_storage_node(storage_node)
             .enqueue_bucket_delete_finalize_for(&name);
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
@@ -530,9 +540,10 @@ impl Coordinator {
             req.bucket.name,
             req.state
         );
-        let authorized = self.authorize_put_bucket_versioning(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_put_bucket_versioning_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_versioning_and_load_info(&authorized.bucket, authorized.state)
             .map_err(|e| match e {
                 storage::BucketSnapshotLoadError::Metadata(
@@ -583,9 +594,10 @@ impl Coordinator {
             req.config.object_lock_enabled.unwrap_or(false),
             req.config.default_retention.is_some()
         );
-        let authorized = self.authorize_put_bucket_object_lock_configuration(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized = self
+            .authorize_put_bucket_object_lock_configuration_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_object_lock_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -617,9 +629,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.sse_c_blocked
         );
-        let authorized = self.authorize_put_bucket_encryption(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_put_bucket_encryption_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_encryption_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -647,9 +660,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_encryption(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_delete_bucket_encryption_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_encryption_and_load_info(
                 &authorized.bucket,
                 BucketEncryptionConfig::default(),
@@ -667,8 +681,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_put_bucket_cors(req)?;
-        let info = self.store_bucket_subresource(
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_put_bucket_cors_with_storage_node(&storage_node, req)?;
+        let info = self.store_bucket_subresource_with_storage_node(
+            &storage_node,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Cors,
@@ -714,9 +730,9 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_cors(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_delete_bucket_cors_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_subresource_and_load_info(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Cors,
@@ -734,8 +750,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_put_bucket_tagging(req)?;
-        let info = self.store_bucket_subresource(
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_put_bucket_tagging_with_storage_node(&storage_node, req)?;
+        let info = self.store_bucket_subresource_with_storage_node(
+            &storage_node,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -765,9 +783,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_tagging(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_delete_bucket_tagging_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_subresource_and_load_info(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Tagging,
@@ -806,8 +825,11 @@ impl Coordinator {
             req.control.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_put_bucket_tag_control(req)?;
-        let info = self.store_bucket_subresource(
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_put_bucket_tag_control_with_storage_node(&storage_node, req)?;
+        let info = self.store_bucket_subresource_with_storage_node(
+            &storage_node,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -829,9 +851,9 @@ impl Coordinator {
             "bucket={:?}",
             req.bucket.name
         );
-        let authorized = self.authorize_bucket_tag_control(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_bucket_tag_control_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_subresource_and_load_info(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Tagging,
@@ -852,8 +874,11 @@ impl Coordinator {
             req.control.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_put_bucket_tags_for_untag_resource(req)?;
-        let info = self.store_bucket_subresource(
+        let storage_node = self.storage_node();
+        let authorized = self
+            .authorize_put_bucket_tags_for_untag_resource_with_storage_node(&storage_node, req)?;
+        let info = self.store_bucket_subresource_with_storage_node(
+            &storage_node,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -875,9 +900,10 @@ impl Coordinator {
             "bucket={:?}",
             req.control.bucket.name
         );
-        let authorized = self.authorize_untag_bucket_tag_control(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_untag_bucket_tag_control_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_subresource_and_load_info(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Tagging,
@@ -895,9 +921,9 @@ impl Coordinator {
             req.bucket.name,
             req.enabled
         );
-        let authorized = self.authorize_put_bucket_abac(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_put_bucket_abac_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_abac_enabled_and_load_info(&authorized.bucket, authorized.enabled)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -923,8 +949,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_put_bucket_policy(req)?;
-        let info = self.store_bucket_subresource(
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_put_bucket_policy_with_storage_node(&storage_node, req)?;
+        let info = self.store_bucket_subresource_with_storage_node(
+            &storage_node,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Policy,
@@ -968,9 +996,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_policy(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_delete_bucket_policy_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_subresource_and_load_info(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Policy,
@@ -991,11 +1020,14 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let authorized = self.authorize_put_bucket_lifecycle(req)?;
+        let storage_node = self.storage_node();
+        #[cfg(test)]
+        maybe_run_bucket_mutation_storage_node_capture_hook(req.bucket.name.as_str());
+        let authorized =
+            self.authorize_put_bucket_lifecycle_with_storage_node(&storage_node, req)?;
         #[cfg(test)]
         if should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
-            let bucket_pg_ready = self
-                .storage_node()
+            let bucket_pg_ready = storage_node
                 .try_probe_bucket_pg_available(&authorized.bucket)
                 .map_err(Self::map_bucket_snapshot_load_error)?;
             if !bucket_pg_ready {
@@ -1005,7 +1037,8 @@ impl Coordinator {
                 });
             }
         }
-        let info = self.store_bucket_subresource(
+        let info = self.store_bucket_subresource_with_storage_node(
+            &storage_node,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Lifecycle,
@@ -1038,9 +1071,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_lifecycle(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_delete_bucket_lifecycle_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_subresource_and_load_info(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Lifecycle,
@@ -1061,9 +1095,10 @@ impl Coordinator {
             req.bucket.name,
             req.config
         );
-        let authorized = self.authorize_put_bucket_public_access_block(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_put_bucket_public_access_block_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_public_access_block_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1094,9 +1129,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_public_access_block(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_delete_bucket_public_access_block_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_public_access_block_and_load_info(&authorized.bucket)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1114,9 +1150,10 @@ impl Coordinator {
             req.bucket.name,
             req.config
         );
-        let authorized = self.authorize_put_bucket_ownership_controls(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_put_bucket_ownership_controls_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .put_bucket_ownership_controls_and_load_info(&authorized.bucket, authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1147,9 +1184,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_delete_bucket_ownership_controls(req)?;
-        let info = self
-            .storage_node()
+        let storage_node = self.storage_node();
+        let authorized =
+            self.authorize_delete_bucket_ownership_controls_with_storage_node(&storage_node, req)?;
+        let info = storage_node
             .delete_bucket_ownership_controls_and_load_info(&authorized.bucket)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1181,25 +1219,28 @@ impl Coordinator {
                 PutBucketAclInput::Grants(_) => "grants",
             }
         );
-        let authorized = self.authorize_put_bucket_acl(req)?;
-        self.apply_authorized_bucket_acl_update(&authorized)
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_put_bucket_acl_with_storage_node(&storage_node, req)?;
+        self.apply_authorized_bucket_acl_update(&storage_node, &authorized)
     }
 
     pub fn validate_put_bucket_acl_request(
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.authorize_put_bucket_acl(req).map(|_| ())
+        let storage_node = self.storage_node();
+        self.authorize_put_bucket_acl_with_storage_node(&storage_node, req)
+            .map(|_| ())
     }
 
     fn apply_authorized_bucket_acl_update(
         &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
         #[cfg(test)]
         if should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
-            let bucket_pg_ready = self
-                .storage_node()
+            let bucket_pg_ready = storage_node
                 .try_probe_bucket_pg_available(&authorized.bucket)
                 .map_err(Self::map_bucket_snapshot_load_error)?;
             if !bucket_pg_ready {
@@ -1209,8 +1250,7 @@ impl Coordinator {
                 });
             }
         }
-        let info = self
-            .storage_node()
+        let info = storage_node
             .put_bucket_acl_and_load_info(
                 &authorized.bucket,
                 &authorized.acl_grants,
@@ -1222,12 +1262,13 @@ impl Coordinator {
         Ok(())
     }
 
-    fn store_bucket_subresource(
+    fn store_bucket_subresource_with_storage_node(
         &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         name: &BucketName,
         req: storage::PutBucketSubresource<'_>,
     ) -> Result<storage::BucketInfo, ServerError> {
-        self.storage_node()
+        storage_node
             .put_bucket_subresource_and_load_info(name, req)
             .map_err(Self::map_bucket_snapshot_load_error)
     }

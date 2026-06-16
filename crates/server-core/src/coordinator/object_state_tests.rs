@@ -4154,7 +4154,7 @@ fn delete_specific_version_rechecks_object_lock_state_at_execution() {
     .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, NO_DELETE)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, NO_DELETE)
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
 }
@@ -4226,7 +4226,7 @@ fn delete_unversioned_rechecks_current_object_at_execution() {
     .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, &cond)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
     assert!(matches!(err, ServerError::PreconditionFailed));
 }
@@ -4306,7 +4306,7 @@ fn delete_current_marker_insert_rechecks_current_object_at_execution() {
     .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, &cond)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
     assert!(matches!(err, ServerError::PreconditionFailed));
 }
@@ -4381,7 +4381,7 @@ fn boe_delete_specific_version_rechecks_object_lock_state_at_execution() {
     .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, NO_DELETE)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, NO_DELETE)
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
 }
@@ -4471,7 +4471,7 @@ fn boe_delete_unversioned_rechecks_current_object_at_execution() {
     .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, &cond)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
     assert!(matches!(err, ServerError::PreconditionFailed));
 }
@@ -4569,7 +4569,7 @@ fn boe_delete_current_marker_insert_rechecks_current_object_at_execution() {
     .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, &cond)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
     assert!(matches!(err, ServerError::PreconditionFailed));
 }
@@ -4645,7 +4645,7 @@ fn boe_delete_missing_specific_version_with_bypass_rechecks_execution_permission
         .unwrap();
 
     let err = coord
-        .apply_authorized_delete_object(authorized, NO_DELETE)
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, NO_DELETE)
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
 }

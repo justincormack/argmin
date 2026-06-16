@@ -7304,18 +7304,25 @@ Status:
   epoch. The normal frontend runtime-map export remains stricter and still
   withholds Active routes until the bound primary has heartbeated Active for the
   post-peering epoch.
+- Completed the request runtime-map pinning audit for the currently implemented
+  foreground multi-step paths. Object metadata subresources, DeleteObject,
+  DeleteObjects, DeleteBucket, bucket create/recreate, bucket subresource
+  writes, bucket ACL writes, and bucket control-plane mutators now capture one
+  request `Arc<StorageCluster>` and use it across authorization, mutation, and
+  reclaim/finalizer enqueue work. Focused regressions now swap in a replacement
+  runtime map at object metadata policy-context load, delete authorization,
+  bucket-delete authorization, and bucket subresource authorization boundaries.
 - Hardened the control-plane Unix socket tests to use short `/tmp` socket paths
   rather than the repository-relative temporary directory, so they keep covering
   private directory creation, frontend bootstrap, runtime-map refresh, and
   storage-node bootstrap without depending on the checkout path being shorter
   than the platform `sun_path` limit.
 - Current remaining Phase 11 work is now concentrated in the distributed
-  correctness layers above the control-plane/runtime-map plumbing: a final
-  request runtime-map pinning audit for less common multi-step/background
-  paths, real command-log reconstruction during PG peering, deterministic
-  epoch-transition fault injection, shard repair, PG backfill/migration,
-  command-log retention/compaction implementation, and a small real-multihost
-  correctness soak separate from the single-host overload soak.
+  correctness layers above the control-plane/runtime-map plumbing: real
+  command-log reconstruction during PG peering, deterministic epoch-transition
+  fault injection, shard repair, PG backfill/migration, command-log
+  retention/compaction implementation, and a small real-multihost correctness
+  soak separate from the single-host overload soak.
 
 Exit criteria:
 

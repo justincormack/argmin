@@ -223,6 +223,297 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
 }
 
 #[test]
+fn object_metadata_pins_runtime_map_after_policy_context_load() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"object-metadata-pinned-runtime-map",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some("bucket".to_string()),
+        after_object_metadata_policy_context: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    put_object_tags_test(
+        &coord,
+        "bucket",
+        "key",
+        None,
+        "<Tagging><TagSet><Tag><Key>pin</Key><Value>metadata</Value></Tag></TagSet></Tagging>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    handle.install(initial).unwrap();
+    let tags = get_object_tags_test(&coord, "bucket", "key", None, test_requester(), None)
+        .unwrap()
+        .unwrap();
+    assert!(tags.contains("<Key>pin</Key>"));
+    assert!(tags.contains("<Value>metadata</Value>"));
+}
+
+#[test]
+fn delete_object_pins_runtime_map_after_authorization() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"delete-pinned-runtime-map",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some("bucket".to_string()),
+        after_loaded: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+
+    handle.install(initial).unwrap();
+    let err = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+}
+
+#[test]
+fn delete_bucket_pins_runtime_map_after_authorization() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some("bucket".to_string()),
+        after_loaded: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    handle.install(initial).unwrap();
+    let err = coord
+        .head_bucket(&bucket_request_with_expected_owner(
+            "bucket",
+            test_requester(),
+            None,
+        ))
+        .unwrap_err();
+    assert!(matches!(err, ServerError::BucketNotFound { .. }));
+}
+
+#[test]
+fn bucket_subresource_write_pins_runtime_map_after_authorization() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some("bucket".to_string()),
+        after_loaded: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    let lifecycle = "<LifecycleConfiguration><Rule><ID>pin</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
+    put_bucket_lifecycle_test(&coord, "bucket", lifecycle, test_requester(), None).unwrap();
+
+    handle.install(initial).unwrap();
+    let stored = coord
+        .get_bucket_lifecycle(&bucket_request_with_expected_owner(
+            "bucket",
+            test_requester(),
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+    assert!(stored.contains("<ID>pin</ID>"));
+}
+
+#[test]
+fn bucket_subresource_write_pins_runtime_map_before_authorization() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some("bucket".to_string()),
+        after_bucket_mutation_storage_node_capture: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    let lifecycle = "<LifecycleConfiguration><Rule><ID>pin-before-auth</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
+    put_bucket_lifecycle_test(&coord, "bucket", lifecycle, test_requester(), None).unwrap();
+
+    handle.install(initial).unwrap();
+    let stored = coord
+        .get_bucket_lifecycle(&bucket_request_with_expected_owner(
+            "bucket",
+            test_requester(),
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+    assert!(stored.contains("<ID>pin-before-auth</ID>"));
+}
+
+#[test]
 fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);

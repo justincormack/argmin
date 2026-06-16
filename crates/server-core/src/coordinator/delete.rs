@@ -1,7 +1,7 @@
 use s3_types::VersionId;
 #[cfg(test)]
 use storage::ObjectLayout;
-use storage::StoredObject;
+use storage::{StorageCluster, StoredObject};
 
 #[cfg(test)]
 use super::{
@@ -17,6 +17,7 @@ use crate::error::ServerError;
 impl Coordinator {
     pub(super) fn apply_authorized_delete_object(
         &self,
+        storage_node: &std::sync::Arc<StorageCluster>,
         authorized: AuthorizedDeleteObject,
         cond: &DeleteCondition,
     ) -> Result<DeleteObjectResult, ServerError> {
@@ -29,8 +30,7 @@ impl Coordinator {
                 bucket_policy,
                 bucket_tags,
             } => {
-                let deleted = self
-                    .storage_node()
+                let deleted = storage_node
                     .delete_current_object_if(&bucket, &key, |stored| -> Result<(), ServerError> {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             crate::coordinator::authz::BucketPolicyAccess {
@@ -77,11 +77,8 @@ impl Coordinator {
                     }
                     #[cfg(not(test))]
                     let _ = layout;
-                    self.read_runtime().enqueue_object_payload_reclaim_for(
-                        &bucket,
-                        &key,
-                        generation_id,
-                    );
+                    self.read_runtime_for_storage_node(std::sync::Arc::clone(storage_node))
+                        .enqueue_object_payload_reclaim_for(&bucket, &key, generation_id);
                 }
 
                 Ok(DeleteObjectResult {
@@ -111,8 +108,7 @@ impl Coordinator {
                     });
                 }
 
-                let deleted = self
-                    .storage_node()
+                let deleted = storage_node
                     .delete_specific_object_version_if(
                         &bucket,
                         &key,
@@ -202,11 +198,8 @@ impl Coordinator {
                         }
                         #[cfg(not(test))]
                         let _ = layout;
-                        self.read_runtime().enqueue_object_payload_reclaim_for(
-                            &bucket,
-                            &key,
-                            generation_id,
-                        );
+                        self.read_runtime_for_storage_node(std::sync::Arc::clone(storage_node))
+                            .enqueue_object_payload_reclaim_for(&bucket, &key, generation_id);
 
                         Ok(DeleteObjectResult {
                             version_id,
@@ -224,8 +217,7 @@ impl Coordinator {
                 bucket_policy,
                 bucket_tags,
             } => {
-                let marker = self
-                    .storage_node()
+                let marker = storage_node
                     .insert_current_delete_marker_if(
                         &bucket,
                         &key,
@@ -279,8 +271,9 @@ impl Coordinator {
             req.object.version_id,
             req.bypass_governance
         );
-        let authorized = self.authorize_delete_object(req)?;
-        self.apply_authorized_delete_object(authorized, req.cond)
+        let storage_node = self.storage_node();
+        let authorized = self.authorize_delete_object_with_storage_node(&storage_node, req)?;
+        self.apply_authorized_delete_object(&storage_node, authorized, req.cond)
     }
 
     /// Batch-delete objects.
@@ -297,7 +290,9 @@ impl Coordinator {
             req.bypass_governance
         );
         let entries = req.entries;
-        self.checked_active_bucket_summary_for(
+        let storage_node = self.storage_node();
+        self.checked_active_bucket_summary_for_storage_node(
+            &storage_node,
             req.bucket.name_typed(),
             req.expected_bucket_owner(),
         )?;
@@ -307,9 +302,10 @@ impl Coordinator {
 
         for entry in entries {
             match self
-                .authorize_delete_objects_entry(req, entry)
-                .and_then(|authorized| self.apply_authorized_delete_object(authorized, &entry.cond))
-            {
+                .authorize_delete_objects_entry_with_storage_node(&storage_node, req, entry)
+                .and_then(|authorized| {
+                    self.apply_authorized_delete_object(&storage_node, authorized, &entry.cond)
+                }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),

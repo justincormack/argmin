@@ -41,7 +41,9 @@ pub(super) static BUCKET_FAST_PATH_IDENTITY_LOAD_ERROR_TEST_BUCKET: OnceLock<
 #[derive(Default, Clone)]
 pub(super) struct BucketWriteHandleTestHooks {
     pub(super) bucket: Option<String>,
+    pub(super) after_bucket_mutation_storage_node_capture: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_loaded: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_object_metadata_policy_context: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) probe_direct_put_commit: bool,
     pub(super) probe_begin_stream_part_session: bool,
     pub(super) probe_finalize_stream_part_commit: bool,
@@ -397,6 +399,32 @@ pub(super) fn maybe_run_bucket_write_handle_loaded_hook(bucket: &str) {
         .clone();
     if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
         if let Some(hook) = hooks.after_loaded {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_bucket_mutation_storage_node_capture_hook(bucket: &str) {
+    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.after_bucket_mutation_storage_node_capture {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_object_metadata_policy_context_hook(bucket: &str) {
+    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.after_object_metadata_policy_context {
             hook();
         }
     }
