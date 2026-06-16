@@ -7333,8 +7333,11 @@ Status:
   still allowing cleanup/release route validation for already-held resources.
   The set now also covers the storage-node heartbeat refresh path after a lease
   expiry epoch transition: a node reporting its stale Active route receives the
-  current Peering map and a non-serving lease, not an Active route backed by the
-  expired lease.
+  current Peering map and a non-serving lease, not an Active route backed by
+  the expired lease. It also covers explicit temporary availability loss: a
+  primary marked `Suspect` fences old authorizations, leaves the PG in
+  `Peering`, and cannot resume unsafe work until availability recovery,
+  current-epoch observation, and peering completion all happen.
 - Extended the deterministic epoch-transition fault regressions to cover an
   acting-set change. A metadata-write token issued to the old active primary is
   fenced by the epoch bump, both old and new primaries fail closed while the PG
