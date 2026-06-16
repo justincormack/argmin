@@ -9007,6 +9007,37 @@ mod tests {
     }
 
     #[test]
+    fn expired_route_map_rejects_new_work_but_allows_cleanup_route_validation() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_valid_until_ms = Some(1);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+
+        let new_work_error = handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(new_work_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(new_work_error
+            .message
+            .contains("storage-node route map for cluster epoch"));
+
+        handler
+            .validate_pg_route_for_cleanup(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap();
+
+        let stale_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+        let stale_epoch_error = handler
+            .validate_pg_route_for_cleanup(config.node_id, stale_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(
+            stale_epoch_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+    }
+
+    #[test]
     fn storage_node_process_config_builds_control_plane_heartbeat() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);

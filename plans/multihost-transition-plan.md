@@ -7325,6 +7325,12 @@ Status:
   storage node, waits for heartbeat/peering refresh, and runs a second S3
   probe. This is intentionally a narrow process/runtime-map wiring smoke, not
   the later full distributed-correctness soak.
+- Started the deterministic epoch-transition fault regression set. The first
+  tests cover exported runtime maps failing closed once their lease validity
+  expires across an authority epoch transition, stale primary operation
+  authorizations being rejected after lease expiry moves a PG back to
+  `Peering`, and storage-node route-map expiry rejecting new unsafe work while
+  still allowing cleanup/release route validation for already-held resources.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition

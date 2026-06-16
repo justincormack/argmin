@@ -7478,6 +7478,141 @@ mod tests {
     }
 
     #[test]
+    fn stale_runtime_map_fails_closed_after_epoch_transition() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(17), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 17, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(17),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 17, PgState::Active, 2_002);
+
+        let active_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let stale_frontend_cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &active_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let valid_until_ms = active_map.valid_until_ms().unwrap();
+        assert_eq!(
+            stale_frontend_cluster.route_map_valid_until_ms(),
+            Some(valid_until_ms)
+        );
+        assert!(stale_frontend_cluster
+            .require_route_map_valid_at(valid_until_ms - 1)
+            .is_ok());
+
+        let before_expiry_epoch = authority.snapshot().cluster_epoch();
+        let expiry = authority.expire_heartbeat_leases(valid_until_ms).unwrap();
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
+        assert!(expiry.cluster_epoch() > before_expiry_epoch);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(17)).unwrap().state(),
+            PgState::Peering
+        );
+
+        assert!(matches!(
+            stale_frontend_cluster.require_route_map_valid_at(valid_until_ms),
+            Err(crate::StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: expired_at,
+                now_ms,
+            }) if cluster_epoch == active_map.cluster_epoch()
+                && expired_at == valid_until_ms
+                && now_ms == valid_until_ms
+        ));
+        assert_eq!(
+            authority
+                .snapshot()
+                .runtime_map(valid_until_ms)
+                .unwrap()
+                .pg_routes()[0]
+                .state(),
+            PgState::Peering
+        );
+    }
+
+    #[test]
+    fn stale_primary_authorization_cannot_validate_after_epoch_transition() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(18), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 18, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(18),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 1, 18, PgState::Active, 2_002);
+        let authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(18),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                active.cluster_epoch(),
+                2_003,
+            )
+            .unwrap();
+        assert!(authority
+            .validate_pg_operation_authorization(&authorization, 2_004)
+            .is_ok());
+
+        let lease_deadline_ms = authorization.primary().lease_deadline_ms();
+        let expiry = authority
+            .expire_heartbeat_leases(lease_deadline_ms)
+            .unwrap();
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(18)).unwrap().state(),
+            PgState::Peering
+        );
+
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(&authorization, lease_deadline_ms),
+            Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch,
+                current_epoch,
+            }) if cluster_epoch == active.cluster_epoch()
+                && current_epoch == expiry.cluster_epoch()
+        ));
+        assert!(matches!(
+            authority.authorize_pg_primary_service(
+                PgId::new(18),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                expiry.cluster_epoch(),
+                lease_deadline_ms,
+            ),
+            Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
+        ));
+    }
+
+    #[test]
     fn failed_expiry_persist_does_not_expose_uncommitted_epoch_or_map() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
