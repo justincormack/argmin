@@ -27,7 +27,7 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
-use storage::{BucketName, ObjectKey, SessionId};
+use storage::{BucketName, SessionId};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -384,9 +384,7 @@ impl StreamingAbortGuard {
 
     fn start_put_object_heartbeat(
         self: &Arc<Self>,
-        trace: observability::TraceContext,
-        bucket: BucketName,
-        key: ObjectKey,
+        ctx: Arc<super::StreamingPutContext>,
         session_id: SessionId,
     ) {
         if self.put_heartbeat_started.swap(true, Ordering::AcqRel) {
@@ -405,13 +403,11 @@ impl StreamingAbortGuard {
                 }
                 drop(guard);
                 let state = Arc::clone(&state);
-                let trace = trace.clone();
-                let bucket = bucket.clone();
-                let key = key.clone();
+                let ctx = Arc::clone(&ctx);
                 let session_id = session_id.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let frontend = acquire_frontend(&state);
-                    frontend.heartbeat_streaming_put_object(&trace, &bucket, &key, &session_id)
+                    frontend.heartbeat_streaming_put_object(&ctx, &session_id)
                 })
                 .await;
             }
@@ -423,24 +419,41 @@ impl StreamingAbortGuard {
         ctx: &Arc<super::StreamingPutContext>,
         session_id: &SessionId,
     ) {
-        self.start_put_object_heartbeat(
-            ctx.trace.clone(),
-            ctx.bucket().clone(),
-            ctx.key().clone(),
-            session_id.clone(),
-        );
+        self.start_put_object_heartbeat(Arc::clone(ctx), session_id.clone());
+    }
+
+    fn start_post_object_heartbeat(self: &Arc<Self>, ctx: Arc<super::StreamingPostContext>) {
+        if self.put_heartbeat_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let guard: Weak<Self> = Arc::downgrade(self);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STREAMING_PUT_HEARTBEAT_INTERVAL).await;
+                let Some(guard) = guard.upgrade() else {
+                    break;
+                };
+                if guard.disarmed.load(Ordering::Acquire) {
+                    break;
+                }
+                drop(guard);
+                let state = Arc::clone(&state);
+                let ctx = Arc::clone(&ctx);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let frontend = acquire_frontend(&state);
+                    frontend.heartbeat_streaming_post_object(&ctx)
+                })
+                .await;
+            }
+        });
     }
 
     fn arm_post(self: &Arc<Self>, ctx: &Arc<super::StreamingPostContext>) {
         *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Post {
             ctx: Arc::clone(ctx),
         });
-        self.start_put_object_heartbeat(
-            ctx.trace.clone(),
-            ctx.bucket().clone(),
-            ctx.key().clone(),
-            ctx.session_id().clone(),
-        );
+        self.start_post_object_heartbeat(Arc::clone(ctx));
     }
 
     fn arm_part(&self, ctx: &Arc<super::StreamingPartContext>) {

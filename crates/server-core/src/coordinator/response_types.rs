@@ -1,4 +1,5 @@
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
+use std::sync::Arc;
 
 use super::authz_types::AuthorizedPutObjectWrite;
 use super::read_core::ReadHandle;
@@ -9,7 +10,7 @@ use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
 use storage::{
     BucketName, BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig,
     ManagedEncryptionAlgorithm, ObjectLockState, OwnerIdentity, PublicAccessBlockConfig, SessionId,
-    UploadId,
+    StorageCluster, UploadId,
 };
 
 /// Result of a PutObject operation.
@@ -137,10 +138,10 @@ pub struct BeginStreamPartResult {
     pub sse_customer: Option<SseCustomerWriteContext>,
 }
 
-#[derive(Debug)]
 pub struct PreparedStreamPut {
     pub authorized_write: AuthorizedPutObjectWrite,
     pub session_id: SessionId,
+    pub storage_node: Arc<StorageCluster>,
 }
 
 /// Result of a GetObject operation.

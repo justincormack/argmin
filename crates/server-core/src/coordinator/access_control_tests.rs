@@ -4303,14 +4303,14 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
     )
     .unwrap();
     coord
-        .append_stream_put_data(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key("logs/key"),
-            &session_id,
-            0,
-            b"data",
-            None,
-        )
+        .append_stream_put_data(&AppendStreamPutRequest {
+            bucket: &trusted_bucket_name(bucket),
+            key: &trusted_object_key("logs/key"),
+            session_id: &session_id,
+            segment_index: 0,
+            data: b"data",
+            sse_customer: None,
+        })
         .unwrap();
 
     let version_id = run_same_pg_probe_test(

@@ -37,33 +37,40 @@ pub fn upload_part(
     coord: &Coordinator,
     req: &UploadPartRequest<'_>,
 ) -> Result<UploadPartResult, ServerError> {
+    let storage_node = coord.storage_node_for_request();
     let upload_id = req.upload.upload_id_typed().clone();
-    let session = coord.begin_stream_part(&BeginStreamPartRequest {
-        upload: MultipartObjectRequest::new(
-            req.upload.object.bucket.name_typed().clone(),
-            req.upload.object.key_typed().clone(),
-            upload_id.clone(),
-            req.upload.requester().clone(),
-            req.upload.expected_bucket_owner(),
-        ),
-        part_number: req.part_number,
-        policy_context: PutObjectPolicyContext::default()
-            .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
-        sse_customer: req.sse_customer,
-    })?;
+    let session = coord.begin_stream_part_with_storage_node(
+        &storage_node,
+        &BeginStreamPartRequest {
+            upload: MultipartObjectRequest::new(
+                req.upload.object.bucket.name_typed().clone(),
+                req.upload.object.key_typed().clone(),
+                upload_id.clone(),
+                req.upload.requester().clone(),
+                req.upload.expected_bucket_owner(),
+            ),
+            part_number: req.part_number,
+            policy_context: PutObjectPolicyContext::default()
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
+            sse_customer: req.sse_customer,
+        },
+    )?;
     let session_id = &session.session_id;
     let result = (|| {
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-            coord.append_stream_part_data(&AppendStreamPartRequest {
-                bucket: req.upload.object.bucket.name_typed().clone(),
-                key: req.upload.object.key_typed().clone(),
-                upload_id: req.upload.upload_id_typed(),
-                session_id,
-                part_number: req.part_number,
-                segment_index: idx as u32,
-                data: chunk,
-                sse_customer: req.sse_customer,
-            })?;
+            coord.append_stream_part_data_with_storage_node(
+                &storage_node,
+                &AppendStreamPartRequest {
+                    bucket: req.upload.object.bucket.name_typed().clone(),
+                    key: req.upload.object.key_typed().clone(),
+                    upload_id: req.upload.upload_id_typed(),
+                    session_id,
+                    part_number: req.part_number,
+                    segment_index: idx as u32,
+                    data: chunk,
+                    sse_customer: req.sse_customer,
+                },
+            )?;
         }
         let crc = checksum::crc64::checksum(req.data);
         let computed_checksum = {
@@ -73,24 +80,28 @@ pub fn upload_part(
                 .or(session.checksum_algorithm);
             algo.map(|a| compute_checksum(a, req.data))
         };
-        coord.finalize_stream_part(FinalizeStreamPartRequest {
-            upload: MultipartObjectRequest::new(
-                req.upload.object.bucket.name_typed().clone(),
-                req.upload.object.key_typed().clone(),
-                upload_id,
-                req.upload.requester().clone(),
-                req.upload.expected_bucket_owner(),
-            ),
-            session_id,
-            part_number: req.part_number,
-            crc64: crc,
-            total_size: req.data.len() as u64,
-            claimed_checksum: req.claimed_checksum,
-            computed_checksum,
-        })
+        coord.finalize_stream_part_with_storage_node(
+            &storage_node,
+            FinalizeStreamPartRequest {
+                upload: MultipartObjectRequest::new(
+                    req.upload.object.bucket.name_typed().clone(),
+                    req.upload.object.key_typed().clone(),
+                    upload_id,
+                    req.upload.requester().clone(),
+                    req.upload.expected_bucket_owner(),
+                ),
+                session_id,
+                part_number: req.part_number,
+                crc64: crc,
+                total_size: req.data.len() as u64,
+                claimed_checksum: req.claimed_checksum,
+                computed_checksum,
+            },
+        )
     })();
     if result.is_err() {
-        let _ = coord.abort_stream_part_session(
+        let _ = coord.abort_stream_part_session_with_storage_node(
+            &storage_node,
             req.upload.bucket_name_typed(),
             req.upload.key_typed(),
             session_id,

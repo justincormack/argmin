@@ -816,6 +816,17 @@ pub struct AppendStreamPartRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
+/// Parsed request for appending plaintext to a streaming PutObject session.
+#[derive(Debug)]
+pub struct AppendStreamPutRequest<'a> {
+    pub bucket: &'a BucketName,
+    pub key: &'a ObjectKey,
+    pub session_id: &'a SessionId,
+    pub segment_index: u32,
+    pub data: &'a [u8],
+    pub sse_customer: Option<&'a SseCustomerRequest>,
+}
+
 pub(super) trait ExpectedBucketOwnerRequest {
     fn expected_bucket_owner(&self) -> Option<&str>;
 }

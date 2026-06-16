@@ -54,7 +54,9 @@ use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
 use server_core::system_metadata::{is_system_metadata_header_name, SystemMetadata};
-use storage::{BucketName, ManagedEncryptionAlgorithm, ObjectKey, SessionId, UploadId};
+use storage::{
+    BucketName, ManagedEncryptionAlgorithm, ObjectKey, SessionId, StorageCluster, UploadId,
+};
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
@@ -3587,6 +3589,7 @@ impl HttpFrontend {
         Ok(StreamingPostContext {
             trace: current_trace_context(),
             session_id: prepared_put.session_id,
+            storage_node: prepared_put.storage_node,
             metadata_blob,
             system_metadata,
             success_status,
@@ -3638,19 +3641,22 @@ impl HttpFrontend {
             }
         }
 
-        let result = self.coordinator.finalize_authorized_stream_put(
-            &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
-                session_id: ctx.session_id(),
-                crc64,
-                total_size,
-                metadata_blob: &ctx.metadata_blob,
-                system_metadata: &ctx.system_metadata,
-                write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
-                cond: &crate::conditional::WriteCondition::default(),
-            },
-            &ctx.authorized_write,
-            ctx.sse_customer.as_ref(),
-        )?;
+        let result = self
+            .coordinator
+            .finalize_authorized_stream_put_with_storage_node(
+                &ctx.storage_node,
+                &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
+                    session_id: ctx.session_id(),
+                    crc64,
+                    total_size,
+                    metadata_blob: &ctx.metadata_blob,
+                    system_metadata: &ctx.system_metadata,
+                    write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
+                    cond: &crate::conditional::WriteCondition::default(),
+                },
+                &ctx.authorized_write,
+                ctx.sse_customer.as_ref(),
+            )?;
 
         let mut resp = S3Response::post_object(
             &result,
@@ -3703,13 +3709,16 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        self.coordinator.append_stream_put_data(
-            ctx.authorized_write.bucket_typed(),
-            ctx.authorized_write.key_typed(),
-            ctx.session_id(),
-            segment_index,
-            data,
-            ctx.sse_customer.as_ref(),
+        self.coordinator.append_stream_put_data_with_storage_node(
+            &ctx.storage_node,
+            &crate::coordinator::AppendStreamPutRequest {
+                bucket: ctx.authorized_write.bucket_typed(),
+                key: ctx.authorized_write.key_typed(),
+                session_id: ctx.session_id(),
+                segment_index,
+                data,
+                sse_customer: ctx.sse_customer.as_ref(),
+            },
         )
     }
 
@@ -3723,9 +3732,12 @@ impl HttpFrontend {
             ctx.bucket(),
             ctx.key()
         );
-        let _ =
-            self.coordinator
-                .abort_stream_put_session(ctx.bucket(), ctx.key(), ctx.session_id());
+        let _ = self.coordinator.abort_stream_put_session_with_storage_node(
+            &ctx.storage_node,
+            ctx.bucket(),
+            ctx.key(),
+            ctx.session_id(),
+        );
     }
 
     fn merged_streaming_put_metadata_blob(
@@ -3882,9 +3894,12 @@ impl HttpFrontend {
         let bucket_name = parse_bucket_name(bucket)?;
         let object_key = parse_object_key(key)?;
         let requester = Self::requester_from_auth(&auth);
-        let authorized_write =
-            self.coordinator
-                .prepare_put_object_write(&AuthorizePutObjectRequest {
+        let storage_node = self.coordinator.storage_node_for_request();
+        let authorized_write = self
+            .coordinator
+            .prepare_put_object_write_with_storage_node(
+                &storage_node,
+                &AuthorizePutObjectRequest {
                     object: ObjectRequest::new(
                         bucket_name.clone(),
                         object_key.clone(),
@@ -3925,10 +3940,12 @@ impl HttpFrontend {
                         sse_customer_request.as_ref(),
                         managed_encryption,
                     ),
-                })?;
+                },
+            )?;
 
         Ok(StreamingPutContext {
             trace: current_trace_context(),
+            storage_node,
             bucket: bucket_name,
             key: object_key,
             metadata_blob,
@@ -3959,7 +3976,8 @@ impl HttpFrontend {
             ctx.key()
         );
         ctx.with_authorized_write(|authorized_write| {
-            self.coordinator.begin_stream_put_session(authorized_write)
+            self.coordinator
+                .begin_stream_put_session_with_storage_node(&ctx.storage_node, authorized_write)
         })
     }
 
@@ -3981,26 +3999,46 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        self.coordinator.append_stream_put_data(
-            ctx.bucket(),
-            ctx.key(),
-            session_id,
-            segment_index,
-            data,
-            ctx.sse_customer.as_ref(),
+        self.coordinator.append_stream_put_data_with_storage_node(
+            &ctx.storage_node,
+            &crate::coordinator::AppendStreamPutRequest {
+                bucket: ctx.bucket(),
+                key: ctx.key(),
+                session_id,
+                segment_index,
+                data,
+                sse_customer: ctx.sse_customer.as_ref(),
+            },
         )
     }
 
     fn heartbeat_streaming_put_object(
         &self,
-        trace: &observability::TraceContext,
-        bucket: &BucketName,
-        key: &ObjectKey,
+        ctx: &StreamingPutContext,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        let _trace = observability::AttachedTrace::new(trace.clone());
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         self.coordinator
-            .heartbeat_stream_put_session(bucket, key, session_id)
+            .heartbeat_stream_put_session_with_storage_node(
+                &ctx.storage_node,
+                ctx.bucket(),
+                ctx.key(),
+                session_id,
+            )
+    }
+
+    fn heartbeat_streaming_post_object(
+        &self,
+        ctx: &StreamingPostContext,
+    ) -> Result<(), ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        self.coordinator
+            .heartbeat_stream_put_session_with_storage_node(
+                &ctx.storage_node,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.session_id(),
+            )
     }
 
     /// Commit a single-segment `PutObject` without creating a stream session.
@@ -4023,7 +4061,8 @@ impl HttpFrontend {
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
         let result = ctx.with_authorized_write(|authorized_write| {
-            self.coordinator.commit_put_object_write(
+            self.coordinator.commit_put_object_write_with_storage_node(
+                &ctx.storage_node,
                 &crate::coordinator::AuthorizedPutObjectCommitRequest {
                     data,
                     metadata: &metadata_blob,
@@ -4066,19 +4105,21 @@ impl HttpFrontend {
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
         let result = ctx.with_authorized_write(|authorized_write| {
-            self.coordinator.finalize_authorized_stream_put(
-                &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
-                    session_id,
-                    crc64,
-                    total_size,
-                    metadata_blob: &metadata_blob,
-                    system_metadata: &system_metadata,
-                    write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
-                    cond: &ctx.cond,
-                },
-                authorized_write,
-                ctx.sse_customer.as_ref(),
-            )
+            self.coordinator
+                .finalize_authorized_stream_put_with_storage_node(
+                    &ctx.storage_node,
+                    &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
+                        session_id,
+                        crc64,
+                        total_size,
+                        metadata_blob: &metadata_blob,
+                        system_metadata: &system_metadata,
+                        write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
+                        cond: &ctx.cond,
+                    },
+                    authorized_write,
+                    ctx.sse_customer.as_ref(),
+                )
         })?;
 
         let mut resp = S3Response::put_object(&result);
@@ -4097,9 +4138,12 @@ impl HttpFrontend {
             ctx.bucket(),
             ctx.key()
         );
-        let _ = self
-            .coordinator
-            .abort_stream_put_session(ctx.bucket(), ctx.key(), session_id);
+        let _ = self.coordinator.abort_stream_put_session_with_storage_node(
+            &ctx.storage_node,
+            ctx.bucket(),
+            ctx.key(),
+            session_id,
+        );
     }
 
     /// Prepare a streaming `UploadPart` session.
@@ -4149,9 +4193,10 @@ impl HttpFrontend {
         let binding_upload_id = upload.upload_id_typed().clone();
         let binding_bucket = upload.object.bucket.name.clone();
         let binding_key = upload.object.key.clone();
-        let begin = self
-            .coordinator
-            .begin_stream_part(&BeginStreamPartRequest {
+        let storage_node = self.coordinator.storage_node_for_request();
+        let begin = self.coordinator.begin_stream_part_with_storage_node(
+            &storage_node,
+            &BeginStreamPartRequest {
                 upload,
                 part_number,
                 policy_context: crate::coordinator::PutObjectPolicyContext::default()
@@ -4162,10 +4207,12 @@ impl HttpFrontend {
                     )
                     .with_object_creation_operation(false),
                 sse_customer: sse_customer_request.as_ref(),
-            })?;
+            },
+        )?;
 
         Ok(StreamingPartContext {
             trace: current_trace_context(),
+            storage_node,
             binding: StreamPartBinding::new(
                 StreamObjectBinding::new(begin.session_id, binding_bucket, binding_key),
                 binding_upload_id,
@@ -4203,8 +4250,9 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        self.coordinator
-            .append_stream_part_data(&crate::coordinator::AppendStreamPartRequest {
+        self.coordinator.append_stream_part_data_with_storage_node(
+            &ctx.storage_node,
+            &crate::coordinator::AppendStreamPartRequest {
                 bucket: ctx.bucket().clone(),
                 key: ctx.key().clone(),
                 upload_id: ctx.upload_id(),
@@ -4216,7 +4264,8 @@ impl HttpFrontend {
                     .sse_customer
                     .as_ref()
                     .map(SseCustomerWriteContext::request),
-            })
+            },
+        )
     }
 
     /// Finalize a streaming `UploadPart` session and return an `S3Response`.
@@ -4257,9 +4306,9 @@ impl HttpFrontend {
         };
         let effective_claim = trailer_claim.as_ref().or(ctx.checksum.claim.as_ref());
 
-        let result = self
-            .coordinator
-            .finalize_stream_part(FinalizeStreamPartRequest {
+        let result = self.coordinator.finalize_stream_part_with_storage_node(
+            &ctx.storage_node,
+            FinalizeStreamPartRequest {
                 upload: MultipartObjectRequest::new_typed(
                     ctx.bucket().clone(),
                     ctx.key().clone(),
@@ -4273,7 +4322,8 @@ impl HttpFrontend {
                 total_size,
                 claimed_checksum: effective_claim,
                 computed_checksum,
-            })?;
+            },
+        )?;
 
         let sse_customer_headers = ctx
             .sse_customer
@@ -4331,9 +4381,14 @@ impl HttpFrontend {
             ctx.upload_id(),
             ctx.part_number()
         );
-        let _ =
-            self.coordinator
-                .abort_stream_part_session(ctx.bucket(), ctx.key(), ctx.session_id());
+        let _ = self
+            .coordinator
+            .abort_stream_part_session_with_storage_node(
+                &ctx.storage_node,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.session_id(),
+            );
         let _ = observability::emit_stream_upload_phase(
             &ctx.trace,
             TRACE_TARGET,
@@ -4390,6 +4445,7 @@ struct StreamingPartChecksumContract {
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 struct StreamingPutContext {
     trace: observability::TraceContext,
+    storage_node: Arc<StorageCluster>,
     bucket: BucketName,
     key: ObjectKey,
     metadata_blob: crate::metadata_blob::MetadataBlob,
@@ -4406,6 +4462,7 @@ struct StreamingPutContext {
 struct StreamingPostContext {
     trace: observability::TraceContext,
     session_id: SessionId,
+    storage_node: Arc<StorageCluster>,
     metadata_blob: crate::metadata_blob::MetadataBlob,
     system_metadata: SystemMetadata,
     success_status: u16,
@@ -4422,6 +4479,7 @@ struct StreamingPostContext {
 /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
 struct StreamingPartContext {
     trace: observability::TraceContext,
+    storage_node: Arc<StorageCluster>,
     binding: StreamPartBinding,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<String>,
@@ -9817,7 +9875,12 @@ mod tests {
 
         let session_id = fe.start_streaming_put_session(&ctx).unwrap();
         fe.coordinator
-            .abort_stream_put_session(ctx.bucket(), ctx.key(), &session_id)
+            .abort_stream_put_session_with_storage_node(
+                &ctx.storage_node,
+                ctx.bucket(),
+                ctx.key(),
+                &session_id,
+            )
             .unwrap();
     }
 
@@ -10782,21 +10845,25 @@ mod tests {
         let requester = HttpFrontend::requester_from_auth(&test_auth());
         let bucket_name = test_bucket_name(bucket);
         let upload_id = parse_present_upload_id(upload_id).unwrap();
+        let storage_node = fe.coordinator.storage_node_for_request();
         let session = fe
             .coordinator
-            .begin_stream_part(&BeginStreamPartRequest {
-                upload: multipart_object_request(
-                    &bucket_name,
-                    key,
-                    upload_id.clone(),
-                    requester.clone(),
-                    None,
-                )
-                .unwrap(),
-                part_number,
-                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
-                sse_customer: None,
-            })
+            .begin_stream_part_with_storage_node(
+                &storage_node,
+                &BeginStreamPartRequest {
+                    upload: multipart_object_request(
+                        &bucket_name,
+                        key,
+                        upload_id.clone(),
+                        requester.clone(),
+                        None,
+                    )
+                    .unwrap(),
+                    part_number,
+                    policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                    sse_customer: None,
+                },
+            )
             .unwrap();
         let result = (|| {
             use base64::Engine;
@@ -10805,7 +10872,8 @@ mod tests {
                 .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
                 .enumerate()
             {
-                fe.coordinator.append_stream_part_data(
+                fe.coordinator.append_stream_part_data_with_storage_node(
+                    &storage_node,
                     &crate::coordinator::AppendStreamPartRequest {
                         bucket: parse_bucket_name(bucket).unwrap(),
                         key: parse_object_key(key).unwrap(),
@@ -10825,8 +10893,9 @@ mod tests {
                 ChecksumClaim::from_base64(expected.algorithm(), &encoded)
                     .expect("checksum helper must round-trip through base64")
             });
-            fe.coordinator
-                .finalize_stream_part(FinalizeStreamPartRequest {
+            fe.coordinator.finalize_stream_part_with_storage_node(
+                &storage_node,
+                FinalizeStreamPartRequest {
                     upload: multipart_object_request(
                         &bucket_name,
                         key,
@@ -10841,10 +10910,12 @@ mod tests {
                     total_size: data.len() as u64,
                     claimed_checksum: claimed_checksum.as_ref(),
                     computed_checksum,
-                })
+                },
+            )
         })();
         if result.is_err() {
-            let _ = fe.coordinator.abort_stream_part_session(
+            let _ = fe.coordinator.abort_stream_part_session_with_storage_node(
+                &storage_node,
                 &parse_bucket_name(bucket).unwrap(),
                 &parse_object_key(key).unwrap(),
                 &session.session_id,

@@ -109,12 +109,22 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub fn append_stream_part_data(
         &self,
         req: &AppendStreamPartRequest<'_>,
     ) -> Result<(), ServerError> {
+        self.append_stream_part_data_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub fn append_stream_part_data_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AppendStreamPartRequest<'_>,
+    ) -> Result<(), ServerError> {
         let write_encryption = self
-            .load_stream_part_write_encryption(
+            .load_stream_part_write_encryption_with_storage_node(
+                storage_node,
                 &req.bucket,
                 &req.key,
                 req.session_id,
@@ -131,7 +141,8 @@ impl Coordinator {
                 other => other,
             })?;
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
-        self.append_stream_segment_for(
+        self.append_stream_segment_for_storage_node(
+            storage_node,
             &req.bucket,
             &req.key,
             req.session_id,
@@ -153,8 +164,17 @@ impl Coordinator {
     ///
     /// Creates a `StreamUploadKind::UploadPart` session tied to the given
     /// multipart upload. Validates that the upload exists and is InProgress.
+    #[cfg(test)]
     pub fn begin_stream_part(
         &self,
+        req: &BeginStreamPartRequest<'_>,
+    ) -> Result<BeginStreamPartResult, ServerError> {
+        self.begin_stream_part_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub fn begin_stream_part_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &BeginStreamPartRequest<'_>,
     ) -> Result<BeginStreamPartResult, ServerError> {
         observability::trace_scope!(
@@ -171,10 +191,13 @@ impl Coordinator {
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         let session_id = Self::random_session_id("failed to generate session ID")?;
-        self.with_bucket_write_handle_for_command(&req.upload, request, |bucket_handle, proof| {
+        self.with_bucket_write_handle_for_command_with_storage_node(
+            storage_node,
+            &req.upload,
+            request,
+            |bucket_handle, proof| {
             let mut proof_transferred_to_command = false;
             let result = (|| {
-                let storage_node = self.storage_node();
                 #[cfg(test)]
                 if should_probe_begin_stream_part_session(req.upload.bucket_name()) {
                     let object_pg_ready = storage_node
@@ -231,7 +254,8 @@ impl Coordinator {
             } else {
                 storage::BucketWriteSnapshotAction::release(result)
             }
-        })
+            },
+        )
     }
 
     pub(super) fn validate_upload_part_number(part_number: u32) -> Result<(), ServerError> {
@@ -352,6 +376,7 @@ impl Coordinator {
         &self,
         req: &CompleteMultipartUploadRequest,
     ) -> Result<CompleteMultipartUploadResult, ServerError> {
+        let storage_node = self.storage_node();
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::complete_multipart_upload",
@@ -370,7 +395,7 @@ impl Coordinator {
                 upload_id,
                 upload,
                 multipart_write_encryption,
-            } = self.authorize_complete_multipart_upload(req)?;
+            } = self.authorize_complete_multipart_upload_with_storage_node(&storage_node, req)?;
             let parts = req.parts;
             let claimed_checksum = req.claimed_checksum;
             let expected_object_size = req.expected_object_size;
@@ -397,8 +422,7 @@ impl Coordinator {
                 parts.iter().map(|part| part.part_number).collect();
             #[cfg(test)]
             maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
-            let completion_snapshot = self
-                .storage_node()
+            let completion_snapshot = storage_node
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
                 .map_err(|error| match error {
                     storage::ObjectPgActionError::Metadata(
@@ -690,36 +714,33 @@ impl Coordinator {
             #[cfg(test)]
             maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
 
-            let completion_outcome = match self
-                .storage_node()
-                .complete_multipart_upload_commit_serialized(
-                    storage::CompleteMultipartCommitRequest {
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        upload_id: upload_id.clone(),
-                        versioning: bucket_info.versioning,
-                        owner: upload.owner.clone(),
-                        acl_grants: upload.acl_grants.clone(),
-                        public_read: upload.public_read,
-                        generation_id: upload.object_generation_id,
-                        size: total_size,
-                        etag_crc64,
-                        tags: upload.tags.clone(),
-                        metadata_blob: Some(upload.metadata_blob.clone()),
-                        system_metadata_blob: Some(system_metadata_bytes),
-                        object_lock: Self::resolve_new_object_lock_state(
-                            &bucket_info,
-                            upload.object_lock,
-                        )?,
-                        encryption: final_encryption,
-                        expected_stale_payload_source: completion_snapshot.stale_payload_source,
-                        part_records: part_records.clone(),
-                        selected_streaming_segments: completion_snapshot
-                            .selected_streaming_segments,
-                        expected_cleanup: completion_snapshot.cleanup,
-                    },
-                    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
-                ) {
+            let completion_outcome = match storage_node.complete_multipart_upload_commit_serialized(
+                storage::CompleteMultipartCommitRequest {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                    versioning: bucket_info.versioning,
+                    owner: upload.owner.clone(),
+                    acl_grants: upload.acl_grants.clone(),
+                    public_read: upload.public_read,
+                    generation_id: upload.object_generation_id,
+                    size: total_size,
+                    etag_crc64,
+                    tags: upload.tags.clone(),
+                    metadata_blob: Some(upload.metadata_blob.clone()),
+                    system_metadata_blob: Some(system_metadata_bytes),
+                    object_lock: Self::resolve_new_object_lock_state(
+                        &bucket_info,
+                        upload.object_lock,
+                    )?,
+                    encryption: final_encryption,
+                    expected_stale_payload_source: completion_snapshot.stale_payload_source,
+                    part_records: part_records.clone(),
+                    selected_streaming_segments: completion_snapshot.selected_streaming_segments,
+                    expected_cleanup: completion_snapshot.cleanup,
+                },
+                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
+            ) {
                 Ok(outcome) => outcome,
                 Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot)
                     if stale_commit_retries < COMPLETE_MULTIPART_STALE_COMMIT_RETRIES =>
@@ -745,7 +766,8 @@ impl Coordinator {
                 lifecycle_last_modified,
             )?;
             if let Some(ref payload) = stale_payload {
-                self.delete_stale_object_payload(&bucket, &key, payload);
+                self.read_runtime_for_storage_node(std::sync::Arc::clone(&storage_node))
+                    .enqueue_object_payload_reclaim_for(&bucket, &key, payload.generation_id);
             }
 
             return Ok(CompleteMultipartUploadResult {
@@ -765,6 +787,7 @@ impl Coordinator {
     /// Publishes an abort metadata command, best-effort deletes all part shard
     /// sets, then deletes the upload and part metadata rows.
     pub fn abort_multipart_upload(&self, req: &MultipartObjectRequest) -> Result<(), ServerError> {
+        let storage_node = self.storage_node();
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::abort_multipart_upload",
@@ -773,11 +796,11 @@ impl Coordinator {
             req.object.key,
             req.upload_id()
         );
-        match self.authorize_abort_multipart_upload(req)? {
+        match self.authorize_abort_multipart_upload_with_storage_node(&storage_node, req)? {
             AuthorizedAbortMultipartUpload::Completed => Ok(()),
             AuthorizedAbortMultipartUpload::InProgress { upload } => {
                 if self
-                    .read_runtime()
+                    .read_runtime_for_storage_node(std::sync::Arc::clone(&storage_node))
                     .abort_authorized_multipart_upload_internal(&upload)?
                 {
                     Ok(())
@@ -947,6 +970,7 @@ impl Coordinator {
     /// rows, and atomically commits the part via `commit_stream_part`.
     /// `computed_checksum` is the actual checksum bytes computed incrementally
     /// during streaming. If `None`, the checksum is derived from `claimed_checksum`.
+    #[cfg(test)]
     pub fn finalize_stream_part(
         &self,
         req: FinalizeStreamPartRequest,
@@ -954,7 +978,7 @@ impl Coordinator {
         self.finalize_stream_part_with_storage_node(&self.storage_node(), req)
     }
 
-    pub(super) fn finalize_stream_part_with_storage_node(
+    pub fn finalize_stream_part_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: FinalizeStreamPartRequest,
@@ -1182,12 +1206,28 @@ impl Coordinator {
         Ok(result)
     }
 
+    #[cfg(test)]
     pub fn abort_stream_part_session(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.abort_stream_put_for(bucket, key, session_id)
+        self.abort_stream_part_session_with_storage_node(
+            &self.storage_node(),
+            bucket,
+            key,
+            session_id,
+        )
+    }
+
+    pub fn abort_stream_part_session_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        self.abort_stream_put_for_storage_node(storage_node, bucket, key, session_id)
     }
 }

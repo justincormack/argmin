@@ -694,8 +694,9 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_complete_multipart_upload_non_boe(
+    pub(in crate::coordinator) fn authorize_complete_multipart_upload_non_boe_with_storage_node(
         &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &CompleteMultipartUploadRequest<'_>,
         bucket_handle: NonBoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
@@ -707,7 +708,7 @@ impl Coordinator {
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         #[cfg(test)]
         let upload = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
-            self.storage_node()
+            storage_node
                 .try_load_in_progress_multipart_upload(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)
                 .and_then(|upload| {
@@ -716,13 +717,12 @@ impl Coordinator {
                     })
                 })?
         } else {
-            self.storage_node()
+            storage_node
                 .load_in_progress_multipart_upload(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)?
         };
         #[cfg(not(test))]
-        let upload = self
-            .storage_node()
+        let upload = storage_node
             .load_in_progress_multipart_upload(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
@@ -761,17 +761,30 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_abort_multipart_upload(
         &self,
+        req: &MultipartObjectRequest<'_>,
+    ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
+        self.authorize_abort_multipart_upload_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(in crate::coordinator) fn authorize_abort_multipart_upload_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &MultipartObjectRequest<'_>,
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
         let upload_id = req.upload_id_typed();
-        let bucket_info =
-            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        let authorized = match self
-            .storage_node()
+        let bucket_info = self.checked_active_bucket_summary_for_storage_node(
+            storage_node,
+            bucket,
+            req.expected_bucket_owner(),
+        )?;
+        #[cfg(test)]
+        super::maybe_run_abort_multipart_bucket_summary_hook(bucket.as_str(), key.as_str());
+        let authorized = match storage_node
             .lookup_multipart_upload_management(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?
         {
@@ -818,6 +831,8 @@ impl Coordinator {
                 });
             }
         };
+        #[cfg(test)]
+        super::maybe_run_abort_multipart_auth_lookup_hook(bucket.as_str(), key.as_str());
         Ok(authorized)
     }
 

@@ -68,6 +68,7 @@ use super::response_types::{BucketSummary, GetBucketAclResult, ModernBucketSumma
 use super::Coordinator;
 #[cfg(test)]
 use super::{
+    maybe_run_abort_multipart_auth_lookup_hook, maybe_run_abort_multipart_bucket_summary_hook,
     maybe_run_bucket_policy_fast_path_hook, maybe_run_bucket_policy_storage_load_hook,
     maybe_run_bucket_write_handle_loaded_hook, should_probe_delete_object_lookup,
     should_probe_multipart_complete_auth_lookup, should_probe_object_read_snapshot,
@@ -293,23 +294,41 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_complete_multipart_upload(
         &self,
+        req: &CompleteMultipartUploadRequest<'_>,
+    ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
+        self.authorize_complete_multipart_upload_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(in crate::coordinator) fn authorize_complete_multipart_upload_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &CompleteMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
-        self.with_bucket_write_handle_for(&req.upload, request, |bucket_handle| {
-            match ObjectAuthLoadedBucketHandle::classify(&bucket_handle) {
-                ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => {
-                    self.authorize_complete_multipart_upload_boe(req, bucket_handle)
-                }
-                ObjectAuthLoadedBucketHandle::NonBoe(bucket_handle) => {
-                    self.authorize_complete_multipart_upload_non_boe(req, bucket_handle)
-                }
-            }
-        })
+        self.with_bucket_write_handle_for_storage_node(
+            storage_node,
+            &req.upload,
+            request,
+            |bucket_handle| match ObjectAuthLoadedBucketHandle::classify(&bucket_handle) {
+                ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => self
+                    .authorize_complete_multipart_upload_boe_with_storage_node(
+                        storage_node,
+                        req,
+                        bucket_handle,
+                    ),
+                ObjectAuthLoadedBucketHandle::NonBoe(bucket_handle) => self
+                    .authorize_complete_multipart_upload_non_boe_with_storage_node(
+                        storage_node,
+                        req,
+                        bucket_handle,
+                    ),
+            },
+        )
     }
 
     fn authorize_object_read_snapshot(
@@ -1660,26 +1679,6 @@ impl Coordinator {
                 },
             )
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
-    }
-
-    pub(super) fn with_bucket_write_handle_for_command<R, T>(
-        &self,
-        req: &R,
-        request: BucketHandleRequest,
-        action: impl FnOnce(
-            LoadedBucketHandle,
-            storage::BucketWriteReservationProof,
-        ) -> storage::BucketWriteSnapshotAction<T, ServerError>,
-    ) -> Result<T, ServerError>
-    where
-        R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
-    {
-        self.with_bucket_write_handle_for_command_with_storage_node(
-            &self.storage_node(),
-            req,
-            request,
-            action,
-        )
     }
 
     pub(super) fn with_bucket_write_handle_for_command_with_storage_node<R, T>(

@@ -83,6 +83,7 @@ impl Coordinator {
         Ok(SessionId::try_from(encoded).expect("generated session IDs must be valid"))
     }
 
+    #[cfg(test)]
     pub(super) fn create_stream_put_session_for_authorized_write(
         &self,
         authorized: &AuthorizedPutObjectWrite,
@@ -117,6 +118,14 @@ impl Coordinator {
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         self.authorize_put_object_write(req)
+    }
+
+    pub fn prepare_put_object_write_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &AuthorizePutObjectRequest<'_>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        self.authorize_put_object_write_with_storage_node(storage_node, req)
     }
 
     #[cfg(test)]
@@ -224,8 +233,15 @@ impl Coordinator {
         &self,
         name: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
-        let info = self
-            .storage_node()
+        self.unchecked_active_bucket_summary_for_storage_node(&self.storage_node(), name)
+    }
+
+    pub(super) fn unchecked_active_bucket_summary_for_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        name: &BucketName,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = storage_node
             .head_bucket_info(name)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         if info.state != BucketState::Active {
@@ -241,8 +257,21 @@ impl Coordinator {
         name: &BucketName,
         expected_bucket_owner: Option<&str>,
     ) -> Result<ValidatedBucket, ServerError> {
+        self.checked_active_bucket_summary_for_storage_node(
+            &self.storage_node(),
+            name,
+            expected_bucket_owner,
+        )
+    }
+
+    pub(super) fn checked_active_bucket_summary_for_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        name: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ValidatedBucket, ServerError> {
         Self::validate_expected_bucket_owner(
-            self.unchecked_active_bucket_summary_for(name)?,
+            self.unchecked_active_bucket_summary_for_storage_node(storage_node, name)?,
             expected_bucket_owner,
         )
     }
@@ -522,6 +551,10 @@ impl Coordinator {
 
     pub(super) fn storage_node(&self) -> Arc<StorageCluster> {
         self.storage_node.current()
+    }
+
+    pub fn storage_node_for_request(&self) -> Arc<StorageCluster> {
+        self.storage_node()
     }
 
     #[cfg(test)]

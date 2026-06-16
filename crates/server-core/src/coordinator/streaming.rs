@@ -140,8 +140,24 @@ impl Coordinator {
         session_id: &SessionId,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let session = self
-            .storage_node()
+        self.load_stream_put_write_encryption_with_storage_node(
+            &self.storage_node(),
+            bucket,
+            key,
+            session_id,
+            sse_customer,
+        )
+    }
+
+    pub(super) fn load_stream_put_write_encryption_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<ActiveWriteEncryption, ServerError> {
+        let session = storage_node
             .load_stream_upload_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)?;
         self.resume_write_encryption(
@@ -418,6 +434,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn append_stream_segment_for(
         &self,
         bucket: &BucketName,
@@ -543,6 +560,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn abort_stream_put_for(
         &self,
         bucket: &BucketName,
@@ -564,6 +582,7 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)
     }
 
+    #[cfg(test)]
     pub(super) fn abort_stream_put_for_cleanup(
         &self,
         bucket: &BucketName,
@@ -597,17 +616,6 @@ impl Coordinator {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    pub(super) fn heartbeat_stream_put_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        self.storage_node()
-            .heartbeat_put_object_stream_session(bucket, key, session_id)
-            .map_err(Self::map_object_pg_action_error)
     }
 
     #[cfg(test)]

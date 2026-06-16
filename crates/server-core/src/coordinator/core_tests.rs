@@ -303,6 +303,527 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
         .unwrap();
 }
 
+#[test]
+fn put_object_pins_runtime_map_after_bucket_write_reservation() {
+    let bucket = "direct-put-pinned-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some(bucket.to_string()),
+        after_loaded: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, "key", test_requester(), None),
+            data: b"direct-put-pinned-runtime-map",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    handle.install(initial).unwrap();
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        result.body.read_all().unwrap(),
+        b"direct-put-pinned-runtime-map"
+    );
+}
+
+#[test]
+fn large_put_object_pins_runtime_map_after_stream_session_create() {
+    let bucket = "large-put-pinned-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some(bucket.to_string()),
+        after_loaded: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
+
+    let metadata = MetadataBlob::new();
+    let data = vec![b'x'; INTERNAL_SEGMENT_SIZE + 1];
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, "large", test_requester(), None),
+            data: &data,
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    handle.install(initial).unwrap();
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "large",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+}
+
+#[test]
+fn streaming_upload_part_pins_runtime_map_after_session_create() {
+    let bucket = "stream-part-pinned-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(bucket, "key", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let storage_node = coord.storage_node_for_request();
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let session = {
+        let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+            bucket: Some(bucket.to_string()),
+            after_loaded: Some(Arc::new(move || {
+                hook_handle.install(Arc::clone(&candidate)).unwrap();
+            })),
+            ..BucketWriteHandleTestHooks::default()
+        });
+
+        coord
+            .begin_stream_part_with_storage_node(
+                &storage_node,
+                &BeginStreamPartRequest {
+                    upload: multipart_object_request_with_expected_owner(
+                        bucket,
+                        "key",
+                        &upload.upload_id,
+                        test_requester(),
+                        None,
+                    ),
+                    part_number: 1,
+                    policy_context: PutObjectPolicyContext::default(),
+                    sse_customer: None,
+                },
+            )
+            .unwrap()
+    };
+    let data = b"streaming-upload-part-pinned-runtime-map";
+    coord
+        .append_stream_part_data_with_storage_node(
+            &storage_node,
+            &AppendStreamPartRequest {
+                bucket: BucketName::new(bucket).unwrap(),
+                key: ObjectKey::new("key").unwrap(),
+                upload_id: &upload.upload_id,
+                session_id: &session.session_id,
+                part_number: 1,
+                segment_index: 0,
+                data,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+    let crc64 = checksum::crc64::checksum(data);
+    let part = coord
+        .finalize_stream_part_with_storage_node(
+            &storage_node,
+            FinalizeStreamPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    bucket,
+                    "key",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                session_id: &session.session_id,
+                part_number: 1,
+                crc64,
+                total_size: data.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            },
+        )
+        .unwrap();
+
+    handle.install(initial).unwrap();
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: part.etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+}
+
+#[test]
+fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
+    let bucket = "complete-multipart-pinned-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(
+        &coord,
+        bucket,
+        "key",
+        &[(1, b"complete-multipart-pinned-runtime-map")],
+    );
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), "key".to_string())),
+        after_multipart_complete_pre_commit: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    handle.install(initial).unwrap();
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        result.body.read_all().unwrap(),
+        b"complete-multipart-pinned-runtime-map"
+    );
+}
+
+#[test]
+fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
+    let bucket = "abort-multipart-pinned-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(bucket, "key", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), "key".to_string())),
+        after_abort_multipart_auth_lookup: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    coord
+        .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+            bucket,
+            "key",
+            &upload.upload_id,
+            test_requester(),
+            None,
+        ))
+        .unwrap();
+
+    handle.install(initial).unwrap();
+    let err = coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number_marker: None,
+            max_parts: 1000,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected pinned abort to remove upload from original map, got {err:?}"
+    );
+}
+
+#[test]
+fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
+    let bucket = "abort-multipart-bucket-summary-pinned";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(bucket, "key", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let hook_handle = handle.clone();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), "key".to_string())),
+        after_abort_multipart_bucket_summary: Some(Arc::new(move || {
+            hook_handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    coord
+        .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+            bucket,
+            "key",
+            &upload.upload_id,
+            test_requester(),
+            None,
+        ))
+        .unwrap();
+
+    handle.install(initial).unwrap();
+    let err = coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number_marker: None,
+            max_parts: 1000,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected pinned abort to remove upload from original map, got {err:?}"
+    );
+}
+
 fn install_bucket_command_log_conflict_hook(
     storage_cluster: &Arc<StorageCluster>,
     bucket: &BucketName,

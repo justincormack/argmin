@@ -2,10 +2,10 @@ use checksum::{ChecksumAlgorithm, ChecksumType};
 #[cfg(test)]
 use s3_types::VersionId;
 #[cfg(test)]
-use storage::StoredObject;
+use storage::{BucketName, ObjectKey, StoredObject};
 use storage::{
-    BucketName, GenerationId, ObjectEncryption, ObjectKey, ObjectPartRecord,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    GenerationId, ObjectEncryption, ObjectPartRecord, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob,
 };
 
 use super::{ActiveWriteEncryption, Coordinator, SegmentPayloadRecord};
@@ -243,15 +243,5 @@ impl Coordinator {
             ObjectEncryption::None => {}
         }
         Ok(system_metadata)
-    }
-
-    pub(super) fn delete_stale_object_payload(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        payload: &StaleObjectPayload,
-    ) {
-        self.read_runtime()
-            .enqueue_object_payload_reclaim_for(bucket, key, payload.generation_id);
     }
 }

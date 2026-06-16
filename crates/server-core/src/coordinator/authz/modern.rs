@@ -352,8 +352,9 @@ impl Coordinator {
         })
     }
 
-    pub(super) fn authorize_complete_multipart_upload_boe(
+    pub(super) fn authorize_complete_multipart_upload_boe_with_storage_node(
         &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &CompleteMultipartUploadRequest<'_>,
         bucket_handle: BoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
@@ -367,7 +368,7 @@ impl Coordinator {
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         #[cfg(test)]
         let upload = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
-            self.storage_node()
+            storage_node
                 .try_load_in_progress_multipart_upload(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)
                 .and_then(|upload| {
@@ -376,13 +377,12 @@ impl Coordinator {
                     })
                 })?
         } else {
-            self.storage_node()
+            storage_node
                 .load_in_progress_multipart_upload(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)?
         };
         #[cfg(not(test))]
-        let upload = self
-            .storage_node()
+        let upload = storage_node
             .load_in_progress_multipart_upload(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
