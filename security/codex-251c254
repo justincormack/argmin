@@ -1,0 +1,153 @@
+Unchecked RPC counts allow control-plane DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/0042967f90ec81918f4d364d00428d43?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 251c254
+Author: justin@specialbusservice.com
+Created: 16/06/2026, 10:40:24
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Resolution
+Fixed in https://github.com/justincormack/argmin/commit/8b45d67d3e1ff591a8937a7962242a03c10f8953.
+
+The control-plane RPC decoder now validates nested collection counts against
+the remaining bounded frame payload before allocating collection capacity. The
+fix applies to heartbeat PG observations, runtime-map nodes, runtime-map PG
+routes, and PG route acting sets. Oversized counts now fail with
+ControlPlaneError::RpcProtocol before Vec::with_capacity is called.
+
+Regression coverage added:
+- control_plane_rpc_rejects_oversized_heartbeat_observation_count_before_allocation
+- control_plane_rpc_rejects_oversized_runtime_node_count_before_allocation
+- control_plane_rpc_rejects_oversized_runtime_route_count_before_allocation
+- control_plane_rpc_rejects_oversized_runtime_acting_set_count_before_allocation
+
+Validation run before the fix commit:
+- cargo test -p storage control_plane_rpc_rejects_oversized_heartbeat_observation_count_before_allocation
+- cargo test -p storage control_plane_rpc_rejects_oversized_runtime_node_count_before_allocation
+- cargo test -p storage control_plane_rpc_rejects_oversized_runtime_route_count_before_allocation
+- cargo test -p storage control_plane_rpc_rejects_oversized_runtime_acting_set_count_before_allocation
+- cargo check -p storage --all-targets
+- cargo clippy -p storage --all-targets --all-features -- -D warnings
+- git diff --check
+
+# Summary
+Introduced: the new control-plane Unix RPC transport contains unchecked nested length fields in request deserialization. The outer frame payload is bounded, but collection capacities are derived from untrusted counts rather than from the remaining payload size or configured limits.
+The commit adds a Unix-domain control-plane RPC server. The frame reader caps the total frame payload at 8 MiB, but the payload decoder then reads internal length/count fields directly from attacker-controlled bytes. For RefreshNodeHeartbeat, read_node_heartbeat reads observation_count and immediately calls Vec::with_capacity(observation_count). A client that can connect to the private control-plane socket can send a small, checksum-valid frame with observation_count set to a very large u32, without including corresponding observation records. The allocation happens before trailing/truncation validation or node authorization, so the request can force an enormous allocation attempt and may abort or exhaust memory in the control-plane worker/process. The CRC64 frame checksum does not prevent this because the client can compute a valid checksum for the malicious payload.
+
+# Validation
+## Rubric
+- [x] Confirm the introduced Unix control-plane path accepts/deserializes client-controlled RPC frames before request-specific authorization.
+- [x] Confirm the frame layer bounds only the outer payload and that the checksum is client-computable, not an authenticity protection.
+- [x] Confirm RefreshNodeHeartbeat deserialization reads a nested observation_count via PayloadReader::read_len without checking remaining payload or a maximum.
+- [x] Confirm allocation occurs immediately from the attacker-controlled count before truncation validation and before the authority refresh method is called.
+- [x] Dynamically validate with a small checksum-valid frame that triggers an oversized allocation/crash; attempt valgrind and debugger corroboration.
+## Report
+Validated the suspected unchecked nested length allocation in Rust. Built a targeted PoC crate at /workspace/argmin/validation-poc using the real public storage::control_plane::handle_control_plane_unix_stream path over UnixStream::pair. The PoC sends a checksum-valid control-plane RPC frame with a 36-byte RefreshNodeHeartbeat payload and observation_count=4294967295. Code evidence: crates/storage/src/control_plane.rs:1997-2009 bounds only the outer payload length before reading it; crates/storage/src/control_plane.rs:2016-2018 verifies a client-computable checksum; crates/storage/src/control_plane.rs:1878-1881 dispatches RefreshNodeHeartbeat to read_node_heartbeat before calling the authority; crates/storage/src/control_plane.rs:2105-2106 reads PG observations length and immediately calls Vec::with_capacity(observation_count); crates/storage/src/control_plane.rs:2404-2407 returns a raw u32 length as usize without checking remaining payload or a protocol maximum. A sanity run with count=1 returned only Err(RpcProtocol { message: "truncated control-plane RPC payload" }), showing the PoC reaches the decoder. The crashing run with POC_RLIMIT_AS=200000000 aborted with exit 134 and "memory allocation of 137438953440 bytes failed". LLDB confirmed the crash chain: alloc::vec::Vec::with_capacity(capacity=4294967295) -> storage::control_plane::read_node_heartbeat at control_plane.rs:2106 -> build_control_plane_unix_response at control_plane.rs:1880 -> handle_control_plane_unix_stream at control_plane.rs:1833 -> PoC main. Valgrind was attempted but is not installed in the container.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L274 to 283)
+  Note: The new control-plane loop accepts Unix socket connections and dispatches each accepted stream to an RPC worker.
+```
+    loop {
+        for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    spawn_control_plane_rpc_worker(
+                        stream,
+                        Arc::clone(&authority),
+                        Arc::clone(&active_rpc_workers),
+                    );
+                }
+```
+
+crates/argmin-s3/src/main.rs (L341 to 353)
+  Note: The worker reads an untrusted RPC request and passes it to the control-plane response builder before any client identity or per-request authorization check.
+```
+        let request = match read_control_plane_unix_request(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("control-plane RPC request read failed: {error}");
+                return;
+            }
+        };
+        let now_ms = storage::clock::current_time_millis();
+        let response = {
+            let mut authority = authority
+                .lock()
+                .expect("control-plane authority mutex poisoned");
+            build_control_plane_unix_response(&mut *authority, request, now_ms)
+```
+
+crates/storage/src/control_plane.rs (L1864 to 1881)
+  Note: RefreshNodeHeartbeat RPC payloads are decoded via read_node_heartbeat before the heartbeat is validated by the authority.
+```
+    let ControlPlaneRpcRequest { kind, payload } = request;
+    let response = match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.runtime_map_snapshot(authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            let mut reader = PayloadReader::new(&payload);
+            let heartbeat = read_node_heartbeat(&mut reader)?;
+            reader.finish()?;
+```
+
+crates/storage/src/control_plane.rs (L1997 to 2009)
+  Note: The frame reader caps only the outer payload length at 8 MiB; it does not constrain nested count fields inside that payload.
+```
+    let payload_len_u32 = reader.read_u32()?;
+    let payload_len =
+        usize::try_from(payload_len_u32).map_err(|_| ControlPlaneError::RpcProtocol {
+            message: "control-plane RPC payload length does not fit usize".to_owned(),
+        })?;
+    let expected_checksum = reader.read_u64()?;
+    reader.finish()?;
+    if payload_len > CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("control-plane RPC payload too large: {payload_len}"),
+        });
+    }
+    let mut payload = vec![0; payload_len];
+```
+
+crates/storage/src/control_plane.rs (L2099 to 2107)
+  Note: read_node_heartbeat reads an attacker-controlled observation_count and immediately reserves that many NodePgHeartbeatObservation entries, allowing a tiny payload to request a huge allocation.
+```
+fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, ControlPlaneError> {
+    let node_id = NodeId::new(reader.read_u32()?);
+    let node_incarnation = reader.read_u64()?;
+    let endpoint = reader.read_string()?.to_owned();
+    let observed_epoch = read_cluster_epoch(reader, "heartbeat observed epoch")?;
+    let requested_lease_duration_ms = reader.read_u64()?;
+    let observation_count = reader.read_len("PG observations")?;
+    let mut pg_observations = Vec::with_capacity(observation_count);
+    for _ in 0..observation_count {
+```
+
+crates/storage/src/control_plane.rs (L2404 to 2412)
+  Note: PayloadReader::read_len returns the raw u32 length as usize with no relationship to remaining payload bytes or protocol-specific maximums.
+```
+    fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
+        usize::try_from(self.read_u32()?).map_err(|_| ControlPlaneError::RpcProtocol {
+            message: format!("{field} length does not fit usize"),
+        })
+    }
+
+    fn read_bytes(&mut self) -> Result<&'a [u8], ControlPlaneError> {
+        let len = self.read_len("byte field")?;
+        self.read_exact(len)
+```
