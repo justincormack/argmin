@@ -517,6 +517,13 @@ impl ClusterControlSnapshot {
         for record in self.nodes.values_mut() {
             record.pg_observations.clear();
         }
+        for record in self.pgs.values_mut() {
+            if record.state == PgState::Active {
+                record.state = PgState::Peering;
+                record.active_primary = None;
+                record.active_metadata_proof = None;
+            }
+        }
         Ok(())
     }
 
@@ -7445,6 +7452,125 @@ mod tests {
             .pg_observation(PgId::new(18))
             .is_none());
         SingleAuthorityControlPlane::open(store).unwrap();
+    }
+
+    #[test]
+    fn authority_restart_moves_active_pg_back_to_peering_before_service() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(26), vec![NodeId::new(1)])
+            .unwrap();
+        let active_metadata_proof = PgMetadataProof {
+            applied_log_index: 11,
+            applied_log_hash: 12,
+            state_digest: 13,
+        };
+        let mut peering_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(26),
+            state: PgState::Peering,
+            metadata_proof: active_metadata_proof,
+        }];
+        authority.heartbeat(peering_heartbeat, 2_000).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(26),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let mut active_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_002);
+        active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(26),
+            state: PgState::Active,
+            metadata_proof: active_metadata_proof,
+        }];
+        let active = authority.heartbeat(active_heartbeat, 2_002).unwrap();
+        let active_epoch = active.cluster_epoch();
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(26)).unwrap().state(),
+            PgState::Active
+        );
+
+        let mut restarted = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let restart_epoch = restarted.snapshot().cluster_epoch();
+        assert!(restart_epoch > active_epoch);
+        let restarted_pg = restarted.snapshot().pg(PgId::new(26)).unwrap();
+        assert_eq!(restarted_pg.state(), PgState::Peering);
+        assert_eq!(restarted_pg.active_primary(), None);
+        assert_eq!(restarted_pg.active_metadata_proof(), None);
+        let historical_pg = restarted
+            .snapshot()
+            .cluster_map_at_epoch(active_epoch)
+            .unwrap()
+            .pgs()
+            .iter()
+            .find(|record| record.pg_id() == PgId::new(26))
+            .unwrap();
+        assert_eq!(historical_pg.state(), PgState::Active);
+        assert_eq!(historical_pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(
+            historical_pg.active_metadata_proof(),
+            Some(active_metadata_proof)
+        );
+
+        let mut stale_active_heartbeat = heartbeat_from_record(&restarted, 1, restart_epoch, 2_003);
+        stale_active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(26),
+            state: PgState::Active,
+            metadata_proof: active_metadata_proof,
+        }];
+        let refresh = restarted
+            .refresh_node_heartbeat(stale_active_heartbeat, 2_003)
+            .unwrap();
+        assert!(refresh.lease().serving());
+        assert_eq!(
+            refresh.runtime_map().pg_routes()[0].state(),
+            PgState::Peering
+        );
+        assert!(matches!(
+            restarted.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(26),
+                NodeId::new(1),
+                node_incarnation(&restarted, 1),
+                restart_epoch,
+                2_004,
+            ),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 26,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+
+        let mut current_peering_heartbeat =
+            heartbeat_from_record(&restarted, 1, restart_epoch, 2_005);
+        current_peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(26),
+            state: PgState::Peering,
+            metadata_proof: active_metadata_proof,
+        }];
+        let refresh = restarted
+            .refresh_node_heartbeat(current_peering_heartbeat, 2_005)
+            .unwrap();
+        assert!(
+            !refresh.lease().serving(),
+            "peering completion bumps the epoch before the node observes it"
+        );
+        assert_eq!(
+            refresh.runtime_map().pg_routes()[0].state(),
+            PgState::Active
+        );
     }
 
     #[test]

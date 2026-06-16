@@ -7099,9 +7099,12 @@ Status:
   accepts only the current version 7 format rather than carrying compatibility
   for earlier Phase 11 scratch formats.
 - Fixed the restart epoch-bump path to clear current PG observations just like
-  ordinary epoch changes. Restart still records the previous map in history, so
-  stale-route diagnostics retain the pre-restart observations, but the newly
-  persisted current map cannot contain node observations from the old epoch.
+  ordinary epoch changes and to move Active PGs back to `Peering` before the
+  restarted authority exposes its new epoch. Restart still records the previous
+  map in history, so stale-route diagnostics retain the pre-restart
+  observations and active-primary bindings, but the newly persisted current map
+  cannot contain node observations from the old epoch or continue serving an
+  Active PG without current-epoch peering.
 - Bound `Active` PG records to the primary that completed peering. The
   authority now persists the active primary in the current control-plane state
   format, clears that binding whenever a PG returns to `Peering`, and fails
