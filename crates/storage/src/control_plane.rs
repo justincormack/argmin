@@ -7680,6 +7680,164 @@ mod tests {
     }
 
     #[test]
+    fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(20), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 20, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(20),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 1, 20, PgState::Active, 2_002);
+        let old_epoch = active.cluster_epoch();
+        let old_authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(20),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                old_epoch,
+                2_003,
+            )
+            .unwrap();
+        authority
+            .validate_pg_operation_authorization(&old_authorization, 2_004)
+            .unwrap();
+
+        authority
+            .set_pg_acting_set(PgId::new(20), vec![NodeId::new(2)])
+            .unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        assert!(peering_epoch > old_epoch);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(20)).unwrap().state(),
+            PgState::Peering
+        );
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(&old_authorization, 2_005),
+            Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch,
+                current_epoch,
+            }) if cluster_epoch == old_epoch && current_epoch == peering_epoch
+        ));
+        for node_id in [1, 2] {
+            let now_ms = 2_006 + u64::from(node_id);
+            authority
+                .heartbeat(
+                    heartbeat_from_record(&authority, node_id, peering_epoch, now_ms),
+                    now_ms,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(20),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                peering_epoch,
+                2_009,
+            ),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 20,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(20),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                peering_epoch,
+                2_010,
+            ),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 20,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+
+        let mut node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 2_011);
+        node_two_peering.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(20),
+            state: PgState::Peering,
+            metadata_proof: PgMetadataProof {
+                applied_log_index: 77,
+                applied_log_hash: 0xabcddcba,
+                state_digest: 0x12344321,
+            },
+        }];
+        authority.heartbeat(node_two_peering, 2_011).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(20),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                2_012,
+            )
+            .unwrap();
+        let new_active =
+            heartbeat_with_pg_observation(&mut authority, 2, 20, PgState::Active, 2_013);
+        let new_epoch = new_active.cluster_epoch();
+        assert!(new_epoch > peering_epoch);
+
+        authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, new_epoch, 2_014),
+                2_014,
+            )
+            .unwrap();
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(20),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                new_epoch,
+                2_015,
+            ),
+            Err(ControlPlaneError::NodeNotPgPrimary {
+                pg_id: 20,
+                node_id: 1,
+                primary_node_id: 2,
+                ..
+            })
+        ));
+
+        let new_authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(20),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                new_epoch,
+                2_016,
+            )
+            .unwrap();
+        assert_eq!(new_authorization.primary_node_id(), NodeId::new(2));
+        authority
+            .validate_pg_operation_authorization(&new_authorization, 2_017)
+            .unwrap();
+    }
+
+    #[test]
     fn failed_expiry_persist_does_not_expose_uncommitted_epoch_or_map() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

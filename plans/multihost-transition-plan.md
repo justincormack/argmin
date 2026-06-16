@@ -7335,6 +7335,11 @@ Status:
   expiry epoch transition: a node reporting its stale Active route receives the
   current Peering map and a non-serving lease, not an Active route backed by the
   expired lease.
+- Extended the deterministic epoch-transition fault regressions to cover an
+  acting-set change. A metadata-write token issued to the old active primary is
+  fenced by the epoch bump, both old and new primaries fail closed while the PG
+  is `Peering`, and only the replacement primary can receive and validate a new
+  operation authorization after current-epoch peering proof completes.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition
