@@ -1,0 +1,1316 @@
+use super::*;
+
+fn shard_scavenger_observation_reason_name(
+    reason: ShardScavengerObservationReason,
+) -> &'static str {
+    match reason {
+        ShardScavengerObservationReason::FileWithoutShardRow => "file_without_shard_row",
+        ShardScavengerObservationReason::ShardRowWithoutFile => "shard_row_without_file",
+        ShardScavengerObservationReason::UnreferencedShardRowAndFile => {
+            "unreferenced_shard_row_and_file"
+        }
+        ShardScavengerObservationReason::ScanIncomplete => "scan_incomplete",
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScavengerShardRow {
+    pub(crate) key: ShardKey,
+    pub(crate) ack: WriteAck,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScavengerShardFile {
+    pub(crate) key: ShardKey,
+    pub(crate) size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScavengerShardFileScan {
+    pub(crate) files: Vec<ScavengerShardFile>,
+    pub(crate) errors: Vec<String>,
+}
+
+fn is_canonical_shard_prefix(prefix: &str) -> bool {
+    prefix.len() == SHARD_KEY_HEX_PREFIX_LEN
+        && prefix
+            .as_bytes()
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+impl PgStore {
+    /// Record a non-authoritative shard scavenger audit observation.
+    pub fn record_shard_scavenger_observation(
+        &self,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        self.validate_shard_scavenger_observation_record(observation)?;
+        let now = Self::now_secs();
+        self.conn
+            .execute(
+                "INSERT INTO shard_scavenger_observations \
+                 (node_id, data_pg_id, shard_index, shard_key, first_seen_at, last_seen_at, \
+                  observation_count, data_size, crc64_nvme, file_exists, shard_row_exists, \
+                  reason, last_error, resolved_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, NULL) \
+                 ON CONFLICT(node_id, data_pg_id, shard_index, shard_key) DO UPDATE SET \
+                  last_seen_at = excluded.last_seen_at, \
+                  observation_count = shard_scavenger_observations.observation_count + 1, \
+                  data_size = excluded.data_size, \
+                  crc64_nvme = excluded.crc64_nvme, \
+                  file_exists = excluded.file_exists, \
+                  shard_row_exists = excluded.shard_row_exists, \
+                  reason = excluded.reason, \
+                  last_error = excluded.last_error, \
+                  resolved_at = NULL",
+                params![
+                    observation.key.node_id as i64,
+                    observation.key.data_pg_id as i64,
+                    observation.key.shard_index.get() as i64,
+                    observation.key.shard_key.as_bytes().as_slice(),
+                    now as i64,
+                    observation.data_size.map(|size| size as i64),
+                    observation.crc64.map(|crc| crc as i64),
+                    if observation.file_exists {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    if observation.shard_row_exists {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    observation.reason as u8 as i64,
+                    observation.last_error.as_deref(),
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "record shard scavenger observation",
+                source,
+            })?;
+        let _ = observability::emit_shard_scavenger_observation(
+            TRACE_TARGET,
+            observability::ShardScavengerObservationSummary {
+                node_id: observation.key.node_id,
+                data_pg_id: observation.key.data_pg_id,
+                shard_index: observation.key.shard_index.get(),
+                shard_key_hex: &observation.key.shard_key.hex(),
+                reason: shard_scavenger_observation_reason_name(observation.reason),
+                file_exists: observation.file_exists,
+                shard_row_exists: observation.shard_row_exists,
+                last_error: observation.last_error.as_deref(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Mark a shard scavenger audit observation as resolved.
+    pub fn resolve_shard_scavenger_observation(
+        &self,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<bool, StoreError> {
+        self.validate_shard_scavenger_observation_key(key)?;
+        let now = Self::now_secs();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shard_scavenger_observations \
+                 SET resolved_at = ?1 \
+                 WHERE node_id = ?2 AND data_pg_id = ?3 AND shard_index = ?4 AND shard_key = ?5",
+                params![
+                    now as i64,
+                    key.node_id as i64,
+                    key.data_pg_id as i64,
+                    key.shard_index.get() as i64,
+                    key.shard_key.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "resolve shard scavenger observation",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
+    pub fn list_shard_scavenger_observations(
+        &self,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT node_id, data_pg_id, shard_index, shard_key, first_seen_at, last_seen_at, \
+                        observation_count, data_size, crc64_nvme, file_exists, shard_row_exists, \
+                        reason, last_error, resolved_at \
+                 FROM shard_scavenger_observations \
+                 ORDER BY node_id, data_pg_id, shard_index, shard_key",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list shard scavenger observations (prepare)",
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list shard scavenger observations",
+                source,
+            })?;
+
+        let mut observations = Vec::new();
+        for row in rows {
+            let (
+                node_id,
+                data_pg_id,
+                shard_index,
+                shard_key,
+                first_seen_at,
+                last_seen_at,
+                observation_count,
+                data_size,
+                crc64,
+                file_exists,
+                shard_row_exists,
+                reason,
+                last_error,
+                resolved_at,
+            ) = row.map_err(|source| StoreError::Db {
+                context: "read shard scavenger observation",
+                source,
+            })?;
+            observations.push(ShardScavengerObservation {
+                key: ShardScavengerObservationKey {
+                    node_id: node_id as u32,
+                    data_pg_id: data_pg_id as u32,
+                    shard_index: ShardIndex::new(shard_index as u8),
+                    shard_key: ShardKey::from_bytes(&shard_key)?,
+                },
+                first_seen_at: first_seen_at as u64,
+                last_seen_at: last_seen_at as u64,
+                observation_count: observation_count as u64,
+                data_size: data_size.map(|size| size as u64),
+                crc64: crc64.map(|crc| crc as u64),
+                file_exists: file_exists != 0,
+                shard_row_exists: shard_row_exists != 0,
+                reason: ShardScavengerObservationReason::from_u8(reason as u8)
+                    .expect("schema restricts shard scavenger observation reasons"),
+                last_error,
+                resolved_at: resolved_at.map(|value| value as u64),
+            });
+        }
+        Ok(observations)
+    }
+
+    /// Audit local shard file/index mismatches for this data PG.
+    ///
+    /// This is intentionally non-destructive. It records only local file/row
+    /// inconsistencies and resolves prior observations of those classes once
+    /// the mismatch disappears.
+    pub fn audit_local_shard_storage_for_scavenger(
+        &self,
+        node_id: u32,
+    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
+        let shard_rows = self.list_scavenger_shard_rows()?;
+        let shard_file_scan = self.list_scavenger_shard_files()?;
+        let shard_files = shard_file_scan.files;
+        let row_keys: HashSet<ShardKey> = shard_rows.iter().map(|row| row.key.clone()).collect();
+        let file_keys: HashSet<ShardKey> =
+            shard_files.iter().map(|file| file.key.clone()).collect();
+        let mut active_mismatch_keys = HashSet::new();
+
+        for row in &shard_rows {
+            let observation_key = ShardScavengerObservationKey {
+                node_id,
+                data_pg_id: self.pg_id,
+                shard_index: row.key.shard_index(),
+                shard_key: row.key.clone(),
+            };
+            if !file_keys.contains(&row.key) {
+                active_mismatch_keys.insert(observation_key.clone());
+                self.record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                    key: observation_key,
+                    data_size: Some(row.ack.stored_size),
+                    crc64: Some(row.ack.crc64),
+                    file_exists: false,
+                    shard_row_exists: true,
+                    reason: ShardScavengerObservationReason::ShardRowWithoutFile,
+                    last_error: None,
+                })?;
+            }
+        }
+
+        for file in &shard_files {
+            let observation_key = ShardScavengerObservationKey {
+                node_id,
+                data_pg_id: self.pg_id,
+                shard_index: file.key.shard_index(),
+                shard_key: file.key.clone(),
+            };
+            if !row_keys.contains(&file.key) {
+                active_mismatch_keys.insert(observation_key.clone());
+                self.record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                    key: observation_key,
+                    data_size: Some(file.size),
+                    crc64: None,
+                    file_exists: true,
+                    shard_row_exists: false,
+                    reason: ShardScavengerObservationReason::FileWithoutShardRow,
+                    last_error: None,
+                })?;
+            }
+        }
+
+        if shard_file_scan.errors.is_empty() {
+            for observation in self.list_shard_scavenger_observations()? {
+                if observation.key.node_id != node_id || observation.key.data_pg_id != self.pg_id {
+                    continue;
+                }
+                if observation.resolved_at.is_some()
+                    || active_mismatch_keys.contains(&observation.key)
+                {
+                    continue;
+                }
+                if matches!(
+                    observation.reason,
+                    ShardScavengerObservationReason::FileWithoutShardRow
+                        | ShardScavengerObservationReason::ShardRowWithoutFile
+                ) {
+                    self.resolve_shard_scavenger_observation(&observation.key)?;
+                }
+            }
+        }
+
+        if !shard_file_scan.errors.is_empty() {
+            return Err(StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                errors: shard_file_scan.errors.join("; "),
+            });
+        }
+
+        self.list_shard_scavenger_observations()
+    }
+
+    pub(crate) fn list_shard_scavenger_payload_references(
+        &self,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let mut references = Vec::new();
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM object_segments",
+            "list object segment shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
+             FROM object_parts WHERE part_okh != zeroblob(16)",
+            "list object part shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM stream_upload_segments",
+            "list stream upload segment shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM multipart_part_segments",
+            "list multipart part segment shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+             FROM object_segment_reclaim_segments",
+            "list object segment reclaim shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
+             FROM multipart_reclaim_parts WHERE storage_kind = 0",
+            "list multipart reclaim part shard scavenger references",
+        )?;
+        self.extend_scavenger_placed_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+             FROM multipart_reclaim_part_segments",
+            "list multipart reclaim segment shard scavenger references",
+        )?;
+        self.extend_scavenger_routed_multipart_part_references(&mut references)?;
+        self.extend_scavenger_pending_command_references(&mut references)?;
+        Ok(references)
+    }
+
+    fn extend_scavenger_pending_command_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+    ) -> Result<(), StoreError> {
+        let Some(command_bytes) = self.query_row_cached_optional(
+            "SELECT command_bytes FROM metadata_command_pending_slot WHERE singleton = 0",
+            [],
+            "load pending metadata command for shard scavenger references",
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        else {
+            return Ok(());
+        };
+        let command = decode_metadata_command_envelope(&command_bytes).map_err(|reason| {
+            StoreError::ShardScavengerScanIncomplete {
+                context: "decode pending metadata command for shard scavenger references",
+                errors: reason,
+            }
+        })?;
+        self.extend_scavenger_command_payload_references(references, command.payload());
+        Ok(())
+    }
+
+    fn extend_scavenger_command_payload_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        payload: &MetadataCommandPayload,
+    ) {
+        match payload {
+            MetadataCommandPayload::CommitDirectPutObject(command) => {
+                Self::extend_object_segment_references(references, &command.segments);
+                if let Some(stale_payload) = &command.stale_payload {
+                    Self::extend_reclaim_payload_references(references, stale_payload);
+                }
+            }
+            MetadataCommandPayload::CommitMultipartObject(command) => {
+                Self::extend_object_part_references(references, &command.parts);
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.selected_streaming_segments,
+                );
+                Self::extend_routed_multipart_part_references(
+                    references,
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.generation_id,
+                    &command.omitted_parts,
+                );
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.omitted_streaming_segments,
+                );
+                Self::extend_stream_segment_references(references, &command.stream_upload_segments);
+                if let Some(stale_payload) = &command.stale_payload {
+                    Self::extend_reclaim_payload_references(references, stale_payload);
+                }
+            }
+            MetadataCommandPayload::DeleteObjectVersion(command) => {
+                if let DeleteObjectVersionTarget::Live { payload, .. } = &command.target {
+                    Self::extend_reclaim_payload_references(references, payload);
+                }
+            }
+            MetadataCommandPayload::InsertDeleteMarker(command) => {
+                if let Some(stale_payload) = &command.stale_payload {
+                    Self::extend_reclaim_payload_references(references, stale_payload);
+                }
+            }
+            MetadataCommandPayload::AppendStreamSegment(command) => {
+                Self::extend_stream_segment_reference(references, &command.segment);
+            }
+            MetadataCommandPayload::AbortStreamUpload(command) => {
+                Self::extend_stream_segment_references(references, &command.staged_segments);
+            }
+            MetadataCommandPayload::CommitStreamPart(command) => {
+                Self::extend_multipart_part_segment_references(references, &command.segments);
+                if let Some(existing_part) = &command.existing_part {
+                    Self::extend_routed_multipart_part_references(
+                        references,
+                        &command.upload.bucket,
+                        &command.upload.key,
+                        command.upload.object_generation_id,
+                        std::slice::from_ref(existing_part),
+                    );
+                }
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.displaced_segments,
+                );
+            }
+            MetadataCommandPayload::AbortMultipartUpload(command) => {
+                Self::extend_routed_multipart_part_references(
+                    references,
+                    &command.cleanup.upload.bucket,
+                    &command.cleanup.upload.key,
+                    command.cleanup.upload.object_generation_id,
+                    &command.cleanup.parts,
+                );
+                Self::extend_multipart_part_segment_references(
+                    references,
+                    &command.cleanup.streaming_segments,
+                );
+                Self::extend_stream_segment_references(
+                    references,
+                    &command.cleanup.stream_upload_segments,
+                );
+            }
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
+                Self::extend_reclaim_payload_references(references, &command.payload);
+            }
+            MetadataCommandPayload::CreateBucket(_)
+            | MetadataCommandPayload::PutBucketVersioning(_)
+            | MetadataCommandPayload::PutBucketAcl(_)
+            | MetadataCommandPayload::PutBucketProperty(_)
+            | MetadataCommandPayload::PutBucketSubresource(_)
+            | MetadataCommandPayload::MarkBucketDeleting(_)
+            | MetadataCommandPayload::ReserveObjectGeneration(_)
+            | MetadataCommandPayload::ReleaseObjectGeneration(_)
+            | MetadataCommandPayload::ReserveObjectVersion(_)
+            | MetadataCommandPayload::PutObjectMetadata(_)
+            | MetadataCommandPayload::CreateStreamUpload(_)
+            | MetadataCommandPayload::CreateMultipartUpload(_)
+            | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
+            | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {}
+        }
+    }
+
+    fn extend_object_segment_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[ObjectSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::push_placed_reference(
+                references,
+                segment.data_pg_id,
+                segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+        }
+    }
+
+    fn extend_object_part_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        parts: &[ObjectPartRecord],
+    ) {
+        for part in parts {
+            if part.part_okh == [0; 16] {
+                continue;
+            }
+            Self::push_placed_reference(
+                references,
+                part.data_pg_id,
+                part.part_okh,
+                part.part_vid,
+                EcShape {
+                    k: part.ec_k,
+                    m: part.ec_m,
+                },
+            );
+        }
+    }
+
+    fn extend_stream_segment_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[StreamUploadSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::extend_stream_segment_reference(references, segment);
+        }
+    }
+
+    fn extend_stream_segment_reference(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segment: &StreamUploadSegmentRecord,
+    ) {
+        Self::push_placed_reference(
+            references,
+            segment.data_pg_id,
+            segment.segment_okh,
+            segment.segment_vid,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+        );
+    }
+
+    fn extend_multipart_part_segment_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[MultipartPartSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::push_placed_reference(
+                references,
+                segment.data_pg_id,
+                segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+        }
+    }
+
+    fn extend_routed_multipart_part_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        object_generation_id: GenerationId,
+        parts: &[MultipartPartRecord],
+    ) {
+        for part in parts {
+            if part.part_okh == [0; 16] {
+                continue;
+            }
+            references.push(ShardScavengerPayloadReference::RoutedMultipartPart(
+                ShardScavengerRoutedMultipartPartReference {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    object_generation_id,
+                    part_number: part.part_number,
+                    part_okh: part.part_okh,
+                    part_vid: part.part_vid,
+                    ec: EcShape {
+                        k: part.ec_k,
+                        m: part.ec_m,
+                    },
+                },
+            ));
+        }
+    }
+
+    fn extend_reclaim_payload_references(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        payload: &ObjectPayloadReclaimCommand,
+    ) {
+        match payload {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => {
+                for segment in &reclaim.segments {
+                    Self::push_placed_reference(
+                        references,
+                        segment.data_pg_id,
+                        segment.segment_okh,
+                        segment.segment_vid,
+                        segment.ec,
+                    );
+                }
+            }
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
+                for part in &reclaim.parts {
+                    match part {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_okh,
+                            part_vid,
+                            data_pg_id,
+                            ec,
+                            ..
+                        } => Self::push_placed_reference(
+                            references,
+                            *data_pg_id,
+                            *part_okh,
+                            *part_vid,
+                            *ec,
+                        ),
+                        MultipartReclaimPartRecord::Segments { segments, .. } => {
+                            for segment in segments {
+                                Self::push_placed_reference(
+                                    references,
+                                    segment.data_pg_id,
+                                    segment.segment_okh,
+                                    segment.segment_vid,
+                                    segment.ec,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_placed_reference(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        data_pg_id: u32,
+        okh: [u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) {
+        references.push(ShardScavengerPayloadReference::Placed(
+            ShardScavengerPlacedShardSetReference {
+                data_pg_id,
+                okh,
+                generation_id,
+                ec,
+            },
+        ));
+    }
+
+    pub(crate) fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT shard_key, data_size, crc64_nvme \
+                 FROM shards \
+                 ORDER BY shard_key",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list scavenger shard rows (prepare)",
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list scavenger shard rows",
+                source,
+            })?;
+        let mut shard_rows = Vec::new();
+        for row in rows {
+            let (key, stored_size, crc64) = row.map_err(|source| StoreError::Db {
+                context: "read scavenger shard row",
+                source,
+            })?;
+            shard_rows.push(ScavengerShardRow {
+                key: ShardKey::from_bytes(&key)?,
+                ack: WriteAck {
+                    stored_size: stored_size as u64,
+                    crc64: crc64 as u64,
+                },
+            });
+        }
+        Ok(shard_rows)
+    }
+
+    fn extend_scavenger_placed_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        sql: &'static str,
+        context: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let okh_blob: Vec<u8> = row.get(1)?;
+                Ok(ShardScavengerPayloadReference::Placed(
+                    ShardScavengerPlacedShardSetReference {
+                        data_pg_id: row.get(0)?,
+                        okh: PgStore::parse_okh_blob(&okh_blob, 1)?,
+                        generation_id: PgStore::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "shard scavenger reference generation",
+                        )?,
+                        ec: EcShape {
+                            k: row.get(3)?,
+                            m: row.get(4)?,
+                        },
+                    },
+                ))
+            })
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+        }
+        Ok(())
+    }
+
+    fn extend_scavenger_routed_multipart_part_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+    ) -> Result<(), StoreError> {
+        let context = "list routed multipart part shard scavenger references";
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT u.bucket, u.key, u.object_generation_id, p.part_number, \
+                 p.part_okh, p.part_vid, p.ec_k, p.ec_m \
+                 FROM multipart_parts p \
+                 JOIN multipart_uploads u ON u.upload_id = p.upload_id \
+                 WHERE p.part_okh != zeroblob(16)",
+            )
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let okh_blob: Vec<u8> = row.get(4)?;
+                Ok(ShardScavengerPayloadReference::RoutedMultipartPart(
+                    ShardScavengerRoutedMultipartPartReference {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        object_generation_id: PgStore::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "multipart upload object generation",
+                        )?,
+                        part_number: row.get(3)?,
+                        part_okh: PgStore::parse_okh_blob(&okh_blob, 4)?,
+                        part_vid: PgStore::parse_generation_id(
+                            row.get::<_, i64>(5)?,
+                            5,
+                            "multipart part payload generation",
+                        )?,
+                        ec: EcShape {
+                            k: row.get(6)?,
+                            m: row.get(7)?,
+                        },
+                    },
+                ))
+            })
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
+        Self::list_scavenger_shard_files_in_dir(&self.shards_dir)
+    }
+
+    pub(crate) fn list_scavenger_shard_files_in_dir(
+        shards_dir: &Path,
+    ) -> Result<ScavengerShardFileScan, StoreError> {
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+        for prefix in fs::read_dir(shards_dir).map_err(|source| StoreError::Io {
+            context: "scan shard prefix directory",
+            source,
+        })? {
+            let prefix = prefix.map_err(|source| StoreError::Io {
+                context: "read shard prefix directory entry",
+                source,
+            })?;
+            let file_type = prefix.file_type().map_err(|source| StoreError::Io {
+                context: "read shard prefix directory entry type",
+                source,
+            })?;
+            let prefix_path = prefix.path();
+            if !file_type.is_dir() {
+                errors.push(format!(
+                    "unexpected non-directory entry under shard root {}",
+                    prefix_path.display()
+                ));
+                continue;
+            }
+            let prefix_name = prefix.file_name();
+            let Some(prefix_name) = prefix_name.to_str() else {
+                errors.push(format!(
+                    "non-UTF8 shard prefix directory {}",
+                    prefix_path.display()
+                ));
+                continue;
+            };
+            if !is_canonical_shard_prefix(prefix_name) {
+                errors.push(format!(
+                    "invalid shard prefix directory {}",
+                    prefix_path.display()
+                ));
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path()).map_err(|source| StoreError::Io {
+                context: "scan shard directory",
+                source,
+            })? {
+                let entry = entry.map_err(|source| StoreError::Io {
+                    context: "read shard directory entry",
+                    source,
+                })?;
+                let file_type = entry.file_type().map_err(|source| StoreError::Io {
+                    context: "read shard directory entry type",
+                    source,
+                })?;
+                let path = entry.path();
+                if !file_type.is_file() {
+                    errors.push(format!(
+                        "unexpected non-file entry under shard prefix {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    errors.push(format!("non-UTF8 shard file {}", path.display()));
+                    continue;
+                };
+                let Ok(key) = ShardKey::from_hex(file_name) else {
+                    errors.push(format!("invalid shard file name {}", path.display()));
+                    continue;
+                };
+                let canonical_prefix = key.hex_prefix();
+                let canonical_file_name = key.to_string();
+                if prefix_name != canonical_prefix || file_name != canonical_file_name {
+                    errors.push(format!(
+                        "non-canonical shard file {} expected shards/{}/{}",
+                        path.display(),
+                        canonical_prefix,
+                        canonical_file_name
+                    ));
+                    continue;
+                };
+                let metadata = entry.metadata().map_err(|source| StoreError::Io {
+                    context: "stat shard file during scavenger scan",
+                    source,
+                })?;
+                files.push(ScavengerShardFile {
+                    key,
+                    size: metadata.len(),
+                });
+            }
+        }
+        files.sort_by(|left, right| left.key.as_bytes().cmp(right.key.as_bytes()));
+        Ok(ScavengerShardFileScan { files, errors })
+    }
+
+    fn validate_shard_scavenger_observation_key(
+        &self,
+        key: &ShardScavengerObservationKey,
+    ) -> Result<(), StoreError> {
+        if key.data_pg_id != self.pg_id {
+            return Err(StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: self.pg_id,
+                observation_pg_id: key.data_pg_id,
+            });
+        }
+        let key_shard_index = key.shard_key.shard_index();
+        if key.shard_index != key_shard_index {
+            return Err(StoreError::ShardScavengerObservationShardIndexMismatch {
+                observation_shard_index: key.shard_index.get(),
+                key_shard_index: key_shard_index.get(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_shard_scavenger_observation_record(
+        &self,
+        observation: &ShardScavengerObservationRecord,
+    ) -> Result<(), StoreError> {
+        self.validate_shard_scavenger_observation_key(&observation.key)?;
+        let state_matches_reason = match observation.reason {
+            ShardScavengerObservationReason::FileWithoutShardRow => {
+                observation.file_exists && !observation.shard_row_exists
+            }
+            ShardScavengerObservationReason::ShardRowWithoutFile => {
+                !observation.file_exists && observation.shard_row_exists
+            }
+            ShardScavengerObservationReason::UnreferencedShardRowAndFile => {
+                observation.file_exists && observation.shard_row_exists
+            }
+            ShardScavengerObservationReason::ScanIncomplete => true,
+        };
+        if !state_matches_reason {
+            return Err(StoreError::ShardScavengerObservationInconsistentReason {
+                reason: observation.reason,
+                file_exists: observation.file_exists,
+                shard_row_exists: observation.shard_row_exists,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_scavenger_observation_is_location_keyed_and_non_authoritative() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+
+        let shard_key = ShardKey::new(&[0xCA; 16], 42, 3);
+        let ack = store.write_shard(&shard_key, b"candidate").unwrap();
+        let node_zero = ShardScavengerObservationKey {
+            node_id: 0,
+            data_pg_id: 7,
+            shard_index: shard_key.shard_index(),
+            shard_key: shard_key.clone(),
+        };
+        let node_one = ShardScavengerObservationKey {
+            node_id: 1,
+            data_pg_id: 7,
+            shard_index: shard_key.shard_index(),
+            shard_key: shard_key.clone(),
+        };
+
+        store
+            .record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                key: node_zero.clone(),
+                data_size: Some(ack.stored_size),
+                crc64: Some(ack.crc64),
+                file_exists: true,
+                shard_row_exists: true,
+                reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                last_error: None,
+            })
+            .unwrap();
+        store
+            .record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                key: node_zero.clone(),
+                data_size: Some(ack.stored_size),
+                crc64: Some(ack.crc64),
+                file_exists: true,
+                shard_row_exists: true,
+                reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                last_error: Some("second scan".to_owned()),
+            })
+            .unwrap();
+        store
+            .record_shard_scavenger_observation(&ShardScavengerObservationRecord {
+                key: node_one.clone(),
+                data_size: Some(ack.stored_size),
+                crc64: Some(ack.crc64),
+                file_exists: true,
+                shard_row_exists: true,
+                reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                last_error: None,
+            })
+            .unwrap();
+
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].key, node_zero);
+        assert_eq!(observations[0].observation_count, 2);
+        assert_eq!(observations[0].last_error.as_deref(), Some("second scan"));
+        assert_eq!(observations[1].key, node_one);
+        assert_eq!(observations[1].observation_count, 1);
+
+        let stat = store.stat_shard(&shard_key).unwrap();
+        assert_eq!(stat.size, ack.stored_size);
+        assert_eq!(stat.crc64, ack.crc64);
+
+        assert!(store
+            .resolve_shard_scavenger_observation(&node_zero)
+            .unwrap());
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert!(observations[0].resolved_at.is_some());
+        assert!(observations[1].resolved_at.is_none());
+    }
+
+    #[test]
+    fn shard_scavenger_observation_rejects_inconsistent_location_identity() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let shard_key = ShardKey::new(&[0xCB; 16], 42, 3);
+
+        let wrong_pg = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 8,
+                shard_index: shard_key.shard_index(),
+                shard_key: shard_key.clone(),
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::FileWithoutShardRow,
+            last_error: None,
+        };
+        let err = store
+            .record_shard_scavenger_observation(&wrong_pg)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: 7,
+                observation_pg_id: 8
+            }
+        ));
+
+        let wrong_index = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 7,
+                shard_index: ShardIndex::new(4),
+                shard_key,
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::FileWithoutShardRow,
+            last_error: None,
+        };
+        let err = store
+            .record_shard_scavenger_observation(&wrong_index)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerObservationShardIndexMismatch {
+                observation_shard_index: 4,
+                key_shard_index: 3
+            }
+        ));
+        assert!(store
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn shard_scavenger_observation_rejects_inconsistent_reason_state() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let shard_key = ShardKey::new(&[0xCC; 16], 42, 3);
+
+        let inconsistent = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 7,
+                shard_index: shard_key.shard_index(),
+                shard_key: shard_key.clone(),
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: true,
+            reason: ShardScavengerObservationReason::FileWithoutShardRow,
+            last_error: None,
+        };
+        let err = store
+            .record_shard_scavenger_observation(&inconsistent)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerObservationInconsistentReason {
+                reason: ShardScavengerObservationReason::FileWithoutShardRow,
+                file_exists: true,
+                shard_row_exists: true
+            }
+        ));
+
+        let scan_incomplete = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: 0,
+                data_pg_id: 7,
+                shard_index: shard_key.shard_index(),
+                shard_key,
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: true,
+            shard_row_exists: true,
+            reason: ShardScavengerObservationReason::ScanIncomplete,
+            last_error: Some("metadata pg unavailable".to_owned()),
+        };
+        store
+            .record_shard_scavenger_observation(&scan_incomplete)
+            .unwrap();
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].reason,
+            ShardScavengerObservationReason::ScanIncomplete
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_records_file_row_mismatches_without_deleting() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let file_without_row = ShardKey::new(&[0xCD; 16], 42, 1);
+        let row_without_file = ShardKey::new(&[0xCE; 16], 42, 2);
+
+        let file_without_row_ack = store.write_shard(&file_without_row, b"file-only").unwrap();
+        store.delete_shard_record(&file_without_row).unwrap();
+        let row_without_file_ack = store.write_shard(&row_without_file, b"row-only").unwrap();
+        fs::remove_file(PgStore::shard_path_for_shards_dir(
+            &store.shards_dir,
+            &row_without_file,
+        ))
+        .unwrap();
+
+        let observations = store.audit_local_shard_storage_for_scavenger(9).unwrap();
+        assert_eq!(observations.len(), 2);
+        let file_observation = observations
+            .iter()
+            .find(|observation| observation.key.shard_key == file_without_row)
+            .unwrap();
+        assert_eq!(
+            file_observation.reason,
+            ShardScavengerObservationReason::FileWithoutShardRow
+        );
+        assert!(file_observation.file_exists);
+        assert!(!file_observation.shard_row_exists);
+        assert_eq!(
+            file_observation.data_size,
+            Some(file_without_row_ack.stored_size)
+        );
+
+        let row_observation = observations
+            .iter()
+            .find(|observation| observation.key.shard_key == row_without_file)
+            .unwrap();
+        assert_eq!(
+            row_observation.reason,
+            ShardScavengerObservationReason::ShardRowWithoutFile
+        );
+        assert!(!row_observation.file_exists);
+        assert!(row_observation.shard_row_exists);
+        assert_eq!(row_observation.crc64, Some(row_without_file_ack.crc64));
+
+        assert!(
+            PgStore::shard_path_for_shards_dir(&store.shards_dir, &file_without_row).exists(),
+            "audit-only scan must not delete file-only candidates"
+        );
+
+        store
+            .register_written_shard(&file_without_row, file_without_row_ack)
+            .unwrap();
+        PgStore::write_shard_file_durable(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &row_without_file,
+            b"row-only",
+        )
+        .unwrap();
+
+        let observations = store.audit_local_shard_storage_for_scavenger(9).unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.resolved_at.is_some()),
+            "later local consistency should resolve prior local mismatch observations"
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_does_not_make_negative_reference_claims() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let candidate_key = ShardKey::new(&[0xD1; 16], 42, 0);
+        store
+            .write_shard(&candidate_key, b"orphan-candidate")
+            .unwrap();
+
+        let observations = store.audit_local_shard_storage_for_scavenger(9).unwrap();
+        assert!(
+            observations.is_empty(),
+            "PgStore-local audit can only prove local row/file mismatches; negative reference \
+             classification needs a cluster-wide metadata PG scan"
+        );
+        assert!(
+            PgStore::shard_path_for_shards_dir(&store.shards_dir, &candidate_key).exists(),
+            "local audit must not delete row+file candidates"
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_requires_canonical_shard_file_paths() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let row_key = ShardKey::new(&[0xCF; 16], 42, 3);
+        store.write_shard(&row_key, b"row").unwrap();
+        fs::remove_file(PgStore::shard_path_for_shards_dir(
+            &store.shards_dir,
+            &row_key,
+        ))
+        .unwrap();
+
+        let wrong_prefix = if row_key.hex_prefix() == "00" {
+            "01"
+        } else {
+            "00"
+        };
+        let wrong_prefix_dir = store.shards_dir.join(wrong_prefix);
+        fs::create_dir_all(&wrong_prefix_dir).unwrap();
+        fs::write(wrong_prefix_dir.join(row_key.to_string()), b"wrong-prefix").unwrap();
+
+        let err = store
+            .audit_local_shard_storage_for_scavenger(9)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                ..
+            }
+        ));
+        let observations = store.list_shard_scavenger_observations().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].key.shard_key, row_key);
+        assert_eq!(
+            observations[0].reason,
+            ShardScavengerObservationReason::ShardRowWithoutFile
+        );
+        assert!(
+            observations[0].resolved_at.is_none(),
+            "non-canonical file must not satisfy or resolve the canonical shard row"
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_surfaces_malformed_shard_files() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let malformed_dir = store.shards_dir.join("aa");
+        fs::create_dir_all(&malformed_dir).unwrap();
+        fs::write(malformed_dir.join("not-a-shard-key"), b"junk").unwrap();
+
+        let err = store
+            .audit_local_shard_storage_for_scavenger(9)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                ..
+            }
+        ));
+        assert!(store
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn shard_scavenger_local_audit_surfaces_unexpected_shard_tree_entries() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let misplaced_key = ShardKey::new(&[0xD0; 16], 42, 4);
+        fs::write(
+            store.shards_dir.join(misplaced_key.to_string()),
+            b"misplaced",
+        )
+        .unwrap();
+        let canonical_dir = store.shards_dir.join(misplaced_key.hex_prefix());
+        fs::create_dir_all(&canonical_dir).unwrap();
+        fs::create_dir(canonical_dir.join("nested")).unwrap();
+
+        let err = store
+            .audit_local_shard_storage_for_scavenger(9)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "local shard file scan",
+                ..
+            }
+        ));
+        assert!(store
+            .list_shard_scavenger_observations()
+            .unwrap()
+            .is_empty());
+    }
+}
