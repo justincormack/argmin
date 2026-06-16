@@ -7345,6 +7345,10 @@ Status:
   alongside the bound active primary, while any transition back to `Peering`
   clears both. The control-plane state format is now version 7 and rejects
   active PG records that lack a complete active metadata proof.
+- Tightened current-epoch Active PG heartbeat observations to match the accepted
+  peering metadata proof. After the authority completes peering, a storage node
+  cannot replace its PG observation with `Active` unless the heartbeat carries
+  the same log-index/hash/state-digest proof that was accepted for that PG.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition

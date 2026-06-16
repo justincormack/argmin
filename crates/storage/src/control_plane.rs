@@ -2745,6 +2745,9 @@ pub enum ControlPlaneError {
     #[error("PG {pg_id} Active state requires complete_pg_peering")]
     ActivePgRequiresPeeringComplete { pg_id: u32 },
 
+    #[error("PG {pg_id} Active state is missing its accepted metadata proof")]
+    ActivePgMissingMetadataProof { pg_id: u32 },
+
     #[error("node {node_id} is not in PG {pg_id} acting set")]
     PgPrimaryNotInActingSet { pg_id: u32, node_id: u32 },
 
@@ -2847,6 +2850,17 @@ pub enum ControlPlaneError {
         "node {node_id} reported PG {pg_id} metadata proof {actual:?} in cluster epoch {cluster_epoch}, expected {expected:?}"
     )]
     PgPeeringMetadataProofMismatch {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        expected: PgMetadataProof,
+        actual: PgMetadataProof,
+    },
+
+    #[error(
+        "node {node_id} reported Active PG {pg_id} metadata proof {actual:?} in cluster epoch {cluster_epoch}, expected active proof {expected:?}"
+    )]
+    PgActiveMetadataProofMismatch {
         pg_id: u32,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
@@ -3652,6 +3666,22 @@ fn validate_pg_heartbeat_observations(
                 node_id: node_id.as_u32(),
                 pg_id: observation.pg_id.get(),
             });
+        }
+        if pg.state == PgState::Active && observation.state == PgState::Active {
+            let expected = pg.active_metadata_proof.ok_or(
+                ControlPlaneError::ActivePgMissingMetadataProof {
+                    pg_id: observation.pg_id.get(),
+                },
+            )?;
+            if observation.metadata_proof != expected {
+                return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                    pg_id: observation.pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                    expected,
+                    actual: observation.metadata_proof,
+                });
+            }
         }
     }
     Ok(())
@@ -6930,6 +6960,88 @@ mod tests {
     }
 
     #[test]
+    fn active_heartbeat_must_match_accepted_peering_metadata_proof() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(19), vec![NodeId::new(1)])
+            .unwrap();
+
+        let accepted_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let mut peering_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Peering,
+            metadata_proof: accepted_proof,
+        }];
+        authority.heartbeat(peering_heartbeat, 2_000).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(19),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+
+        let different_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let mut mismatched_active =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_020);
+        mismatched_active.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Active,
+            metadata_proof: different_proof,
+        }];
+        assert!(matches!(
+            authority.heartbeat(mismatched_active, 2_020),
+            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                pg_id: 19,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == accepted_proof && actual == different_proof
+        ));
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(19))
+            .is_none());
+
+        let mut matching_active =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_030);
+        matching_active.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Active,
+            metadata_proof: accepted_proof,
+        }];
+        authority.heartbeat(matching_active, 2_030).unwrap();
+        let observation = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(19))
+            .unwrap();
+        assert_eq!(observation.state(), PgState::Active);
+        assert_eq!(observation.metadata_proof(), accepted_proof);
+    }
+
+    #[test]
     fn stale_heartbeat_does_not_mutate_pg_observations() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -7844,15 +7956,16 @@ mod tests {
             })
         ));
 
+        let node_two_proof = PgMetadataProof {
+            applied_log_index: 77,
+            applied_log_hash: 0xabcddcba,
+            state_digest: 0x12344321,
+        };
         let mut node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 2_011);
         node_two_peering.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(20),
             state: PgState::Peering,
-            metadata_proof: PgMetadataProof {
-                applied_log_index: 77,
-                applied_log_hash: 0xabcddcba,
-                state_digest: 0x12344321,
-            },
+            metadata_proof: node_two_proof,
         }];
         authority.heartbeat(node_two_peering, 2_011).unwrap();
         authority
@@ -7863,8 +7976,14 @@ mod tests {
                 2_012,
             )
             .unwrap();
-        let new_active =
-            heartbeat_with_pg_observation(&mut authority, 2, 20, PgState::Active, 2_013);
+        let mut new_active_heartbeat =
+            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 2_013);
+        new_active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(20),
+            state: PgState::Active,
+            metadata_proof: node_two_proof,
+        }];
+        let new_active = authority.heartbeat(new_active_heartbeat, 2_013).unwrap();
         let new_epoch = new_active.cluster_epoch();
         assert!(new_epoch > peering_epoch);
 
