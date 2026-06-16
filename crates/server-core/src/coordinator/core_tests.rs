@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind, PgId,
-    ShardScavengerObservationReason, StorageCluster,
+    ShardScavengerObservationReason, StorageCluster, StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -38,6 +38,269 @@ fn setup_direct_coordinator_with_storage_cluster(
         test_sse_s3_provider(),
     )
     .unwrap()
+}
+
+#[test]
+fn coordinator_storage_node_tracks_runtime_map_handle_install() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+
+    assert!(Arc::ptr_eq(&coord.storage_node(), &initial));
+
+    let next_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(next_tmp.path(), &[0, 1]);
+    assert!(!Arc::ptr_eq(&coord.storage_node(), &candidate));
+    handle.install(Arc::clone(&candidate)).unwrap();
+
+    assert!(Arc::ptr_eq(&coord.storage_node(), &candidate));
+}
+
+#[test]
+fn get_object_pins_runtime_map_for_snapshot_and_body() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"pinned-runtime-map",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "key".to_string())),
+        after_object_read_snapshot: Some(Arc::new(move || {
+            handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    assert_eq!(result.body.read_all().unwrap(), b"pinned-runtime-map");
+}
+
+#[test]
+fn copy_object_pins_runtime_map_for_source_and_destination() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"copy-pinned-runtime-map",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let handle_for_hook = handle.clone();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "src".to_string())),
+        after_object_read_snapshot: Some(Arc::new(move || {
+            handle_for_hook.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+
+    handle.install(initial).unwrap();
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    assert_eq!(result.body.read_all().unwrap(), b"copy-pinned-runtime-map");
+}
+
+#[test]
+fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"upload-part-copy-pinned-runtime-map",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "dst".to_string())),
+        after_upload_part_copy_stream_session: Some(Arc::new(move || {
+            handle.install(Arc::clone(&candidate)).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "src", None),
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap();
 }
 
 fn install_bucket_command_log_conflict_hook(
@@ -1007,7 +1270,7 @@ fn put_object_persists_explicit_object_owner_identity() {
         .unwrap();
 
     let live = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     let live = live.into_live().expect("expected live object");
@@ -2686,14 +2949,14 @@ fn lifecycle_current_expiry_maps_command_log_conflict_to_operation_aborted() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
     let version_id = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&bucket, &key)
         .unwrap()
         .as_live()
         .unwrap()
         .version_id;
     let bucket_incarnation_generation = coord
-        .storage_node
+        .storage_node()
         .head_bucket_info(&bucket)
         .unwrap()
         .bucket_incarnation_generation;
@@ -2762,7 +3025,7 @@ fn lifecycle_abort_multipart_maps_command_log_conflict_to_operation_aborted() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("logs/app");
     let bucket_incarnation_generation = coord
-        .storage_node
+        .storage_node()
         .head_bucket_info(&bucket)
         .unwrap()
         .bucket_incarnation_generation;
@@ -2954,7 +3217,7 @@ fn delete_marker_persists_explicit_owner_identity() {
         .unwrap();
 
     let marker = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     let marker = match marker {
@@ -3002,7 +3265,7 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
         .unwrap();
 
     let upload_record = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -3053,7 +3316,7 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
         .unwrap();
 
     let live = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     let live = live.into_live().expect("expected completed object");
@@ -3121,7 +3384,7 @@ fn create_multipart_upload_bucket_owner_preferred_promotes_bucket_owner_with_ful
         .unwrap();
 
     let upload_record = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -7408,13 +7671,13 @@ fn delete_object_eventually_reclaims_simple_shards() {
 
     let (generation_id, ec, data_pg_id, okh, segment_vid) = {
         match coord
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => {
                 let segments = coord
-                    .storage_node
+                    .storage_node()
                     .test_get_object_segments(
                         &trusted_bucket_name("bucket"),
                         &trusted_object_key("key"),
@@ -7465,11 +7728,11 @@ fn shard_scavenger_worker_records_audit_observations() {
     let key = trusted_object_key("key");
     let reservation_id = storage::SessionId::try_from("77".repeat(16)).unwrap();
     let generation_id = coord
-        .storage_node
+        .storage_node()
         .reserve_put_object_generation(&bucket, &key, &reservation_id)
         .unwrap();
     let written = coord
-        .storage_node
+        .storage_node()
         .write_direct_put_segment_payload_shards(
             &bucket,
             &key,
@@ -7483,7 +7746,7 @@ fn shard_scavenger_worker_records_audit_observations() {
     let start = std::time::Instant::now();
     loop {
         let observations = coord
-            .storage_node
+            .storage_node()
             .test_list_shard_scavenger_observations(written.data_pg_id)
             .unwrap();
         if written.written_shards.iter().all(|shard| {
@@ -7535,13 +7798,13 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
 
     let (generation_id, ec, data_pg_id, okh, segment_vid) = {
         match coord
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => {
                 let segments = coord
-                    .storage_node
+                    .storage_node()
                     .test_get_object_segments(
                         &trusted_bucket_name("bucket"),
                         &trusted_object_key("key"),
@@ -7567,7 +7830,7 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
 
     let failing_key = ShardKey::new(&okh, segment_vid.get(), 0);
     let placed_cleanup_guard = coord
-        .storage_node
+        .storage_node()
         .test_install_before_placed_payload_shard_delete_hook(Arc::new(move |shard_key| {
             if shard_key == &failing_key {
                 return Err(storage::StoreError::Io {
@@ -7607,14 +7870,14 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
         let shard_key = ShardKey::new(&okh, segment_vid.get(), shard_index);
         assert!(
             coord
-                .storage_node
+                .storage_node()
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
             "failed reclaim should keep ack metadata {shard_index} retryable"
         );
         assert!(
             coord
-                .storage_node
+                .storage_node()
                 .test_payload_shard_file_exists(data_pg_id, ec, &okh, segment_vid, shard_index)
                 .unwrap(),
             "failed reclaim should keep placed shard {shard_index} retryable"
@@ -7976,11 +8239,11 @@ fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8
         let bucket_name = trusted_bucket_name(bucket);
         let object_key = trusted_object_key(key);
         let record = coord
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&bucket_name, &object_key)
             .unwrap();
         let segments = coord
-            .storage_node
+            .storage_node()
             .test_get_object_segments(&bucket_name, &object_key, record.version_id())
             .unwrap();
         if let Some(segment) = segments.first() {
@@ -8009,7 +8272,7 @@ fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8
         }
     };
     coord
-        .storage_node
+        .storage_node()
         .test_payload_shard_file_path(data_pg_id, ec, &okh, generation_id, shard_index)
         .unwrap()
 }
@@ -8183,8 +8446,8 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     delete_shard_on_disk(&coord, "bucket", "obj-reconstruct", 0);
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
-    let ec = coord.storage_node.default_payload_ec_shape();
-    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
+    let ec = coord.storage_node().default_payload_ec_shape();
+    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
 
     let first = coord
         .get_object(&GetObjectRequest {
@@ -8201,7 +8464,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
         .unwrap();
     assert_eq!(first.body.read_all().unwrap(), data);
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
-    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
 
     let second = coord
         .get_object(&GetObjectRequest {
@@ -8218,7 +8481,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
         .unwrap();
     assert_eq!(second.body.read_all().unwrap(), data);
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
-    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
 }
 
 #[test]
@@ -8403,20 +8666,20 @@ fn ec_range_get_with_missing_shard() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("obj5");
     let generation_id = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&bucket, &key)
         .unwrap()
         .into_live()
         .expect("put object should create a live object")
         .generation_id;
     let segment = coord
-        .storage_node
+        .storage_node()
         .test_get_object_segments(&bucket, &key, put.version_id)
         .unwrap()
         .pop()
         .expect("put object should create one object segment");
     let expected_selected_nodes = coord
-        .storage_node
+        .storage_node()
         .segment_payload_shard_locations(
             segment.data_pg_id,
             storage::EcShape {
@@ -8452,7 +8715,7 @@ fn ec_range_get_with_missing_shard() {
         .unwrap();
     assert_eq!(
         coord
-            .storage_node
+            .storage_node()
             .object_payload_lease_holder_node_count(&bucket, &key, generation_id),
         expected_selected_nodes,
         "degraded EC range read should hold handles for the selected recovery shard-owner set"
@@ -8460,7 +8723,7 @@ fn ec_range_get_with_missing_shard() {
     assert_eq!(result.body.read_all().unwrap(), b"Hello");
     assert_eq!(
         coord
-            .storage_node
+            .storage_node()
             .object_payload_lease_holder_node_count(&bucket, &key, generation_id),
         0,
         "degraded EC range read should release shard-owner handles after body consumption"
@@ -8549,7 +8812,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
 
     let segment = {
         let segments = coord
-            .storage_node
+            .storage_node()
             .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("obj7"),
@@ -8580,7 +8843,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
     let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 4);
     assert!(
         coord
-            .storage_node
+            .storage_node()
             .test_shard_exists(segment.data_pg_id, &parity_key)
             .unwrap(),
         "healthy-path read should not touch parity shard 4"
@@ -8619,7 +8882,7 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
 
     let segment = {
         let segments = coord
-            .storage_node
+            .storage_node()
             .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("obj8"),
@@ -8651,7 +8914,7 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
     let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 5);
     assert!(
         coord
-            .storage_node
+            .storage_node()
             .test_shard_exists(segment.data_pg_id, &parity_key)
             .unwrap(),
         "reconstruction should stop once enough shards are present"

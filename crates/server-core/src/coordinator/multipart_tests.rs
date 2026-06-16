@@ -39,7 +39,7 @@ fn upload_part_stream_session_count(
     part_number: u32,
 ) -> usize {
     coord
-        .storage_node
+        .storage_node()
         .test_list_all_stream_uploads()
         .unwrap()
         .into_iter()
@@ -68,7 +68,7 @@ fn assert_payload_shard_files_state(
 ) {
     for shard_index in 0..(ec.k + ec.m) {
         let exists = coord
-            .storage_node
+            .storage_node()
             .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, shard_index)
             .unwrap();
         assert_eq!(
@@ -1231,7 +1231,7 @@ fn create_multipart_upload_preserves_metadata() {
 
     // Verify we can retrieve the upload and its metadata blob is stored.
     let record = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("photo.png"),
@@ -1294,10 +1294,10 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("ghost");
     let data_pg_id = coord
-        .storage_node
+        .storage_node()
         .test_data_pg_id_for(&bucket, &key, generation_id);
     coord
-        .storage_node
+        .storage_node()
         .test_put_object_segments_reclaim(
             &bucket,
             &key,
@@ -1326,7 +1326,7 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
     wait_until_bucket_gone(&coord, "bucket");
 
     assert!(coord
-        .storage_node
+        .storage_node()
         .test_get_object_segments_reclaim(&bucket, &key, generation_id)
         .unwrap()
         .is_none());
@@ -1378,7 +1378,7 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
 
     let generation_id = {
         match admin
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
@@ -1402,7 +1402,7 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
 
     {
         assert!(admin
-            .storage_node
+            .storage_node()
             .test_get_object_segments_reclaim(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
@@ -1424,7 +1424,7 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
 
     {
         assert!(admin
-            .storage_node
+            .storage_node()
             .test_get_object_segments_reclaim(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
@@ -1493,7 +1493,7 @@ fn no_such_upload_from_storage() {
 
     // Directly call get_multipart_upload on a PG with a bogus upload ID.
     let err = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -1636,11 +1636,11 @@ fn upload_part_first_upload() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
     let upload = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(&bucket, &key, &create.upload_id)
         .unwrap();
     let part = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(&bucket, &key, &create.upload_id, 1)
         .unwrap();
     assert_eq!(part.part_number, 1);
@@ -1650,14 +1650,14 @@ fn upload_part_first_upload() {
     assert_eq!(part.part_vid, GenerationId::MIN);
 
     let segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &create.upload_id)
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].part_number, 1);
     assert_eq!(segments[0].segment_index, 0);
     assert_eq!(segments[0].size, 11);
-    let topology = storage::PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
+    let topology = storage::PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
     assert_eq!(
         segments[0].data_pg_id,
         topology
@@ -1737,7 +1737,7 @@ fn upload_part_reupload_increments_generation() {
     .unwrap();
 
     let part = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -1953,7 +1953,7 @@ fn upload_part_multiple_parts() {
 
     // Verify all three parts exist.
     let parts_resp = coord
-        .storage_node
+        .storage_node()
         .test_list_multipart_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -2019,7 +2019,7 @@ fn upload_part_repeated_reupload_generations() {
     }
 
     let part = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -2095,7 +2095,7 @@ fn upload_part_boundary_part_numbers() {
     .unwrap();
 
     coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -2104,7 +2104,7 @@ fn upload_part_boundary_part_numbers() {
         )
         .unwrap();
     coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -2274,7 +2274,7 @@ fn upload_part_same_part_last_writer_wins() {
 
     // Final state should reflect the last writer.
     let part = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -2306,7 +2306,7 @@ fn complete_multipart_upload_happy_path() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
     let upload = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(&bucket, &key, &upload_id)
         .unwrap();
 
@@ -2335,7 +2335,7 @@ fn complete_multipart_upload_happy_path() {
 
     // Object should be visible via get_object metadata.
     let obj = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&bucket, &key)
         .unwrap();
     let live_obj = obj.as_live().expect("expected live object");
@@ -2352,13 +2352,13 @@ fn complete_multipart_upload_happy_path() {
 
     // object_parts should be committed.
     let committed = coord
-        .storage_node
+        .storage_node()
         .test_get_object_parts(&bucket, &key, result.version_id)
         .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].part_number, 1);
     assert_eq!(committed[1].part_number, 2);
-    let topology = storage::PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
+    let topology = storage::PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
     for part in &committed {
         assert_eq!(
             part.data_pg_id,
@@ -2375,7 +2375,7 @@ fn complete_multipart_upload_happy_path() {
 
     // Upload should be deleted.
     let err = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(&bucket, &key, &upload_id)
         .unwrap_err();
     assert!(matches!(
@@ -2415,7 +2415,7 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
 
     let (generation_id, parts_to_reclaim) = {
         let generation_id = match coord
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
@@ -2425,7 +2425,7 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
             }
         };
         let parts = coord
-            .storage_node
+            .storage_node()
             .test_get_object_parts(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
@@ -2881,7 +2881,7 @@ fn complete_multipart_upload_overwrite_unversioned() {
 
     // Verify the object was overwritten — should have 2 parts now.
     let obj = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap();
     let live_obj = obj.as_live().expect("expected live object");
@@ -2889,7 +2889,7 @@ fn complete_multipart_upload_overwrite_unversioned() {
 
     // Old manifest parts (from first upload) should be replaced.
     let committed = coord
-        .storage_node
+        .storage_node()
         .test_get_object_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -3076,7 +3076,7 @@ fn complete_multipart_upload_rejects_non_in_progress_upload() {
     let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
 
     coord
-        .storage_node
+        .storage_node()
         .test_set_upload_state(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -3171,7 +3171,7 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         .unwrap();
 
     let uploaded_part = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -3180,7 +3180,7 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         )
         .unwrap();
     let upload_record = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -3188,7 +3188,7 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         )
         .unwrap();
     let streamed_segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -4321,7 +4321,7 @@ fn begin_stream_part_aborting_upload_returns_no_such_upload_without_creating_ses
         .unwrap();
 
     coord
-        .storage_node
+        .storage_node()
         .test_set_upload_state(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -4378,7 +4378,7 @@ fn begin_stream_part_completing_upload_returns_no_such_upload_without_creating_s
         .unwrap();
 
     coord
-        .storage_node
+        .storage_node()
         .test_set_upload_state(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -5197,7 +5197,7 @@ fn read_multipart_range_detects_incomplete_manifest() {
 
     // Get the real manifest, then replace with only part 2 (gap: part 1 missing).
     let real_parts = coord
-        .storage_node
+        .storage_node()
         .test_get_object_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -5207,7 +5207,7 @@ fn read_multipart_range_detects_incomplete_manifest() {
     assert_eq!(real_parts.len(), 2);
     let part2_record = real_parts[1].clone(); // real part 2 with valid shards
     coord
-        .storage_node
+        .storage_node()
         .test_replace_object_parts(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -6092,7 +6092,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
 
     {
         let record = coord
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("obj"))
             .unwrap();
         let live = record.as_live().unwrap();
@@ -6587,7 +6587,7 @@ fn sse_c_multipart_parts_with_same_plaintext_use_distinct_nonce_scopes() {
     }
 
     let segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -7098,7 +7098,7 @@ fn stream_put_multiple_segments_correct_manifest() {
 
     // Verify the committed object segments exist in the metadata PG.
     let committed = coord
-        .storage_node
+        .storage_node()
         .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -7107,13 +7107,13 @@ fn stream_put_multiple_segments_correct_manifest() {
         .unwrap();
     assert_eq!(committed.len(), 3);
     let live = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
         .unwrap()
         .as_live()
         .expect("stream put should create a live object")
         .clone();
-    let topology = storage::PgTopology::new(coord.storage_node.test_pg_ids()).unwrap();
+    let topology = storage::PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
     for (i, segment) in committed.iter().enumerate() {
         let segment_index = i as u32;
         assert_eq!(segment.segment_index, segment_index);
@@ -7155,7 +7155,7 @@ fn stream_put_abort_cleans_up_shards() {
 
     // Record shard keys before abort for verification.
     let segments = coord
-        .storage_node
+        .storage_node()
         .test_list_stream_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -7172,7 +7172,7 @@ fn stream_put_abort_cleans_up_shards() {
     for i in 0..ec.k + ec.m {
         assert!(
             coord
-                .storage_node
+                .storage_node()
                 .test_payload_shard_file_exists(
                     data_pg_id,
                     ec,
@@ -7194,14 +7194,14 @@ fn stream_put_abort_cleans_up_shards() {
         let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i);
         assert!(
             !coord
-                .storage_node
+                .storage_node()
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap(),
             "shard {i} should have been deleted"
         );
         assert!(
             !coord
-                .storage_node
+                .storage_node()
                 .test_payload_shard_file_exists(
                     data_pg_id,
                     ec,
@@ -7398,7 +7398,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
 
     let (generation_id, segments) = {
         let generation_id = match coord
-            .storage_node
+            .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
@@ -7408,7 +7408,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
             }
         };
         let segments = coord
-            .storage_node
+            .storage_node()
             .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
@@ -7699,7 +7699,7 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
         .unwrap();
 
     let source_segments = coord
-        .storage_node
+        .storage_node()
         .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("src"),
@@ -7714,7 +7714,7 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
     };
     for shard_index in 0..(broken_segment.ec_k + broken_segment.ec_m) {
         let shard_path = coord
-            .storage_node
+            .storage_node()
             .test_payload_shard_file_path(
                 broken_segment.data_pg_id,
                 broken_ec,
@@ -8040,7 +8040,7 @@ fn stream_append_accepts_upload_part_session() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session.session_id, 0, b"data")
         .unwrap();
     let segments = coord
-        .storage_node
+        .storage_node()
         .test_list_stream_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -8071,18 +8071,18 @@ fn stream_append_reuses_encode_scratch_for_aligned_segments() {
         .unwrap();
 
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-    let ec = coord.storage_node.default_payload_ec_shape();
-    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 0);
+    let ec = coord.storage_node().default_payload_ec_shape();
+    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 0);
 
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data")
         .unwrap();
-    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
 
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 1, b"more")
         .unwrap();
-    assert_eq!(coord.storage_node.test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
 }
 
 // ── Phase 3a: Streaming UploadPart tests ─────────────────────────
@@ -8200,7 +8200,7 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
     let before_segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
         .unwrap();
     let part2_segments: Vec<_> = before_segments
@@ -8237,7 +8237,7 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
     for (pg_id, shard_key) in &part2_shards {
         assert!(
             coord
-                .storage_node
+                .storage_node()
                 .test_shard_exists(*pg_id, shard_key)
                 .unwrap(),
             "omitted part shard should exist before complete"
@@ -8266,7 +8266,7 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
         .unwrap();
 
     let after_segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
         .unwrap();
     assert!(
@@ -8278,7 +8278,7 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
     for (pg_id, shard_key) in &part2_shards {
         assert!(
             !coord
-                .storage_node
+                .storage_node()
                 .test_shard_exists(*pg_id, shard_key)
                 .unwrap(),
             "omitted part shard should be deleted after complete"
@@ -8399,7 +8399,7 @@ fn complete_multipart_upload_prune_failure_still_cleans_omitted_streamed_part() 
     let bucket = trusted_bucket_name(bucket_name);
     let key = trusted_object_key(key_name);
     let before_segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
         .unwrap();
     let part2_segments: Vec<_> = before_segments
@@ -8460,7 +8460,7 @@ fn complete_multipart_upload_prune_failure_still_cleans_omitted_streamed_part() 
     );
 
     let after_segments = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
         .unwrap();
     assert!(
@@ -8472,7 +8472,7 @@ fn complete_multipart_upload_prune_failure_still_cleans_omitted_streamed_part() 
     for (pg_id, shard_key) in &part2_shards {
         assert!(
             !coord
-                .storage_node
+                .storage_node()
                 .test_shard_exists(*pg_id, shard_key)
                 .unwrap(),
             "omitted part shard metadata should be deleted even when prune fails"
@@ -8562,7 +8562,7 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
     let first_segments: Vec<_> = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
         .unwrap()
         .into_iter()
@@ -8610,7 +8610,7 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
         );
     }
     let final_segments: Vec<_> = coord
-        .storage_node
+        .storage_node()
         .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
         .unwrap()
         .into_iter()
@@ -9086,14 +9086,14 @@ fn object_segments_integrity_readback() {
 
     // Read back via storage layer directly.
     let record = coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("verify"),
         )
         .unwrap();
     let segments = coord
-        .storage_node
+        .storage_node()
         .test_get_object_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("verify"),
@@ -9163,7 +9163,7 @@ fn get_object_rejects_bad_segment_crc64() {
 
     {
         let mut segments = coord
-            .storage_node
+            .storage_node()
             .test_get_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("bad-segment-crc"),
@@ -9174,7 +9174,7 @@ fn get_object_rejects_bad_segment_crc64() {
         segments[0].segment_crc64 = Some(segments[0].segment_crc64.unwrap() ^ 1);
 
         coord
-            .storage_node
+            .storage_node()
             .test_replace_live_object_segments(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("bad-segment-crc"),

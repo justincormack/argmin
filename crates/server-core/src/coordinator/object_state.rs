@@ -81,8 +81,10 @@ impl Coordinator {
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ServerError> {
         match version_id {
-            Some(vid) => self.storage_node.test_get_object_version(bucket, key, vid),
-            None => self.storage_node.test_get_object_meta(bucket, key),
+            Some(vid) => self
+                .storage_node()
+                .test_get_object_version(bucket, key, vid),
+            None => self.storage_node().test_get_object_meta(bucket, key),
         }
         .map_err(|e| match e {
             storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound)

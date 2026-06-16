@@ -18,7 +18,10 @@ use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use storage::PgTopology;
-use storage::{BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster};
+use storage::{
+    BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster,
+    StorageClusterRuntimeMapHandle,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackgroundWorkerMode {
@@ -84,9 +87,20 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<SessionId, ServerError> {
+        self.create_stream_put_session_for_authorized_write_with_storage_node(
+            &self.storage_node(),
+            authorized,
+        )
+    }
+
+    pub(super) fn create_stream_put_session_for_authorized_write_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<SessionId, ServerError> {
         let stored_encryption = authorized.write_encryption.object_encryption();
         let session_id = Self::random_session_id("failed to generate session ID")?;
-        self.storage_node
+        storage_node
             .create_put_object_stream_session_record(
                 authorized.bucket_typed(),
                 authorized.key_typed(),
@@ -111,7 +125,7 @@ impl Coordinator {
         bucket: &BucketName,
         keep: usize,
     ) -> Result<(), ServerError> {
-        self.storage_node
+        self.storage_node()
             .prune_completed_multipart_uploads_for_bucket_with_limit(bucket, keep)
             .map_err(Coordinator::map_object_pg_action_error)
     }
@@ -195,7 +209,7 @@ impl Coordinator {
     ) -> Result<BucketSummary, ServerError> {
         let name = trusted_bucket_name(name);
         let info = self
-            .storage_node
+            .storage_node()
             .head_bucket_info(&name)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         if info.state != BucketState::Active {
@@ -211,7 +225,7 @@ impl Coordinator {
         name: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
         let info = self
-            .storage_node
+            .storage_node()
             .head_bucket_info(name)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         if info.state != BucketState::Active {
@@ -301,6 +315,23 @@ impl Coordinator {
         managed_key_provider: StaticManagedKeyProvider,
         background_worker_mode: BackgroundWorkerMode,
     ) -> Result<Self, ServerError> {
+        Self::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            StorageClusterRuntimeMapHandle::new(storage_cluster),
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            background_worker_mode,
+        )
+    }
+
+    pub fn new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        storage_cluster: StorageClusterRuntimeMapHandle,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: StaticManagedKeyProvider,
+        background_worker_mode: BackgroundWorkerMode,
+    ) -> Result<Self, ServerError> {
+        let initial_storage_cluster = storage_cluster.current();
         let lifecycle_sweeper_factory =
             |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
                 if background_worker_mode.lifecycle {
@@ -324,8 +355,9 @@ impl Coordinator {
             }
         };
         Self::new_with_shared_caches_and_background_sweeper_factories(
-            Arc::clone(&storage_cluster),
-            shared_caches_for_storage_cluster(&storage_cluster),
+            storage_cluster,
+            Arc::clone(&initial_storage_cluster),
+            shared_caches_for_storage_cluster(&initial_storage_cluster),
             region,
             sse_c_validator,
             Some(managed_key_provider),
@@ -373,6 +405,7 @@ impl Coordinator {
         H: FnOnce(&Arc<StorageCluster>) -> Result<Arc<StreamSessionSweeper>, ServerError>,
     {
         Self::new_with_shared_caches_and_background_sweeper_factories(
+            StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)),
             Arc::clone(&storage_cluster),
             shared_caches_for_storage_cluster(&storage_cluster),
             region,
@@ -394,6 +427,7 @@ impl Coordinator {
         F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
         Self::new_with_shared_caches_and_background_sweeper_factories(
+            StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)),
             storage_cluster,
             shared_caches,
             region,
@@ -409,6 +443,7 @@ impl Coordinator {
     }
 
     pub(super) fn new_with_shared_caches_and_background_sweeper_factories<F, G, H>(
+        storage_handle: StorageClusterRuntimeMapHandle,
         storage_cluster: Arc<StorageCluster>,
         shared_caches: Arc<CoordinatorSharedCaches>,
         region: String,
@@ -452,7 +487,7 @@ impl Coordinator {
         let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&storage_cluster)?;
         let stream_session_sweeper = stream_session_sweeper_factory(&storage_cluster)?;
         Ok(Self {
-            storage_node: storage_cluster,
+            storage_node: storage_handle,
             shared_caches,
             payload_buffer_pool,
             region,
@@ -466,15 +501,27 @@ impl Coordinator {
     }
 
     pub(super) fn read_runtime(&self) -> ReadRuntime {
+        let storage_node = self.storage_node();
+        self.read_runtime_for_storage_node(storage_node)
+    }
+
+    pub(super) fn read_runtime_for_storage_node(
+        &self,
+        storage_node: Arc<StorageCluster>,
+    ) -> ReadRuntime {
         ReadRuntime {
-            storage_node: Arc::clone(&self.storage_node),
+            storage_node: Arc::clone(&storage_node),
             #[cfg(test)]
-            pg_topology: PgTopology::new(self.storage_node.test_pg_ids())
+            pg_topology: PgTopology::new(storage_node.test_pg_ids())
                 .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),
         }
+    }
+
+    pub(super) fn storage_node(&self) -> Arc<StorageCluster> {
+        self.storage_node.current()
     }
 
     #[cfg(test)]

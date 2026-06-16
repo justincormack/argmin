@@ -12,6 +12,8 @@ pub(super) struct ReclamationTestHooks {
     pub(super) after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) before_multipart_complete_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_complete_pre_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_object_read_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_upload_part_copy_stream_session: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_object_segments_first_segment: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_object_segments_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -168,6 +170,40 @@ pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
         .is_some_and(|(b, k)| b == bucket && k == key)
     {
         if let Some(hook) = hooks.after_multipart_snapshot {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_object_read_snapshot_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_object_read_snapshot {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_upload_part_copy_stream_session_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_upload_part_copy_stream_session {
             hook();
         }
     }

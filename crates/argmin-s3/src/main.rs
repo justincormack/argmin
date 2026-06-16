@@ -34,7 +34,7 @@ use storage::storage_node_server::{
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
-    StorageCluster,
+    StorageCluster, StorageClusterRuntimeMapHandle,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -856,12 +856,16 @@ async fn run_frontend_server(
                 std::process::exit(1);
             });
 
+    let storage_cluster_handle = StorageClusterRuntimeMapHandle::new(storage_cluster);
+    let _frontend_runtime_map_refresh_loop =
+        maybe_spawn_frontend_control_plane_refresh_loop(storage_cluster_handle.clone(), &config);
+
     // Build frontend pool sharing the same storage cluster handle.
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
         let coordinator =
-            Coordinator::new_with_managed_key_provider_for_storage_cluster_with_background_worker_mode(
-                Arc::clone(&storage_cluster),
+            Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+                storage_cluster_handle.clone(),
                 config.region.clone(),
                 sse_c_validator.clone(),
                 managed_key_provider.clone(),
@@ -963,6 +967,35 @@ async fn run_frontend_server(
             .await;
         }
     }
+}
+
+fn maybe_spawn_frontend_control_plane_refresh_loop(
+    storage_cluster_handle: StorageClusterRuntimeMapHandle,
+    config: &ServerConfig,
+) -> Option<storage::StorageClusterRuntimeMapRefreshLoop> {
+    let socket_path = config.control_plane_socket_path.as_deref()?;
+    let admission_settings = LocalUnixStorageNodeClientAdmissionSettings::new(
+        config.storage_node_rpc_admission_limit,
+        config.storage_node_rpc_admission_wait_timeout,
+        config.storage_node_rpc_control_admission_wait_timeout,
+    );
+    let loop_handle = storage_cluster_handle
+        .spawn_control_plane_refresh_loop_with_unix_storage_node_clients(
+            UnixControlPlaneClient::new(socket_path),
+            config.control_plane_refresh_interval,
+            storage::clock::current_time_millis,
+            admission_settings,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to start frontend control-plane runtime-map refresh loop: {error}");
+            std::process::exit(1);
+        });
+    eprintln!(
+        "argmin-s3 frontend control-plane runtime-map refresh using {} (refresh {} ms)",
+        socket_path,
+        config.control_plane_refresh_interval.as_millis(),
+    );
+    Some(loop_handle)
 }
 
 #[cfg(test)]

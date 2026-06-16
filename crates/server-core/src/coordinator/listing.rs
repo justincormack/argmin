@@ -43,7 +43,7 @@ impl Coordinator {
         let list_start_after = optional_list_object_key(continuation_token)?;
 
         let listed = self
-            .storage_node
+            .storage_node()
             .list_objects_for_bucket(
                 bucket,
                 list_prefix.as_ref(),
@@ -129,7 +129,7 @@ impl Coordinator {
         let list_prefix = optional_list_object_key(prefix)?;
         let list_key_marker = optional_list_object_key(key_marker)?;
         let listed = self
-            .storage_node
+            .storage_node()
             .list_object_versions_for_bucket(
                 bucket,
                 list_prefix.as_ref(),

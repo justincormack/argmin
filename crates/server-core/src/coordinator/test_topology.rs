@@ -2,13 +2,13 @@ use super::*;
 
 pub(crate) fn bucket_pg_id(coord: &Coordinator, bucket: &str) -> u32 {
     coord
-        .storage_node
+        .storage_node()
         .test_bucket_pg_id_for(&trusted_bucket_name(bucket))
 }
 
 pub(crate) fn object_pg_id(coord: &Coordinator, bucket: &str, key: &str) -> u32 {
     coord
-        .storage_node
+        .storage_node()
         .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(key))
 }
 
@@ -18,7 +18,7 @@ pub(crate) fn object_data_pg_id(
     key: &str,
     generation_id: GenerationId,
 ) -> u32 {
-    coord.storage_node.test_data_pg_id_for(
+    coord.storage_node().test_data_pg_id_for(
         &trusted_bucket_name(bucket),
         &trusted_object_key(key),
         generation_id,
@@ -103,7 +103,7 @@ pub(crate) fn assert_object_maps_object_pg_gt_data_pg(
 ) {
     let object_pg_id = object_pg_id(coord, bucket, key);
     let generation_id = match coord
-        .storage_node
+        .storage_node()
         .test_get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
         .unwrap()
     {
@@ -128,15 +128,15 @@ pub(crate) fn stream_put_session_has_cross_pg_segments(
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let meta_pg_id = coord
-        .storage_node
+        .storage_node()
         .test_object_pg_id_for(&bucket_name, &object_key);
     let generation_id = coord
-        .storage_node
+        .storage_node()
         .test_object_generation_reservation_for(&bucket_name, &object_key, session_id)
         .unwrap();
     let data_pg_id =
         coord
-            .storage_node
+            .storage_node()
             .test_data_pg_id_for(&bucket_name, &object_key, generation_id);
     data_pg_id != meta_pg_id
 }
@@ -148,7 +148,7 @@ pub(crate) fn multipart_part_data_pg_id(
     object_generation_id: GenerationId,
     part_number: u32,
 ) -> u32 {
-    coord.storage_node.test_multipart_part_data_pg_id_for(
+    coord.storage_node().test_multipart_part_data_pg_id_for(
         bucket,
         key,
         object_generation_id,

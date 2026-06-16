@@ -210,6 +210,7 @@ impl Coordinator {
 
     pub(super) fn authorize_upload_part_copy_boe(
         &self,
+        storage_node: &Arc<storage::StorageCluster>,
         req: &UploadPartCopyRequest<'_>,
         dst_bucket_handle: BoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
@@ -237,8 +238,7 @@ impl Coordinator {
         let modern_bucket = BoeBucketSummary::assume_boe(&modern_bucket_info);
         let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;
         let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
-        let dst_upload = self
-            .storage_node
+        let dst_upload = storage_node
             .load_in_progress_multipart_upload(dst_bucket, dst_key, upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
@@ -268,15 +268,18 @@ impl Coordinator {
             SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
-        let source = self.authorize_copy_source_read_snapshot(CopySourceReadSnapshotRequest {
-            requester,
-            bucket: &req.source.bucket,
-            key: &req.source.key,
-            version_id: src_version_id,
-            expected_bucket_owner: req.source.expected_bucket_owner(),
-            policy_action: Self::get_object_policy_action(src_version_id),
-            existing_object_tags_mode: ExistingObjectTagsMode::Available,
-        })?;
+        let source = self.authorize_copy_source_read_snapshot_with_storage_node(
+            storage_node,
+            CopySourceReadSnapshotRequest {
+                requester,
+                bucket: &req.source.bucket,
+                key: &req.source.key,
+                version_id: src_version_id,
+                expected_bucket_owner: req.source.expected_bucket_owner(),
+                policy_action: Self::get_object_policy_action(src_version_id),
+                existing_object_tags_mode: ExistingObjectTagsMode::Available,
+            },
+        )?;
         Ok(AuthorizedUploadPartCopy {
             source,
             destination: AuthorizedMultipartPartWrite {
@@ -364,7 +367,7 @@ impl Coordinator {
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         #[cfg(test)]
         let upload = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
-            self.storage_node
+            self.storage_node()
                 .try_load_in_progress_multipart_upload(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)
                 .and_then(|upload| {
@@ -373,13 +376,13 @@ impl Coordinator {
                     })
                 })?
         } else {
-            self.storage_node
+            self.storage_node()
                 .load_in_progress_multipart_upload(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)?
         };
         #[cfg(not(test))]
         let upload = self
-            .storage_node
+            .storage_node()
             .load_in_progress_multipart_upload(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
@@ -422,6 +425,7 @@ impl Coordinator {
 
     pub(super) fn authorize_copy_source_read_snapshot_boe(
         &self,
+        storage_node: &Arc<storage::StorageCluster>,
         req: CopySourceReadSnapshotRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
     ) -> Result<storage::ObjectReadSnapshot, ServerError> {
@@ -447,8 +451,7 @@ impl Coordinator {
                 req.key.as_str(),
                 req.version_id,
             )?;
-        let outcome = self
-            .storage_node
+        let outcome = storage_node
             .load_object_read_snapshot_if(
                 &bucket.bucket().name,
                 req.key,
@@ -488,6 +491,7 @@ impl Coordinator {
 
     pub(super) fn authorize_object_read_snapshot_boe(
         &self,
+        storage_node: &Arc<storage::StorageCluster>,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
     ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
@@ -515,8 +519,7 @@ impl Coordinator {
         )?;
         #[cfg(test)]
         if should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
-            let object_pg_ready = self
-                .storage_node
+            let object_pg_ready = storage_node
                 .try_probe_object_pg_available(&bucket.bucket().name, req.key)
                 .map_err(|error| {
                     Self::map_object_read_snapshot_error(
@@ -534,8 +537,7 @@ impl Coordinator {
                 });
             }
         }
-        let outcome = self
-            .storage_node
+        let outcome = storage_node
             .load_object_read_snapshot_if(
                 &bucket.bucket().name,
                 req.key,
@@ -592,7 +594,7 @@ impl Coordinator {
         #[cfg(test)]
         if should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = self
-                .storage_node
+                .storage_node()
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(Self::map_object_pg_action_error)?;
             if !object_pg_ready {
@@ -606,7 +608,7 @@ impl Coordinator {
         match (bucket_info.versioning, request_version_id) {
             (BucketVersioningState::Disabled, _) => {
                 match self
-                    .storage_node
+                    .storage_node()
                     .load_object_if(bucket, key, None, |stored| {
                         let allowed = delete_object_authorization_with_bucket_policy(
                             requester,
@@ -660,7 +662,7 @@ impl Coordinator {
             }
             (_, Some(version_id)) => {
                 match self
-                    .storage_node
+                    .storage_node()
                     .load_object_if(bucket, key, Some(version_id), |stored| {
                         let allowed = delete_object_authorization_with_bucket_policy(
                             requester,
@@ -741,7 +743,7 @@ impl Coordinator {
                 let owner =
                     Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
                 match self
-                    .storage_node
+                    .storage_node()
                     .load_object_if(bucket, key, None, |stored| {
                         let allowed = delete_object_authorization_with_bucket_policy(
                             requester,

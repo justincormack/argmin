@@ -15,7 +15,8 @@ use s3_types::{
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
     BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
-    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadState,
+    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StorageCluster, StoredObject,
+    UploadState,
 };
 
 use self::acl::NonBoeLoadedBucketHandle;
@@ -248,20 +249,30 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_upload_part_copy(
         &self,
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
-        let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read(
+        self.authorize_upload_part_copy_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(in crate::coordinator) fn authorize_upload_part_copy_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &UploadPartCopyRequest<'_>,
+    ) -> Result<AuthorizedUploadPartCopy, ServerError> {
+        let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read_with_storage_node(
+            storage_node,
             req.upload.bucket_name_typed(),
             req.expected_bucket_owner(),
         )?;
         match ObjectAuthLoadedBucketHandle::classify(&dst_bucket_handle) {
             ObjectAuthLoadedBucketHandle::Boe(dst_bucket_handle) => {
-                self.authorize_upload_part_copy_boe(req, dst_bucket_handle)
+                self.authorize_upload_part_copy_boe(storage_node, req, dst_bucket_handle)
             }
             ObjectAuthLoadedBucketHandle::NonBoe(dst_bucket_handle) => {
-                self.authorize_upload_part_copy_non_boe(req, dst_bucket_handle)
+                self.authorize_upload_part_copy_non_boe(storage_node, req, dst_bucket_handle)
             }
         }
     }
@@ -305,30 +316,45 @@ impl Coordinator {
         &self,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
     ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
-        let bucket =
-            self.load_bucket_handle_for_modern_object_read(req.bucket, req.expected_bucket_owner)?;
+        self.authorize_object_read_snapshot_with_storage_node(&self.storage_node(), req)
+    }
+
+    fn authorize_object_read_snapshot_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: AuthorizedObjectReadSnapshotRequest<'_>,
+    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+        let bucket = self.load_bucket_handle_for_modern_object_read_with_storage_node(
+            storage_node,
+            req.bucket,
+            req.expected_bucket_owner,
+        )?;
         match ObjectAuthLoadedBucketHandle::classify(&bucket) {
             ObjectAuthLoadedBucketHandle::Boe(bucket) => {
-                self.authorize_object_read_snapshot_boe(req, bucket)
+                self.authorize_object_read_snapshot_boe(storage_node, req, bucket)
             }
             ObjectAuthLoadedBucketHandle::NonBoe(bucket) => {
-                self.authorize_object_read_snapshot_non_boe(req, bucket)
+                self.authorize_object_read_snapshot_non_boe(storage_node, req, bucket)
             }
         }
     }
 
-    fn authorize_copy_source_read_snapshot(
+    fn authorize_copy_source_read_snapshot_with_storage_node(
         &self,
+        storage_node: &Arc<StorageCluster>,
         req: CopySourceReadSnapshotRequest<'_>,
     ) -> Result<storage::ObjectReadSnapshot, ServerError> {
-        let bucket =
-            self.load_bucket_handle_for_object_policy_read(req.bucket, req.expected_bucket_owner)?;
+        let bucket = self.load_bucket_handle_for_object_policy_read_with_storage_node(
+            storage_node,
+            req.bucket,
+            req.expected_bucket_owner,
+        )?;
         match ObjectAuthLoadedBucketHandle::classify(&bucket) {
             ObjectAuthLoadedBucketHandle::Boe(bucket) => {
-                self.authorize_copy_source_read_snapshot_boe(req, bucket)
+                self.authorize_copy_source_read_snapshot_boe(storage_node, req, bucket)
             }
             ObjectAuthLoadedBucketHandle::NonBoe(bucket) => {
-                self.authorize_copy_source_read_snapshot_non_boe(req, bucket)
+                self.authorize_copy_source_read_snapshot_non_boe(storage_node, req, bucket)
             }
         }
     }
@@ -905,7 +931,7 @@ impl Coordinator {
         }
 
         let raw_policy = self
-            .storage_node
+            .storage_node()
             .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Policy)
             .map_err(|error| match error {
                 storage::BucketSnapshotLoadError::Store(
@@ -1485,18 +1511,36 @@ impl Coordinator {
         bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
     ) -> Result<LoadedBucketHandle, ServerError> {
+        self.load_bucket_handle_for_object_policy_read_with_storage_node(
+            &self.storage_node(),
+            bucket,
+            expected_bucket_owner,
+        )
+    }
+
+    pub(super) fn load_bucket_handle_for_object_policy_read_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        bucket: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
 
         #[cfg(test)]
         maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
-        self.bucket_handle_loader()
-            .load_bucket(bucket, expected_bucket_owner, request)
+        self.bucket_handle_loader().load_bucket_with_storage_node(
+            storage_node,
+            bucket,
+            expected_bucket_owner,
+            request,
+        )
     }
 
-    fn load_bucket_handle_for_modern_object_read(
+    fn load_bucket_handle_for_modern_object_read_with_storage_node(
         &self,
+        storage_node: &Arc<StorageCluster>,
         bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
     ) -> Result<LoadedBucketHandle, ServerError> {
@@ -1556,16 +1600,14 @@ impl Coordinator {
 
         #[cfg(test)]
         maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
-        let snapshot = match self
-            .storage_node
-            .load_bucket_snapshot(bucket, request.resolve_to_storage_request())
-        {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                self.remove_bucket_fast_path(bucket);
-                return Err(BucketHandleLoader::map_bucket_snapshot_error(err));
-            }
-        };
+        let snapshot =
+            match storage_node.load_bucket_snapshot(bucket, request.resolve_to_storage_request()) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    self.remove_bucket_fast_path(bucket);
+                    return Err(BucketHandleLoader::map_bucket_snapshot_error(err));
+                }
+            };
         let bucket_is_boe =
             Self::is_bucket_owner_enforced(snapshot.bucket.ownership_controls.as_ref());
         if bucket_is_boe {
@@ -1586,8 +1628,21 @@ impl Coordinator {
     where
         R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
     {
+        self.with_bucket_write_handle_for_storage_node(&self.storage_node(), req, request, action)
+    }
+
+    pub(super) fn with_bucket_write_handle_for_storage_node<R, T>(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &R,
+        request: BucketHandleRequest,
+        action: impl FnOnce(LoadedBucketHandle) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError>
+    where
+        R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
+    {
         let expected_bucket_owner = req.expected_bucket_owner();
-        self.storage_node
+        storage_node
             .with_bucket_write_snapshot(
                 req.bucket_name_typed(),
                 request.resolve_to_storage_request(),
@@ -1619,8 +1674,29 @@ impl Coordinator {
     where
         R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
     {
+        self.with_bucket_write_handle_for_command_with_storage_node(
+            &self.storage_node(),
+            req,
+            request,
+            action,
+        )
+    }
+
+    pub(super) fn with_bucket_write_handle_for_command_with_storage_node<R, T>(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &R,
+        request: BucketHandleRequest,
+        action: impl FnOnce(
+            LoadedBucketHandle,
+            storage::BucketWriteReservationProof,
+        ) -> storage::BucketWriteSnapshotAction<T, ServerError>,
+    ) -> Result<T, ServerError>
+    where
+        R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
+    {
         let expected_bucket_owner = req.expected_bucket_owner();
-        self.storage_node
+        storage_node
             .with_bucket_write_snapshot_for_command(
                 req.bucket_name_typed(),
                 request.resolve_to_storage_request(),

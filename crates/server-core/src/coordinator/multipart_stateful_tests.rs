@@ -246,7 +246,7 @@ impl<'a> InvariantHarness<'a> {
 
     fn active_stream_sessions(&self) -> Vec<StreamUploadRecord> {
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_all_stream_uploads()
             .unwrap()
     }
@@ -264,7 +264,7 @@ impl<'a> InvariantHarness<'a> {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_multipart_uploads_for_bucket(&bucket_name)
             .unwrap()
             .into_iter()
@@ -276,7 +276,7 @@ impl<'a> InvariantHarness<'a> {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_bucket_payload_reclaim_roots(&bucket_name)
             .unwrap()
             .into_iter()
@@ -291,7 +291,7 @@ impl<'a> InvariantHarness<'a> {
         upload_id: &UploadId,
     ) -> Vec<MultipartPartSegmentRecord> {
         self.coord
-            .storage_node
+            .storage_node()
             .test_get_all_multipart_part_segments_for_upload(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
@@ -307,7 +307,7 @@ impl<'a> InvariantHarness<'a> {
         upload_id: &UploadId,
     ) -> MultipartUploadRecord {
         self.coord
-            .storage_node
+            .storage_node()
             .test_get_multipart_upload(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
@@ -323,7 +323,7 @@ impl<'a> InvariantHarness<'a> {
         session_id: &SessionId,
     ) -> Vec<StreamUploadSegmentRecord> {
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_stream_segments(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
@@ -340,7 +340,7 @@ impl<'a> InvariantHarness<'a> {
         created_at: u64,
     ) {
         self.coord
-            .storage_node
+            .storage_node()
             .test_force_stream_upload_created_at(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
@@ -387,14 +387,14 @@ fn assert_segment_shards_exist(
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should exist {phase}"
             );
             assert!(
                 coord
-                    .storage_node
+                    .storage_node()
                     .test_payload_shard_file_exists(
                         segment.data_pg_id,
                         EcShape {
@@ -424,14 +424,14 @@ fn assert_segment_shards_deleted(
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 !coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should be deleted {phase}"
             );
             assert!(
                 !coord
-                    .storage_node
+                    .storage_node()
                     .test_payload_shard_file_exists(
                         segment.data_pg_id,
                         EcShape {
@@ -652,7 +652,7 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
     };
 
     let staged = admin
-        .storage_node
+        .storage_node()
         .test_list_stream_segments(
             &trusted_bucket_name("bucket"),
             &trusted_object_key(&key),
@@ -761,7 +761,7 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: displaced shard {i} should exist before the reupload commits"
@@ -806,7 +806,7 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 !coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: displaced shard {i} should be deleted after the reupload commits"
@@ -819,7 +819,7 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: current shard {i} should remain after reupload"
@@ -885,14 +885,14 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should exist before abort"
             );
             assert!(
                 coord
-                    .storage_node
+                    .storage_node()
                     .test_payload_shard_file_exists(
                         segment.data_pg_id,
                         EcShape {
@@ -933,14 +933,14 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             assert!(
                 !coord
-                    .storage_node
+                    .storage_node()
                     .test_shard_exists(segment.data_pg_id, &shard_key)
                     .unwrap(),
                 "{invariant}: shard {i} should be deleted after abort"
             );
             assert!(
                 !coord
-                    .storage_node
+                    .storage_node()
                     .test_payload_shard_file_exists(
                         segment.data_pg_id,
                         EcShape {
@@ -1136,7 +1136,7 @@ fn aborting_multipart_upload_rejects_late_list_parts_without_state_loss() {
     .unwrap();
 
     coord
-        .storage_node
+        .storage_node()
         .test_set_upload_state(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
@@ -1179,7 +1179,7 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
     let create = create_basic_multipart_upload(&coord, "bucket", "key");
 
     coord
-        .storage_node
+        .storage_node()
         .test_set_upload_state(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),

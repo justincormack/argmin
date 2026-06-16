@@ -119,10 +119,12 @@ impl Coordinator {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
-        let snapshot = match self.storage_node.load_bucket_delete_authorization_snapshot(
-            req.name_typed(),
-            request.resolve_to_storage_request(),
-        ) {
+        let snapshot = match self
+            .storage_node()
+            .load_bucket_delete_authorization_snapshot(
+                req.name_typed(),
+                request.resolve_to_storage_request(),
+            ) {
             Ok(snapshot) => snapshot,
             Err(_) => return Ok(None),
         };

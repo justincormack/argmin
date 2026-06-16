@@ -2982,7 +2982,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
     let bucket = coord.unchecked_active_bucket_summary("dst").unwrap();
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
     let upload = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("dst"),
             &trusted_object_key("copied"),
@@ -3736,7 +3736,7 @@ fn lifecycle_sweeper_registry_drops_process_local_worker_with_last_coordinator()
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     let lifecycle_sweeper = Arc::downgrade(&coord._lifecycle_sweeper);
-    let storage_node = Arc::downgrade(&coord.storage_node);
+    let storage_node = Arc::downgrade(&coord.storage_node());
 
     drop(coord);
 
@@ -7850,7 +7850,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
     let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
     let upload = coord
-        .storage_node
+        .storage_node()
         .test_get_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),

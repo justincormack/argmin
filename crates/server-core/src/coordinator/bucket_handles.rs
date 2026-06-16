@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use s3_types::VersionId;
+use std::sync::Arc;
 use storage::{
     BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, ObjectKey,
+    BucketSnapshotTagsRequest, ObjectKey, StorageCluster,
 };
 
 use super::{BucketSummary, Coordinator};
@@ -330,9 +331,18 @@ impl<'a> BucketHandleLoader<'a> {
         expected_bucket_owner: Option<&str>,
         request: BucketHandleRequest,
     ) -> Result<LoadedBucketHandle, ServerError> {
-        let snapshot = self
-            .coordinator
-            .storage_node
+        let storage_node = self.coordinator.storage_node();
+        self.load_bucket_with_storage_node(&storage_node, name, expected_bucket_owner, request)
+    }
+
+    pub(super) fn load_bucket_with_storage_node(
+        self,
+        storage_node: &Arc<StorageCluster>,
+        name: &BucketName,
+        expected_bucket_owner: Option<&str>,
+        request: BucketHandleRequest,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let snapshot = storage_node
             .load_bucket_snapshot(name, request.resolve_to_storage_request())
             .map_err(Self::map_bucket_snapshot_error)?;
         self.load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
@@ -347,7 +357,7 @@ impl<'a> BucketHandleLoader<'a> {
             let merged_request = source.2.merge(destination.2);
             let snapshot = self
                 .coordinator
-                .storage_node
+                .storage_node()
                 .load_bucket_snapshot(source.0, merged_request.resolve_to_storage_request())
                 .map_err(Self::map_bucket_snapshot_error)?;
             let bucket =
@@ -358,7 +368,7 @@ impl<'a> BucketHandleLoader<'a> {
 
         let snapshots = self
             .coordinator
-            .storage_node
+            .storage_node()
             .load_bucket_snapshot_pair(
                 (source.0, source.2.resolve_to_storage_request()),
                 (destination.0, destination.2.resolve_to_storage_request()),

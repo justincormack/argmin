@@ -6,7 +6,7 @@ use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage::{NodeId, StorageCluster};
+use storage::{NodeId, StorageCluster, StorageClusterRuntimeMapHandle};
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -104,7 +104,7 @@ fn stop_reclaim_sweeper_for_test(coord: &mut Coordinator) {
         ._reclaim_sweeper
         .stop
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    coord.storage_node.wake_reclaim_workers();
+    coord.storage_node().wake_reclaim_workers();
     if let Some(handle) = coord._reclaim_sweeper.handle.take() {
         let _ = handle.join();
     }
@@ -221,6 +221,7 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_backgr
 ) -> Coordinator {
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_background_sweeper_factories(
+        StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)),
         storage_cluster,
         shared_caches,
         "us-east-1".to_string(),
@@ -463,7 +464,7 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
             coord.unchecked_active_bucket_summary(name),
             Err(ServerError::BucketNotFound { .. })
         ) && coord
-            .storage_node
+            .storage_node()
             .test_head_bucket_raw(&trusted_bucket_name(name))
             .is_err()
         {
@@ -500,11 +501,11 @@ pub(crate) fn assert_shard_set_deleted(
         (0..(ec.k as usize + ec.m as usize)).all(|i| {
             let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
             !coord
-                .storage_node
+                .storage_node()
                 .test_shard_exists(data_pg_id, &shard_key)
                 .unwrap()
                 && !coord
-                    .storage_node
+                    .storage_node()
                     .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, i as u8)
                     .unwrap()
         }),

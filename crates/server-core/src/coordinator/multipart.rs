@@ -174,10 +174,10 @@ impl Coordinator {
         self.with_bucket_write_handle_for_command(&req.upload, request, |bucket_handle, proof| {
             let mut proof_transferred_to_command = false;
             let result = (|| {
+                let storage_node = self.storage_node();
                 #[cfg(test)]
                 if should_probe_begin_stream_part_session(req.upload.bucket_name()) {
-                    let object_pg_ready = self
-                        .storage_node
+                    let object_pg_ready = storage_node
                         .try_probe_object_pg_available(
                             req.upload.bucket_name_typed(),
                             req.upload.key_typed(),
@@ -192,7 +192,7 @@ impl Coordinator {
                     }
                 }
                 proof_transferred_to_command = true;
-                self.storage_node
+                storage_node
                     .begin_upload_part_stream_session(
                         storage::BeginUploadPartStreamSessionReq {
                             bucket: req.upload.bucket_name_typed().clone(),
@@ -282,7 +282,7 @@ impl Coordinator {
             value: authorized,
             initiated_at,
         } = self
-            .storage_node
+            .storage_node()
             .create_multipart_upload(
                 req.object.bucket.name_typed(),
                 req.object.key_typed(),
@@ -398,7 +398,7 @@ impl Coordinator {
             #[cfg(test)]
             maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
             let completion_snapshot = self
-                .storage_node
+                .storage_node()
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
                 .map_err(|error| match error {
                     storage::ObjectPgActionError::Metadata(
@@ -691,7 +691,7 @@ impl Coordinator {
             maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
 
             let completion_outcome = match self
-                .storage_node
+                .storage_node()
                 .complete_multipart_upload_commit_serialized(
                     storage::CompleteMultipartCommitRequest {
                         bucket: bucket.clone(),
@@ -806,7 +806,7 @@ impl Coordinator {
             upload: authorized_upload,
         } = self.authorize_list_parts(req)?;
         let listed = self
-            .storage_node
+            .storage_node()
             .list_multipart_parts_for_authorized_upload(
                 &authorized_upload,
                 req.part_number_marker,
@@ -888,7 +888,7 @@ impl Coordinator {
             uploads: mut all_uploads,
             hit_record_cap,
         } = self
-            .storage_node
+            .storage_node()
             .list_multipart_uploads_for_bucket(
                 &bucket,
                 optional_list_object_key(prefix)?.as_ref(),
@@ -951,6 +951,14 @@ impl Coordinator {
         &self,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
+        self.finalize_stream_part_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(super) fn finalize_stream_part_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: FinalizeStreamPartRequest,
+    ) -> Result<UploadPartResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::finalize_stream_part",
@@ -973,8 +981,7 @@ impl Coordinator {
         let computed_checksum = req.computed_checksum;
         #[cfg(test)]
         if should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
-            let object_pg_ready = self
-                .storage_node
+            let object_pg_ready = storage_node
                 .try_probe_object_pg_available(
                     req.upload.bucket_name_typed(),
                     req.upload.key_typed(),
@@ -990,8 +997,7 @@ impl Coordinator {
         let FinalizeStreamPartOutcome {
             value: mut result,
             last_modified,
-        } = self
-            .storage_node
+        } = storage_node
             .finalize_upload_part_stream(
                 req.upload.bucket_name_typed(),
                 req.upload.key_typed(),
@@ -1135,7 +1141,7 @@ impl Coordinator {
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let ec = staging_segments.first().map_or(
-                        self.storage_node.default_payload_ec_shape(),
+                        storage_node.default_payload_ec_shape(),
                         |segment| storage::EcShape {
                             k: segment.ec_k,
                             m: segment.ec_m,

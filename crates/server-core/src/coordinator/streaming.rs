@@ -141,7 +141,7 @@ impl Coordinator {
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let session = self
-            .storage_node
+            .storage_node()
             .load_stream_upload_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)?;
         self.resume_write_encryption(
@@ -160,8 +160,26 @@ impl Coordinator {
         part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let session = self
-            .storage_node
+        self.load_stream_part_write_encryption_with_storage_node(
+            &self.storage_node(),
+            bucket,
+            key,
+            session_id,
+            part_number,
+            sse_customer,
+        )
+    }
+
+    pub(super) fn load_stream_part_write_encryption_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        part_number: u32,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<ActiveWriteEncryption, ServerError> {
+        let session = storage_node
             .load_stream_upload_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)?;
         self.resume_write_encryption(
@@ -181,7 +199,7 @@ impl Coordinator {
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let target = self
-            .storage_node
+            .storage_node()
             .load_stream_upload_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)?
             .target;
@@ -408,6 +426,25 @@ impl Coordinator {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
+        self.append_stream_segment_for_storage_node(
+            &self.storage_node(),
+            bucket,
+            key,
+            session_id,
+            segment_index,
+            data,
+        )
+    }
+
+    pub(super) fn append_stream_segment_for_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        segment_index: u32,
+        data: &[u8],
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::append_stream_segment",
@@ -423,8 +460,7 @@ impl Coordinator {
         let logical_size = if data.is_empty() {
             0
         } else {
-            match self
-                .storage_node
+            match storage_node
                 .load_stream_upload_session(bucket, key, session_id)
                 .map_err(Self::map_object_pg_action_error)?
                 .encryption
@@ -443,8 +479,7 @@ impl Coordinator {
             }
         };
 
-        let (target, segment_record) = self
-            .storage_node
+        let (target, segment_record) = storage_node
             .prepare_stream_segment_append(
                 bucket,
                 key,
@@ -470,16 +505,15 @@ impl Coordinator {
         #[cfg(test)]
         self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
-        let written_shards = self
-            .storage_node
-            .write_stream_segment_payload_shards(&segment_record, data)?;
+        let written_shards =
+            storage_node.write_stream_segment_payload_shards(&segment_record, data)?;
 
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
 
-        self.storage_node
+        storage_node
             .commit_stream_segment_append(
                 bucket,
                 key,
@@ -515,7 +549,17 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.storage_node
+        self.abort_stream_put_for_storage_node(&self.storage_node(), bucket, key, session_id)
+    }
+
+    pub(super) fn abort_stream_put_for_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        storage_node
             .abort_stream_upload_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)
     }
@@ -526,9 +570,24 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
+        self.abort_stream_put_for_cleanup_with_storage_node(
+            &self.storage_node(),
+            bucket,
+            key,
+            session_id,
+        )
+    }
+
+    pub(super) fn abort_stream_put_for_cleanup_with_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match self.abort_stream_put_for(bucket, key, session_id) {
+            match self.abort_stream_put_for_storage_node(storage_node, bucket, key, session_id) {
                 Ok(()) => return Ok(()),
                 Err(ServerError::OperationAborted | ServerError::SlowDown)
                     if Instant::now() < deadline =>
@@ -546,7 +605,7 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.storage_node
+        self.storage_node()
             .heartbeat_put_object_stream_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)
     }
@@ -566,7 +625,7 @@ impl Coordinator {
     }
 
     pub fn scavenge_stale_sessions(&self, max_age_ms: u64) -> usize {
-        self.storage_node
+        self.storage_node()
             .scavenge_abandoned_stream_sessions(max_age_ms)
     }
 }

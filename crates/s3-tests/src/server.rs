@@ -240,7 +240,7 @@ impl TestServer {
                 });
 
                 server_http::http::HttpFrontend {
-                    coordinator,
+                    coordinator: Arc::new(coordinator),
                     credentials,
                     host_id: Arc::clone(&host_id),
                 }

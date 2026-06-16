@@ -287,7 +287,7 @@ impl Coordinator {
         #[cfg(test)]
         if should_probe_object_metadata_access(bucket.as_str()) {
             let object_pg_ready = self
-                .storage_node
+                .storage_node()
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(|error| {
                     Self::map_object_metadata_access_error(
@@ -305,7 +305,7 @@ impl Coordinator {
                 });
             }
         }
-        self.storage_node
+        self.storage_node()
             .put_object_tags_if(bucket, key, req.object.version_id, req.tags, |stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
                     BucketPolicyAccess {
@@ -360,7 +360,7 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.object.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
-        self.storage_node
+        self.storage_node()
             .put_object_retention_if(
                 bucket,
                 key,
@@ -432,7 +432,7 @@ impl Coordinator {
         #[cfg(test)]
         if should_probe_object_metadata_access(bucket.as_str()) {
             let object_pg_ready = self
-                .storage_node
+                .storage_node()
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(|error| {
                     Self::map_object_metadata_access_error(
@@ -450,7 +450,7 @@ impl Coordinator {
                 });
             }
         }
-        self.storage_node
+        self.storage_node()
             .get_object_retention_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
@@ -500,7 +500,7 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         let legal_hold = StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold));
-        self.storage_node
+        self.storage_node()
             .put_object_legal_hold_if(bucket, key, req.object.version_id, legal_hold, |stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
@@ -549,7 +549,7 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
-        self.storage_node
+        self.storage_node()
             .get_object_legal_hold_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
@@ -599,7 +599,7 @@ impl Coordinator {
         #[cfg(test)]
         if should_probe_object_metadata_access(bucket.as_str()) {
             let object_pg_ready = self
-                .storage_node
+                .storage_node()
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(|error| {
                     Self::map_object_metadata_access_error(
@@ -617,7 +617,7 @@ impl Coordinator {
                 });
             }
         }
-        self.storage_node
+        self.storage_node()
             .get_object_tags_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
                     BucketPolicyAccess {
@@ -665,7 +665,7 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
-        self.storage_node
+        self.storage_node()
             .delete_object_tags_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
                     BucketPolicyAccess {
@@ -718,7 +718,7 @@ impl Coordinator {
         } = self.load_object_metadata_policy_context(bucket, req.expected_bucket_owner())?;
         let can_discover_missing =
             Self::requester_can_discover_missing_object_acl(req.object.requester(), &bucket_info);
-        self.storage_node
+        self.storage_node()
             .load_object_if(bucket, key, req.version_id, |stored| {
                 if !self.requester_can_read_object_acl_with_bucket_policy(
                     req.object.requester(),
@@ -792,7 +792,7 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_discover_missing_object_acl(req.object.requester(), &bucket_info);
         let policy_context = req.authorization_policy_context()?;
-        self.storage_node
+        self.storage_node()
             .put_object_acl_if(bucket, key, req.object.version_id, |stored| {
                 if !self.requester_can_write_object_acl_with_bucket_policy(
                     BucketPolicyAccess {

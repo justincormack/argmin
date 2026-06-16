@@ -30,7 +30,7 @@ impl Coordinator {
                 bucket_tags,
             } => {
                 let deleted = self
-                    .storage_node
+                    .storage_node()
                     .delete_current_object_if(&bucket, &key, |stored| -> Result<(), ServerError> {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             crate::coordinator::authz::BucketPolicyAccess {
@@ -112,7 +112,7 @@ impl Coordinator {
                 }
 
                 let deleted = self
-                    .storage_node
+                    .storage_node()
                     .delete_specific_object_version_if(
                         &bucket,
                         &key,
@@ -225,7 +225,7 @@ impl Coordinator {
                 bucket_tags,
             } => {
                 let marker = self
-                    .storage_node
+                    .storage_node()
                     .insert_current_delete_marker_if(
                         &bucket,
                         &key,

@@ -1,9 +1,10 @@
 use checksum::RawChecksum;
+use std::sync::Arc;
 use storage::{ObjectLayout, StoredObject};
 
-#[cfg(test)]
-use super::maybe_run_multipart_snapshot_hook;
 use super::read_core::snapshotted_multipart_parts_from_storage;
+#[cfg(test)]
+use super::{maybe_run_multipart_snapshot_hook, maybe_run_object_read_snapshot_hook};
 use super::{
     segment_payloads_from_object_segments, AuthorizedObjectRead, Coordinator,
     GetObjectAttributesRequest, GetObjectAttributesResult, GetObjectPartRequest,
@@ -29,16 +30,20 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
+        let storage_node = self.storage_node();
+        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
-        } = self.authorize_get_object(req)?;
+        } = self.authorize_get_object_with_storage_node(&storage_node, req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
         } = snapshot;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -71,7 +76,7 @@ impl Coordinator {
             )?;
 
             let body = ReadHandle::from_multipart(
-                self.read_runtime(),
+                read_runtime.clone(),
                 req.object.bucket_name_typed(),
                 req.object.key_typed(),
                 record.generation_id,
@@ -80,7 +85,8 @@ impl Coordinator {
                 req.sse_customer.cloned(),
             )?;
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration(
+                self.current_object_lifecycle_expiration_with_storage_node(
+                    &storage_node,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -123,7 +129,7 @@ impl Coordinator {
             } else {
                 let body = ReadHandle::from_segments(
                     ReadObjectContext {
-                        runtime: self.read_runtime(),
+                        runtime: read_runtime,
                         bucket: req.object.bucket_name_typed(),
                         key: req.object.key_typed(),
                         generation_id: record.generation_id,
@@ -139,7 +145,8 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration(
+                self.current_object_lifecycle_expiration_with_storage_node(
+                    &storage_node,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -190,26 +197,33 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
+        let storage_node = self.storage_node();
+        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
-        } = self.authorize_get_object(&GetObjectRequest {
-            object: ObjectVersionRequest::new(
-                req.object.bucket_name_typed().clone(),
-                req.object.key_typed().clone(),
-                req.object.version_id,
-                req.object.requester().clone(),
-                req.expected_bucket_owner(),
-            ),
-            cond: req.cond,
-            sse_customer: req.sse_customer,
-        })?;
+        } = self.authorize_get_object_with_storage_node(
+            &storage_node,
+            &GetObjectRequest {
+                object: ObjectVersionRequest::new(
+                    req.object.bucket_name_typed().clone(),
+                    req.object.key_typed().clone(),
+                    req.object.version_id,
+                    req.object.requester().clone(),
+                    req.expected_bucket_owner(),
+                ),
+                cond: req.cond,
+                sse_customer: req.sse_customer,
+            },
+        )?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
         } = snapshot;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -270,7 +284,7 @@ impl Coordinator {
             let mut part_body = part.clone();
             part_body.object_offset_start = 0;
             let body = ReadHandle::from_multipart(
-                self.read_runtime(),
+                read_runtime.clone(),
                 req.object.bucket_name_typed(),
                 req.object.key_typed(),
                 record.generation_id,
@@ -279,7 +293,8 @@ impl Coordinator {
                 req.sse_customer.cloned(),
             )?;
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration(
+                self.current_object_lifecycle_expiration_with_storage_node(
+                    &storage_node,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -324,7 +339,7 @@ impl Coordinator {
             } else {
                 let body = ReadHandle::from_segments(
                     ReadObjectContext {
-                        runtime: self.read_runtime(),
+                        runtime: read_runtime,
                         bucket: req.object.bucket_name_typed(),
                         key: req.object.key_typed(),
                         generation_id: record.generation_id,
@@ -340,7 +355,8 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration(
+                self.current_object_lifecycle_expiration_with_storage_node(
+                    &storage_node,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -399,20 +415,24 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
+        let storage_node = self.storage_node();
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
-        } = self.authorize_head_object_for_part(&GetObjectRequest {
-            object: ObjectVersionRequest::new(
-                req.object.bucket_name_typed().clone(),
-                req.object.key_typed().clone(),
-                req.object.version_id,
-                req.object.requester().clone(),
-                req.expected_bucket_owner(),
-            ),
-            cond: req.cond,
-            sse_customer: req.sse_customer,
-        })?;
+        } = self.authorize_head_object_for_part_with_storage_node(
+            &storage_node,
+            &GetObjectRequest {
+                object: ObjectVersionRequest::new(
+                    req.object.bucket_name_typed().clone(),
+                    req.object.key_typed().clone(),
+                    req.object.version_id,
+                    req.object.requester().clone(),
+                    req.expected_bucket_owner(),
+                ),
+                cond: req.cond,
+                sse_customer: req.sse_customer,
+            },
+        )?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -439,7 +459,8 @@ impl Coordinator {
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let obj_parts = multipart_parts;
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration(
+                self.current_object_lifecycle_expiration_with_storage_node(
+                    &storage_node,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -506,7 +527,8 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration(
+                self.current_object_lifecycle_expiration_with_storage_node(
+                    &storage_node,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -561,10 +583,11 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
+        let storage_node = self.storage_node();
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
-        } = self.authorize_head_object(req)?;
+        } = self.authorize_head_object_with_storage_node(&storage_node, req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -595,7 +618,8 @@ impl Coordinator {
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
         let emit_lifecycle_expiration = version_id.is_none();
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            self.current_object_lifecycle_expiration(
+            self.current_object_lifecycle_expiration_with_storage_node(
+                &storage_node,
                 &bucket_summary,
                 key,
                 record.tags.as_deref(),
@@ -781,26 +805,33 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let range = req.range;
         let cond = req.cond;
+        let storage_node = self.storage_node();
+        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
-        } = self.authorize_get_object(&GetObjectRequest {
-            object: ObjectVersionRequest::new(
-                req.object.bucket_name_typed().clone(),
-                req.object.key_typed().clone(),
-                req.object.version_id,
-                req.object.requester().clone(),
-                req.expected_bucket_owner(),
-            ),
-            cond: req.cond,
-            sse_customer: req.sse_customer,
-        })?;
+        } = self.authorize_get_object_with_storage_node(
+            &storage_node,
+            &GetObjectRequest {
+                object: ObjectVersionRequest::new(
+                    req.object.bucket_name_typed().clone(),
+                    req.object.key_typed().clone(),
+                    req.object.version_id,
+                    req.object.requester().clone(),
+                    req.expected_bucket_owner(),
+                ),
+                cond: req.cond,
+                sse_customer: req.sse_customer,
+            },
+        )?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
         } = snapshot;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -887,7 +918,7 @@ impl Coordinator {
             )?;
 
             let body = ReadHandle::from_multipart_range(
-                self.read_runtime(),
+                read_runtime.clone(),
                 req.object.bucket_name_typed(),
                 req.object.key_typed(),
                 record.generation_id,
@@ -908,7 +939,7 @@ impl Coordinator {
 
             let body = ReadHandle::from_segments_range(
                 ReadObjectContext {
-                    runtime: self.read_runtime(),
+                    runtime: read_runtime,
                     bucket: req.object.bucket_name_typed(),
                     key: req.object.key_typed(),
                     generation_id: record.generation_id,
@@ -922,7 +953,8 @@ impl Coordinator {
             (metadata, system_metadata, body)
         };
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            self.current_object_lifecycle_expiration(
+            self.current_object_lifecycle_expiration_with_storage_node(
+                &storage_node,
                 &bucket_summary,
                 key,
                 record.tags.as_deref(),

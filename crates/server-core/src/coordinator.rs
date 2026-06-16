@@ -26,7 +26,7 @@ use storage::ObjectLockState;
 use storage::ShardKey;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
-use storage::{BucketName, ObjectKey, StorageCluster};
+use storage::{BucketName, ObjectKey, StorageCluster, StorageClusterRuntimeMapHandle};
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, EcShape, GenerationId,
@@ -454,7 +454,7 @@ fn spawn_bucket_fast_path_watcher(
 }
 
 pub struct Coordinator {
-    storage_node: Arc<StorageCluster>,
+    storage_node: StorageClusterRuntimeMapHandle,
     shared_caches: Arc<CoordinatorSharedCaches>,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
@@ -490,7 +490,7 @@ impl Coordinator {
             self.remove_bucket_fast_path(bucket);
             return None;
         }
-        match self.storage_node.load_bucket_fast_path_identity(bucket) {
+        match self.storage_node().load_bucket_fast_path_identity(bucket) {
             Ok(Some(identity)) if identity == info.identity() => Some(info),
             Ok(_) | Err(_) => {
                 self.remove_bucket_fast_path(bucket);
@@ -512,7 +512,7 @@ impl Coordinator {
             self.remove_bucket_fast_path(bucket);
             return None;
         }
-        match self.storage_node.load_bucket_fast_path_identity(bucket) {
+        match self.storage_node().load_bucket_fast_path_identity(bucket) {
             Ok(Some(identity)) if identity == cached_identity => Some(parsed),
             Ok(_) | Err(_) => {
                 self.remove_bucket_fast_path(bucket);

@@ -930,7 +930,7 @@ impl SameKeyUploadHarness {
                 let create = create_basic_multipart_upload(&self.coord, TRACE_BUCKET, TRACE_KEY);
                 let upload = self
                     .coord
-                    .storage_node
+                    .storage_node()
                     .test_get_multipart_upload(
                         &trusted_bucket_name(TRACE_BUCKET),
                         &trusted_object_key(TRACE_KEY),
@@ -1149,7 +1149,7 @@ impl SameKeyUploadHarness {
 
     fn active_session_count(&self) -> usize {
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_all_stream_uploads()
             .unwrap()
             .into_iter()
@@ -1388,7 +1388,7 @@ impl MultipartHeadTailHarness {
 
     fn active_session_count(&self) -> usize {
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_all_stream_uploads()
             .unwrap()
             .into_iter()
@@ -1547,7 +1547,7 @@ impl MultipartTraceHarness {
 
     fn active_session_count(&self) -> usize {
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_all_stream_uploads()
             .unwrap()
             .into_iter()
@@ -1559,7 +1559,7 @@ impl MultipartTraceHarness {
 
     fn pending_upload_count(&self) -> usize {
         self.coord
-            .storage_node
+            .storage_node()
             .test_list_multipart_uploads_for_bucket(&trusted_bucket_name(TRACE_BUCKET))
             .unwrap()
             .into_iter()

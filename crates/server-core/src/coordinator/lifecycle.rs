@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use s3_types::{
     BucketLifecycleConfiguration, LifecycleDate, LifecycleExpiration, LifecycleRule,
     LifecycleRuleStatus, VersionId,
 };
-use storage::StoredObject;
+use storage::{StorageCluster, StoredObject};
 
 use super::{
     bucket_handles::{LoadedBucketHandle, LoadedBucketValue},
@@ -29,13 +30,20 @@ impl Coordinator {
         &self,
         bucket: &BucketSummary,
     ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
+        self.cached_bucket_lifecycle_with_storage_node(&self.storage_node(), bucket)
+    }
+
+    pub(super) fn cached_bucket_lifecycle_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        bucket: &BucketSummary,
+    ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
         if !bucket.bucket_lifecycle_present {
             return Ok(None);
         }
 
         let authorized = self.authorize_load_bucket_lifecycle_for(&bucket.name);
-        let raw_config = self
-            .storage_node
+        let raw_config = storage_node
             .get_bucket_subresource(
                 &authorized.bucket,
                 storage::BucketSubresourceKind::Lifecycle,
@@ -80,15 +88,17 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn current_object_lifecycle_expiration(
+    pub(super) fn current_object_lifecycle_expiration_with_storage_node(
         &self,
+        storage_node: &Arc<StorageCluster>,
         bucket: &BucketSummary,
         key: &str,
         tags_xml: Option<&str>,
         size: u64,
         last_modified: u64,
     ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
-        let Some(config) = self.cached_bucket_lifecycle(bucket)? else {
+        let Some(config) = self.cached_bucket_lifecycle_with_storage_node(storage_node, bucket)?
+        else {
             return Ok(None);
         };
         let tags = match tags_xml {

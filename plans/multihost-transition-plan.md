@@ -7273,16 +7273,16 @@ Status:
   lease intervals. Frontend processes can bootstrap their initial storage
   cluster from the authority runtime map without a static
   `ARGMIN_STORAGE_NODE_SOCKETS` map, preserving configured Unix storage-node RPC
-  admission settings. Live frontend coordinator handle swapping remains a
-  separate boundary because current coordinators own an immutable
-  `Arc<StorageCluster>`.
-- Started preparing that frontend swap boundary by making each HTTP frontend
-  hold its coordinator through `Arc<Coordinator>`. Request handling still uses a
-  coherent immutable coordinator per request, but the process layer no longer
-  requires the HTTP frontend to own the coordinator by value. The remaining live
-  frontend work is to add a monotonic coordinator-handle install loop that
-  rebuilds coordinators from the refreshed `StorageClusterRuntimeMapHandle`
-  without leaking or duplicating background workers.
+  admission settings.
+- Added the live frontend runtime-map install boundary. Frontend startup now
+  creates one `StorageClusterRuntimeMapHandle`, starts the control-plane
+  runtime-map refresh loop when `ARGMIN_CONTROL_PLANE_SOCKET_PATH` is set, and
+  shares that handle with every coordinator. Coordinators snapshot the current
+  `Arc<StorageCluster>` from the handle at request/runtime entry points, so
+  foreground request routing can advance monotonically without rebuilding
+  coordinators or duplicating background workers on every lease extension.
+  Direct PUT, streaming append, and stream-part begin paths snapshot the current
+  cluster once for their multi-step storage operations.
 - Added fresh-state control-plane bootstrap from the existing
   `ARGMIN_STORAGE_NODE_SOCKETS` and PG configuration. When a manager opens an
   empty authority state and a storage-node socket map is present, it persists

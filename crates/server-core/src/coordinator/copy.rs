@@ -1,12 +1,16 @@
 use checksum::MultipartChecksumConfig;
+use std::sync::Arc;
 use storage::{
     BucketName, ObjectEncryption, ObjectKey, ObjectLayout, SerializedTagSet, StoredObject,
 };
 
-#[cfg(test)]
-use super::maybe_run_multipart_snapshot_hook;
 use super::read_core::{
-    segment_payloads_from_object_segments, snapshotted_multipart_parts_from_storage,
+    segment_payloads_from_object_segments, snapshotted_multipart_parts_from_storage, ReadRuntime,
+};
+#[cfg(test)]
+use super::{
+    maybe_run_multipart_snapshot_hook, maybe_run_object_read_snapshot_hook,
+    maybe_run_upload_part_copy_stream_session_hook,
 };
 use super::{
     AuthorizedCopyObject, AuthorizedFinalizeStreamPutRequest, AuthorizedMultipartPartWrite,
@@ -24,6 +28,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
+        read_runtime: ReadRuntime,
         snapshot: storage::ObjectReadSnapshot,
         source_sse_customer: Option<&crate::sse::SseCustomerRequest>,
     ) -> Result<ReadHandle, ServerError> {
@@ -33,6 +38,8 @@ impl Coordinator {
             multipart_parts,
             multipart_part_segments,
         } = snapshot;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
         let src_record = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         match src_record.layout {
             ObjectLayout::MultipartManifest { .. } => {
@@ -47,7 +54,7 @@ impl Coordinator {
                         &src_record.encryption,
                     );
                     let body = ReadHandle::from_multipart(
-                        self.read_runtime(),
+                        read_runtime,
                         bucket,
                         key,
                         src_record.generation_id,
@@ -66,7 +73,7 @@ impl Coordinator {
                 } else {
                     ReadHandle::from_segments(
                         ReadObjectContext {
-                            runtime: self.read_runtime(),
+                            runtime: read_runtime,
                             bucket,
                             key,
                             generation_id: src_record.generation_id,
@@ -88,11 +95,12 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
+        read_runtime: ReadRuntime,
         snapshot: storage::ObjectReadSnapshot,
-        read_start: usize,
-        read_end: usize,
+        read_range: (usize, usize),
         source_sse_customer: Option<&crate::sse::SseCustomerRequest>,
     ) -> Result<ReadHandle, ServerError> {
+        let (read_start, read_end) = read_range;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
@@ -111,7 +119,7 @@ impl Coordinator {
                         &src_record.encryption,
                     );
                     let body = ReadHandle::from_multipart_range(
-                        self.read_runtime(),
+                        read_runtime,
                         bucket,
                         key,
                         src_record.generation_id,
@@ -130,7 +138,7 @@ impl Coordinator {
                 } else {
                     ReadHandle::from_segments_range(
                         ReadObjectContext {
-                            runtime: self.read_runtime(),
+                            runtime: read_runtime,
                             bucket,
                             key,
                             generation_id: src_record.generation_id,
@@ -172,6 +180,8 @@ impl Coordinator {
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
         let source_sse_customer = req.source_sse_customer;
+        let storage_node = self.storage_node();
+        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let dst_explicit_sse_customer = self.prepare_sse_customer_write_context(
             req.destination_encryption.sse_customer_request(),
         )?;
@@ -181,7 +191,7 @@ impl Coordinator {
         let AuthorizedCopyObject {
             source: source_snapshot,
             destination: dst_authorized,
-        } = self.authorize_copy_object(req)?;
+        } = self.authorize_copy_object_with_storage_node(&storage_node, req)?;
 
         let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
             let src_stored = source_snapshot.stored.clone();
@@ -246,6 +256,7 @@ impl Coordinator {
             let body = self.copy_source_snapshot_to_read_handle(
                 &req.source.bucket,
                 &req.source.key,
+                read_runtime,
                 source_snapshot,
                 source_sse_customer,
             )?;
@@ -299,7 +310,10 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
-        let session_id = self.create_stream_put_session_for_authorized_write(&dst_authorized)?;
+        let session_id = self.create_stream_put_session_for_authorized_write_with_storage_node(
+            &storage_node,
+            &dst_authorized,
+        )?;
         let dst_write_encryption = &dst_authorized.write_encryption;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
@@ -327,7 +341,8 @@ impl Coordinator {
                     checksum.update(&chunk);
                 }
                 let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
-                self.append_stream_segment_for(
+                self.append_stream_segment_for_storage_node(
+                    &storage_node,
                     req.destination.bucket.name_typed(),
                     req.destination.key_typed(),
                     &session_id,
@@ -351,19 +366,21 @@ impl Coordinator {
                 system_metadata.set_checksum(algo, None, b64);
             }
 
-            let put_result = self.finalize_stream_put_with_authorized_write_tags(
-                &AuthorizedFinalizeStreamPutRequest {
-                    session_id: &session_id,
-                    crc64: crc64.finalize(),
-                    total_size,
-                    metadata_blob: &metadata_blob,
-                    system_metadata: &system_metadata,
-                    write_encryption: dst_write_encryption.as_ref(),
-                    cond: dst_cond,
-                },
-                &dst_authorized,
-                AuthorizedWriteTags::TrustedDerived(committed_tags.as_deref()),
-            )?;
+            let put_result = self
+                .finalize_stream_put_with_authorized_write_tags_with_storage_node(
+                    &storage_node,
+                    &AuthorizedFinalizeStreamPutRequest {
+                        session_id: &session_id,
+                        crc64: crc64.finalize(),
+                        total_size,
+                        metadata_blob: &metadata_blob,
+                        system_metadata: &system_metadata,
+                        write_encryption: dst_write_encryption.as_ref(),
+                        cond: dst_cond,
+                    },
+                    &dst_authorized,
+                    AuthorizedWriteTags::TrustedDerived(committed_tags.as_deref()),
+                )?;
 
             Ok(CopyObjectResult {
                 etag: put_result.etag,
@@ -376,7 +393,8 @@ impl Coordinator {
             })
         })();
         if copy_result.is_err() {
-            let _ = self.abort_stream_put_for_cleanup(
+            let _ = self.abort_stream_put_for_cleanup_with_storage_node(
+                &storage_node,
                 req.destination.bucket.name_typed(),
                 req.destination.key_typed(),
                 &session_id,
@@ -408,10 +426,12 @@ impl Coordinator {
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
         let source_sse_customer = req.source_sse_customer;
+        let storage_node = self.storage_node();
+        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedUploadPartCopy {
             source,
             destination,
-        } = self.authorize_upload_part_copy(req)?;
+        } = self.authorize_upload_part_copy_with_storage_node(&storage_node, req)?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -472,9 +492,9 @@ impl Coordinator {
             self.copy_source_snapshot_to_range_read_handle(
                 &req.source.bucket,
                 &req.source.key,
+                read_runtime,
                 source,
-                read_start as usize,
-                read_end as usize,
+                (read_start as usize, read_end as usize),
                 source_sse_customer,
             )?
         };
@@ -488,10 +508,11 @@ impl Coordinator {
             sse_customer,
         } = destination;
         let session_id = Self::random_session_id("failed to generate session ID")?;
-        let session_id = self
-            .storage_node
+        let session_id = storage_node
             .create_upload_part_stream_session(&upload, part_number, &session_id)
             .map_err(Self::map_object_pg_action_error)?;
+        #[cfg(test)]
+        maybe_run_upload_part_copy_stream_session_hook(bucket.as_str(), key.as_str());
         let session = BeginStreamPartResult {
             session_id,
             checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
@@ -503,7 +524,8 @@ impl Coordinator {
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
         let result = (|| {
-            let write_encryption = self.load_stream_part_write_encryption(
+            let write_encryption = self.load_stream_part_write_encryption_with_storage_node(
+                &storage_node,
                 &bucket,
                 &key,
                 session_id,
@@ -531,7 +553,8 @@ impl Coordinator {
                     checksum.update(&chunk);
                 }
                 let storage_chunk = write_encryption.encrypt_segment(segment_index, &chunk)?;
-                self.append_stream_segment_for(
+                self.append_stream_segment_for_storage_node(
+                    &storage_node,
                     &bucket,
                     &key,
                     session_id,
@@ -551,24 +574,32 @@ impl Coordinator {
                 .as_ref()
                 .map(|checksum| ChecksumClaim::from_raw(checksum.clone()));
 
-            self.finalize_stream_part(FinalizeStreamPartRequest {
-                upload: MultipartObjectRequest::new_typed(
-                    bucket.clone(),
-                    key.clone(),
-                    upload_id.clone(),
-                    req.upload.requester().clone(),
-                    req.expected_bucket_owner(),
-                ),
-                session_id,
-                part_number,
-                crc64: crc64.finalize(),
-                total_size,
-                claimed_checksum: claimed_checksum.as_ref(),
-                computed_checksum,
-            })
+            self.finalize_stream_part_with_storage_node(
+                &storage_node,
+                FinalizeStreamPartRequest {
+                    upload: MultipartObjectRequest::new_typed(
+                        bucket.clone(),
+                        key.clone(),
+                        upload_id.clone(),
+                        req.upload.requester().clone(),
+                        req.expected_bucket_owner(),
+                    ),
+                    session_id,
+                    part_number,
+                    crc64: crc64.finalize(),
+                    total_size,
+                    claimed_checksum: claimed_checksum.as_ref(),
+                    computed_checksum,
+                },
+            )
         })();
         if result.is_err() {
-            let _ = self.abort_stream_put_for_cleanup(&bucket, &key, session_id);
+            let _ = self.abort_stream_put_for_cleanup_with_storage_node(
+                &storage_node,
+                &bucket,
+                &key,
+                session_id,
+            );
         }
         let inner = result?;
         Ok(UploadPartCopyResult {
