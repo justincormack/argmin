@@ -7546,9 +7546,10 @@ Shard repair design:
   can now reconstruct a segment through the existing read-time EC path, derive
   up to `m` target shards from that reconstructed segment in one encode pass,
   write them through normal routed shard IO, and refresh their shard acks in the
-  authoritative data PG metadata. A focused regression removes two physical
-  shards, repairs both in one call, verifies the repaired acks match the bytes
-  on disk, and then reads the segment back normally.
+  authoritative data PG metadata. Focused regressions remove two physical
+  shards and repair both in one call, and corrupt a same-size physical shard and
+  repair it in place; both verify the repaired acks match the bytes on disk and
+  then read the segment back normally.
 - Added unrecoverable-shard coverage for the same boundary: when more than `m`
   shards are physically unavailable, both read-time reconstruction and explicit
   repair fail closed instead of returning partial or guessed payload bytes.

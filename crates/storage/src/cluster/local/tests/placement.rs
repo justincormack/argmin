@@ -1878,6 +1878,83 @@ fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shard
 }
 
 #[test]
+fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"phase-eleven-repair-corrupt-shard");
+    let shard_index = ShardIndex::new(0);
+    let shard_size = segment
+        .payload
+        .len()
+        .div_ceil(usize::from(segment.written.ec.k));
+    let shard_path = cluster
+        .test_payload_shard_file_path(
+            segment.written.data_pg_id,
+            segment.written.ec,
+            &segment.segment_okh,
+            segment.generation_id,
+            shard_index.get(),
+        )
+        .unwrap();
+    let corrupt_bytes = vec![0xAB; shard_size];
+    std::fs::write(&shard_path, &corrupt_bytes).unwrap();
+
+    let repaired = cluster
+        .repair_placed_segment_payload_shards(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: segment.written.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.generation_id,
+                stored_size: segment.payload.len(),
+                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                ec: segment.written.ec,
+            },
+            &[shard_index],
+        )
+        .unwrap();
+
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0].key.shard_index(), shard_index);
+    let repaired_bytes = std::fs::read(&shard_path).unwrap();
+    assert_ne!(repaired_bytes, corrupt_bytes);
+    assert_eq!(repaired[0].ack.stored_size, repaired_bytes.len() as u64);
+    assert_eq!(
+        repaired[0].ack.crc64,
+        checksum::crc64::checksum(&repaired_bytes)
+    );
+
+    let mut read_back = Vec::new();
+    cluster
+        .read_segment_payload_stored_bytes_into(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: segment.written.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.generation_id,
+                stored_size: segment.payload.len(),
+                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                ec: segment.written.ec,
+            },
+            &mut read_back,
+        )
+        .unwrap();
+    assert_eq!(read_back, segment.payload);
+}
+
+#[test]
 fn repair_placed_segment_payload_shards_rejects_invalid_target_sets() {
     let tmp = test_util::tempdir();
     let node_ids = [
