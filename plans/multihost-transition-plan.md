@@ -7525,6 +7525,9 @@ PG peering reconstruction design:
   read snapshots and multipart-upload lookups now have regressions proving they
   fail closed with `PgNotActive` while their metadata PG is `Peering`, rather
   than authorizing against incomplete per-PG state.
+- Extended the point-read coverage to bucket metadata snapshots. Single-bucket
+  snapshots and two-bucket snapshot pairs now fail closed with `PgNotActive`
+  when any participating bucket metadata PG is `Peering`.
 
 Exit criteria:
 

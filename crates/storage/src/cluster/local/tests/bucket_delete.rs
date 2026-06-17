@@ -1784,6 +1784,103 @@ fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
 }
 
 #[test]
+fn bucket_snapshot_fails_closed_while_bucket_pg_is_peering() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "snapshot-peering-")
+    };
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    drop(cluster);
+
+    Arc::get_mut(&mut map)
+        .unwrap()
+        .pg_routes
+        .get_mut(&PgId::new(1))
+        .unwrap()
+        .state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+
+    let err = cluster
+        .load_bucket_snapshot(&bucket, crate::BucketSnapshotRequest::default())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::BucketSnapshotLoadError::Store(StoreError::PgNotActive {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Peering,
+        })
+    ));
+}
+
+#[test]
+fn bucket_snapshot_pair_fails_closed_while_either_bucket_pg_is_peering() {
+    let assert_pair_fails = |peering_pg: u32| {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+        let (source_bucket, destination_bucket) = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            (
+                bucket_for_pg(topology, 1, "snapshot-pair-source-peering-"),
+                bucket_for_pg(topology, 2, "snapshot-pair-destination-peering-"),
+            )
+        };
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &source_bucket);
+        create_test_bucket(&cluster, &destination_bucket);
+        drop(cluster);
+
+        Arc::get_mut(&mut map)
+            .unwrap()
+            .pg_routes
+            .get_mut(&PgId::new(peering_pg))
+            .unwrap()
+            .state = PgState::Peering;
+        let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+
+        let err = cluster
+            .load_bucket_snapshot_pair(
+                (&source_bucket, crate::BucketSnapshotRequest::default()),
+                (&destination_bucket, crate::BucketSnapshotRequest::default()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketSnapshotLoadError::Store(StoreError::PgNotActive {
+                    pg_id,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: PgState::Peering,
+                }) if pg_id == peering_pg
+            ),
+            "unexpected snapshot-pair error for Peering PG {peering_pg}: {err:?}"
+        );
+    };
+
+    assert_pair_fails(1);
+    assert_pair_fails(2);
+}
+
+#[test]
 fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
