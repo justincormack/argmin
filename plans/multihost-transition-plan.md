@@ -7368,7 +7368,11 @@ Status:
   acting-set change. A metadata-write token issued to the old active primary is
   fenced by the epoch bump, both old and new primaries fail closed while the PG
   is `Peering`, and only the replacement primary can receive and validate a new
-  operation authorization after current-epoch peering proof completes.
+  operation authorization after current-epoch peering proof completes. A
+  separate Peering-state acting-set change regression proves observations
+  collected under the previous acting set cannot complete peering after the
+  epoch bump; the authority requires fresh current-epoch observations from the
+  new serving acting set.
 - Made the accepted peering metadata proof durable in the authoritative PG
   record. `Active` PGs now persist the proof that was validated during peering
   alongside the bound active primary, while any transition back to `Peering`

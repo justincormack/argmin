@@ -9177,6 +9177,87 @@ mod tests {
     }
 
     #[test]
+    fn acting_set_change_discards_stale_peering_observations() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(38), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        let first_peering_epoch = authority.snapshot().cluster_epoch();
+        heartbeat_with_pg_observation(&mut authority, 1, 38, PgState::Peering, 2_000);
+        heartbeat_with_pg_observation(&mut authority, 2, 38, PgState::Peering, 2_001);
+
+        authority
+            .set_pg_acting_set(
+                PgId::new(38),
+                vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+            )
+            .unwrap();
+        let changed_epoch = authority.snapshot().cluster_epoch();
+        assert!(changed_epoch > first_peering_epoch);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(38)).unwrap().state(),
+            PgState::Peering
+        );
+
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(38),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            ),
+            Err(ControlPlaneError::NodeNotServingCurrentEpoch {
+                node_id: 1,
+                cluster_epoch,
+            }) if cluster_epoch == changed_epoch
+        ));
+        assert!(authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, changed_epoch, 2_003),
+                2_003,
+            )
+            .unwrap()
+            .serving());
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(38),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_004,
+            ),
+            Err(ControlPlaneError::PgPeeringMissingObservation {
+                pg_id: 38,
+                cluster_epoch,
+                ..
+            }) if cluster_epoch == changed_epoch
+        ));
+
+        for (node_id, now_ms) in [(1, 2_005), (2, 2_006), (3, 2_007)] {
+            heartbeat_with_pg_observation(&mut authority, node_id, 38, PgState::Peering, now_ms);
+        }
+        authority
+            .complete_pg_peering(
+                PgId::new(38),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_008,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(38)).unwrap().state(),
+            PgState::Active
+        );
+    }
+
+    #[test]
     fn membership_change_to_joining_forces_active_pg_to_peering() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
