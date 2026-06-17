@@ -7354,7 +7354,11 @@ Status:
   the expired lease. It also covers explicit temporary availability loss: a
   primary marked `Suspect` fences old authorizations, leaves the PG in
   `Peering`, and cannot resume unsafe work until availability recovery,
-  current-epoch observation, and peering completion all happen.
+  current-epoch observation, and peering completion all happen. The same
+  deterministic set now also covers non-PG node-service authorization tokens:
+  an epoch bump fences a token issued under the old map, old observed-epoch
+  requests fail closed, and the node can receive a fresh authorization only
+  after heartbeating the current epoch.
 - Extended the deterministic epoch-transition fault regressions to cover an
   acting-set change. A metadata-write token issued to the old active primary is
   fenced by the epoch bump, both old and new primaries fail closed while the PG
@@ -7382,13 +7386,13 @@ Status:
   cover Active-to-`Joining` and Active-to-`Draining` so non-serving joins and
   draining handoff both require current-epoch peering before unsafe service can
   resume.
-- Tightened the storage-node heartbeat proof source so a node validates its
-  local metadata command replay state before advertising a PG peering/active
-  proof to the authority. The heartbeat builder now replays and checks the
-  command-log hash chain, pending-slot relation, and materialized metadata
-  digest while preserving any pending slot, so a corrupted local replica cannot
-  be treated as a valid peering participant just because the cached proof row
-  still exists.
+- Tightened the storage-node heartbeat proof source without putting unbounded
+  command-log replay on the recurring heartbeat path. Heartbeat observations now
+  read the incrementally maintained metadata replica proof and validate its
+  state digest against the cached metadata table digest state while preserving
+  the unresolved pending-command signal. Full command-log replay remains for
+  startup/open validation, explicit diagnostics, and later repair/checkpoint
+  work where O(retained history) validation is acceptable.
 - Extended PG heartbeat observations with explicit unresolved pending-metadata
   command state. Peering completion, automatic ready-peering completion, active
   heartbeat ingestion, active route export, and persisted state loading now

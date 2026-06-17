@@ -7088,6 +7088,59 @@ mod tests {
     }
 
     #[test]
+    fn node_service_authorization_cannot_validate_after_epoch_transition() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let serving = heartbeat_until_serving(&mut authority, 1, 100);
+        assert!(serving.serving());
+        let active_epoch = serving.cluster_epoch();
+        let node_incarnation = node_incarnation(&authority, 1);
+        let authorization = authority
+            .authorize_node_service(NodeId::new(1), node_incarnation, active_epoch, 150)
+            .unwrap();
+        authority
+            .validate_node_service_authorization(&authorization, 151)
+            .unwrap();
+
+        authority
+            .set_pg_acting_set(PgId::new(37), vec![NodeId::new(1)])
+            .unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        assert!(peering_epoch > active_epoch);
+
+        assert!(matches!(
+            authority.validate_node_service_authorization(&authorization, 152),
+            Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch,
+                current_epoch,
+            }) if cluster_epoch == active_epoch && current_epoch == peering_epoch
+        ));
+        assert!(matches!(
+            authority.authorize_node_service(NodeId::new(1), node_incarnation, active_epoch, 153),
+            Err(ControlPlaneError::StaleNodeObservedEpoch {
+                node_id: 1,
+                observed_epoch,
+                current_epoch,
+            }) if observed_epoch == active_epoch && current_epoch == peering_epoch
+        ));
+
+        let current = authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, peering_epoch, 154),
+                154,
+            )
+            .unwrap();
+        assert!(current.serving());
+        authority
+            .authorize_node_service(NodeId::new(1), node_incarnation, peering_epoch, 155)
+            .unwrap();
+    }
+
+    #[test]
     fn pg_primary_authorization_fails_closed_for_peering_and_wrong_primary() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
