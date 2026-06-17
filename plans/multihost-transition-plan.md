@@ -7497,7 +7497,9 @@ PG peering reconstruction design:
   the authority persists `Active` with that proof. The cluster catch-up helper
   is also covered through Unix storage-node clients, proving the production RPC
   path can read retained payload entries, apply Peering-only replay commands on
-  lagging replicas, and re-gather the converged proof.
+  lagging replicas, and re-gather the converged proof. Local cluster coverage
+  also forces replay across multiple retained-entry RPC batches so the batching
+  path is part of the regression suite, not only the single-entry replay path.
 - Added a side-effect-free cluster peering gather helper that reads the current
   acting set's replica state and pending slot state through
   `MetadataCommandNodeClient`, fetches the selected primary's retained suffix
