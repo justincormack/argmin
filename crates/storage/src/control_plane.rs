@@ -696,6 +696,8 @@ pub struct PgControlRecord {
     state: PgState,
     acting_set: Vec<NodeId>,
     active_primary: Option<NodeId>,
+    // Activation-time metadata floor. Active heartbeats may report later
+    // metadata progress, but not an older or divergent proof at this index.
     active_metadata_proof: Option<PgMetadataProof>,
 }
 
@@ -4204,6 +4206,51 @@ mod tests {
     }
 
     #[test]
+    fn active_metadata_proof_floor_accepts_only_same_or_later_progress() {
+        let active_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        assert!(metadata_proof_satisfies_active_floor(
+            active_floor,
+            active_floor
+        ));
+        assert!(metadata_proof_satisfies_active_floor(
+            active_floor,
+            PgMetadataProof {
+                applied_log_index: 43,
+                applied_log_hash: 0xabd,
+                state_digest: 0xdf0,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_floor(
+            active_floor,
+            PgMetadataProof {
+                applied_log_index: 41,
+                applied_log_hash: 0xabc,
+                state_digest: 0xdef,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_floor(
+            active_floor,
+            PgMetadataProof {
+                applied_log_index: 42,
+                applied_log_hash: 0xabd,
+                state_digest: 0xdef,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_floor(
+            active_floor,
+            PgMetadataProof {
+                applied_log_index: 42,
+                applied_log_hash: 0xabc,
+                state_digest: 0xdf0,
+            },
+        ));
+    }
+
+    #[test]
     fn unix_control_plane_client_fetches_runtime_map() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -5647,6 +5694,77 @@ mod tests {
                 ..
             }) if expected == accepted_proof && actual == mismatched_proof
         ));
+    }
+
+    #[test]
+    fn non_primary_active_observation_cannot_satisfy_primary_active_proof() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(23), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        let accepted_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        for node_id in [1, 2] {
+            let mut peering_heartbeat = heartbeat_from_record(
+                &authority,
+                node_id,
+                authority.snapshot().cluster_epoch(),
+                2_000 + u64::from(node_id),
+            );
+            peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: PgId::new(23),
+                state: PgState::Peering,
+                metadata_proof: accepted_proof,
+                has_pending_metadata_command: false,
+            }];
+            authority
+                .heartbeat(peering_heartbeat, 2_000 + u64::from(node_id))
+                .unwrap();
+        }
+        authority
+            .complete_pg_peering(
+                PgId::new(23),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+
+        let progressed_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
+        };
+        let mut non_primary_active =
+            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 2_020);
+        non_primary_active.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(23),
+            state: PgState::Active,
+            metadata_proof: progressed_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(non_primary_active, 2_020).unwrap();
+        assert_eq!(authority.serving_pg_primary(PgId::new(23), 2_030), None);
+        assert!(authority
+            .snapshot()
+            .active_pg_route(PgId::new(23), 2_030)
+            .is_err());
+        assert!(authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_030, NodeId::new(2))
+            .is_err());
     }
 
     #[test]
@@ -7553,6 +7671,12 @@ mod tests {
                 2_010,
             )
             .unwrap();
+        let pre_progress_deadline = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
 
         let same_index_mismatched_proof = PgMetadataProof {
             applied_log_index: 42,
@@ -7599,6 +7723,7 @@ mod tests {
         }];
         let lease = authority.heartbeat(progressed_active, 2_030).unwrap();
         assert_eq!(lease.lease_deadline_ms(), 2_130);
+        assert!(lease.lease_deadline_ms() > pre_progress_deadline);
         let observation = authority
             .snapshot()
             .node(NodeId::new(1))
@@ -7610,6 +7735,15 @@ mod tests {
         assert_eq!(
             authority.serving_pg_primary(PgId::new(19), 2_031),
             Some(NodeId::new(1))
+        );
+        let expiry_at_old_deadline = authority
+            .expire_heartbeat_leases(pre_progress_deadline + 1)
+            .unwrap();
+        assert_eq!(expiry_at_old_deadline.expired_nodes(), &[]);
+        assert_eq!(expiry_at_old_deadline.peering_pgs(), &[]);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(19)).unwrap().state(),
+            PgState::Active
         );
     }
 
