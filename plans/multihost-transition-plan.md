@@ -7498,9 +7498,10 @@ PG peering reconstruction design:
   is also covered through Unix storage-node clients, proving the production RPC
   path can read retained payload entries, apply Peering-only replay commands on
   lagging replicas, and re-gather the converged proof. Local cluster coverage
-  also forces replay across mixed replica lag distances and across multiple
-  retained-entry RPC batches, so those production replay paths are part of the
-  regression suite, not only the single-entry replay path.
+  also forces replay across mixed replica lag distances, retry after a partial
+  earlier catch-up, and multiple retained-entry RPC batches, so those
+  production replay paths are part of the regression suite, not only the
+  single-entry replay path.
 - Added a side-effect-free cluster peering gather helper that reads the current
   acting set's replica state and pending slot state through
   `MetadataCommandNodeClient`, fetches the selected primary's retained suffix
