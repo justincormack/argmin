@@ -40,10 +40,12 @@ use crate::node_client::{
     ShardAckNodeClient, StorageNodeClient,
 };
 use crate::peering::{
+    build_pg_peering_replay_plan_from_retained_log_entries,
     reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
     PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
+use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
@@ -2012,6 +2014,76 @@ impl StorageCluster {
             primary,
             &replicas,
         )?)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn replay_pg_peering_catchup_from_retained_metadata_log(
+        &self,
+        pg_id: PgId,
+        primary: NodeId,
+    ) -> Result<PgPeeringReconstructionDecision, PgPeeringReconstructionFailure> {
+        let decision = self.reconstruct_pg_peering_from_retained_metadata_log(pg_id, primary)?;
+        let PgPeeringReconstructionDecision::CatchUpRequired { replicas, .. } = decision else {
+            return Ok(decision);
+        };
+
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
+        let primary_node = nodes
+            .iter()
+            .find(|node| node.node_id() == primary)
+            .ok_or(PgPeeringReconstructionError::PrimaryMissing { primary })?;
+        let first_log_index = replicas
+            .iter()
+            .map(|replica| replica.from_log_index + 1)
+            .min()
+            .expect("catch-up decision contains at least one replica");
+        let last_log_index = replicas
+            .iter()
+            .map(|replica| replica.to_log_index)
+            .max()
+            .expect("catch-up decision contains at least one replica");
+        let mut retained_log_entries = Vec::new();
+        let mut batch_start = first_log_index;
+        while batch_start <= last_log_index {
+            let batch_end = last_log_index
+                .min(batch_start + STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES - 1);
+            let first_log_index = MetadataCommandLogIndex::new(batch_start)
+                .expect("catch-up retained entry range starts after zero");
+            let last_log_index = MetadataCommandLogIndex::new(batch_end)
+                .expect("catch-up retained entry range ends after zero");
+            retained_log_entries.extend(
+                primary_node
+                    .metadata_command_client()
+                    .retained_metadata_command_log_entries(
+                        pg_id,
+                        self.operation_epoch(),
+                        first_log_index,
+                        last_log_index,
+                    )?,
+            );
+            batch_start = batch_end + 1;
+        }
+
+        let replay_plans = build_pg_peering_replay_plan_from_retained_log_entries(
+            &replicas,
+            &retained_log_entries,
+        )?;
+        for replay_plan in replay_plans {
+            let target_node = nodes
+                .iter()
+                .find(|node| node.node_id() == replay_plan.node_id)
+                .ok_or(PgPeeringReconstructionError::ReplayTargetMissing {
+                    node_id: replay_plan.node_id,
+                })?;
+            let metadata_client = target_node.metadata_command_client();
+            for command in replay_plan.commands {
+                metadata_client.replay_metadata_command_for_peering(pg_id, &command)?;
+            }
+        }
+
+        self.reconstruct_pg_peering_from_retained_metadata_log(pg_id, primary)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

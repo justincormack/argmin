@@ -117,7 +117,7 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 16;
 // Keep the worst-case all-applied retained-entry response within the 64 MiB
 // frame cap after success-response wrapping.
-const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES: u64 = 31;
+pub(crate) const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES: u64 = 31;
 const STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN: usize =
     8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
@@ -552,6 +552,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
+    MetadataCommandPeeringReplayApplyAndRecord = 127,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,6 +649,9 @@ impl StorageRpcMessageKind {
                 "metadata command bucket-control pending slot insert"
             }
             Self::MetadataCommandApplyAndRecord => "metadata command apply and record",
+            Self::MetadataCommandPeeringReplayApplyAndRecord => {
+                "metadata command peering replay apply and record"
+            }
             Self::MetadataCommandPgLockAcquire => "metadata command PG lock acquire",
             Self::MetadataCommandPgLockRelease => "metadata command PG lock release",
             Self::BucketHeadRaw => "bucket head raw",
@@ -879,6 +883,7 @@ impl StorageRpcMessageKind {
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
+            127 => Ok(Self::MetadataCommandPeeringReplayApplyAndRecord),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -2992,7 +2997,8 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
         | StorageRpcMessageKind::MetadataCommandAbandoned
         | StorageRpcMessageKind::MetadataCommandRecordAbandoned
-        | StorageRpcMessageKind::MetadataCommandApplyAndRecord => {
+        | StorageRpcMessageKind::MetadataCommandApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
             STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandPendingSlotInsert

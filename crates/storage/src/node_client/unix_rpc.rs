@@ -1333,22 +1333,43 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.metadata_command_apply_and_record_with_kind(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            "decode metadata command apply and record response",
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.metadata_command_apply_and_record_with_kind(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord,
+            "decode metadata command peering replay response",
+        )
+    }
+
+    fn metadata_command_apply_and_record_with_kind(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        kind: StorageRpcMessageKind,
+        decode_context: &'static str,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         let payload = self
             .encode_metadata_command_request(pg_id, command)
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = self
-            .rpc_request(
-                StorageRpcMessageKind::MetadataCommandApplyAndRecord,
-                payload,
-            )
+            .rpc_request(kind, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = decode_metadata_command_state_outcome_response(&response)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command apply and record response",
-                    error.to_string(),
-                )
-            })
+            .map_err(|error| self.rpc_payload_error(decode_context, error.to_string()))
             .map_err(BucketSnapshotLoadError::Store)?;
         match response.outcome {
             StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
@@ -1917,6 +1938,14 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         UnixStorageNodeClient::apply_metadata_command_and_record(self, pg_id, command)
+    }
+
+    fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        UnixStorageNodeClient::replay_metadata_command_for_peering(self, pg_id, command)
     }
 
     fn record_metadata_command_abandoned(

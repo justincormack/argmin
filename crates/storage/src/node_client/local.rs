@@ -3756,6 +3756,15 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
     }
 
+    fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+    }
+
     fn record_metadata_command_abandoned(
         &self,
         pg_id: PgId,

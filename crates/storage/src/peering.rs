@@ -1,5 +1,5 @@
 use crate::control_plane::PgMetadataProof;
-use crate::error::StoreError;
+use crate::error::{BucketSnapshotLoadError, StoreError};
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandLogHashRangeEntry, MetadataCommandLogRangeEntry,
     MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState,
@@ -45,6 +45,8 @@ pub(crate) enum PgPeeringReconstructionDecision {
 pub(crate) enum PgPeeringReconstructionError {
     #[error("PG peering selected primary {primary:?} is missing from reconstruction input")]
     PrimaryMissing { primary: NodeId },
+    #[error("PG peering replay target {node_id:?} is missing from acting-set clients")]
+    ReplayTargetMissing { node_id: NodeId },
     #[error(
         "PG peering node {node_id:?} reported epoch {replica_epoch}, expected {cluster_epoch}"
     )]
@@ -91,6 +93,8 @@ pub(crate) enum PgPeeringReconstructionError {
 pub(crate) enum PgPeeringReconstructionFailure {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Apply(#[from] BucketSnapshotLoadError),
     #[error(transparent)]
     Reconstruction(#[from] PgPeeringReconstructionError),
 }

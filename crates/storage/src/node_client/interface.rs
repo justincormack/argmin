@@ -1110,6 +1110,12 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 
+    fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
     fn record_metadata_command_abandoned(
         &self,
         pg_id: PgId,

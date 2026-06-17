@@ -355,6 +355,95 @@ impl UnixStorageNodeMetadataCommandSession {
             )),
         }
     }
+
+    fn metadata_command_apply_and_record_with_kind(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        kind: StorageRpcMessageKind,
+        decode_context: &'static str,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let payload = self
+            .encode_metadata_command_request(pg_id, command)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self
+            .rpc_request(kind, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_metadata_command_state_outcome_response(&response)
+            .map_err(|error| self.rpc_payload_error(decode_context, error.to_string()))
+            .map_err(BucketSnapshotLoadError::Store)?;
+        match response.outcome {
+            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(BucketSnapshotLoadError::Store(
+                metadata_command_log_conflict_error(
+                    self.cluster_epoch,
+                    pg_id,
+                    decode_context,
+                    |operation, message| self.rpc_payload_error(operation, message),
+                    MetadataCommandLogConflictRpcFields {
+                        node_id,
+                        pg_id: conflict_pg_id,
+                        cluster_epoch,
+                        log_index,
+                    },
+                ),
+            )),
+            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+                reservation_id,
+                generation_id,
+            } => Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict {
+                    reservation_id: reservation_id.into_string(),
+                    generation_id: generation_id.get(),
+                },
+            )),
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
+                version_id,
+            } => Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::ObjectVersionReservationConflict { version_id },
+            )),
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+                name,
+                bucket_execution_generation,
+            } => match stale_bucket_metadata_command_error(
+                command,
+                name,
+                bucket_execution_generation,
+                decode_context,
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+            },
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
+            } => match stale_object_write_command_error(
+                command,
+                bucket,
+                key,
+                write_sequence,
+                generation_id,
+                decode_context,
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+            },
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => {
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::StreamSegmentConflict { segment_index },
+                ))
+            }
+        }
+    }
 }
 impl Drop for UnixStorageNodeMetadataCommandSession {
     fn drop(&mut self) {
@@ -965,94 +1054,25 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let payload = self
-            .encode_metadata_command_request(pg_id, command)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::MetadataCommandApplyAndRecord,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_metadata_command_state_outcome_response(&response)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command apply and record response",
-                    error.to_string(),
-                )
-            })
-            .map_err(BucketSnapshotLoadError::Store)?;
-        match response.outcome {
-            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
-            StorageRpcMetadataCommandStateOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(BucketSnapshotLoadError::Store(
-                metadata_command_log_conflict_error(
-                    self.cluster_epoch,
-                    pg_id,
-                    "decode metadata command apply and record response",
-                    |operation, message| self.rpc_payload_error(operation, message),
-                    MetadataCommandLogConflictRpcFields {
-                        node_id,
-                        pg_id: conflict_pg_id,
-                        cluster_epoch,
-                        log_index,
-                    },
-                ),
-            )),
-            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
-                reservation_id,
-                generation_id,
-            } => Err(BucketSnapshotLoadError::Metadata(
-                MetadataError::ObjectGenerationReservationConflict {
-                    reservation_id: reservation_id.into_string(),
-                    generation_id: generation_id.get(),
-                },
-            )),
-            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
-                version_id,
-            } => Err(BucketSnapshotLoadError::Metadata(
-                MetadataError::ObjectVersionReservationConflict { version_id },
-            )),
-            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
-                name,
-                bucket_execution_generation,
-            } => match stale_bucket_metadata_command_error(
-                command,
-                name,
-                bucket_execution_generation,
-                "decode metadata command apply and record response",
-                |operation, message| self.rpc_payload_error(operation, message),
-            ) {
-                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
-                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
-            },
-            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
-                bucket,
-                key,
-                write_sequence,
-                generation_id,
-            } => match stale_object_write_command_error(
-                command,
-                bucket,
-                key,
-                write_sequence,
-                generation_id,
-                "decode metadata command apply and record response",
-                |operation, message| self.rpc_payload_error(operation, message),
-            ) {
-                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
-                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
-            },
-            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => {
-                Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::StreamSegmentConflict { segment_index },
-                ))
-            }
-        }
+        self.metadata_command_apply_and_record_with_kind(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            "decode metadata command apply and record response",
+        )
+    }
+
+    fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.metadata_command_apply_and_record_with_kind(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord,
+            "decode metadata command peering replay response",
+        )
     }
 
     fn record_metadata_command_abandoned(

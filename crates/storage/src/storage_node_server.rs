@@ -2418,6 +2418,17 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
+                match decode_metadata_command_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_peering_replay_apply_and_record_response(
+                        session, request,
+                    ),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::MetadataCommandPgLockAcquire => {
                 match decode_metadata_command_state_request(&frame.payload) {
                     Ok(request) => self.metadata_command_pg_lock_acquire_response(session, request),
@@ -6868,9 +6879,37 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        self.metadata_command_apply_and_record_response_with_allowed_states(
+            session,
+            request,
+            &[PgState::Active],
+        )
+    }
+
+    fn metadata_command_peering_replay_apply_and_record_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        self.metadata_command_apply_and_record_response_with_allowed_states(
+            session,
+            request,
+            &[PgState::Peering],
+        )
+    }
+
+    fn metadata_command_apply_and_record_response_with_allowed_states(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandRequest,
+        allowed_states: &[PgState],
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route_with_allowed_states(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            allowed_states,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -11315,6 +11354,81 @@ mod tests {
         let decoded =
             crate::storage_rpc::decode_metadata_command_log_entry_range_response(&payload).unwrap();
         assert_eq!(decoded.entries, expected);
+    }
+
+    #[test]
+    fn storage_node_server_allows_peering_replay_apply() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let command = test_metadata_command(0, 1);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert!(matches!(
+            decoded.outcome,
+            StorageRpcMetadataCommandStateOutcome::State(
+                crate::metadata_command::MetadataCommandReplicaState {
+                    applied_log_index: 1,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn storage_node_server_rejects_normal_apply_while_peering() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let command = test_metadata_command(0, 1);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                pg_id: PgId::new(0),
+                command,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::InactivePgRoute);
     }
 
     #[test]

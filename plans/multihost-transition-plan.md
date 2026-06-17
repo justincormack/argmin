@@ -7479,6 +7479,17 @@ PG peering reconstruction design:
   proof. Abandoned retained entries fail closed before any mutation, so the
   next production slice can apply only explicit all-applied replay plans and
   leave tombstone recovery to a later design.
+- Added the first mutating catch-up path for all-applied retained suffixes. The
+  storage cluster fetches primary retained payload entries in RPC-cap-sized
+  batches, builds replay plans, applies each planned command to lagging acting
+  set members through a distinct Peering-only metadata replay RPC, and then
+  reruns the side-effect-free reconstruction gather to prove the acting set
+  converged before any authority activation attempt. Normal metadata
+  `apply-and-record` remains Active-only at the Unix storage-node boundary, and
+  the cluster catch-up entry point requires a Peering route before mutation so
+  local/direct clients cannot replay through an Active map. Primary retained
+  abandoned tombstones still fail closed before mutation; replaying those
+  entries needs a separate explicit tombstone recovery design.
 - Added a side-effect-free cluster peering gather helper that reads the current
   acting set's replica state and pending slot state through
   `MetadataCommandNodeClient`, fetches the selected primary's retained suffix

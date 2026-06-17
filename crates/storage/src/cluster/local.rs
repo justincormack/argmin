@@ -2677,6 +2677,18 @@ impl LocalClusterMap {
         )
     }
 
+    pub(crate) fn metadata_pg_acting_nodes_for_peering_replay(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        self.metadata_pg_acting_nodes_with_allowed_states(
+            operation_epoch,
+            pg_id,
+            &[PgState::Peering],
+        )
+    }
+
     fn metadata_pg_acting_nodes_with_allowed_states(
         &self,
         operation_epoch: ClusterEpoch,
