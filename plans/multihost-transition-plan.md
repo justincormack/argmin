@@ -7487,8 +7487,10 @@ PG peering reconstruction design:
   reruns the side-effect-free reconstruction gather to prove the acting set
   converged before any authority activation attempt. Normal metadata
   `apply-and-record` remains Active-only at the Unix storage-node boundary, and
-  the cluster catch-up entry point requires a Peering route before mutation so
-  local/direct clients cannot replay through an Active map. Primary retained
+  the Peering replay RPC rejects Active routes at the Unix storage-node
+  boundary. The cluster catch-up entry point also requires a Peering route
+  before mutation so local/direct clients cannot replay through an Active map.
+  Primary retained
   abandoned tombstones still fail closed before mutation; replaying those
   entries needs a separate explicit tombstone recovery design. A focused
   end-to-end regression now covers the handoff sequence after catch-up:
