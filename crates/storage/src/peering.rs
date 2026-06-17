@@ -311,6 +311,20 @@ mod tests {
         }
     }
 
+    fn state_at_epoch(
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+        log_hash: u64,
+        state_digest: u64,
+    ) -> MetadataCommandReplicaState {
+        MetadataCommandReplicaState {
+            cluster_epoch,
+            applied_log_index: log_index,
+            applied_log_hash: log_hash,
+            state_digest,
+        }
+    }
+
     fn replica(
         node_id: u32,
         state: MetadataCommandReplicaState,
@@ -588,6 +602,55 @@ mod tests {
                 reference_node_id: NodeId::new(1),
                 replica: PgMetadataProof::new(2, 20, 201),
                 reference: PgMetadataProof::new(2, 20, 200),
+            }
+        );
+    }
+
+    #[test]
+    fn peering_reconstruction_fails_closed_when_replica_is_ahead_of_primary() {
+        let err = reconstruct_pg_peering_from_primary_retained_log(
+            ClusterEpoch::INITIAL,
+            PgId::new(7),
+            NodeId::new(1),
+            &[
+                replica(1, state(2, 20, 200), Vec::new()),
+                replica(2, state(3, 30, 300), Vec::new()),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PgPeeringReconstructionError::ReplicaAheadOfPrimary {
+                node_id: NodeId::new(2),
+                replica_log_index: 3,
+                primary_log_index: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn peering_reconstruction_fails_closed_on_stale_replica_epoch() {
+        let current_epoch = ClusterEpoch::new(2).unwrap();
+        let err = reconstruct_pg_peering_from_primary_retained_log(
+            current_epoch,
+            PgId::new(7),
+            NodeId::new(1),
+            &[
+                replica(1, state_at_epoch(current_epoch, 2, 20, 200), Vec::new()),
+                replica(
+                    2,
+                    state_at_epoch(ClusterEpoch::INITIAL, 2, 20, 200),
+                    Vec::new(),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PgPeeringReconstructionError::StaleReplicaEpoch {
+                node_id: NodeId::new(2),
+                replica_epoch: ClusterEpoch::INITIAL,
+                cluster_epoch: current_epoch,
             }
         );
     }

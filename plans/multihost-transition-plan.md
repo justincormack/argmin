@@ -7454,8 +7454,9 @@ PG peering reconstruction design:
   hash-chain entries. It returns either already-converged, deterministic catch-up
   required for lagging replicas, or a fail-closed reason for pending commands,
   same-index metadata forks, missing retained suffix entries, retained
-  hash-chain forks, stale epochs, or replicas ahead of the selected primary. The
-  helper is now normal storage-layer code, not test-only scaffolding.
+  hash-chain forks, stale epochs, or replicas ahead of the selected primary.
+  Focused pure tests cover each of those fail-closed branches. The helper is now
+  normal storage-layer code, not test-only scaffolding.
 - Added the first production boundary for those range reads. `PgStore`, local
   metadata clients, Unix metadata clients, metadata-command sessions, and the
   storage-node Unix RPC protocol can now read a bounded sparse range of retained
