@@ -1146,11 +1146,16 @@ impl SharedStorageNode {
 
     pub fn pg_heartbeat_observation(
         &self,
+        node_id: NodeId,
         pg_id: PgId,
         state: PgState,
     ) -> Result<NodePgHeartbeatObservation, StoreError> {
         let pg = self.get_pg(pg_id.get())?;
-        let metadata_state = pg.metadata_command_replica_state()?;
+        let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
+        let metadata_state = pg.validate_metadata_command_replay_state_preserving_pending_slot(
+            node_id.as_u32(),
+            metadata_epoch,
+        )?;
         Ok(NodePgHeartbeatObservation {
             pg_id,
             state,
@@ -1173,7 +1178,7 @@ impl SharedStorageNode {
     ) -> Result<NodeHeartbeat, StoreError> {
         let pg_observations = pg_states
             .into_iter()
-            .map(|(pg_id, state)| self.pg_heartbeat_observation(pg_id, state))
+            .map(|(pg_id, state)| self.pg_heartbeat_observation(node_id, pg_id, state))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(NodeHeartbeat {
             node_id,
@@ -1815,7 +1820,7 @@ mod tests {
         };
 
         let observation = node
-            .pg_heartbeat_observation(PgId::new(0), PgState::Peering)
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
             .unwrap();
 
         assert_eq!(observation.pg_id, PgId::new(0));
@@ -1831,6 +1836,39 @@ mod tests {
         assert_eq!(
             observation.metadata_proof.state_digest,
             metadata_state.state_digest
+        );
+    }
+
+    #[test]
+    fn shared_node_pg_heartbeat_observation_validates_metadata_replay_state() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE metadata_command_replica_state \
+                     SET state_digest = state_digest + 1 \
+                     WHERE singleton = 0",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let err = node
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::MetadataStateDigestMismatch {
+                    node_id: 7,
+                    pg_id: 0,
+                    ..
+                }
+            ),
+            "heartbeat proof must not advertise a corrupted replay state: {err:?}"
         );
     }
 

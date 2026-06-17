@@ -7368,6 +7368,13 @@ Status:
   cover Active-to-`Joining` and Active-to-`Draining` so non-serving joins and
   draining handoff both require current-epoch peering before unsafe service can
   resume.
+- Tightened the storage-node heartbeat proof source so a node validates its
+  local metadata command replay state before advertising a PG peering/active
+  proof to the authority. The heartbeat builder now replays and checks the
+  command-log hash chain, pending-slot relation, and materialized metadata
+  digest while preserving any pending slot, so a corrupted local replica cannot
+  be treated as a valid peering participant just because the cached proof row
+  still exists.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition
