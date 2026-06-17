@@ -1,0 +1,289 @@
+Active PG handoff can strand the primary without a route map
+Link: https://chatgpt.com/codex/cloud/security/findings/8077d5731e4c8191a405c9864d058539?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d8be5fb
+Author: justin@specialbusservice.com
+Created: 16/06/2026, 22:07:14
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the proof-fencing change correctly tries to fail closed for stale or mismatched active-primary observations, but the just-activated handoff exception is scoped only to the refresh call that completed peering rather than to the primary's first refresh/installation of the new epoch route. This can strand the selected primary if another acting-set node triggers activation.
+The new validation requires active storage-node refresh routes to pass validate_pg_primary_active_observation unless the PG is in the local just_activated_pgs set. That set is constructed only from complete_ready_pg_peerings() during the same refresh_node_heartbeat call. In a multi-node acting set, a non-primary node can be the heartbeat that makes the PG ready. The authority then marks the PG Active, chooses the deterministic primary, bumps the epoch, and returns an Active route only to the non-primary caller under the just_activated exception. The actual primary is still running its old Peering-epoch config. When the primary later refreshes, its heartbeat has the old observed_epoch and cannot update its PG observation. Because just_activated_pgs is empty on this later request, runtime_map_for_storage_node_refresh calls validate_pg_primary_active_observation, which requires a current-epoch Active observation and matching proof. The primary cannot produce that observation until it receives and installs the new Active route map, but the new validation prevents it from receiving that map. This creates a liveness failure/denial of service for the PG until lease expiry or manual recovery, and a non-primary storage node could repeatedly trigger this timing to keep a PG unavailable.
+
+# Resolution
+Fixed in https://github.com/justincormack/argmin/commit/ca3bc078.
+
+The storage-node runtime-map refresh path now carries the refreshing node id into Active PG route construction. Active route export still validates the bound primary's current Active observation, but there is one narrow handoff exception: if the only validation failure is `PgPrimaryMissingActiveObservation`, the refreshing node must be the selected primary. This lets the selected primary receive the new Active route map after a non-primary heartbeat completes peering, while non-primary refreshes fail closed instead of receiving an Active route before the primary has installed and reported the current Active state.
+
+The regression `storage_node_refresh_hands_active_route_to_primary_after_non_primary_completes_peering` covers the reported sequence: node 2 can trigger activation for PG 77, but node 2 receives `PgPrimaryMissingActiveObservation`; frontend export remains closed; node 1, the selected primary, receives the handoff map and then reports Active, after which normal serving/export succeeds.
+
+# Validation
+## Rubric
+- [x] Identify whether a non-primary storage-node refresh can be the call that completes PG peering and activates the PG.
+- [x] Confirm the activation chooses a deterministic primary different from the refreshing node and bumps the cluster epoch.
+- [x] Confirm just_activated_pgs is local to that single refresh, so the chosen primary's later refresh does not receive the bypass.
+- [x] Confirm a primary that has not installed the Active route still sends the old Peering epoch/state and cannot update to an Active observation before receiving the route.
+- [x] Confirm the later primary refresh is rejected by validate_pg_primary_active_observation, leaving no serving PG primary.
+## Report
+Validated the liveness bug with a targeted Rust unit-test PoC and an LLDB trace. The PoC creates two healthy storage nodes with PG 77 acting set [1,2]. Node 1 first reports Peering; node 2 then sends the refresh that completes peering. The authority activates the PG and chooses node 1 as primary, but only node 2's refresh receives the local just_activated_pgs bypass. When node 1 later refreshes using its still-installed Peering epoch/route, refresh_node_heartbeat fails while constructing the runtime map: PgPrimaryMissingActiveObservation { pg_id: 77, node_id: 1, cluster_epoch: ClusterEpoch(7) }, and serving_pg_primary remains None. Targeted test output: `primary refresh after non-primary activation failed with: PgPrimaryMissingActiveObservation { pg_id: 77, node_id: 1, cluster_epoch: ClusterEpoch(7) } ... ok`. Code evidence: complete_ready_pg_peerings marks PGs Active, stores active_primary/proof, and bumps epoch at crates/storage/src/control_plane.rs:1420-1467; bump_epoch clears node pg_observations at lines 523-527; refresh_node_heartbeat scopes just_activated_pgs to one call at lines 1969-1985; active_pg_route_for_storage_node_refresh calls validate_pg_primary_active_observation when just_activated is false at lines 321-371; validate_pg_primary_active_observation rejects missing primary Active observation at lines 3797-3820; storage-node heartbeats are derived from installed cluster_epoch/pg_routes at crates/storage/src/storage_node_server.rs:414-423, and stale observed_epoch heartbeats return early without installing/updating observations at control_plane.rs:1512-1520. LLDB confirmed the chain: breakpoint at control_plane.rs:1461 in complete_ready_pg_peerings was reached from node 2's refresh_node_heartbeat at line 1977; later breakpoint at control_plane.rs:3816 was reached from active_pg_route_for_storage_node_refresh line 371 via runtime_map_for_storage_node_refresh and refresh_node_heartbeat line 1985 during node 1's later refresh. Valgrind was attempted but is not installed in the container; this is a logic/liveness issue rather than memory corruption.
+
+# Evidence
+crates/storage/src/control_plane.rs (L1420 to 1467)
+  Note: complete_ready_pg_peerings can mark a Peering PG Active, choose the primary, store the accepted proof, bump the cluster epoch, and return only the activated PG ids. It does not persist which primary still needs the handoff route.
+```
+    pub fn complete_ready_pg_peerings(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Vec<PgId>, ControlPlaneError> {
+        let mut ready = Vec::new();
+        for record in self.snapshot.pgs.values() {
+            if record.state != PgState::Peering {
+                continue;
+            }
+            let Some(primary) =
+                self.deterministic_pg_primary(record.pg_id, record.acting_set(), now_ms)
+            else {
+                continue;
+            };
+            match validate_pg_peering_observations(
+                &self.snapshot,
+                record.pg_id,
+                record.acting_set(),
+                now_ms,
+            ) {
+                Ok(active_metadata_proof) => {
+                    ready.push((record.pg_id, primary, active_metadata_proof))
+                }
+                Err(
+                    ControlPlaneError::PgPeeringMissingObservation { .. }
+                    | ControlPlaneError::PgPeeringObservationNotPeering { .. }
+                    | ControlPlaneError::PgPeeringMetadataProofMismatch { .. },
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if ready.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut next_snapshot = self.snapshot.clone();
+        for (pg_id, primary, active_metadata_proof) in &ready {
+            let record = next_snapshot
+                .pgs
+                .get_mut(pg_id)
+                .expect("ready PG must exist in cloned snapshot");
+            record.state = PgState::Active;
+            record.active_primary = Some(*primary);
+            record.active_metadata_proof = Some(*active_metadata_proof);
+        }
+        next_snapshot.bump_epoch()?;
+        self.commit_snapshot(next_snapshot)?;
+        Ok(ready.into_iter().map(|(pg_id, _, _)| pg_id).collect())
+```
+
+crates/storage/src/control_plane.rs (L1512 to 1520)
+  Note: A primary still running the old route map sends a stale observed_epoch; heartbeat returns early and does not update the node's PG observation to the new Active epoch.
+```
+        if heartbeat.observed_epoch != current_epoch {
+            return Ok(HeartbeatLease {
+                authority_incarnation: self.snapshot.authority_incarnation,
+                cluster_epoch: current_epoch,
+                node_id: heartbeat.node_id,
+                lease_deadline_ms: record.lease_deadline_ms.unwrap_or(authority_now_ms),
+                serving: false,
+                snapshot: self.snapshot.clone(),
+            });
+```
+
+crates/storage/src/control_plane.rs (L1969 to 1985)
+  Note: just_activated_pgs is a local set for this single refresh_node_heartbeat call. Only the node whose heartbeat triggered completion receives the validation bypass.
+```
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let node_id = heartbeat.node_id;
+        let mut lease = self.heartbeat(heartbeat, authority_now_ms)?;
+        let just_activated_pgs: BTreeSet<PgId> = self
+            .complete_ready_pg_peerings(authority_now_ms)?
+            .into_iter()
+            .collect();
+        if !just_activated_pgs.is_empty() {
+            lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
+        }
+        let runtime_map = self
+            .snapshot
+            .runtime_map_for_storage_node_refresh(authority_now_ms, &just_activated_pgs)?;
+```
+
+crates/storage/src/control_plane.rs (L321 to 372)
+  Note: The new storage-node refresh path requires validate_pg_primary_active_observation unless the PG is in the one-call just_activated set, blocking later primary refreshes that have not yet installed the Active route.
+```
+    fn active_pg_route_for_storage_node_refresh(
+        &self,
+        pg_id: PgId,
+        now_ms: u64,
+        just_activated: bool,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if record.state != PgState::Active {
+            return Err(ControlPlaneError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+                state: record.state,
+            });
+        }
+        let primary = record
+            .active_primary
+            .filter(|primary| record.acting_set.contains(primary))
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            })?;
+        let primary_record = self
+            .node(primary)
+            .ok_or(ControlPlaneError::UnknownActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+            })?;
+        if !primary_record.membership.can_serve_primary()
+            || primary_record.availability != NodeAvailabilityState::Healthy
+        {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        }
+        let Some(primary_lease_deadline_ms) = primary_record.lease_deadline_ms else {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        };
+        if primary_lease_deadline_ms <= now_ms {
+            return Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+            });
+        }
+        if !just_activated {
+            validate_pg_primary_active_observation(self, pg_id, primary)?;
+        }
+```
+
+crates/storage/src/control_plane.rs (L3802 to 3843)
+  Note: The validation now requires the primary to already have a current-epoch Active observation with the accepted metadata proof, which the stranded primary cannot produce until after receiving the new route map.
+```
+    let pg = snapshot
+        .pgs
+        .get(&pg_id)
+        .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+    let expected_proof = pg
+        .active_metadata_proof
+        .ok_or(ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() })?;
+    let Some(node) = snapshot.nodes.get(&primary) else {
+        return Err(ControlPlaneError::UnknownNode {
+            node_id: primary.as_u32(),
+        });
+    };
+    let observation =
+        node.pg_observation(pg_id)
+            .ok_or(ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+                cluster_epoch: snapshot.cluster_epoch,
+            })?;
+    if observation.observed_epoch != snapshot.cluster_epoch {
+        return Err(ControlPlaneError::StaleNodeObservedEpoch {
+            node_id: primary.as_u32(),
+            observed_epoch: observation.observed_epoch,
+            current_epoch: snapshot.cluster_epoch,
+        });
+    }
+    if observation.state != PgState::Active {
+        return Err(ControlPlaneError::PgPrimaryObservationNotActive {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+            cluster_epoch: snapshot.cluster_epoch,
+            state: observation.state,
+        });
+    }
+    if observation.metadata_proof != expected_proof {
+        return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+            cluster_epoch: snapshot.cluster_epoch,
+            expected: expected_proof,
+            actual: observation.metadata_proof,
+        });
+```
+
+crates/storage/src/storage_node_server.rs (L414 to 423)
+  Note: Storage-node heartbeats derive observed_epoch and PG state from the node's installed config/routes, so a primary that has not received the new Active route continues to report the old Peering epoch/state.
+```
+        node.control_plane_heartbeat(
+            self.node_id,
+            node_incarnation,
+            endpoint,
+            self.cluster_epoch,
+            requested_lease_duration_ms,
+            self.pg_routes
+                .iter()
+                .map(|route| (PgId::new(route.pg_id), route.state)),
+        )
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from medium for security triage because the bug is a validated liveness defect but has a narrow internal attack surface. The strongest evidence shows a normal storage-node/control-plane heartbeat sequence can strand a PG, but the affected RPC is on a private Unix socket and the documented threat model mainly concerns public S3 HTTP clients and trusted local process/filesystem boundaries. There is no demonstrated remote unauthenticated path, data exposure, integrity impact, privilege escalation, or code execution. If a deployment treats storage nodes as mutually untrusted or exposes the control plane over a network transport, this could reasonably be treated as medium availability risk.
+## Likelihood
+low - The path is not reachable from the public S3 API in the provided evidence. It requires internal storage-node/control-plane access, control of timing in a multi-node acting set, or same-user local Unix-socket access; typical documented deployments are local/single-node.
+## Impact
+medium - A successful trigger can make an affected placement group unavailable and may block route-map refreshes until lease expiry or manual recovery, but it is availability-only and does not expose data, alter authorization, or execute code.
+## Assumptions
+- No Kubernetes, Terraform, Docker, or load-balancer manifests were found in the checkout; exposure is inferred from Rust configuration and README documentation.
+- The supplied validation evidence is treated as credible: a targeted Rust unit-test PoC reproduced the liveness failure and showed PgPrimaryMissingActiveObservation on the stranded primary refresh.
+- The control-plane path is only attacker-reachable if an attacker controls or can impersonate a configured storage node, or has local same-user access to the private control-plane Unix socket.
+- argmin-s3 deployed with control-plane/storage-node runtime-map refresh enabled
+- multi-node PG acting set
+- PG in Peering state with observations sufficient for activation
+- a non-primary storage node refresh occurs before the deterministic primary receives and installs the new Active route
+- attacker can time or spoof an internal storage-node heartbeat, or the race occurs naturally
+## Path
+storage node refresh
+  -> complete_ready_pg_peerings activates PG and bumps epoch
+  -> bypass applies only to triggering refresh
+  -> selected primary later refreshes with old Peering route
+  -> active-primary observation validation fails
+  -> PG route map not delivered / PG unavailable
+## Path evidence
+- `crates/storage/src/control_plane.rs:1420-1467` - complete_ready_pg_peerings marks ready PGs Active, records active_primary/metadata proof, bumps the cluster epoch, and returns only PG ids rather than persisting a primary handoff allowance.
+- `crates/storage/src/control_plane.rs:1969-1985` - refresh_node_heartbeat builds just_activated_pgs only for the current call, then passes it into runtime_map_for_storage_node_refresh.
+- `crates/storage/src/control_plane.rs:321-371` - active_pg_route_for_storage_node_refresh skips validate_pg_primary_active_observation only when the PG is in the one-call just_activated set.
+- `crates/storage/src/control_plane.rs:1512-1520` - stale observed_epoch heartbeats return early and do not update the node's PG observation, preventing the stranded primary from producing the required Active observation.
+- `crates/storage/src/control_plane.rs:3797-3843` - validate_pg_primary_active_observation requires a current-epoch Active observation and matching active metadata proof from the primary.
+- `crates/storage/src/storage_node_server.rs:393-423` - storage-node heartbeats are derived from the node's installed cluster_epoch and PG route states, so a node that has not received the Active route continues reporting the old route state.
+- `crates/argmin-s3/src/main.rs:420-460` - control-plane RPC binds to a Unix socket path and creates/validates a private socket directory, supporting internal-only exposure.
+- `crates/argmin-s3/src/config.rs:101-132` - environment configuration defines process roles, control-plane socket/state paths, refresh intervals, and heartbeat lease duration for the affected runtime mode.
+## Narrative
+The reported liveness bug is real: code paths show activation can be triggered by any refresh that completes peering, but the just_activated bypass is a local set used only for that one refresh. The selected primary may still be on the old Peering epoch; stale-epoch heartbeats do not update its PG observation, while later route-map construction requires a current Active observation and matching proof. That creates a circular dependency and can strand the PG. The impact is availability-only and internal-control-plane-only: no confidentiality, integrity, code execution, or external HTTP exploit path is evidenced. Because exploitation requires a configured storage-node/internal Unix-socket actor or a naturally timed race in an optional/in-progress distributed mode, the security severity is lower than a typical remotely reachable DoS.
+## Controls
+- Control-plane RPC is a Unix domain socket rather than a public TCP listener.
+- Control-plane socket parent directory is created/validated as private 0700 and owned by the process user.
+- Known node membership, lease duration, node incarnation, and epoch checks exist before heartbeat mutation.
+- Control-plane RPC has worker and IO timeout limits.
+- The public S3 HTTP surface uses SigV4 authentication and is not shown to directly control the vulnerable heartbeat sequence.
+## Blindspots
+- Static review did not execute the supplied validation PoC in this stage.
+- No deployment manifests were present, so actual production exposure of control-plane and storage-node sockets is unknown.
+- README text describes some multihost modes as in-progress/partly unsupported while current main.rs contains process-role support; operational maturity is ambiguous.
+- Severity could increase if an operator exposes the control-plane RPC beyond a private local Unix socket or has a threat model that includes malicious storage nodes.
