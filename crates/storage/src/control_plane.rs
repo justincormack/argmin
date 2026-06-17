@@ -4194,6 +4194,30 @@ mod tests {
         authority.heartbeat(heartbeat, now_ms).unwrap()
     }
 
+    fn heartbeat_with_pg_proof<S: ControlPlaneStore>(
+        authority: &mut SingleAuthorityControlPlane<S>,
+        node_id: u32,
+        pg_id: u32,
+        state: PgState,
+        metadata_proof: PgMetadataProof,
+        has_pending_metadata_command: bool,
+        now_ms: u64,
+    ) -> HeartbeatLease {
+        let mut heartbeat = heartbeat_from_record(
+            authority,
+            node_id,
+            authority.snapshot().cluster_epoch(),
+            now_ms,
+        );
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(pg_id),
+            state,
+            metadata_proof,
+            has_pending_metadata_command,
+        }];
+        authority.heartbeat(heartbeat, now_ms).unwrap()
+    }
+
     fn node_incarnation<S: ControlPlaneStore>(
         authority: &SingleAuthorityControlPlane<S>,
         node_id: u32,
@@ -7775,6 +7799,132 @@ mod tests {
         let persisted_pg = persisted.pg(PgId::new(19)).unwrap();
         assert_eq!(persisted_pg.active_primary(), Some(NodeId::new(1)));
         assert_eq!(persisted_pg.active_metadata_proof(), Some(matching_proof));
+    }
+
+    #[test]
+    fn pg_peering_reconstruction_fails_closed_until_serving_replicas_converge() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        let reconstructed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            31,
+            PgState::Peering,
+            reconstructed_proof,
+            false,
+            2_001,
+        );
+
+        let lagging_proof = PgMetadataProof::new(41, 0xaaa, 0xddd);
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            31,
+            PgState::Peering,
+            lagging_proof,
+            false,
+            2_002,
+        );
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                pg_id: 31,
+                node_id: 2,
+                expected,
+                actual,
+                ..
+            }) if expected == reconstructed_proof && actual == lagging_proof
+        ));
+
+        let same_index_hash_fork = PgMetadataProof::new(42, 0xabd, 0xdef);
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            31,
+            PgState::Peering,
+            same_index_hash_fork,
+            false,
+            2_020,
+        );
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_030,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                pg_id: 31,
+                node_id: 2,
+                expected,
+                actual,
+                ..
+            }) if expected == reconstructed_proof && actual == same_index_hash_fork
+        ));
+
+        let same_index_state_fork = PgMetadataProof::new(42, 0xabc, 0xdf0);
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            31,
+            PgState::Peering,
+            same_index_state_fork,
+            false,
+            2_040,
+        );
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                pg_id: 31,
+                node_id: 2,
+                expected,
+                actual,
+                ..
+            }) if expected == reconstructed_proof && actual == same_index_state_fork
+        ));
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            31,
+            PgState::Peering,
+            reconstructed_proof,
+            false,
+            2_060,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_070,
+            )
+            .unwrap();
+        let active_pg = authority.snapshot().pg(PgId::new(31)).unwrap();
+        assert_eq!(active_pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(active_pg.active_metadata_proof(), Some(reconstructed_proof));
     }
 
     #[test]

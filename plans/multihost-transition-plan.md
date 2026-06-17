@@ -7422,6 +7422,35 @@ Status:
   retention/compaction implementation, and a small real-multihost correctness
   soak separate from the single-host overload soak.
 
+PG peering reconstruction design:
+
+- Peering activation is now intentionally split into two layers. The
+  control-plane layer only accepts a candidate active metadata proof after every
+  currently serving acting-set member reports the current epoch, `Peering`
+  state, no unresolved pending metadata command, and the same applied
+  log-index/hash/state-digest proof. That remains the durable activation gate.
+- The next storage-node layer must produce that converged proof from durable PG
+  command logs instead of relying on already-equal heartbeats. The selected
+  primary should gather each serving acting-set member's replica state, pending
+  metadata-command state, retained command-log interval, and command-log entry
+  hashes. If every serving member already shares the same proof, peering can
+  hand that proof to the authority. If a member is behind and the primary has a
+  contiguous retained suffix from the member's applied proof to the candidate
+  proof, peering may apply/replay that suffix on the behind member and then
+  retry the authority activation with fresh matching heartbeats.
+- Reconstruction must fail closed, leaving the PG in `Peering`, when any serving
+  member reports an unresolved pending metadata command, a same-index hash or
+  state-digest fork, a missing retained log entry needed for catch-up, an
+  unknown command payload, or an observation from the wrong epoch or acting set.
+  Later repair/backfill can choose an explicit recovery path, but Phase 11
+  peering must not mark the PG `Active` from ambiguous metadata history.
+- The first reconstruction regressions now cover the control-plane activation
+  contract directly: lagging serving replicas, same-index hash forks, and
+  same-index state-digest forks all fail closed until the serving replicas
+  converge on the exact reconstructed proof. The next test slice should add a
+  pure storage-node reconstruction helper for retained-log catch-up and missing
+  retained-log failure before wiring that helper through the peering RPC path.
+
 Exit criteria:
 
 1. stale primaries cannot accept writes after an epoch change
