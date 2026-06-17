@@ -7351,7 +7351,11 @@ Status:
   The set now also covers the storage-node heartbeat refresh path after a lease
   expiry epoch transition: a node reporting its stale Active route receives the
   current Peering map and a non-serving lease, not an Active route backed by
-  the expired lease. It also covers explicit temporary availability loss: a
+  the expired lease. The direct PG-operation token regression now follows the
+  same lease-expiry path through recovery: the expired token is fenced, the
+  caught-up node cannot write while the PG is still `Peering`, and fresh write
+  authorization is available only after current-epoch peering completion and an
+  Active heartbeat. It also covers explicit temporary availability loss: a
   primary marked `Suspect` fences old authorizations, leaves the PG in
   `Peering`, and cannot resume unsafe work until availability recovery,
   current-epoch observation, and peering completion all happen. The same

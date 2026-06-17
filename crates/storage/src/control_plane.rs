@@ -8726,6 +8726,82 @@ mod tests {
             ),
             Err(ControlPlaneError::NodeLeaseExpired { node_id: 1, .. })
         ));
+
+        let recovery = authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, expiry.cluster_epoch(), lease_deadline_ms + 1),
+                lease_deadline_ms + 1,
+            )
+            .unwrap();
+        assert!(
+            !recovery.serving(),
+            "availability recovery bumps the epoch before the node observes it"
+        );
+        let recovery_epoch = recovery.cluster_epoch();
+        assert!(recovery_epoch > expiry.cluster_epoch());
+
+        let caught_up = authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 1, recovery_epoch, lease_deadline_ms + 2),
+                lease_deadline_ms + 2,
+            )
+            .unwrap();
+        assert!(caught_up.serving());
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(18),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                recovery_epoch,
+                lease_deadline_ms + 3,
+            ),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 18,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+
+        heartbeat_with_pg_observation(
+            &mut authority,
+            1,
+            18,
+            PgState::Peering,
+            lease_deadline_ms + 4,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(18),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                lease_deadline_ms + 5,
+            )
+            .unwrap();
+        let active_again = heartbeat_with_pg_observation(
+            &mut authority,
+            1,
+            18,
+            PgState::Active,
+            lease_deadline_ms + 6,
+        );
+        let fresh_authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(18),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                active_again.cluster_epoch(),
+                lease_deadline_ms + 7,
+            )
+            .unwrap();
+        assert_eq!(
+            fresh_authorization.cluster_epoch(),
+            active_again.cluster_epoch()
+        );
+        authority
+            .validate_pg_operation_authorization(&fresh_authorization, lease_deadline_ms + 8)
+            .unwrap();
     }
 
     #[test]
