@@ -1,0 +1,236 @@
+Heartbeat proof validation can cause unbounded replay DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/3e6938797df881918ab3f003ee690398?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 877cf17
+Author: justin@specialbusservice.com
+Created: 17/06/2026, 11:46:04
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed by removing full metadata command-log replay from the recurring
+control-plane heartbeat proof path.
+
+Fix commit: 357abe1f (`Bound heartbeat metadata proof validation`).
+
+Heartbeat PG observations now read the incrementally maintained
+`metadata_command_replica_state` and validate its `state_digest` against the
+cached metadata table digest state. That keeps heartbeat proof generation
+bounded by metadata digest inventory size instead of retained command-log
+history, while still failing closed if the advertised proof state no longer
+matches the maintained metadata digest.
+
+The full replay validator remains available for startup/open validation,
+explicit diagnostics, and repair/checkpoint paths where O(retained log history)
+work is acceptable. A regression test now creates retained applied command-log
+history, emits a heartbeat observation, and asserts the full replay validation
+counter is unchanged while the heartbeat still reports the maintained proof.
+
+# Summary
+Introduced. The security hardening validates heartbeat metadata proofs, but it places an unbounded full replay operation on the recurring heartbeat path without a checkpoint, cache, incremental validation, or log-size bound.
+Before this change, heartbeat proof generation read the cached metadata replica state. The new code calls validate_metadata_command_replay_state_preserving_pending_slot for every PG observation in every control-plane heartbeat. That validator replays the entire applied metadata command-log prefix from index 1 through state.applied_log_index, loading each row and verifying it. This happens while pg_heartbeat_observation holds the per-PG PgStore mutex obtained by get_pg, so normal metadata operations for that PG can be blocked during validation. Since metadata command-log compaction is explicitly unsupported, a client with write permissions can accumulate a large command log through normal metadata-changing operations and force recurring expensive heartbeat validation. The result can be CPU/IO exhaustion, missed leases, or prolonged unavailability of affected PGs.
+
+# Validation
+## Rubric
+- [x] Heartbeat path must hold the per-PG PgStore mutex while generating the metadata proof.
+- [x] Every PG observation in a control-plane heartbeat must call the expensive proof/validation path.
+- [x] The validator must replay the entire applied metadata command-log prefix rather than using only cached state.
+- [x] Each replayed entry must incur SQLite row loading plus checksum/hash verification cost.
+- [x] Retained metadata command-log history must lack an effective compaction/checkpoint bound, and dynamic timing/debugger evidence must show cost grows with retained entries.
+## Report
+Validated the suspected availability issue with a targeted Rust unit-test PoC and LLDB. Crash attempt: the PoC does not crash, which is expected for this CPU/IO exhaustion class; the direct test passed and showed heartbeat proof_index equals the number of retained applied metadata log entries. Valgrind attempt: valgrind is not installed in the container (`bash: valgrind: command not found`), and this is not a memory-safety bug. Debugger validation: LLDB was run against the debug test binary with a breakpoint at crates/storage/src/pg_store/command_log.rs:1517 inside `for raw_log_index in 1..=state.applied_log_index`; with ARGMIN_AUTOVALIDATOR_LOG_ENTRIES=4, LLDB reported `hit count = 4` for that breakpoint during one `control_plane_heartbeat` call. A separate LLDB backtrace showed the chain `SharedStorageNode::control_plane_heartbeat` at node.rs:1181 -> `pg_heartbeat_observation` at node.rs:1155 -> `validate_metadata_command_replay_state_preserving_pending_slot` at command_log.rs:1471 -> replay loop/load at command_log.rs:1517. Code evidence: node.rs:1153 obtains the per-PG mutex via `get_pg`, whose lock is taken at node.rs:1140-1144; node.rs:1155 then calls the replay validator while the guard remains live; node.rs:1179-1182 does this for every PG in the heartbeat. command_log.rs:1514-1537 replays indices 1..=applied_log_index, loading and verifying each entry; command_log.rs:1701-1715 selects `command_bytes` from SQLite; command_log.rs:1731 recomputes CRC64; command_log.rs:2249-2258 returns `UnsupportedUntilCheckpoint`, leaving retained entries unbounded by compaction. Timing smoke test with the same PoC showed increasing heartbeat time as retained entries grew: entries=1 elapsed_us=1205, entries=16 elapsed_us=1794, entries=128 elapsed_us=5575, entries=512 elapsed_us=20093. This confirms the introduced heartbeat path performs full log-prefix replay proportional to retained metadata log size.
+
+# Evidence
+crates/storage/src/node.rs (L1153 to 1158)
+  Note: Heartbeat observation now holds the PG mutex and invokes full metadata replay validation instead of only reading cached replica state.
+```
+        let pg = self.get_pg(pg_id.get())?;
+        let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
+        let metadata_state = pg.validate_metadata_command_replay_state_preserving_pending_slot(
+            node_id.as_u32(),
+            metadata_epoch,
+        )?;
+```
+
+crates/storage/src/node.rs (L1179 to 1182)
+  Note: Every PG included in each control-plane heartbeat goes through the expensive validation path.
+```
+        let pg_observations = pg_states
+            .into_iter()
+            .map(|(pg_id, state)| self.pg_heartbeat_observation(node_id, pg_id, state))
+            .collect::<Result<Vec<_>, _>>()?;
+```
+
+crates/storage/src/pg_store/command_log.rs (L1512 to 1562)
+  Note: The validation path replays the entire applied command-log prefix from 1 through applied_log_index, doing a database lookup and verification for each entry.
+```
+        state = self.advance_abandoned_metadata_command_log_tail(node_id, cluster_epoch, state)?;
+        let mut applied_log_hash = 0_u64;
+        for raw_log_index in 1..=state.applied_log_index {
+            let log_index = MetadataCommandLogIndex::new(raw_log_index)
+                .expect("applied metadata command log index is non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load metadata command log entry for replay validation",
+                cluster_epoch,
+                pg_id,
+                log_index,
+            )?
+            else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                pg_id,
+                log_index,
+                &entry,
+            )?;
+            let expected_log_hash = metadata_command_log_hash(
+                cluster_epoch,
+                pg_id,
+                log_index,
+                applied_log_hash,
+                entry.command_checksum,
+            );
+            match (entry.previous_log_hash, entry.log_hash) {
+                (Some(previous_log_hash), Some(log_hash))
+                    if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
+                (previous_log_hash, log_hash) => {
+                    return Err(StoreError::MetadataCommandLogHashMismatch {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: raw_log_index,
+                        expected_previous_log_hash: applied_log_hash,
+                        actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
+                        expected_log_hash,
+                        actual_log_hash: log_hash.unwrap_or_default(),
+                    });
+                }
+            }
+            applied_log_hash = expected_log_hash;
+        }
+```
+
+crates/storage/src/pg_store/command_log.rs (L1696 to 1731)
+  Note: Each replayed entry loads command_bytes from SQLite and recomputes its CRC64 checksum, adding CPU and IO cost proportional to total retained log data.
+```
+        context: &'static str,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: MetadataCommandLogIndex,
+    ) -> Result<Option<MetadataCommandLogEntry>, StoreError> {
+        self.query_row_cached_optional(
+            "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+             FROM metadata_command_log \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![
+                cluster_epoch.get() as i64,
+                pg_id.get() as i64,
+                log_index.get() as i64,
+            ],
+            context,
+            |row| {
+                Ok(MetadataCommandLogEntry {
+                    command_checksum: row.get::<_, i64>(0)? as u64,
+                    command_bytes: row.get::<_, Vec<u8>>(1)?,
+                    abandoned: row.get::<_, i64>(2)? != 0,
+                    previous_log_hash: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                    log_hash: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                })
+            },
+        )
+    }
+
+    fn verify_metadata_command_log_entry(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: MetadataCommandLogIndex,
+        entry: &MetadataCommandLogEntry,
+    ) -> Result<(), StoreError> {
+        let computed_checksum = checksum::crc64::checksum(&entry.command_bytes);
+```
+
+crates/storage/src/pg_store/command_log.rs (L2249 to 2258)
+  Note: Metadata command-log compaction is currently unsupported, so the amount of retained history that each heartbeat may replay can grow without a built-in bound.
+```
+    pub fn compact_metadata_command_log_without_checkpoint(
+        &self,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        let stats = self.metadata_command_log_stats(cluster_epoch)?;
+        Ok(
+            MetadataCommandLogCompactionStatus::UnsupportedUntilCheckpoint {
+                retained_entries: stats.retained_entries,
+            },
+        )
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The original medium severity is retained. Static evidence and the prior executable validation support a real DoS: node.rs calls full metadata replay validation in each heartbeat while holding the PG mutex; command_log.rs replays 1..=applied_log_index with SQLite command_bytes loads and CRC64 verification; compaction reports UnsupportedUntilCheckpoint; and validation observed loop hit count equal to retained entries plus increasing heartbeat time. The issue should not be raised to high/critical because exploitation requires an authenticated/write-capable client and a control-plane storage-node deployment, and the impact is runtime availability only, with no confidentiality, integrity, authentication bypass, or RCE impact.
+## Likelihood
+high - Once a control-plane storage-node deployment is in use, exploitation is straightforward for a write-authorized client because it uses normal S3 metadata-changing operations and the heartbeat repeats automatically. Likelihood is not high because it requires write privileges, enough request volume/time to grow the log, and a non-default control-plane heartbeat deployment; the repository default listener is localhost and no IaC shows public exposure. | Remote network vector
+## Impact
+medium - The credible impact is availability degradation of affected PGs or a storage node: periodic heartbeat work becomes O(total retained applied metadata commands), performs SQLite reads and CRC64 work, and holds the per-PG mutex. This can block normal metadata operations and cause missed leases or unavailability. There is no demonstrated data exfiltration, integrity bypass, privilege escalation, or code execution.
+## Assumptions
+- The affected deployment uses the storage-node or combined role with ARGMIN_CONTROL_PLANE_SOCKET_PATH configured so the storage-node control-plane refresh/heartbeat loop runs.
+- The attacker has normal S3 write capability for at least one bucket/key namespace, or an operator has intentionally enabled public write semantics for a bucket.
+- The service is reachable to that client over the configured HTTP listener; the repository default is 127.0.0.1:9000 and no deployment manifests prove public internet exposure.
+- Metadata-changing operations can be repeated enough times to grow retained metadata_command_log history before operational intervention.
+- S3 write-authorized requester or public-write bucket
+- control-plane heartbeat path enabled for storage node or combined process
+- repeated metadata-changing operations to grow retained command log
+## Path
+S3 writer
+  -> HTTP frontend
+  -> metadata command application
+  -> retained metadata_command_log
+  -> periodic storage-node heartbeat
+  -> full replay under PgStore mutex
+  -> CPU/IO exhaustion + PG operation blocking
+## Path evidence
+- `crates/argmin-s3/src/config.rs:101-127` - Environment configuration documents the main argmin-s3 runtime, default listener 127.0.0.1:9000, control-plane heartbeat timing, max connections, and related runtime knobs.
+- `crates/argmin-s3/src/main.rs:229-241` - The main binary supports ControlPlane, StorageNode, Combined, Frontend, and LegacyLocal process roles; storage-node/combined roles are production runtime scope.
+- `crates/argmin-s3/src/main.rs:540-562` - Storage-node and combined process paths bind the storage node and spawn the control-plane refresh loop when configured.
+- `crates/argmin-s3/src/main.rs:586-604` - The storage-node control-plane refresh loop is enabled by ARGMIN_CONTROL_PLANE_SOCKET_PATH and uses the configured heartbeat lease and refresh intervals.
+- `crates/server-http/src/http/mod.rs:858-915` - Non-OPTIONS S3 requests are routed, authenticated with SigV4, and then dispatched, showing the network entry path is authenticated normal S3 traffic.
+- `crates/server-http/src/http/mod.rs:1302-1318` - CreateBucket is a normal authenticated metadata-changing operation that reaches coordinator storage logic.
+- `crates/server-http/src/http/mod.rs:1588-1631` - PutObject is a normal authenticated write path that dispatches to coordinator.put_object and can generate metadata commands.
+- `crates/storage/src/cluster/request_ops.rs:984-1122` - Metadata commands are applied to the acting set and call apply_metadata_command_and_record on metadata clients.
+- `crates/storage/src/pg_store/metadata.rs:671-705` - Applying a metadata command records it through record_metadata_command_applied_inner in the same transaction.
+- `crates/storage/src/pg_store/command_log.rs:2035-2073` - Applied metadata commands insert command_bytes into metadata_command_log.
+- `crates/storage/src/storage_node_server.rs:393-414` - StorageNodeProcessConfig builds a NodeHeartbeat by calling SharedStorageNode::control_plane_heartbeat with configured PG routes.
+- `crates/storage/src/storage_node_server.rs:885-919` - The storage-node server builds heartbeats and submits/refreshes them with the control plane.
+- `crates/storage/src/storage_node_server.rs:955-1016` - The control-plane refresh thread repeatedly calls refresh_and_install_control_plane_runtime_map and waits only the configured refresh interval between attempts.
+- `crates/storage/src/node.rs:1139-1158` - pg_heartbeat_observation obtains the per-PG mutex via get_pg and then calls validate_metadata_command_replay_state_preserving_pending_slot while the guard remains live.
+- `crates/storage/src/node.rs:1179-1182` - Each PG included in a control-plane heartbeat is processed through pg_heartbeat_observation.
+- `crates/storage/src/pg_store/command_log.rs:1512-1562` - Replay validation iterates from 1 through state.applied_log_index and verifies every retained log entry.
+- `crates/storage/src/pg_store/command_log.rs:1696-1731` - Each replay step loads command_bytes from SQLite and recomputes a CRC64 checksum, adding CPU and IO cost proportional to retained history.
+- `crates/storage/src/pg_store/command_log.rs:2249-2258` - Metadata command-log compaction without checkpoints is unsupported, leaving retained entries unbounded by this compaction path.
+## Narrative
+The finding is real for control-plane storage-node deployments. The code obtains a per-PG PgStore mutex, then heartbeat proof generation calls validate_metadata_command_replay_state_preserving_pending_slot. That validator loops over every applied metadata log index, loads command_bytes from SQLite, verifies checksums/hashes, and compaction currently reports UnsupportedUntilCheckpoint. Normal metadata writes record commands into the same log. The prior executable validation confirmed the replay loop runs once per retained entry during one heartbeat and showed heartbeat time increasing with retained entries. This is an availability issue, not a confidentiality/integrity bypass or code execution issue.
+## Controls
+- SigV4 authentication before normal request dispatch
+- Coordinator bucket/object authorization and ACL checks
+- Global max_connections and max_inflight_requests configuration
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000
+- Storage-node and control-plane communication uses configured Unix sockets
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+## Blindspots
+- No Kubernetes, Terraform, Docker, or other deployment manifests were present to prove actual public exposure, load balancer type, or production process role.
+- The prior validation exercised a Rust unit-test/control-plane heartbeat path, not a complete HTTP-to-storage end-to-end exploit in this stage.
+- Static analysis cannot determine real operator rate limits, filesystem performance, retained log sizes, or whether deployments use the default legacy-local role versus control-plane storage-node roles.
+- Cloud IAM/service-account posture is unknown because repository-only analysis was required and no cloud APIs were called.
