@@ -7447,9 +7447,17 @@ PG peering reconstruction design:
 - The first reconstruction regressions now cover the control-plane activation
   contract directly: lagging serving replicas, same-index hash forks, and
   same-index state-digest forks all fail closed until the serving replicas
-  converge on the exact reconstructed proof. The next test slice should add a
-  pure storage-node reconstruction helper for retained-log catch-up and missing
-  retained-log failure before wiring that helper through the peering RPC path.
+  converge on the exact reconstructed proof.
+- Added the first pure retained-log reconstruction decision tests in the
+  storage layer. The test-only helper is transport-neutral and takes
+  per-replica metadata proof, pending-command state, and retained command-log
+  hash-chain entries. It returns either already-converged, deterministic catch-up
+  required for lagging replicas, or a fail-closed reason for pending commands,
+  same-index metadata forks, missing retained suffix entries, retained
+  hash-chain forks, stale epochs, or replicas ahead of the selected primary. The
+  next slice should promote this shape into the production peering path by
+  feeding it from actual storage-node command-log range reads and wiring it
+  through the peering RPC path.
 
 Exit criteria:
 

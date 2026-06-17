@@ -32,6 +32,8 @@ pub mod error;
 pub(crate) mod metadata_command;
 pub mod node;
 pub(crate) mod node_client;
+#[cfg(test)]
+pub(crate) mod peering;
 pub mod pg_store;
 pub mod pg_topology;
 pub mod schema;
