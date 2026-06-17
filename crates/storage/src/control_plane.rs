@@ -5060,6 +5060,110 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_change_fences_active_pg_until_repeering_completes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(5), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 5, 100).serving());
+        authority
+            .set_pg_acting_set(PgId::new(39), vec![NodeId::new(5)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Peering, 200);
+        authority
+            .complete_pg_peering(
+                PgId::new(39),
+                NodeId::new(5),
+                node_incarnation(&authority, 5),
+                201,
+            )
+            .unwrap();
+        let active = heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Active, 202);
+        let active_epoch = active.cluster_epoch();
+        let authorization = authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(39),
+                NodeId::new(5),
+                node_incarnation(&authority, 5),
+                active_epoch,
+                203,
+            )
+            .unwrap();
+
+        let mut moved = heartbeat_from_record(&authority, 5, active_epoch, 204);
+        moved.endpoint = "node-5-new.sock".to_owned();
+        moved.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(39),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
+        }];
+        let changed = authority.heartbeat(moved, 204).unwrap();
+        assert!(!changed.serving());
+        assert!(changed.cluster_epoch() > active_epoch);
+        let peering_epoch = changed.cluster_epoch();
+        let pg = authority.snapshot().pg(PgId::new(39)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.active_primary(), None);
+        assert_eq!(pg.active_metadata_proof(), None);
+        assert!(matches!(
+            authority.validate_pg_operation_authorization(&authorization, 205),
+            Err(ControlPlaneError::StaleAuthorizationEpoch {
+                cluster_epoch,
+                current_epoch,
+            }) if cluster_epoch == active_epoch && current_epoch == peering_epoch
+        ));
+
+        assert!(authority
+            .heartbeat(
+                heartbeat_from_record(&authority, 5, peering_epoch, 206),
+                206
+            )
+            .unwrap()
+            .serving());
+        assert!(matches!(
+            authority.authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(39),
+                NodeId::new(5),
+                node_incarnation(&authority, 5),
+                peering_epoch,
+                207,
+            ),
+            Err(ControlPlaneError::PgNotActive {
+                pg_id: 39,
+                state: PgState::Peering,
+                ..
+            })
+        ));
+
+        heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Peering, 208);
+        authority
+            .complete_pg_peering(
+                PgId::new(39),
+                NodeId::new(5),
+                node_incarnation(&authority, 5),
+                209,
+            )
+            .unwrap();
+        let active_again =
+            heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Active, 210);
+        authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(39),
+                NodeId::new(5),
+                node_incarnation(&authority, 5),
+                active_again.cluster_epoch(),
+                211,
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn pg_acting_set_changes_start_in_peering_and_validate_nodes() {
         let tmp = test_util::tempdir();
         let store_path = tmp.path().join("control-plane.state");

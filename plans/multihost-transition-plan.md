@@ -7364,6 +7364,12 @@ Status:
   requests fail closed, authority restart fences stale tokens by incarnation,
   and the node can receive a fresh authorization only after heartbeating the
   current epoch.
+- Extended endpoint-change epoch-transition coverage from node serving to active
+  PG service. A route endpoint change now has a deterministic regression proving
+  old write tokens are fenced, the affected PG moves back to `Peering`, writes
+  remain blocked after the node observes the new endpoint epoch, and fresh write
+  authorization appears only after current-epoch peering completion plus an
+  Active heartbeat.
 - Extended the deterministic epoch-transition fault regressions to cover an
   acting-set change. A metadata-write token issued to the old active primary is
   fenced by the epoch bump, both old and new primaries fail closed while the PG
