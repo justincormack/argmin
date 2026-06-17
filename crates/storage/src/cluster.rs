@@ -6815,6 +6815,129 @@ impl StorageCluster {
         }
     }
 
+    pub fn repair_placed_segment_payload_shard(
+        &self,
+        req: SegmentStoredBytesRequest,
+        shard_index: ShardIndex,
+    ) -> Result<WrittenShardAck, StoreError> {
+        let mut repaired = self.repair_placed_segment_payload_shards(req, &[shard_index])?;
+        repaired
+            .pop()
+            .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                reason: "single-shard repair produced no shard ack".to_string(),
+            })
+    }
+
+    pub fn repair_placed_segment_payload_shards(
+        &self,
+        req: SegmentStoredBytesRequest,
+        shard_indices: &[ShardIndex],
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let total_shards =
+            req.ec
+                .k
+                .checked_add(req.ec.m)
+                .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                    reason: format!("EC shard count overflow for {}+{}", req.ec.k, req.ec.m),
+                })?;
+        if shard_indices.len() > usize::from(req.ec.m) {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "repair requested {} shards, but EC {}+{} can tolerate at most {}",
+                    shard_indices.len(),
+                    req.ec.k,
+                    req.ec.m,
+                    req.ec.m
+                ),
+            });
+        }
+        let mut seen = HashSet::with_capacity(shard_indices.len());
+        for shard_index in shard_indices {
+            if shard_index.get() >= total_shards {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "repair shard index {} outside EC {}+{}",
+                        shard_index.get(),
+                        req.ec.k,
+                        req.ec.m
+                    ),
+                });
+            }
+            if !seen.insert(shard_index.get()) {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!("duplicate repair shard index {}", shard_index.get()),
+                });
+            }
+        }
+        if shard_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut recovered_segment = Vec::new();
+        self.read_segment_payload_stored_bytes_into(req, &mut recovered_segment)?;
+
+        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
+        let locations = self
+            .place_payload_shards(data_pg, req.ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        let target_slots: Vec<(usize, ShardLocation)> = shard_indices
+            .iter()
+            .map(|shard_index| {
+                let slot = usize::from(shard_index.get());
+                let location = locations.get(slot).copied().ok_or_else(|| {
+                    StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "repair shard index {} outside {} placed shards",
+                            shard_index.get(),
+                            locations.len()
+                        ),
+                    }
+                })?;
+                Ok((slot, location))
+            })
+            .collect::<Result<_, StoreError>>()?;
+
+        let repaired = self.local_map.write_erasure_coded_segment_shards_with(
+            &req.segment_okh,
+            req.segment_vid,
+            &recovered_segment,
+            req.ec,
+            |shard_batch| {
+                let mut repaired = Vec::with_capacity(target_slots.len());
+                for (slot, target_location) in &target_slots {
+                    let (shard_key, shard_payload) = shard_batch.get(*slot).ok_or_else(|| {
+                        StoreError::PayloadShardSetMismatch {
+                            reason: format!(
+                                "repair shard index {} outside encoded shard batch of {}",
+                                slot,
+                                shard_batch.len()
+                            ),
+                        }
+                    })?;
+                    let ack = self
+                        .write_payload_shard(*target_location, shard_key, shard_payload)
+                        .map_err(shard_io_error_to_store)?;
+                    repaired.push((shard_key.clone(), ack));
+                }
+                Ok(repaired)
+            },
+        )?;
+        let repaired_acks: Vec<_> = repaired
+            .iter()
+            .map(|repaired| (&repaired.key, repaired.ack))
+            .collect();
+        self.register_payload_shard_acks(req.data_pg_id, &repaired_acks)
+            .map_err(|error| match error {
+                ObjectPgActionError::Store(error) => error,
+                other => StoreError::Io {
+                    context: "register repaired payload shard acks",
+                    source: io::Error::other(other.to_string()),
+                },
+            })?;
+        Ok(repaired)
+    }
+
     fn try_read_placed_segment_stored_bytes_into(
         &self,
         req: SegmentStoredBytesRequest,

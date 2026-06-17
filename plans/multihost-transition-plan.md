@@ -7542,6 +7542,13 @@ Shard repair design:
   corrupt shard now have explicit coverage proving that the read path treats the
   shard as unavailable and reconstructs the full segment from the remaining EC
   set before returning bytes.
+- Added the first explicit shard-repair write primitive. The storage cluster
+  can now reconstruct a segment through the existing read-time EC path, derive
+  up to `m` target shards from that reconstructed segment in one encode pass,
+  write them through normal routed shard IO, and refresh their shard acks in the
+  authoritative data PG metadata. A focused regression removes two physical
+  shards, repairs both in one call, verifies the repaired acks match the bytes
+  on disk, and then reads the segment back normally.
 
 Exit criteria:
 
