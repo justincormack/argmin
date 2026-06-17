@@ -6811,7 +6811,10 @@ impl StorageCluster {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
         match self.try_read_placed_segment_stored_bytes_into(req, dst)? {
             true => Ok(()),
-            false => Err(StoreError::NotFound),
+            false => {
+                dst.clear();
+                Err(StoreError::NotFound)
+            }
         }
     }
 

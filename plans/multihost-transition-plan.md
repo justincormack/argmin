@@ -7549,6 +7549,9 @@ Shard repair design:
   authoritative data PG metadata. A focused regression removes two physical
   shards, repairs both in one call, verifies the repaired acks match the bytes
   on disk, and then reads the segment back normally.
+- Added unrecoverable-shard coverage for the same boundary: when more than `m`
+  shards are physically unavailable, both read-time reconstruction and explicit
+  repair fail closed instead of returning partial or guessed payload bytes.
 
 Exit criteria:
 
