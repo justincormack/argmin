@@ -7516,6 +7516,11 @@ PG peering reconstruction design:
   route-map gather, a stale replica epoch, a replica ahead of the selected
   primary, a Peering storage-node retained-log RPC, and a pending command that
   leaves the PG failed closed in peering.
+- Extended the Peering availability fail-closed coverage for composite
+  metadata listings. Object listings, object-version listings, and multipart
+  upload listings now have a regression proving that one Peering metadata PG
+  aborts the whole fanout operation with `PgNotActive` instead of returning a
+  partial or empty result while the PG lacks complete truth.
 
 Exit criteria:
 

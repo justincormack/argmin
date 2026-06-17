@@ -93,6 +93,69 @@ fn composite_object_listings_fan_out_to_routed_pg_primaries() {
 }
 
 #[test]
+fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    write_committed_direct_segment_for_with_okh(
+        &cluster,
+        &bucket,
+        &crate::ObjectKey::try_from("key".to_string()).unwrap(),
+        [54; 16],
+        b"payload",
+    );
+
+    drop(cluster);
+    Arc::get_mut(&mut map)
+        .unwrap()
+        .pg_routes
+        .get_mut(&PgId::new(1))
+        .unwrap()
+        .state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+
+    let err = cluster
+        .list_objects_for_bucket(&bucket, None, None, None, 100, 100)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::ObjectPgActionError::Store(StoreError::PgNotActive {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Peering,
+        })
+    ));
+
+    let err = cluster
+        .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::ObjectPgActionError::Store(StoreError::PgNotActive {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Peering,
+        })
+    ));
+
+    let err = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, 100, 100)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::ObjectPgActionError::Store(StoreError::PgNotActive {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Peering,
+        })
+    ));
+}
+
+#[test]
 fn composite_bucket_listing_fan_out_to_routed_pg_primaries() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
