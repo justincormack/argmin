@@ -7529,6 +7529,19 @@ PG peering reconstruction design:
   snapshots and two-bucket snapshot pairs now fail closed with `PgNotActive`
   when any participating bucket metadata PG is `Peering`.
 
+Shard repair design:
+
+- The current storage layer already has read-time EC reconstruction for placed
+  segment payloads, but not yet a durable repair/backfill writer. Phase 11
+  repair should build on that boundary explicitly: first identify missing or
+  corrupt shards, reconstruct from at least `k` valid shards, then write the
+  repaired shard through normal routed shard IO with current epoch/location
+  validation rather than hiding repair as an implicit read side effect.
+- Added a read-time repair precondition regression for checksum-corrupt placed
+  shards. A same-size corrupt shard now has explicit coverage proving that the
+  read path treats the shard as unavailable and reconstructs the full segment
+  from the remaining EC set before returning bytes.
+
 Exit criteria:
 
 1. stale primaries cannot accept writes after an epoch change
