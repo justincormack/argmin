@@ -312,6 +312,8 @@ pub struct PgStore {
     clean_metadata_digest_revision: AtomicU64,
     #[cfg(test)]
     metadata_command_log_prefix_fast_path_hits: AtomicU64,
+    #[cfg(test)]
+    metadata_command_log_replay_validation_entries: AtomicU64,
 }
 
 const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 1024;
@@ -380,6 +382,8 @@ impl PgStore {
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             #[cfg(test)]
             metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
+            #[cfg(test)]
+            metadata_command_log_replay_validation_entries: AtomicU64::new(0),
         })
         .and_then(|store| {
             store.ensure_metadata_digest_bootstrap()?;

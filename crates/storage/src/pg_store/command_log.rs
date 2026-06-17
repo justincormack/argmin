@@ -1475,6 +1475,35 @@ impl PgStore {
         )
     }
 
+    pub(crate) fn metadata_command_replica_state_for_heartbeat(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        if state.cluster_epoch != cluster_epoch {
+            return Err(StoreError::StaleMetadataCommand {
+                node_id,
+                pg_id: self.pg_id,
+                command_epoch: state.cluster_epoch,
+                current_epoch: cluster_epoch,
+            });
+        }
+
+        let actual_digest = self.cached_metadata_state_digest()?;
+        if state.state_digest != actual_digest {
+            return Err(StoreError::MetadataStateDigestMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: state.cluster_epoch,
+                expected_digest: state.state_digest,
+                actual_digest,
+            });
+        }
+
+        Ok(state)
+    }
+
     fn validate_metadata_command_replay_state_with_pending_cleanup(
         &self,
         node_id: u32,
@@ -1512,6 +1541,9 @@ impl PgStore {
         state = self.advance_abandoned_metadata_command_log_tail(node_id, cluster_epoch, state)?;
         let mut applied_log_hash = 0_u64;
         for raw_log_index in 1..=state.applied_log_index {
+            #[cfg(test)]
+            self.metadata_command_log_replay_validation_entries
+                .fetch_add(1, Ordering::Relaxed);
             let log_index = MetadataCommandLogIndex::new(raw_log_index)
                 .expect("applied metadata command log index is non-zero");
             let Some(entry) = self.load_metadata_command_log_entry(
@@ -2904,6 +2936,12 @@ impl PgStore {
             Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }
         Ok(hasher.finalize())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_metadata_command_log_replay_validation_entries(&self) -> u64 {
+        self.metadata_command_log_replay_validation_entries
+            .load(Ordering::Relaxed)
     }
 
     pub(super) fn digest_canonical_sql_value(

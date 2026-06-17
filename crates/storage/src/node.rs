@@ -1157,10 +1157,8 @@ impl SharedStorageNode {
     ) -> Result<NodePgHeartbeatObservation, StoreError> {
         let pg = self.get_pg(pg_id.get())?;
         let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
-        let metadata_state = pg.validate_metadata_command_replay_state_preserving_pending_slot(
-            node_id.as_u32(),
-            metadata_epoch,
-        )?;
+        let metadata_state =
+            pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;
         let has_pending_metadata_command = pg
             .pending_metadata_command_slot(node_id.as_u32(), metadata_epoch)?
             .is_some();
@@ -1892,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_pg_heartbeat_observation_validates_metadata_replay_state() {
+    fn shared_node_pg_heartbeat_observation_validates_cached_metadata_state() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         {
@@ -1921,6 +1919,70 @@ mod tests {
                 }
             ),
             "heartbeat proof must not advertise a corrupted replay state: {err:?}"
+        );
+    }
+
+    #[test]
+    fn shared_node_pg_heartbeat_observation_does_not_replay_applied_log_prefix() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        {
+            let pg = node.get_pg(0).unwrap();
+            let owner = crate::OwnerIdentity::from_principal("owner");
+            for index in 1..=4 {
+                let bucket = bucket_name(&format!("heartbeat-replay-{index}"));
+                let config = CreateBucketConfig {
+                    name: bucket.as_str(),
+                    owner_principal: &owner.principal,
+                    owner_canonical_id: &owner.canonical_id,
+                    acl_grants: &AclGrants::default(),
+                    public_read: false,
+                    public_write: false,
+                    versioning: BucketVersioningState::Disabled,
+                    object_lock: BucketObjectLockConfig::default(),
+                    ownership_controls: crate::BucketOwnershipControls {
+                        object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                    },
+                };
+                let command = MetadataCommandEnvelope::new(
+                    MetadataCommandId::new(
+                        ClusterEpoch::INITIAL,
+                        PgId::new(0),
+                        MetadataCommandLogIndex::new(index).unwrap(),
+                    ),
+                    MetadataCommandPayload::CreateBucket(
+                        CreateBucketCommand::from_config(&config, 123, index).unwrap(),
+                    ),
+                );
+                pg.record_metadata_command_applied(7, &command).unwrap();
+            }
+            assert_eq!(
+                pg.metadata_command_replica_state()
+                    .unwrap()
+                    .applied_log_index,
+                4
+            );
+        }
+
+        let before = {
+            let pg = node.get_pg(0).unwrap();
+            pg.test_metadata_command_log_replay_validation_entries()
+        };
+        let observation = node
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
+            .unwrap();
+        let after = {
+            let pg = node.get_pg(0).unwrap();
+            pg.test_metadata_command_log_replay_validation_entries()
+        };
+
+        assert_eq!(
+            observation.metadata_proof.applied_log_index, 4,
+            "heartbeat should report the maintained metadata proof"
+        );
+        assert_eq!(
+            after, before,
+            "heartbeat must not run full command-log replay validation"
         );
     }
 
