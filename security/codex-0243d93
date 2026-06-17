@@ -1,0 +1,170 @@
+Active PG proof floor bypass permits divergent metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/502cecdc170881919ac9bf2f0f8bc62d?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: high
+Status: accepted-risk
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 0243d93
+Author: justin@specialbusservice.com
+Created: 17/06/2026, 11:45:45
+Assignee: Unassigned
+Signals: Security
+
+# Resolution
+Accepted as outside the current Phase 11 threat model and documented rather
+than fixed by changing the Active PG proof floor.
+
+The finding correctly observes that the Phase 11 single-authority control plane
+cannot independently prove that a higher-index `(applied_log_hash,
+state_digest)` is a valid successor of the peering-time proof. That is an
+intentional Phase 11 trust boundary, not a public S3 authorization bypass: local
+storage-node processes are trusted runtime components, and a storage-node
+heartbeat is treated as a statement from a trusted node about its locally
+verified durable PG state. The storage-node heartbeat producer validates the
+metadata command-log hash chain and materialized metadata digest before
+reporting a PG proof.
+
+The threat model now explicitly documents that Phase 11 does not defend against
+a malicious or compromised storage node forging heartbeats, corrupting local
+metadata, or lying about PG metadata proofs. Remote authenticated control-plane
+transport and stronger node attestation are future deployment/runtime concerns,
+not part of the current S3 object-store request authorization boundary.
+
+Updated documentation:
+- `guides/threat_model.md`: added the cluster-internal trust boundary and Phase
+  11 trusted-node assumptions.
+- `plans/multihost-transition-plan.md`: added the matching Phase 11
+  threat-model boundary note.
+
+# Summary
+Introduced: equality checks against the peering metadata proof were replaced with a floor check that only compares applied_log_index for progressed states. This allows future-index proofs with arbitrary applied_log_hash and state_digest to pass heartbeat validation, active route generation, and PG operation authorization.
+The new metadata_proof_satisfies_active_floor() helper treats an observed proof as valid whenever observed.applied_log_index is greater than the active proof's applied_log_index, without validating that the observed applied_log_hash or state_digest is a legitimate successor of the active proof. That helper is now used when accepting active heartbeat observations and when deciding whether the active primary can be routed to or authorized for PG operations. As a result, a storage node heartbeat or persisted control-plane state can advance to an arbitrary future metadata proof with unrelated hash/digest values and still be considered serving. This weakens the metadata divergence protection established during peering and can allow corrupted or forged metadata state to receive routes and write authorization. The practical exploit path appears limited to an actor/process able to submit control-plane heartbeats or influence storage-node/control-plane state, not an unauthenticated public S3 client.
+
+# Evidence
+crates/storage/src/control_plane.rs (L1426 to 1436)
+  Note: The active metadata proof is established from exact matching peering observations and stored as the active PG proof/floor.
+```
+        let active_metadata_proof =
+            validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
+
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record validated before peering completion");
+        record.state = PgState::Active;
+        record.active_primary = Some(primary);
+        record.active_metadata_proof = Some(active_metadata_proof);
+```
+
+crates/storage/src/control_plane.rs (L3760 to 3767)
+  Note: Active heartbeat validation now uses the relaxed floor check instead of requiring the full proof to match.
+```
+            if !metadata_proof_satisfies_active_floor(expected, observation.metadata_proof) {
+                return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                    pg_id: observation.pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                    expected,
+                    actual: observation.metadata_proof,
+                });
+```
+
+crates/storage/src/control_plane.rs (L3841 to 3846)
+  Note: The introduced helper accepts any proof with a greater applied_log_index, ignoring applied_log_hash and state_digest for progressed states.
+```
+fn metadata_proof_satisfies_active_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+) -> bool {
+    observed.applied_log_index > active_floor.applied_log_index || observed == active_floor
+}
+```
+
+crates/storage/src/control_plane.rs (L3863 to 3869)
+  Note: Serving-primary checks rely on the relaxed helper, so a divergent future proof can keep the primary routable.
+```
+            observation.observed_epoch == snapshot.cluster_epoch
+                && observation.state == expected_state
+                && !observation.has_pending_metadata_command
+                && (expected_state != PgState::Active
+                    || expected_active_proof.is_some_and(|expected| {
+                        metadata_proof_satisfies_active_floor(expected, observation.metadata_proof)
+                    }))
+```
+
+crates/storage/src/control_plane.rs (L3919 to 3927)
+  Note: Primary active-observation validation, used by route and operation authorization paths, also accepts the relaxed proof.
+```
+    if !metadata_proof_satisfies_active_floor(expected_proof, observation.metadata_proof) {
+        return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+            cluster_epoch: snapshot.cluster_epoch,
+            expected: expected_proof,
+            actual: observation.metadata_proof,
+        });
+    }
+```
+
+crates/storage/src/control_plane.rs (L5557 to 5592)
+  Note: The updated test demonstrates that an arbitrary higher-index proof with different hash and digest is accepted for serving and metadata-write authorization.
+```
+        let progressed_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
+        };
+        authority
+            .snapshot
+            .nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .pg_observations
+            .get_mut(&PgId::new(22))
+            .unwrap()
+            .metadata_proof = progressed_proof;
+
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(22), 2_031),
+            Some(NodeId::new(1))
+        );
+        assert!(authority
+            .snapshot()
+            .active_pg_route(PgId::new(22), 2_031)
+            .is_ok());
+        assert!(authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1))
+            .is_ok());
+        assert!(authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(22),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                authority.snapshot().cluster_epoch(),
+                2_031,
+            )
+```
+
+crates/storage/src/control_plane.rs (L7587 to 7601)
+  Note: The heartbeat test explicitly accepts a progressed proof whose hash and digest differ from the accepted peering proof.
+```
+        let progressed_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
+        };
+        let mut progressed_active =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_030);
+        progressed_active.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Active,
+            metadata_proof: progressed_proof,
+            has_pending_metadata_command: false,
+        }];
+        let lease = authority.heartbeat(progressed_active, 2_030).unwrap();
+        assert_eq!(lease.lease_deadline_ms(), 2_130);
+```

@@ -6967,6 +6967,17 @@ must carry enough epoch and sender-incarnation context for receivers to reject
 stale senders. Lease issuance is valid only after the authority has durably
 recorded the epoch/map/incarnation tuple being leased.
 
+Threat-model boundary: Phase 11 treats storage-node and single-authority
+control-plane processes as trusted runtime components on trusted hosts, as
+documented in [`guides/threat_model.md`](../guides/threat_model.md). The
+authority validates heartbeat freshness, epoch/incarnation fencing, PG state,
+pending-command absence, and peering/active metadata proof floors, but it does
+not attempt to prove that a hostile storage node's future metadata proof is a
+valid successor without trusting that node's local durable replay validation.
+Remote authenticated control-plane transport is a future phase, and stronger
+node attestation is a deployment/runtime trust problem rather than an S3 object
+store authorization mechanism.
+
 PG primary assignment should be deterministic once the authoritative map is
 known. Given `(cluster_epoch, pg_id, acting_set, temporary availability view)`,
 all nodes must compute the same primary, for example by choosing the first

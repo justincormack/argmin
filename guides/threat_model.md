@@ -39,10 +39,27 @@ non-confidential deployment mode.
 - **Authentication boundary:** `auth::authenticate_request` and `auth::authenticate_post_sigv4` are the primary gates; any bug here impacts all operations.
 - **Core/storage boundary:** `server-core` assumes validated bucket/key strings and authenticated `Requester` identity; `storage` assumes internal shard keys and well-formed metadata.
 - **Configuration boundary:** Environment variables control credentials, listen address, limits, data directory, and tracing output.
+- **Cluster-internal boundary:** Phase 11 control-plane and storage-node
+  roles communicate over local Unix sockets and trust the local host, process
+  identity, data directory ownership, and socket directory permissions. A
+  storage node heartbeat is treated as a statement from a trusted node process
+  about its locally verified durable PG state, not as an arbitrary public
+  network input.
 - **Developer boundary:** Test utilities (`crates/s3-tests`, `test-util`) and build scripts are not part of production runtime.
 
 ### Assumptions
 - Host OS and filesystem permissions are trusted; unprivileged local users cannot modify `ARGMIN_DATA_DIR` contents.
+- Phase 11 multihost/control-plane work assumes the storage-node and
+  single-authority control-plane processes are trusted runtime components on
+  trusted hosts. It does not attempt to defend against a malicious or
+  compromised storage node forging heartbeats, corrupting its local metadata
+  database, or lying about PG metadata proofs. Local storage nodes validate
+  their command-log hash chain and metadata state digest before reporting PG
+  heartbeat proofs, and the authority uses those proofs as fencing evidence
+  from trusted nodes. Remote authenticated control-plane transport and any
+  stronger node attestation story are future work and outside the current
+  object-store threat boundary; they belong to the deployment/runtime trust
+  model rather than S3 request authorization.
 - System clock is reasonably accurate for SigV4 expiry checks.
 - Deployments that need confidentiality or `SSE-C` use secure transport. This
   can be provided directly by `argmin-s3` via its TLS config or by a trusted
