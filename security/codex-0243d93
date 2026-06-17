@@ -1,6 +1,6 @@
 Active PG proof floor bypass permits divergent metadata
 Link: https://chatgpt.com/codex/cloud/security/findings/502cecdc170881919ac9bf2f0f8bc62d?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
-Criticality: high
+Criticality: medium (attack path: medium)
 Status: accepted-risk
 
 # Metadata
@@ -9,7 +9,7 @@ Commit: 0243d93
 Author: justin@specialbusservice.com
 Created: 17/06/2026, 11:45:45
 Assignee: Unassigned
-Signals: Security
+Signals: Security, Validated, Attack-path
 
 # Resolution
 Accepted as outside the current Phase 11 threat model and documented rather
@@ -40,6 +40,24 @@ Updated documentation:
 # Summary
 Introduced: equality checks against the peering metadata proof were replaced with a floor check that only compares applied_log_index for progressed states. This allows future-index proofs with arbitrary applied_log_hash and state_digest to pass heartbeat validation, active route generation, and PG operation authorization.
 The new metadata_proof_satisfies_active_floor() helper treats an observed proof as valid whenever observed.applied_log_index is greater than the active proof's applied_log_index, without validating that the observed applied_log_hash or state_digest is a legitimate successor of the active proof. That helper is now used when accepting active heartbeat observations and when deciding whether the active primary can be routed to or authorized for PG operations. As a result, a storage node heartbeat or persisted control-plane state can advance to an arbitrary future metadata proof with unrelated hash/digest values and still be considered serving. This weakens the metadata divergence protection established during peering and can allow corrupted or forged metadata state to receive routes and write authorization. The practical exploit path appears limited to an actor/process able to submit control-plane heartbeats or influence storage-node/control-plane state, not an unauthenticated public S3 client.
+
+# Validation
+## Rubric
+- [x] Confirm active PG metadata proof is established from peering observations and stored as the active floor (`control_plane.rs:1426-1436`).
+- [x] Confirm peering still enforces exact metadata proof equality before activation (`control_plane.rs:3820-3828`).
+- [x] Confirm `metadata_proof_satisfies_active_floor` accepts any greater `applied_log_index` without checking `applied_log_hash` or `state_digest` (`control_plane.rs:3841-3845`).
+- [x] Confirm active heartbeat, serving-primary/routing, and operation authorization paths rely on that relaxed helper (`control_plane.rs:3760`, `3867-3868`, `3919`).
+- [x] Dynamically reproduce through the real public control-plane API that a divergent future proof is accepted for heartbeat, route generation, and MetadataWrite authorization while same-index divergence is rejected.
+## Report
+Validated the finding as a logical authorization/metadata-integrity flaw. Crash reproduction is not applicable because the issue is acceptance of an invalid control-plane state, not memory corruption; a targeted Rust test ran successfully and demonstrated the unsafe acceptance. Valgrind and gdb were not installed in the container; lldb was available and used non-interactively.
+
+Key code evidence: `complete_pg_peering` stores the active proof selected from peering observations at `crates/storage/src/control_plane.rs:1426-1436`; peering itself still requires exact metadata proof equality at `control_plane.rs:3820-3828`. The introduced helper at `control_plane.rs:3841-3845` returns true when `observed.applied_log_index > active_floor.applied_log_index || observed == active_floor`, so it ignores `applied_log_hash` and `state_digest` for any higher index. That helper gates active heartbeat validation at `control_plane.rs:3760`, serving-primary state checks at `control_plane.rs:3867-3868`, and primary route/operation authorization validation at `control_plane.rs:3919`.
+
+I added a focused integration PoC at `crates/storage/tests/metadata_floor_poc.rs` using the public `SingleAuthorityControlPlane` API. It peers PG 22 with active_floor `{ index: 42, hash: 0xabc, digest: 0xdef }`, then submits an Active heartbeat with forged future proof `{ index: 43, hash: 0xabd, digest: 0xdf0 }`. The PoC confirms the heartbeat lease is serving, `serving_pg_primary` returns node 1, `active_pg_route` succeeds, and `authorize_pg_operation(MetadataWrite)` succeeds. It also confirms a same-index divergent proof is rejected, isolating the bypass to the higher-index floor check.
+
+Command output: `cargo test -p storage --test metadata_floor_poc future_index_divergent_metadata_proof_is_accepted_for_route_and_write_auth -- --nocapture` printed: `accepted divergent future proof: active_floor=PgMetadataProof { applied_log_index: 42, applied_log_hash: 2748, state_digest: 3567 }, observed=PgMetadataProof { applied_log_index: 43, applied_log_hash: 2749, state_digest: 3568 }, lease_serving=true, serving=Some(NodeId(1)), route_ok=true, metadata_write_auth_ok=true` and `same-index divergent proof rejected: true`; the test passed.
+
+Debugger evidence: lldb breakpoint at `control_plane.rs:3845` stopped inside `metadata_proof_satisfies_active_floor` during the forged heartbeat. Frame variables showed `active_floor = (applied_log_index = 42, applied_log_hash = 2748, state_digest = 3567)` and `observed = (applied_log_index = 43, applied_log_hash = 2749, state_digest = 3568)`. The backtrace showed the call chain `metadata_proof_satisfies_active_floor -> validate_pg_heartbeat_observations at control_plane.rs:3760 -> SingleAuthorityControlPlane::heartbeat at control_plane.rs:1545 -> metadata_floor_poc.rs`, confirming the mismatched higher-index proof is accepted through the actual heartbeat path.
 
 # Evidence
 crates/storage/src/control_plane.rs (L1426 to 1436)
@@ -168,3 +186,48 @@ crates/storage/src/control_plane.rs (L7587 to 7601)
         let lease = authority.heartbeat(progressed_active, 2_030).unwrap();
         assert_eq!(lease.lease_deadline_ms(), 2_130);
 ```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from high to medium based on probability × impact. The code flaw is real and executable validation showed that a higher-index divergent proof is accepted for heartbeat, routing, runtime-map refresh, and MetadataWrite authorization. However, repository evidence shows the vulnerable input is an internal control-plane heartbeat/state path, not the public S3 HTTP/SigV4 surface: argmin-s3 binds the control plane on a Unix socket, requires the socket directory to be private and owned by the service uid, and normal storage-node heartbeat construction derives proofs from validated local metadata state. README further describes local multihost mode as development/test oriented and lacking internal auth. Thus the impact is potentially severe for clustered metadata integrity, but the realistic attacker and exposure are limited to internal/local compromise rather than broad remote reachability.
+## Likelihood
+low - Exploitation is not available to unauthenticated or ordinary authenticated S3 clients. It requires local/internal control-plane socket access, storage-node compromise, or state tampering; the socket is protected by private filesystem permissions and the multihost mode is documented as in-progress/local-development oriented.
+## Impact
+high - If an internal actor can submit or cause a forged/corrupted active PG proof, the bug can keep a divergent metadata state serving and authorize MetadataWrite operations, which can undermine object metadata integrity and availability.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin; no cloud APIs or live deployment state were queried.
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were present in the shallow file search, so exposure is inferred from application config and README defaults.
+- The control-plane heartbeat path is considered reachable only by local/internal actors that can access the configured Unix domain socket or influence storage-node/control-plane state.
+- control-plane/storage-node style deployment or tests using SingleAuthorityControlPlane rather than only the default legacy-local single-process path
+- attacker can submit a RefreshNodeHeartbeat/NodeHeartbeat to the private control-plane Unix socket, compromise a storage-node process, or tamper with persisted control-plane/storage-node metadata state
+- target PG has already completed peering and has an active_metadata_proof floor
+- attacker-controlled or corrupted observation uses a higher applied_log_index with divergent applied_log_hash/state_digest
+## Path
+internal socket/state access -> forged/corrupted future PG proof -> floor-only check -> heartbeat/route/write auth accepted -> divergent metadata can serve
+## Path evidence
+- `crates/storage/src/control_plane.rs:1426-1436` - PG peering stores an active_metadata_proof selected from peering observations as the active floor.
+- `crates/storage/src/control_plane.rs:3820-3832` - Peering still requires exact metadata proof equality across observations before establishing the active proof.
+- `crates/storage/src/control_plane.rs:3841-3846` - The introduced helper accepts any proof with observed.applied_log_index greater than active_floor.applied_log_index, ignoring hash and digest for progressed proofs.
+- `crates/storage/src/control_plane.rs:3755-3767` - Active heartbeat validation uses the relaxed helper instead of requiring exact proof continuity.
+- `crates/storage/src/control_plane.rs:3862-3869` - Serving-primary state checks rely on the relaxed helper, allowing a divergent future proof to keep the primary routable.
+- `crates/storage/src/control_plane.rs:3919-3927` - Primary active-observation validation used by active route and PG operation authorization also relies on the relaxed helper.
+- `crates/storage/src/control_plane.rs:2139-2165` - The control-plane Unix RPC dispatch decodes a RefreshNodeHeartbeat and submits it to the control-plane heartbeat/runtime-map path.
+- `crates/argmin-s3/src/main.rs:245-264` - argmin-s3 has a runtime control-plane process role that opens persisted state and binds the configured control-plane socket.
+- `crates/argmin-s3/src/main.rs:420-493` - Control-plane socket exposure is local-only and mitigated by requiring an absolute Unix socket path in a private, current-user-owned directory.
+- `crates/storage/src/node.rs:1152-1176` - Normal storage-node heartbeat observations derive PgMetadataProof from local metadata replay state after validation, limiting arbitrary proof control to compromised/tampered internal paths.
+- `README.md:138-157` - The documented local multihost mode is described as intended for local development/tests while distributed storage is being built and lacks internal auth/failure detection.
+## Narrative
+The finding is a real logic flaw: the committed helper accepts any observed active PG metadata proof with a greater applied_log_index, even if applied_log_hash and state_digest diverge from the active peering proof. That helper is used for active heartbeat validation, serving-primary checks, active route generation, and PG operation authorization, and the validation PoC demonstrated route and MetadataWrite authorization acceptance for a divergent future proof. The severity should be reduced from high because the path is not exposed through the public S3 HTTP API; it requires local/internal control-plane heartbeat access, compromised storage-node behavior, or state tampering. The control-plane process uses a Unix socket in a private owned directory, and README notes the local multihost path is in-progress/development oriented. Impact can be high for metadata integrity/availability if those preconditions are met, but likelihood from the main threat model is low.
+## Controls
+- HTTP S3 surface uses SigV4 authentication and is separate from this control-plane heartbeat path
+- control-plane RPC is a Unix domain socket, not a public TCP listener
+- control-plane socket directory must be private and owned by the running uid
+- heartbeat validation checks node membership, incarnation, cluster epoch, acting-set membership, active state, and pending metadata command flag
+- normal storage-node heartbeat generation validates metadata replay state before advertising proof
+- control-plane RPC has worker limits and read/write timeouts
+## Blindspots
+- Static review cannot confirm production deployment topology or whether operators expose control-plane sockets across containers/hosts through shared volumes.
+- No IaC or service manifests were found to validate real ingress, Unix socket ownership, or process user separation.
+- The validation PoC exercised the public Rust API/control-plane logic, not a full end-to-end multi-process deployment over the Unix socket.
+- Lineage requirements for legitimate progressed metadata proofs are inferred from hash/digest semantics; a complete fix requires understanding the intended metadata-command hash chain.
