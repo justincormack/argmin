@@ -7324,10 +7324,13 @@ Status:
   `./scripts/uat-s3-tests --smoke control-plane-runtime-map`. The smoke starts a
   separate single-authority control-plane manager, two storage-node processes,
   and a frontend process that bootstraps and refreshes routing only through
-  `ARGMIN_CONTROL_PLANE_SOCKET_PATH`; it then runs an S3 probe, restarts one
-  storage node, waits for heartbeat/peering refresh, and runs a second S3
-  probe. This is intentionally a narrow process/runtime-map wiring smoke, not
-  the later full distributed-correctness soak.
+  `ARGMIN_CONTROL_PLANE_SOCKET_PATH`; it then runs S3 probes, including a
+  metadata-progress PUT/update/delete probe followed by a refresh wait and a
+  second request before any restart, so post-write Active heartbeat lease
+  renewal is covered. It then restarts one storage node, waits for
+  heartbeat/peering refresh, and runs a final S3 probe. This is intentionally a
+  narrow process/runtime-map wiring smoke, not the later full
+  distributed-correctness soak.
 - Started the deterministic epoch-transition fault regression set. The first
   tests cover exported runtime maps failing closed once their lease validity
   expires across an authority epoch transition, stale primary operation
