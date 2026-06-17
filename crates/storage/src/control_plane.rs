@@ -3370,10 +3370,10 @@ fn validate_current_pg_observations(
                 let Some(expected) = pg.active_metadata_proof else {
                     return Err(parse_error(line, "active PG is missing metadata proof"));
                 };
-                if observation.metadata_proof != expected {
+                if !metadata_proof_satisfies_active_floor(expected, observation.metadata_proof) {
                     return Err(parse_error(
                         line,
-                        "active node PG observation metadata proof does not match PG active proof",
+                        "active node PG observation metadata proof is behind or diverges from PG active proof",
                     ));
                 }
             }
@@ -3757,7 +3757,7 @@ fn validate_pg_heartbeat_observations(
                     pg_id: observation.pg_id.get(),
                 },
             )?;
-            if observation.metadata_proof != expected {
+            if !metadata_proof_satisfies_active_floor(expected, observation.metadata_proof) {
                 return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                     pg_id: observation.pg_id.get(),
                     node_id: node_id.as_u32(),
@@ -3838,6 +3838,13 @@ fn validate_pg_peering_observations(
     })
 }
 
+fn metadata_proof_satisfies_active_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+) -> bool {
+    observed.applied_log_index > active_floor.applied_log_index || observed == active_floor
+}
+
 fn primary_has_current_pg_state(
     snapshot: &ClusterControlSnapshot,
     pg_id: PgId,
@@ -3857,7 +3864,9 @@ fn primary_has_current_pg_state(
                 && observation.state == expected_state
                 && !observation.has_pending_metadata_command
                 && (expected_state != PgState::Active
-                    || Some(observation.metadata_proof) == expected_active_proof)
+                    || expected_active_proof.is_some_and(|expected| {
+                        metadata_proof_satisfies_active_floor(expected, observation.metadata_proof)
+                    }))
         })
 }
 
@@ -3907,7 +3916,7 @@ fn validate_pg_primary_active_observation(
             cluster_epoch: snapshot.cluster_epoch,
         });
     }
-    if observation.metadata_proof != expected_proof {
+    if !metadata_proof_satisfies_active_floor(expected_proof, observation.metadata_proof) {
         return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
             pg_id: pg_id.get(),
             node_id: primary.as_u32(),
@@ -4814,8 +4823,47 @@ mod tests {
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
                 if message
-                    == "active node PG observation metadata proof does not match PG active proof"
+                    == "active node PG observation metadata proof is behind or diverges from PG active proof"
         ));
+    }
+
+    #[test]
+    fn file_backed_authority_accepts_active_pg_observation_after_metadata_progress() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=8\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node_pg=1,7,active,2,100,10,20,30,0\n",
+                "pg=7,active,1,1,9,10,11\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        let authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let historical_node = authority
+            .snapshot()
+            .cluster_map_at_epoch(ClusterEpoch::new(2).unwrap())
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|record| record.node_id() == NodeId::new(1))
+            .unwrap();
+        assert_eq!(
+            historical_node
+                .pg_observation(PgId::new(7))
+                .unwrap()
+                .metadata_proof(),
+            PgMetadataProof {
+                applied_log_index: 10,
+                applied_log_hash: 20,
+                state_digest: 30,
+            }
+        );
     }
 
     #[test]
@@ -5506,10 +5554,48 @@ mod tests {
             )
             .is_ok());
 
-        let mismatched_proof = PgMetadataProof {
+        let progressed_proof = PgMetadataProof {
             applied_log_index: 43,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
+        };
+        authority
+            .snapshot
+            .nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .pg_observations
+            .get_mut(&PgId::new(22))
+            .unwrap()
+            .metadata_proof = progressed_proof;
+
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(22), 2_031),
+            Some(NodeId::new(1))
+        );
+        assert!(authority
+            .snapshot()
+            .active_pg_route(PgId::new(22), 2_031)
+            .is_ok());
+        assert!(authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1))
+            .is_ok());
+        assert!(authority
+            .authorize_pg_operation(
+                PgServiceOperation::MetadataWrite,
+                PgId::new(22),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                authority.snapshot().cluster_epoch(),
+                2_031,
+            )
+            .is_ok());
+
+        let mismatched_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
         };
         authority
             .snapshot
@@ -5521,9 +5607,9 @@ mod tests {
             .unwrap()
             .metadata_proof = mismatched_proof;
 
-        assert_eq!(authority.serving_pg_primary(PgId::new(22), 2_031), None);
+        assert_eq!(authority.serving_pg_primary(PgId::new(22), 2_032), None);
         assert!(matches!(
-            authority.snapshot().active_pg_route(PgId::new(22), 2_031),
+            authority.snapshot().active_pg_route(PgId::new(22), 2_032),
             Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                 pg_id: 22,
                 node_id: 1,
@@ -5535,7 +5621,7 @@ mod tests {
         assert!(matches!(
             authority
                 .snapshot()
-                .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1)),
+                .runtime_map_for_storage_node_refresh(2_032, NodeId::new(1)),
             Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                 pg_id: 22,
                 node_id: 1,
@@ -5551,7 +5637,7 @@ mod tests {
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
                 authority.snapshot().cluster_epoch(),
-                2_031,
+                2_032,
             ),
             Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                 pg_id: 22,
@@ -7433,7 +7519,7 @@ mod tests {
     }
 
     #[test]
-    fn active_heartbeat_must_match_accepted_peering_metadata_proof() {
+    fn active_heartbeat_accepts_metadata_progress_after_peering() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -7468,17 +7554,17 @@ mod tests {
             )
             .unwrap();
 
-        let different_proof = PgMetadataProof {
-            applied_log_index: 43,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
+        let same_index_mismatched_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
         };
         let mut mismatched_active =
             heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_020);
         mismatched_active.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(19),
             state: PgState::Active,
-            metadata_proof: different_proof,
+            metadata_proof: same_index_mismatched_proof,
             has_pending_metadata_command: false,
         }];
         assert!(matches!(
@@ -7489,7 +7575,7 @@ mod tests {
                 expected,
                 actual,
                 ..
-            }) if expected == accepted_proof && actual == different_proof
+            }) if expected == accepted_proof && actual == same_index_mismatched_proof
         ));
         assert!(authority
             .snapshot()
@@ -7498,15 +7584,21 @@ mod tests {
             .pg_observation(PgId::new(19))
             .is_none());
 
-        let mut matching_active =
+        let progressed_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
+        };
+        let mut progressed_active =
             heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_030);
-        matching_active.pg_observations = vec![NodePgHeartbeatObservation {
+        progressed_active.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(19),
             state: PgState::Active,
-            metadata_proof: accepted_proof,
+            metadata_proof: progressed_proof,
             has_pending_metadata_command: false,
         }];
-        authority.heartbeat(matching_active, 2_030).unwrap();
+        let lease = authority.heartbeat(progressed_active, 2_030).unwrap();
+        assert_eq!(lease.lease_deadline_ms(), 2_130);
         let observation = authority
             .snapshot()
             .node(NodeId::new(1))
@@ -7514,7 +7606,11 @@ mod tests {
             .pg_observation(PgId::new(19))
             .unwrap();
         assert_eq!(observation.state(), PgState::Active);
-        assert_eq!(observation.metadata_proof(), accepted_proof);
+        assert_eq!(observation.metadata_proof(), progressed_proof);
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(19), 2_031),
+            Some(NodeId::new(1))
+        );
     }
 
     #[test]
