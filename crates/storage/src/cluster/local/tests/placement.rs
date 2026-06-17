@@ -1955,6 +1955,139 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
 }
 
 #[test]
+fn repair_placed_segment_payload_shards_rejects_non_active_pg_route_without_writing() {
+    let non_active_states = [
+        PgState::Peering,
+        PgState::Degraded,
+        PgState::Backfilling,
+        PgState::Inconsistent,
+    ];
+
+    for state in non_active_states {
+        let tmp = test_util::tempdir();
+        let node_ids = [
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ];
+        let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let mut map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let segment = write_committed_direct_segment(&cluster, b"phase-eleven-repair-route");
+        let shard_index = ShardIndex::new(0);
+        let shard_path = cluster
+            .test_payload_shard_file_path(
+                segment.written.data_pg_id,
+                segment.written.ec,
+                &segment.segment_okh,
+                segment.generation_id,
+                shard_index.get(),
+            )
+            .unwrap();
+        std::fs::remove_file(&shard_path).unwrap();
+        drop(cluster);
+
+        Arc::get_mut(&mut map)
+            .unwrap()
+            .pg_routes
+            .get_mut(&PgId::new(segment.written.data_pg_id))
+            .unwrap()
+            .state = state;
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+        let err = cluster
+            .repair_placed_segment_payload_shards(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: segment.written.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.generation_id,
+                    stored_size: segment.payload.len(),
+                    segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                    ec: segment.written.ec,
+                },
+                &[shard_index],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::PgNotActive {
+                pg_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: err_state,
+            } if pg_id == segment.written.data_pg_id && err_state == state
+        ));
+        assert!(
+            !shard_path.exists(),
+            "repair wrote shard while PG route state was {state}"
+        );
+    }
+}
+
+#[test]
+fn repair_placed_segment_payload_shards_rejects_stale_operation_epoch_without_writing() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let segment = write_committed_direct_segment(&current_cluster, b"phase-eleven-stale-repair");
+    let shard_index = ShardIndex::new(0);
+    let shard_path = current_cluster
+        .test_payload_shard_file_path(
+            segment.written.data_pg_id,
+            segment.written.ec,
+            &segment.segment_okh,
+            segment.generation_id,
+            shard_index.get(),
+        )
+        .unwrap();
+    std::fs::remove_file(&shard_path).unwrap();
+    let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::clone(&map),
+        ClusterEpoch::new(2).unwrap(),
+    )
+    .unwrap();
+
+    let err = stale_cluster
+        .repair_placed_segment_payload_shards(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: segment.written.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.generation_id,
+                stored_size: segment.payload.len(),
+                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                ec: segment.written.ec,
+            },
+            &[shard_index],
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StoreError::StalePayloadOperation {
+            pg_id,
+            operation_epoch,
+            current_epoch,
+        } if pg_id == segment.written.data_pg_id
+            && operation_epoch == ClusterEpoch::new(2).unwrap()
+            && current_epoch == ClusterEpoch::INITIAL
+    ));
+    assert!(!shard_path.exists(), "stale repair wrote target shard");
+}
+
+#[test]
 fn repair_placed_segment_payload_shards_rejects_invalid_target_sets() {
     let tmp = test_util::tempdir();
     let node_ids = [

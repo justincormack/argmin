@@ -7553,6 +7553,11 @@ Shard repair design:
 - Added unrecoverable-shard coverage for the same boundary: when more than `m`
   shards are physically unavailable, both read-time reconstruction and explicit
   repair fail closed instead of returning partial or guessed payload bytes.
+- Added repair-route fencing coverage. Explicit shard repair now has focused
+  regressions proving it does not recreate a missing shard while the data PG is
+  `Peering`, `Degraded`, `Backfilling`, or `Inconsistent`, and does not write
+  through a stale cluster handle whose operation epoch no longer matches the
+  current route map.
 
 Exit criteria:
 
