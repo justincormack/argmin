@@ -39,10 +39,11 @@ use crate::metadata_command::{
     DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
     MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandLogEntryKind, MetadataCommandLogHashRangeEntry,
-    MetadataCommandLogIndex, MetadataCommandPayload, MetadataCommandReplicaState,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
+    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};

@@ -7463,6 +7463,22 @@ PG peering reconstruction design:
   4096 log indexes, validates ordered non-zero indexes at the frame boundary,
   and verifies retained command-log entry checksums before returning stored
   previous/current hash pairs.
+- Added the payload-bearing retained-log boundary needed before mutating
+  catch-up. `PgStore` and the local/session/Unix metadata-command clients can
+  now read a smaller bounded range of retained command-log entries: applied
+  entries carry the verified canonical `MetadataCommandEnvelope`, while
+  abandoned tombstones are exposed explicitly with the original command
+  checksum instead of being treated as replayable payloads. The Unix RPC decoder
+  caps entry ranges separately from hash-only ranges and rejects unknown entry
+  kinds, keeping abandoned or unsupported replay cases fail-closed for the next
+  catch-up slice.
+- Added a pure replay-planning layer on top of the retained-entry boundary. The
+  catch-up decision now carries both the starting and target log hashes, and the
+  planner builds per-replica applied-command batches only when the retained
+  payload suffix chains exactly from the lagging replica proof to the primary
+  proof. Abandoned retained entries fail closed before any mutation, so the
+  next production slice can apply only explicit all-applied replay plans and
+  leave tombstone recovery to a later design.
 - Added a side-effect-free cluster peering gather helper that reads the current
   acting set's replica state and pending slot state through
   `MetadataCommandNodeClient`, fetches the selected primary's retained suffix

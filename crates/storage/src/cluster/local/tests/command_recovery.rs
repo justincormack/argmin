@@ -1619,6 +1619,14 @@ fn peering_reconstruction_gather_uses_primary_retained_suffix_for_lagging_replic
         pg.apply_metadata_command_and_record(node_id.as_u32(), &first)
             .unwrap();
     }
+    let lagging_state = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
     let primary_pg = map
         .node(NodeId::new(0))
         .unwrap()
@@ -1647,12 +1655,16 @@ fn peering_reconstruction_gather_uses_primary_retained_suffix_for_lagging_replic
                 crate::peering::PgPeeringReplicaCatchUp {
                     node_id: NodeId::new(1),
                     from_log_index: 1,
+                    from_log_hash: lagging_state.applied_log_hash,
                     to_log_index: 2,
+                    to_log_hash: primary_state.applied_log_hash,
                 },
                 crate::peering::PgPeeringReplicaCatchUp {
                     node_id: NodeId::new(2),
                     from_log_index: 1,
+                    from_log_hash: lagging_state.applied_log_hash,
                     to_log_index: 2,
+                    to_log_hash: primary_state.applied_log_hash,
                 },
             ],
         }

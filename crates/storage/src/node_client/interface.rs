@@ -1088,6 +1088,15 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         last_log_index: MetadataCommandLogIndex,
     ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError>;
 
+    #[allow(dead_code)]
+    fn retained_metadata_command_log_entries(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError>;
+
     fn has_matching_applied_metadata_command_log_entry(
         &self,
         pg_id: PgId,

@@ -1085,6 +1085,114 @@ impl PgStore {
         Ok(entries)
     }
 
+    pub(crate) fn retained_metadata_command_log_entries(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
+        let mut entries = Vec::new();
+        for raw_log_index in first_log_index.get()..=last_log_index.get() {
+            let log_index = MetadataCommandLogIndex::new(raw_log_index)
+                .expect("metadata command log index range starts non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load retained metadata command log entry range",
+                cluster_epoch,
+                PgId::new(self.pg_id),
+                log_index,
+            )?
+            else {
+                continue;
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                PgId::new(self.pg_id),
+                log_index,
+                &entry,
+            )?;
+            let Some(previous_log_hash) = entry.previous_log_hash else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            let Some(log_hash) = entry.log_hash else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            let header =
+                decode_metadata_command_log_entry_header(&entry.command_bytes).map_err(|_| {
+                    StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: raw_log_index,
+                    }
+                })?;
+            if header.id()
+                != MetadataCommandId::new(cluster_epoch, PgId::new(self.pg_id), log_index)
+            {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            }
+            let kind =
+                match header.kind() {
+                    MetadataCommandLogEntryKind::Applied => {
+                        if entry.abandoned {
+                            return Err(StoreError::MetadataCommandLogConflict {
+                                node_id,
+                                pg_id: self.pg_id,
+                                cluster_epoch,
+                                log_index: raw_log_index,
+                            });
+                        }
+                        let command = decode_metadata_command_envelope(&entry.command_bytes)
+                            .map_err(|_| StoreError::MetadataCommandLogConflict {
+                                node_id,
+                                pg_id: self.pg_id,
+                                cluster_epoch,
+                                log_index: raw_log_index,
+                            })?;
+                        MetadataCommandLogRangeEntryKind::Applied(Box::new(command))
+                    }
+                    MetadataCommandLogEntryKind::Abandoned {
+                        original_command_checksum,
+                    } => {
+                        if !entry.abandoned {
+                            return Err(StoreError::MetadataCommandLogConflict {
+                                node_id,
+                                pg_id: self.pg_id,
+                                cluster_epoch,
+                                log_index: raw_log_index,
+                            });
+                        }
+                        MetadataCommandLogRangeEntryKind::Abandoned {
+                            original_command_checksum,
+                        }
+                    }
+                };
+            entries.push(MetadataCommandLogRangeEntry {
+                log_index: raw_log_index,
+                previous_log_hash,
+                log_hash,
+                kind,
+            });
+        }
+        Ok(entries)
+    }
+
     pub(crate) fn metadata_command_log_entry_command_kind_name(
         &self,
         cluster_epoch: ClusterEpoch,

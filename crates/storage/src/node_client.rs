@@ -19,9 +19,10 @@ use crate::metadata_command::{
     DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
     MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    MetadataCommandLogRangeEntry, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
@@ -44,7 +45,8 @@ use crate::storage_rpc::{
     decode_list_multipart_uploads_response, decode_list_object_versions_response,
     decode_list_objects_response, decode_metadata_command_acceptance_response,
     decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
-    decode_metadata_command_bool_response, decode_metadata_command_log_hash_range_response,
+    decode_metadata_command_bool_response, decode_metadata_command_log_entry_range_response,
+    decode_metadata_command_log_hash_range_response,
     decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
     decode_metadata_command_pending_envelope_response,
     decode_metadata_command_pending_slot_insert_response,

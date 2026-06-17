@@ -112,6 +112,20 @@ pub(crate) struct MetadataCommandLogHashRangeEntry {
     pub(crate) log_hash: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataCommandLogRangeEntry {
+    pub(crate) log_index: u64,
+    pub(crate) previous_log_hash: u64,
+    pub(crate) log_hash: u64,
+    pub(crate) kind: MetadataCommandLogRangeEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MetadataCommandLogRangeEntryKind {
+    Applied(Box<MetadataCommandEnvelope>),
+    Abandoned { original_command_checksum: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MetadataCommandId {
     cluster_epoch: ClusterEpoch,

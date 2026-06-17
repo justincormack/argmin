@@ -1,6 +1,9 @@
 use crate::control_plane::PgMetadataProof;
 use crate::error::StoreError;
-use crate::metadata_command::{MetadataCommandLogHashRangeEntry, MetadataCommandReplicaState};
+use crate::metadata_command::{
+    MetadataCommandEnvelope, MetadataCommandLogHashRangeEntry, MetadataCommandLogRangeEntry,
+    MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState,
+};
 use crate::types::{ClusterEpoch, PgId};
 use placement::NodeId;
 
@@ -16,7 +19,15 @@ pub(crate) struct PgPeeringReplicaReconstructionInput {
 pub(crate) struct PgPeeringReplicaCatchUp {
     pub(crate) node_id: NodeId,
     pub(crate) from_log_index: u64,
+    pub(crate) from_log_hash: u64,
     pub(crate) to_log_index: u64,
+    pub(crate) to_log_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PgPeeringReplicaReplayPlan {
+    pub(crate) node_id: NodeId,
+    pub(crate) commands: Vec<MetadataCommandEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +83,8 @@ pub(crate) enum PgPeeringReconstructionError {
         expected_previous_log_hash: u64,
         actual_previous_log_hash: u64,
     },
+    #[error("PG peering node {node_id:?} retained command-log entry {log_index} is abandoned and cannot be replayed from retained payloads")]
+    UnreplayableAbandonedCommandLogEntry { node_id: NodeId, log_index: u64 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -134,7 +147,9 @@ pub(crate) fn reconstruct_pg_peering_from_primary_retained_log(
                 catchups.push(PgPeeringReplicaCatchUp {
                     node_id: replica.node_id,
                     from_log_index: replica.state.applied_log_index,
+                    from_log_hash: replica.state.applied_log_hash,
                     to_log_index: primary_replica.state.applied_log_index,
+                    to_log_hash: primary_replica.state.applied_log_hash,
                 });
             }
         }
@@ -210,6 +225,64 @@ fn validate_retained_suffix_for_catchup(
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(crate) fn build_pg_peering_replay_plan_from_retained_log_entries(
+    catchups: &[PgPeeringReplicaCatchUp],
+    retained_log_entries: &[MetadataCommandLogRangeEntry],
+) -> Result<Vec<PgPeeringReplicaReplayPlan>, PgPeeringReconstructionError> {
+    let mut plans = Vec::with_capacity(catchups.len());
+    for catchup in catchups {
+        let mut expected_previous_log_hash = catchup.from_log_hash;
+        let mut commands = Vec::new();
+        for log_index in (catchup.from_log_index + 1)..=catchup.to_log_index {
+            let retained = retained_log_entries
+                .iter()
+                .find(|entry| entry.log_index == log_index)
+                .ok_or(
+                    PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                        node_id: catchup.node_id,
+                        log_index,
+                    },
+                )?;
+            if retained.previous_log_hash != expected_previous_log_hash {
+                return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
+                    node_id: catchup.node_id,
+                    log_index,
+                    expected_previous_log_hash,
+                    actual_previous_log_hash: retained.previous_log_hash,
+                });
+            }
+            match &retained.kind {
+                MetadataCommandLogRangeEntryKind::Applied(command) => {
+                    commands.push((**command).clone());
+                }
+                MetadataCommandLogRangeEntryKind::Abandoned { .. } => {
+                    return Err(
+                        PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                            node_id: catchup.node_id,
+                            log_index,
+                        },
+                    );
+                }
+            }
+            expected_previous_log_hash = retained.log_hash;
+        }
+        if expected_previous_log_hash != catchup.to_log_hash {
+            return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
+                node_id: catchup.node_id,
+                log_index: catchup.to_log_index,
+                expected_previous_log_hash,
+                actual_previous_log_hash: catchup.to_log_hash,
+            });
+        }
+        plans.push(PgPeeringReplicaReplayPlan {
+            node_id: catchup.node_id,
+            commands,
+        });
+    }
+    Ok(plans)
+}
+
 fn proof_from_replica_state(state: MetadataCommandReplicaState) -> PgMetadataProof {
     PgMetadataProof::new(
         state.applied_log_index,
@@ -221,6 +294,9 @@ fn proof_from_replica_state(state: MetadataCommandReplicaState) -> PgMetadataPro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_command::{
+        CreateBucketCommand, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    };
 
     fn state(log_index: u64, log_hash: u64, state_digest: u64) -> MetadataCommandReplicaState {
         MetadataCommandReplicaState {
@@ -253,6 +329,49 @@ mod tests {
             log_index,
             previous_log_hash,
             log_hash,
+        }
+    }
+
+    fn command(log_index: u64) -> MetadataCommandEnvelope {
+        let owner = crate::types::OwnerIdentity::from_principal("owner");
+        let bucket =
+            crate::types::BucketName::try_from(format!("peering-replay-{log_index}")).unwrap();
+        let config = crate::types::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
+            ownership_controls: crate::types::BucketOwnershipControls {
+                object_ownership: crate::types::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 1, log_index).unwrap(),
+            ),
+        )
+    }
+
+    fn retained_entry(
+        log_index: u64,
+        previous_log_hash: u64,
+        log_hash: u64,
+        kind: MetadataCommandLogRangeEntryKind,
+    ) -> MetadataCommandLogRangeEntry {
+        MetadataCommandLogRangeEntry {
+            log_index,
+            previous_log_hash,
+            log_hash,
+            kind,
         }
     }
 
@@ -299,7 +418,9 @@ mod tests {
                 replicas: vec![PgPeeringReplicaCatchUp {
                     node_id: NodeId::new(2),
                     from_log_index: 1,
+                    from_log_hash: 10,
                     to_log_index: 3,
+                    to_log_hash: 30,
                 }],
             }
         );
@@ -349,6 +470,74 @@ mod tests {
                 log_index: 3,
                 expected_previous_log_hash: 20,
                 actual_previous_log_hash: 99,
+            }
+        );
+    }
+
+    #[test]
+    fn peering_replay_plan_returns_applied_commands_for_lagging_replica() {
+        let first = command(2);
+        let second = command(3);
+        let plans = build_pg_peering_replay_plan_from_retained_log_entries(
+            &[PgPeeringReplicaCatchUp {
+                node_id: NodeId::new(2),
+                from_log_index: 1,
+                from_log_hash: 10,
+                to_log_index: 3,
+                to_log_hash: 30,
+            }],
+            &[
+                retained_entry(
+                    2,
+                    10,
+                    20,
+                    MetadataCommandLogRangeEntryKind::Applied(Box::new(first.clone())),
+                ),
+                retained_entry(
+                    3,
+                    20,
+                    30,
+                    MetadataCommandLogRangeEntryKind::Applied(Box::new(second.clone())),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plans,
+            vec![PgPeeringReplicaReplayPlan {
+                node_id: NodeId::new(2),
+                commands: vec![first, second],
+            }]
+        );
+    }
+
+    #[test]
+    fn peering_replay_plan_fails_closed_on_abandoned_tombstone() {
+        let err = build_pg_peering_replay_plan_from_retained_log_entries(
+            &[PgPeeringReplicaCatchUp {
+                node_id: NodeId::new(2),
+                from_log_index: 1,
+                from_log_hash: 10,
+                to_log_index: 2,
+                to_log_hash: 20,
+            }],
+            &[retained_entry(
+                2,
+                10,
+                20,
+                MetadataCommandLogRangeEntryKind::Abandoned {
+                    original_command_checksum: 0x1234,
+                },
+            )],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                node_id: NodeId::new(2),
+                log_index: 2,
             }
         );
     }

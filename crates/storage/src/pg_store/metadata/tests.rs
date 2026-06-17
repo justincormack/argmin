@@ -2022,6 +2022,68 @@ fn metadata_command_apply_and_record_rolls_back_log_on_metadata_failure() {
 }
 
 #[test]
+fn retained_metadata_command_log_entries_returns_applied_payloads() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("retained-entry-applied");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+
+    let entries = store
+        .retained_metadata_command_log_entries(
+            0,
+            ClusterEpoch::INITIAL,
+            MetadataCommandLogIndex::new(1).unwrap(),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].log_index, 1);
+    assert_eq!(entries[0].previous_log_hash, 0);
+    match &entries[0].kind {
+        MetadataCommandLogRangeEntryKind::Applied(decoded) => {
+            assert_eq!(decoded.command_bytes(), command.command_bytes());
+        }
+        other => panic!("expected applied command entry, got {other:?}"),
+    }
+}
+
+#[test]
+fn retained_metadata_command_log_entries_preserves_abandoned_tombstones() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("retained-entry-abandoned");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+
+    store
+        .record_metadata_command_abandoned(0, &command)
+        .unwrap();
+
+    let entries = store
+        .retained_metadata_command_log_entries(
+            0,
+            ClusterEpoch::INITIAL,
+            MetadataCommandLogIndex::new(1).unwrap(),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].log_index, 1);
+    assert_eq!(entries[0].previous_log_hash, 0);
+    match entries[0].kind {
+        MetadataCommandLogRangeEntryKind::Abandoned {
+            original_command_checksum,
+        } => {
+            assert_eq!(original_command_checksum, command.checksum_crc64());
+        }
+        ref other => panic!("expected abandoned command entry, got {other:?}"),
+    }
+}
+
+#[test]
 fn metadata_command_log_contiguous_insert_uses_prefix_fast_path() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
