@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn object_read_snapshot_fails_closed_while_metadata_pg_is_peering() {
+    let tmp = test_util::tempdir();
+    let mut map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"first",
+    );
+    drop(cluster);
+
+    Arc::get_mut(&mut map)
+        .unwrap()
+        .pg_routes
+        .get_mut(&PgId::new(0))
+        .unwrap()
+        .state = PgState::Peering;
+    let cluster = current_cluster(&map);
+
+    let err = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::MetadataOnly,
+            |_stored| Ok::<_, ()>(()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::ObjectPgActionError::Store(StoreError::PgNotActive {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Peering,
+        })
+    ));
+}
+
+#[test]
 fn object_read_snapshot_retries_when_object_changes_after_auth_subject_load() {
     let tmp = test_util::tempdir();
     let map = Arc::new(

@@ -7521,6 +7521,10 @@ PG peering reconstruction design:
   upload listings now have a regression proving that one Peering metadata PG
   aborts the whole fanout operation with `PgNotActive` instead of returning a
   partial or empty result while the PG lacks complete truth.
+- Extended the same Peering availability rule to point metadata reads. Object
+  read snapshots and multipart-upload lookups now have regressions proving they
+  fail closed with `PgNotActive` while their metadata PG is `Peering`, rather
+  than authorizing against incomplete per-PG state.
 
 Exit criteria:
 

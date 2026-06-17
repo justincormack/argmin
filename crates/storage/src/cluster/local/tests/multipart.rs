@@ -1,6 +1,70 @@
 use super::*;
 
 #[test]
+fn multipart_upload_lookup_fails_closed_while_metadata_pg_is_peering() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    let object_pg = cluster.object_metadata_pg_id(&bucket, &key);
+    let upload_id = upload_id_from_label("peeringlookuplock");
+    create_test_bucket(&cluster, &bucket);
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    drop(cluster);
+
+    Arc::get_mut(&mut map)
+        .unwrap()
+        .pg_routes
+        .get_mut(&PgId::new(object_pg))
+        .unwrap()
+        .state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+
+    let err = cluster
+        .load_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::BucketSnapshotLoadError::Store(StoreError::PgNotActive {
+            pg_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Peering,
+        }) if pg_id == object_pg
+    ));
+}
+
+#[test]
 fn multipart_create_pending_install_race_reruns_authorization_action() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
