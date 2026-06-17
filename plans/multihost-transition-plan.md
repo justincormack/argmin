@@ -7493,7 +7493,10 @@ PG peering reconstruction design:
   end-to-end regression now covers the handoff sequence after catch-up:
   divergent heartbeat proofs reject authority activation, replay converges the
   lagging replicas, fresh Peering heartbeats report the reconstructed proof, and
-  the authority persists `Active` with that proof.
+  the authority persists `Active` with that proof. The cluster catch-up helper
+  is also covered through Unix storage-node clients, proving the production RPC
+  path can read retained payload entries, apply Peering-only replay commands on
+  lagging replicas, and re-gather the converged proof.
 - Added a side-effect-free cluster peering gather helper that reads the current
   acting set's replica state and pending slot state through
   `MetadataCommandNodeClient`, fetches the selected primary's retained suffix

@@ -669,6 +669,107 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
 }
 
 #[test]
+fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let frontend_dir = tmp.path().join("frontend-peering-replay");
+    let mut map = LocalClusterMap::open(&frontend_dir, &node_ids, &[1], ec_shape).unwrap();
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "unix-peering-replay-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "unix-peering-replay-second-");
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+
+    let mut server_configs = Vec::new();
+    let mut client_configs = Vec::new();
+    for node_id in node_ids {
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join(format!("peering-node-{}.sock", node_id.as_u32()));
+        private_socket_dir(socket_path.parent().unwrap());
+        let data_dir = tmp
+            .path()
+            .join(format!("remote-peering-node-{}", node_id.as_u32()));
+        let remote =
+            SharedStorageNode::open_with_default_ec_shape(&data_dir, &[1], ec_shape).unwrap();
+        let pg = remote.get_pg(1).unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &first)
+            .unwrap();
+        if node_id == NodeId::new(0) {
+            pg.apply_metadata_command_and_record(node_id.as_u32(), &second)
+                .unwrap();
+        }
+        drop(pg);
+        drop(remote);
+
+        server_configs.push(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
+            data_dir,
+            default_ec_shape: ec_shape,
+            pg_ids: vec![1],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(0),
+                acting_set: node_ids.to_vec(),
+            }],
+        });
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
+    }
+
+    for config in server_configs {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+    map.install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let map = Arc::new(map);
+    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let decision = cluster
+        .replay_pg_peering_catchup_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap();
+
+    let primary_state = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .metadata_command_client()
+        .metadata_command_replica_state(pg_id)
+        .unwrap();
+    let proof = crate::control_plane::PgMetadataProof::new(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
+    assert_eq!(
+        decision,
+        crate::peering::PgPeeringReconstructionDecision::AlreadyConverged { proof }
+    );
+    for node_id in node_ids {
+        let state = map
+            .node(node_id)
+            .unwrap()
+            .metadata_command_client()
+            .metadata_command_replica_state(pg_id)
+            .unwrap();
+        assert_eq!(state, primary_state);
+    }
+}
+
+#[test]
 fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
     let tmp = test_util::tempdir();
     let node_id = NodeId::new(1);
