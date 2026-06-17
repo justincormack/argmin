@@ -7489,7 +7489,11 @@ PG peering reconstruction design:
   the cluster catch-up entry point requires a Peering route before mutation so
   local/direct clients cannot replay through an Active map. Primary retained
   abandoned tombstones still fail closed before mutation; replaying those
-  entries needs a separate explicit tombstone recovery design.
+  entries needs a separate explicit tombstone recovery design. A focused
+  end-to-end regression now covers the handoff sequence after catch-up:
+  divergent heartbeat proofs reject authority activation, replay converges the
+  lagging replicas, fresh Peering heartbeats report the reconstructed proof, and
+  the authority persists `Active` with that proof.
 - Added a side-effect-free cluster peering gather helper that reads the current
   acting set's replica state and pending slot state through
   `MetadataCommandNodeClient`, fetches the selected primary's retained suffix
@@ -7500,10 +7504,7 @@ PG peering reconstruction design:
   validation. Focused tests cover an already-converged acting set, a lagging
   replica that requires catch-up from the primary retained suffix, a Peering
   route-map gather, a Peering storage-node retained-log RPC, and a pending
-  command that leaves the PG failed closed in peering. The next slice is the
-  mutating catch-up path: replay/apply the required retained suffix on behind
-  replicas, refresh heartbeats, and then call the authority peering completion
-  gate.
+  command that leaves the PG failed closed in peering.
 
 Exit criteria:
 

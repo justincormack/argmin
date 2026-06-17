@@ -1856,6 +1856,154 @@ fn peering_replay_fails_closed_on_primary_abandoned_tombstone() {
 }
 
 #[test]
+fn peering_replay_then_fresh_heartbeats_complete_authority_activation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map =
+        LocalClusterMap::open(&tmp.path().join("nodes"), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "authority-replay-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "authority-replay-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &first)
+            .unwrap();
+    }
+    let primary_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    primary_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    let primary_state = primary_pg.metadata_command_replica_state().unwrap();
+    let proof = crate::control_plane::PgMetadataProof::new(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
+    drop(primary_pg);
+
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            vec![
+                (NodeId::new(0), "node-0.sock".to_owned()),
+                (NodeId::new(1), "node-1.sock".to_owned()),
+                (NodeId::new(2), "node-2.sock".to_owned()),
+            ],
+            vec![pg_id],
+        )
+        .unwrap();
+
+    for (node_id, now_ms) in node_ids.into_iter().zip([990, 991, 992]) {
+        heartbeat_authority_node(&mut authority, node_id, now_ms);
+    }
+    heartbeat_authority_with_local_pg_proof(&mut authority, &map, NodeId::new(0), pg_id, 1_000);
+    heartbeat_authority_with_local_pg_proof(&mut authority, &map, NodeId::new(1), pg_id, 1_001);
+    heartbeat_authority_with_local_pg_proof(&mut authority, &map, NodeId::new(2), pg_id, 1_002);
+    let pre_replay_completion = authority.complete_pg_peering(pg_id, NodeId::new(0), 0, 1_003);
+    assert!(
+        matches!(
+            pre_replay_completion,
+            Err(crate::control_plane::ControlPlaneError::PgPeeringMetadataProofMismatch { .. })
+        ),
+        "unexpected pre-replay completion result: {pre_replay_completion:?}"
+    );
+
+    let decision = cluster
+        .replay_pg_peering_catchup_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        decision,
+        crate::peering::PgPeeringReconstructionDecision::AlreadyConverged { proof }
+    );
+
+    heartbeat_authority_with_local_pg_proof(&mut authority, &map, NodeId::new(0), pg_id, 1_010);
+    heartbeat_authority_with_local_pg_proof(&mut authority, &map, NodeId::new(1), pg_id, 1_011);
+    heartbeat_authority_with_local_pg_proof(&mut authority, &map, NodeId::new(2), pg_id, 1_012);
+
+    let activated = authority
+        .complete_pg_peering(pg_id, NodeId::new(0), 0, 1_013)
+        .unwrap();
+    let pg = activated.pg(pg_id).unwrap();
+    assert_eq!(pg.state(), PgState::Active);
+    assert_eq!(pg.active_primary(), Some(NodeId::new(0)));
+    assert_eq!(pg.active_metadata_proof(), Some(proof));
+}
+
+fn heartbeat_authority_node<S: crate::control_plane::ControlPlaneStore>(
+    authority: &mut crate::control_plane::SingleAuthorityControlPlane<S>,
+    node_id: NodeId,
+    now_ms: u64,
+) {
+    let record = authority.snapshot().node(node_id).unwrap();
+    let heartbeat = crate::control_plane::NodeHeartbeat {
+        node_id,
+        node_incarnation: record.node_incarnation(),
+        endpoint: record.endpoint().to_owned(),
+        observed_epoch: authority.snapshot().cluster_epoch(),
+        requested_lease_duration_ms: 100,
+        pg_observations: Vec::new(),
+    };
+    authority.heartbeat(heartbeat, now_ms).unwrap();
+}
+
+fn heartbeat_authority_with_local_pg_proof<S: crate::control_plane::ControlPlaneStore>(
+    authority: &mut crate::control_plane::SingleAuthorityControlPlane<S>,
+    map: &Arc<LocalClusterMap>,
+    node_id: NodeId,
+    pg_id: PgId,
+    now_ms: u64,
+) {
+    let state = map
+        .node(node_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    let record = authority.snapshot().node(node_id).unwrap();
+    let heartbeat = crate::control_plane::NodeHeartbeat {
+        node_id,
+        node_incarnation: record.node_incarnation(),
+        endpoint: record.endpoint().to_owned(),
+        observed_epoch: authority.snapshot().cluster_epoch(),
+        requested_lease_duration_ms: 100,
+        pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+            pg_id,
+            state: PgState::Peering,
+            metadata_proof: crate::control_plane::PgMetadataProof::new(
+                state.applied_log_index,
+                state.applied_log_hash,
+                state.state_digest,
+            ),
+            has_pending_metadata_command: false,
+        }],
+    };
+    authority.heartbeat(heartbeat, now_ms).unwrap();
+}
+
+#[test]
 fn peering_reconstruction_gather_fails_closed_on_pending_metadata_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
