@@ -1,21 +1,15 @@
 use crate::control_plane::PgMetadataProof;
-use crate::metadata_command::MetadataCommandReplicaState;
+use crate::error::StoreError;
+use crate::metadata_command::{MetadataCommandLogHashRangeEntry, MetadataCommandReplicaState};
 use crate::types::{ClusterEpoch, PgId};
 use placement::NodeId;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RetainedMetadataCommandLogHash {
-    pub(crate) log_index: u64,
-    pub(crate) previous_log_hash: u64,
-    pub(crate) log_hash: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PgPeeringReplicaReconstructionInput {
     pub(crate) node_id: NodeId,
     pub(crate) state: MetadataCommandReplicaState,
     pub(crate) has_pending_metadata_command: bool,
-    pub(crate) retained_log_hashes: Vec<RetainedMetadataCommandLogHash>,
+    pub(crate) retained_log_hashes: Vec<MetadataCommandLogHashRangeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,40 +30,56 @@ pub(crate) enum PgPeeringReconstructionDecision {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum PgPeeringReconstructionError {
-    PrimaryMissing {
-        primary: NodeId,
-    },
+    #[error("PG peering selected primary {primary:?} is missing from reconstruction input")]
+    PrimaryMissing { primary: NodeId },
+    #[error(
+        "PG peering node {node_id:?} reported epoch {replica_epoch}, expected {cluster_epoch}"
+    )]
     StaleReplicaEpoch {
         node_id: NodeId,
         replica_epoch: ClusterEpoch,
         cluster_epoch: ClusterEpoch,
     },
-    PendingMetadataCommand {
-        node_id: NodeId,
-    },
+    #[error("PG peering node {node_id:?} still has a pending metadata command")]
+    PendingMetadataCommand { node_id: NodeId },
+    #[error(
+        "PG peering node {node_id:?} is ahead of primary: replica log index {replica_log_index}, primary log index {primary_log_index}"
+    )]
     ReplicaAheadOfPrimary {
         node_id: NodeId,
         replica_log_index: u64,
         primary_log_index: u64,
     },
+    #[error(
+        "PG peering metadata fork on node {node_id:?}; reference node {reference_node_id:?} has {reference:?}, replica has {replica:?}"
+    )]
     MetadataFork {
         node_id: NodeId,
         reference_node_id: NodeId,
         replica: PgMetadataProof,
         reference: PgMetadataProof,
     },
-    MissingRetainedCommandLogEntry {
-        node_id: NodeId,
-        log_index: u64,
-    },
+    #[error("PG peering node {node_id:?} is missing retained command-log entry {log_index}")]
+    MissingRetainedCommandLogEntry { node_id: NodeId, log_index: u64 },
+    #[error(
+        "PG peering node {node_id:?} retained command-log entry {log_index} forks: expected previous hash {expected_previous_log_hash:#018X}, actual {actual_previous_log_hash:#018X}"
+    )]
     RetainedCommandLogFork {
         node_id: NodeId,
         log_index: u64,
         expected_previous_log_hash: u64,
         actual_previous_log_hash: u64,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PgPeeringReconstructionFailure {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Reconstruction(#[from] PgPeeringReconstructionError),
 }
 
 pub(crate) fn reconstruct_pg_peering_from_primary_retained_log(
@@ -224,7 +234,7 @@ mod tests {
     fn replica(
         node_id: u32,
         state: MetadataCommandReplicaState,
-        retained_log_hashes: Vec<RetainedMetadataCommandLogHash>,
+        retained_log_hashes: Vec<MetadataCommandLogHashRangeEntry>,
     ) -> PgPeeringReplicaReconstructionInput {
         PgPeeringReplicaReconstructionInput {
             node_id: NodeId::new(node_id),
@@ -238,8 +248,8 @@ mod tests {
         log_index: u64,
         previous_log_hash: u64,
         log_hash: u64,
-    ) -> RetainedMetadataCommandLogHash {
-        RetainedMetadataCommandLogHash {
+    ) -> MetadataCommandLogHashRangeEntry {
+        MetadataCommandLogHashRangeEntry {
             log_index,
             previous_log_hash,
             log_hash,

@@ -3701,6 +3701,22 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg.applied_metadata_command_log_entry_hashes(self.node_id.as_u32(), command)
     }
 
+    fn retained_metadata_command_log_hashes(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.retained_metadata_command_log_hashes(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            first_log_index,
+            last_log_index,
+        )
+    }
+
     fn has_matching_applied_metadata_command_log_entry(
         &self,
         pg_id: PgId,

@@ -1505,6 +1505,198 @@ fn zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence
 }
 
 #[test]
+fn peering_reconstruction_gather_accepts_converged_acting_set() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "peering-converged-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &command)
+        .unwrap();
+
+    let state = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    let proof = crate::control_plane::PgMetadataProof::new(
+        state.applied_log_index,
+        state.applied_log_hash,
+        state.state_digest,
+    );
+
+    let decision = cluster
+        .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        decision,
+        crate::peering::PgPeeringReconstructionDecision::AlreadyConverged { proof }
+    );
+}
+
+#[test]
+fn peering_reconstruction_gather_allows_peering_route_state() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "peering-route-gather-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+    }
+    let state = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    let proof = crate::control_plane::PgMetadataProof::new(
+        state.applied_log_index,
+        state.applied_log_hash,
+        state.state_digest,
+    );
+
+    let decision = cluster
+        .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        decision,
+        crate::peering::PgPeeringReconstructionDecision::AlreadyConverged { proof }
+    );
+}
+
+#[test]
+fn peering_reconstruction_gather_uses_primary_retained_suffix_for_lagging_replica() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "peering-lagging-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "peering-lagging-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &first)
+            .unwrap();
+    }
+    let primary_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    primary_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    let primary_state = primary_pg.metadata_command_replica_state().unwrap();
+    let proof = crate::control_plane::PgMetadataProof::new(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
+    drop(primary_pg);
+
+    let decision = cluster
+        .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        decision,
+        crate::peering::PgPeeringReconstructionDecision::CatchUpRequired {
+            proof,
+            replicas: vec![
+                crate::peering::PgPeeringReplicaCatchUp {
+                    node_id: NodeId::new(1),
+                    from_log_index: 1,
+                    to_log_index: 2,
+                },
+                crate::peering::PgPeeringReplicaCatchUp {
+                    node_id: NodeId::new(2),
+                    from_log_index: 1,
+                    to_log_index: 2,
+                },
+            ],
+        }
+    );
+}
+
+#[test]
+fn peering_reconstruction_gather_fails_closed_on_pending_metadata_command() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "peering-pending-first-");
+    let pending_bucket = bucket_for_pg(topology, 1, "peering-pending-next-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &first)
+        .unwrap();
+    let pending = create_bucket_metadata_command(pg_id, 2, pending_bucket.clone());
+    insert_pending_metadata_command_for_test(&map, pg_id, &pending_bucket, &pending);
+
+    let err = cluster
+        .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::PendingMetadataCommand {
+                node_id
+            }
+        ) if node_id == NodeId::new(0)
+    ));
+}
+
+#[test]
 fn partial_tombstone_recording_retries_as_idempotent_abandon() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

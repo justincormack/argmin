@@ -879,6 +879,36 @@ impl UnixStorageNodeClient {
             })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn retained_metadata_command_log_hashes(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError> {
+        let request = StorageRpcMetadataCommandLogHashRangeRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+            first_log_index,
+            last_log_index,
+        };
+        let payload = encode_metadata_command_log_hash_range_request(&request);
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandRetainedLogHashes,
+            payload,
+        )?;
+        decode_metadata_command_log_hash_range_response(&response)
+            .map(|response| response.entries)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command retained log hashes response",
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) fn pending_metadata_command_envelope(
         &self,
         pg_id: PgId,
@@ -1803,6 +1833,22 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<(u64, u64)>, StoreError> {
         UnixStorageNodeClient::applied_metadata_command_log_entry_hashes(self, pg_id, command)
+    }
+
+    fn retained_metadata_command_log_hashes(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError> {
+        UnixStorageNodeClient::retained_metadata_command_log_hashes(
+            self,
+            pg_id,
+            cluster_epoch,
+            first_log_index,
+            last_log_index,
+        )
     }
 
     fn has_matching_applied_metadata_command_log_entry(

@@ -57,6 +57,7 @@ use crate::storage_rpc::{
     decode_lifecycle_sweep_claim_heartbeat_request, decode_lifecycle_sweep_claim_record_request,
     decode_lifecycle_sweep_roots_request, decode_list_multipart_uploads_request,
     decode_list_object_versions_request, decode_list_objects_request,
+    decode_metadata_command_log_hash_range_request,
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
@@ -99,8 +100,9 @@ use crate::storage_rpc::{
     encode_list_multipart_uploads_response, encode_list_object_versions_response,
     encode_list_objects_response, encode_metadata_command_acceptance_response,
     encode_metadata_command_applied_hashes_response, encode_metadata_command_bool_outcome_response,
-    encode_metadata_command_bool_response, encode_metadata_command_max_log_index_response,
-    encode_metadata_command_next_id_response, encode_metadata_command_pending_envelope_response,
+    encode_metadata_command_bool_response, encode_metadata_command_log_hash_range_response,
+    encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
+    encode_metadata_command_pending_envelope_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
@@ -175,7 +177,8 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAcceptanceResponse,
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
-    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
+    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandLogHashRangeRequest,
+    StorageRpcMetadataCommandLogHashRangeResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
     StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
     StorageRpcMetadataCommandPendingEnvelopeResponse,
@@ -2297,6 +2300,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::MetadataCommandMaxLogIndex => {
                 match decode_metadata_command_state_request(&frame.payload) {
                     Ok(request) => self.metadata_command_max_log_index_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandRetainedLogHashes => {
+                match decode_metadata_command_log_hash_range_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_log_hash_range_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6301,9 +6313,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -6328,9 +6342,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -6344,6 +6360,60 @@ impl StorageNodeConnectionHandler {
                     &StorageRpcMetadataCommandMaxLogIndexResponse { max_log_index },
                 );
                 encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_log_hash_range_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandLogHashRangeRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.retained_metadata_command_log_hashes(
+                self.config.node_id.as_u32(),
+                request.cluster_epoch,
+                request.first_log_index,
+                request.last_log_index,
+            )
+        }) {
+            Ok(entries) => {
+                let payload = encode_metadata_command_log_hash_range_response(
+                    &StorageRpcMetadataCommandLogHashRangeResponse { entries },
+                )?;
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    None,
+                );
+                encode_storage_rpc_error_response(&store_error_response(
+                    StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id,
+                        cluster_epoch,
+                        log_index,
+                    },
+                ))?
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
@@ -6452,9 +6522,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -7323,6 +7395,35 @@ impl StorageNodeConnectionHandler {
         cluster_epoch: ClusterEpoch,
         pg_id: PgId,
     ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_with_allowed_states(
+            node_id,
+            cluster_epoch,
+            pg_id,
+            &[PgState::Active],
+        )
+    }
+
+    fn validate_pg_route_for_peering_inspection(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_with_allowed_states(
+            node_id,
+            cluster_epoch,
+            pg_id,
+            &[PgState::Active, PgState::Peering],
+        )
+    }
+
+    fn validate_pg_route_with_allowed_states(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        allowed_states: &[PgState],
+    ) -> Result<(), StorageRpcErrorResponse> {
         if node_id != self.config.node_id {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::UnknownNode,
@@ -7377,7 +7478,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        if route.state != PgState::Active {
+        if !allowed_states.contains(&route.state) {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::InactivePgRoute,
                 message: format!("PG {raw_pg_id} route is {}", route.state),
@@ -8570,6 +8671,7 @@ mod tests {
         decode_metadata_command_acceptance_response,
         decode_metadata_command_applied_hashes_response,
         decode_metadata_command_bool_outcome_response,
+        decode_metadata_command_log_hash_range_response,
         decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
         decode_metadata_command_pending_envelope_response,
         decode_metadata_command_pending_slot_insert_response,
@@ -8579,18 +8681,19 @@ mod tests {
         decode_scavenger_list_files_response, decode_shard_ack_item_response,
         decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
         decode_storage_rpc_response_payload, encode_bucket_mark_deleting_command_build_request,
-        encode_bucket_pg_request, encode_metadata_command_matching_applied_request,
-        encode_metadata_command_next_id_request, encode_metadata_command_pending_slot_request,
-        encode_metadata_command_request, encode_metadata_command_state_request,
-        encode_read_handle_acquire_request, encode_read_handle_release_request,
-        encode_scavenger_list_files_request, encode_scavenger_observation_key_request,
-        encode_scavenger_observation_record_request, encode_shard_ack_batch_request,
-        encode_shard_ack_item_request, encode_shard_delete_request,
+        encode_bucket_pg_request, encode_metadata_command_log_hash_range_request,
+        encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+        encode_metadata_command_pending_slot_request, encode_metadata_command_request,
+        encode_metadata_command_state_request, encode_read_handle_acquire_request,
+        encode_read_handle_release_request, encode_scavenger_list_files_request,
+        encode_scavenger_observation_key_request, encode_scavenger_observation_record_request,
+        encode_shard_ack_batch_request, encode_shard_ack_item_request, encode_shard_delete_request,
         encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
         encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcBucketMarkDeletingCommandBuildOutcome,
         StorageRpcBucketMarkDeletingCommandBuildRequest, StorageRpcBucketPgRequest,
         StorageRpcBucketRequest, StorageRpcMetadataCommandAcceptanceOutcome,
+        StorageRpcMetadataCommandLogHashRangeRequest,
         StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdRequest,
         StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
@@ -11052,6 +11155,53 @@ mod tests {
             .unwrap();
         let decoded = decode_metadata_command_state_response(&payload).unwrap();
         assert_eq!(decoded.state, expected);
+    }
+
+    #[test]
+    fn storage_node_server_allows_peering_metadata_log_hash_inspection() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let command = test_metadata_command(0, 1);
+        let pg = server._node.get_pg(0).unwrap();
+        pg.apply_metadata_command_and_record(7, &command).unwrap();
+        let expected = pg
+            .retained_metadata_command_log_hashes(
+                7,
+                config.cluster_epoch,
+                MetadataCommandLogIndex::new(1).unwrap(),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            )
+            .unwrap();
+        drop(pg);
+
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+        let request = StorageRpcMetadataCommandLogHashRangeRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+            first_log_index: MetadataCommandLogIndex::new(1).unwrap(),
+            last_log_index: MetadataCommandLogIndex::new(1).unwrap(),
+        };
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandRetainedLogHashes,
+            encode_metadata_command_log_hash_range_request(&request),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_log_hash_range_response(&payload).unwrap();
+        assert_eq!(decoded.entries, expected);
     }
 
     #[test]

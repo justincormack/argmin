@@ -1033,6 +1033,58 @@ impl PgStore {
         Ok(Some((previous_log_hash, log_hash)))
     }
 
+    pub(crate) fn retained_metadata_command_log_hashes(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError> {
+        let mut entries = Vec::new();
+        for raw_log_index in first_log_index.get()..=last_log_index.get() {
+            let log_index = MetadataCommandLogIndex::new(raw_log_index)
+                .expect("metadata command log index range starts non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load retained metadata command log entry hash range",
+                cluster_epoch,
+                PgId::new(self.pg_id),
+                log_index,
+            )?
+            else {
+                continue;
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                PgId::new(self.pg_id),
+                log_index,
+                &entry,
+            )?;
+            let Some(previous_log_hash) = entry.previous_log_hash else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            let Some(log_hash) = entry.log_hash else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            entries.push(MetadataCommandLogHashRangeEntry {
+                log_index: raw_log_index,
+                previous_log_hash,
+                log_hash,
+            });
+        }
+        Ok(entries)
+    }
+
     pub(crate) fn metadata_command_log_entry_command_kind_name(
         &self,
         cluster_epoch: ClusterEpoch,

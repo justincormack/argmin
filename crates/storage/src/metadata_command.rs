@@ -105,6 +105,13 @@ pub(crate) struct MetadataCommandReplicaState {
     pub(crate) state_digest: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataCommandLogHashRangeEntry {
+    pub(crate) log_index: u64,
+    pub(crate) previous_log_hash: u64,
+    pub(crate) log_hash: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MetadataCommandId {
     cluster_epoch: ClusterEpoch,

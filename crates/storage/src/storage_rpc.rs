@@ -3,8 +3,9 @@ use crate::{
     metadata_command::{
         decode_metadata_command_envelope, BucketPropertyMutation, BucketSubresourceMutation,
         BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandReplicaState,
-        ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
+        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry,
+        MetadataCommandLogIndex, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+        PutObjectMetadataMutation,
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow},
     types::{
@@ -111,6 +112,9 @@ const STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN: usize = 4 + 8 + 4;
 const STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_ENTRIES: u64 = 4096;
+const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 16;
 const STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN: usize =
     8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
@@ -543,6 +547,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPgLockAcquire = 121,
     MetadataCommandPgLockRelease = 122,
     BucketWriteDrainHeartbeat = 124,
+    MetadataCommandRetainedLogHashes = 125,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -630,6 +635,7 @@ impl StorageRpcMessageKind {
             }
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
+            Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
             Self::MetadataCommandAbandoned => "metadata command abandoned",
             Self::MetadataCommandRecordAbandoned => "metadata command record abandoned",
             Self::MetadataCommandPendingSlotReplace => "metadata command pending slot replace",
@@ -866,6 +872,7 @@ impl StorageRpcMessageKind {
             121 => Ok(Self::MetadataCommandPgLockAcquire),
             122 => Ok(Self::MetadataCommandPgLockRelease),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
+            125 => Ok(Self::MetadataCommandRetainedLogHashes),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -2472,6 +2479,20 @@ pub(crate) struct StorageRpcMetadataCommandStateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) first_log_index: MetadataCommandLogIndex,
+    pub(crate) last_log_index: MetadataCommandLogIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandLogHashRangeResponse {
+    pub(crate) entries: Vec<MetadataCommandLogHashRangeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandStateResponse {
     pub(crate) state: MetadataCommandReplicaState,
 }
@@ -2972,6 +2993,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
             STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandRetainedLogHashes => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandMaxLogIndex
         | StorageRpcMessageKind::MetadataCommandPendingEnvelope
@@ -7451,6 +7475,57 @@ pub(crate) fn decode_metadata_command_next_id_request(
     })
 }
 
+pub(crate) fn encode_metadata_command_log_hash_range_request(
+    request: &StorageRpcMetadataCommandLogHashRangeRequest,
+) -> Vec<u8> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    put_u64(&mut out, request.first_log_index.get());
+    put_u64(&mut out, request.last_log_index.get());
+    out
+}
+
+pub(crate) fn decode_metadata_command_log_hash_range_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandLogHashRangeRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let first_log_index = MetadataCommandLogIndex::new(decoder.read_u64()?).ok_or({
+        StorageRpcPayloadError::InvalidResponseEnvelope(
+            "metadata command hash range first log index must not be zero",
+        )
+    })?;
+    let last_log_index = MetadataCommandLogIndex::new(decoder.read_u64()?).ok_or({
+        StorageRpcPayloadError::InvalidResponseEnvelope(
+            "metadata command hash range last log index must not be zero",
+        )
+    })?;
+    if last_log_index.get() < first_log_index.get() {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "metadata command hash range must be ordered",
+        ));
+    }
+    let requested = last_log_index.get() - first_log_index.get() + 1;
+    if requested > STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_ENTRIES {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "metadata command hash range is too large",
+        ));
+    }
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandLogHashRangeRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        first_log_index,
+        last_log_index,
+    })
+}
+
 pub(crate) fn encode_metadata_command_max_log_index_response(
     response: &StorageRpcMetadataCommandMaxLogIndexResponse,
 ) -> Vec<u8> {
@@ -7466,6 +7541,55 @@ pub(crate) fn decode_metadata_command_max_log_index_response(
     let max_log_index = decoder.read_u64()?;
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandMaxLogIndexResponse { max_log_index })
+}
+
+pub(crate) fn encode_metadata_command_log_hash_range_response(
+    response: &StorageRpcMetadataCommandLogHashRangeResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if response.entries.len() > STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_ENTRIES as usize {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "metadata command hash range response is too large",
+        ));
+    }
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.entries.len()).expect("bounded response count fits u32"),
+    );
+    for entry in &response.entries {
+        put_u64(&mut out, entry.log_index);
+        put_u64(&mut out, entry.previous_log_hash);
+        put_u64(&mut out, entry.log_hash);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_log_hash_range_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandLogHashRangeResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()?;
+    if u64::from(count) > STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_ENTRIES {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "metadata command hash range response is too large",
+        ));
+    }
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let log_index = decoder.read_u64()?;
+        if MetadataCommandLogIndex::new(log_index).is_none() {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "metadata command hash range response log index must not be zero",
+            ));
+        }
+        entries.push(MetadataCommandLogHashRangeEntry {
+            log_index,
+            previous_log_hash: decoder.read_u64()?,
+            log_hash: decoder.read_u64()?,
+        });
+    }
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandLogHashRangeResponse { entries })
 }
 
 pub(crate) fn encode_metadata_command_next_id_response(
@@ -14434,6 +14558,83 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_log_hash_range_request_round_trips() {
+        let request = StorageRpcMetadataCommandLogHashRangeRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+            first_log_index: MetadataCommandLogIndex::new(2).unwrap(),
+            last_log_index: MetadataCommandLogIndex::new(5).unwrap(),
+        };
+
+        let bytes = encode_metadata_command_log_hash_range_request(&request);
+        let decoded = decode_metadata_command_log_hash_range_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn metadata_command_log_hash_range_request_rejects_invalid_ranges() {
+        let mut bytes = encode_metadata_command_log_hash_range_request(
+            &StorageRpcMetadataCommandLogHashRangeRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                pg_id: PgId::new(11),
+                first_log_index: MetadataCommandLogIndex::new(5).unwrap(),
+                last_log_index: MetadataCommandLogIndex::new(4).unwrap(),
+            },
+        );
+        assert!(matches!(
+            decode_metadata_command_log_hash_range_request(&bytes),
+            Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "metadata command hash range must be ordered"
+            ))
+        ));
+
+        bytes = encode_metadata_command_log_hash_range_request(
+            &StorageRpcMetadataCommandLogHashRangeRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                pg_id: PgId::new(11),
+                first_log_index: MetadataCommandLogIndex::new(1).unwrap(),
+                last_log_index: MetadataCommandLogIndex::new(
+                    STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_ENTRIES + 1,
+                )
+                .unwrap(),
+            },
+        );
+        assert!(matches!(
+            decode_metadata_command_log_hash_range_request(&bytes),
+            Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "metadata command hash range is too large"
+            ))
+        ));
+    }
+
+    #[test]
+    fn metadata_command_log_hash_range_response_round_trips() {
+        let response = StorageRpcMetadataCommandLogHashRangeResponse {
+            entries: vec![
+                MetadataCommandLogHashRangeEntry {
+                    log_index: 2,
+                    previous_log_hash: 0x11,
+                    log_hash: 0x22,
+                },
+                MetadataCommandLogHashRangeEntry {
+                    log_index: 4,
+                    previous_log_hash: 0x33,
+                    log_hash: 0x44,
+                },
+            ],
+        };
+
+        let bytes = encode_metadata_command_log_hash_range_response(&response).unwrap();
+        let decoded = decode_metadata_command_log_hash_range_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn metadata_command_pending_envelope_response_round_trips() {
         let command = test_metadata_command();
         for response in [
@@ -15343,6 +15544,11 @@ mod tests {
                 StorageRpcMessageKind::MetadataCommandMatchingAppliedLog,
                 STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRetainedLogHashes,
+                STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::MetadataCommandAbandoned,

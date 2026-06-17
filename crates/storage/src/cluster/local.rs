@@ -2658,6 +2658,31 @@ impl LocalClusterMap {
         operation_epoch: ClusterEpoch,
         pg_id: PgId,
     ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        self.metadata_pg_acting_nodes_with_allowed_states(
+            operation_epoch,
+            pg_id,
+            &[PgState::Active],
+        )
+    }
+
+    pub(crate) fn metadata_pg_acting_nodes_for_peering_inspection(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        self.metadata_pg_acting_nodes_with_allowed_states(
+            operation_epoch,
+            pg_id,
+            &[PgState::Active, PgState::Peering],
+        )
+    }
+
+    fn metadata_pg_acting_nodes_with_allowed_states(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+        allowed_states: &[PgState],
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
         if operation_epoch != self.epoch {
             return Err(StoreError::StaleMetadataOperation {
                 pg_id: pg_id.get(),
@@ -2681,7 +2706,7 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
-        if !route.is_active() {
+        if !allowed_states.contains(&route.state()) {
             return Err(StoreError::PgNotActive {
                 pg_id: pg_id.get(),
                 cluster_epoch: self.epoch,

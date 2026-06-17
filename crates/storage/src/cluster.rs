@@ -39,6 +39,11 @@ use crate::node_client::{
     CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
     ShardAckNodeClient, StorageNodeClient,
 };
+use crate::peering::{
+    reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
+    PgPeeringReconstructionError, PgPeeringReconstructionFailure,
+    PgPeeringReplicaReconstructionInput,
+};
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
@@ -1947,6 +1952,66 @@ impl StorageCluster {
             );
         }
         Ok(max_log_index)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reconstruct_pg_peering_from_retained_metadata_log(
+        &self,
+        pg_id: PgId,
+        primary: NodeId,
+    ) -> Result<PgPeeringReconstructionDecision, PgPeeringReconstructionFailure> {
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_inspection(self.operation_epoch(), pg_id)?;
+        let primary_index = nodes
+            .iter()
+            .position(|node| node.node_id() == primary)
+            .ok_or(PgPeeringReconstructionError::PrimaryMissing { primary })?;
+
+        let mut min_applied_log_index = u64::MAX;
+        let mut primary_applied_log_index = None;
+        let mut replicas = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let metadata_client = node.metadata_command_client();
+            let state = metadata_client.metadata_command_replica_state(pg_id)?;
+            min_applied_log_index = min_applied_log_index.min(state.applied_log_index);
+            if node.node_id() == primary {
+                primary_applied_log_index = Some(state.applied_log_index);
+            }
+            let has_pending_metadata_command = metadata_client
+                .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+                .is_some();
+            replicas.push(PgPeeringReplicaReconstructionInput {
+                node_id: node.node_id(),
+                state,
+                has_pending_metadata_command,
+                retained_log_hashes: Vec::new(),
+            });
+        }
+
+        let primary_applied_log_index = primary_applied_log_index
+            .ok_or(PgPeeringReconstructionError::PrimaryMissing { primary })?;
+        if min_applied_log_index < primary_applied_log_index {
+            let first_log_index = MetadataCommandLogIndex::new(min_applied_log_index + 1)
+                .expect("lagging metadata command log index range starts after zero");
+            let last_log_index = MetadataCommandLogIndex::new(primary_applied_log_index)
+                .expect("primary applied log index must be nonzero when a replica is behind");
+            replicas[primary_index].retained_log_hashes = nodes[primary_index]
+                .metadata_command_client()
+                .retained_metadata_command_log_hashes(
+                    pg_id,
+                    self.operation_epoch(),
+                    first_log_index,
+                    last_log_index,
+                )?;
+        }
+
+        Ok(reconstruct_pg_peering_from_primary_retained_log(
+            self.operation_epoch(),
+            pg_id,
+            primary,
+            &replicas,
+        )?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

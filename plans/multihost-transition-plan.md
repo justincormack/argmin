@@ -7449,15 +7449,34 @@ PG peering reconstruction design:
   same-index state-digest forks all fail closed until the serving replicas
   converge on the exact reconstructed proof.
 - Added the first pure retained-log reconstruction decision tests in the
-  storage layer. The test-only helper is transport-neutral and takes
+  storage layer. The reconstruction helper is transport-neutral and takes
   per-replica metadata proof, pending-command state, and retained command-log
   hash-chain entries. It returns either already-converged, deterministic catch-up
   required for lagging replicas, or a fail-closed reason for pending commands,
   same-index metadata forks, missing retained suffix entries, retained
   hash-chain forks, stale epochs, or replicas ahead of the selected primary. The
-  next slice should promote this shape into the production peering path by
-  feeding it from actual storage-node command-log range reads and wiring it
-  through the peering RPC path.
+  helper is now normal storage-layer code, not test-only scaffolding.
+- Added the first production boundary for those range reads. `PgStore`, local
+  metadata clients, Unix metadata clients, metadata-command sessions, and the
+  storage-node Unix RPC protocol can now read a bounded sparse range of retained
+  metadata command-log hash-chain entries for a PG. The request is capped at
+  4096 log indexes, validates ordered non-zero indexes at the frame boundary,
+  and verifies retained command-log entry checksums before returning stored
+  previous/current hash pairs.
+- Added a side-effect-free cluster peering gather helper that reads the current
+  acting set's replica state and pending slot state through
+  `MetadataCommandNodeClient`, fetches the selected primary's retained suffix
+  only when an acting-set member is behind, and feeds the reconstruction helper.
+  The local route-map and storage-node Unix RPC boundaries now have explicit
+  read-only peering-inspection validation, so this state collection can run
+  while the PG route is `Peering` without weakening normal mutating RPC
+  validation. Focused tests cover an already-converged acting set, a lagging
+  replica that requires catch-up from the primary retained suffix, a Peering
+  route-map gather, a Peering storage-node retained-log RPC, and a pending
+  command that leaves the PG failed closed in peering. The next slice is the
+  mutating catch-up path: replay/apply the required retained suffix on behind
+  replicas, refresh heartbeats, and then call the authority peering completion
+  gate.
 
 Exit criteria:
 
