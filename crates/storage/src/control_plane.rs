@@ -7141,6 +7141,51 @@ mod tests {
     }
 
     #[test]
+    fn node_service_authorization_cannot_validate_after_authority_restart() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let serving = heartbeat_until_serving(&mut authority, 1, 100);
+        assert!(serving.serving());
+        let active_epoch = serving.cluster_epoch();
+        let active_authority_incarnation = serving.authority_incarnation();
+        let node_incarnation = node_incarnation(&authority, 1);
+        let authorization = authority
+            .authorize_node_service(NodeId::new(1), node_incarnation, active_epoch, 150)
+            .unwrap();
+        authority
+            .validate_node_service_authorization(&authorization, 151)
+            .unwrap();
+
+        let mut restarted = SingleAuthorityControlPlane::open(store).unwrap();
+        assert!(restarted.snapshot().cluster_epoch() > active_epoch);
+        assert!(restarted.snapshot().authority_incarnation() > active_authority_incarnation);
+        assert!(matches!(
+            restarted.validate_node_service_authorization(&authorization, 152),
+            Err(ControlPlaneError::StaleAuthorityIncarnation {
+                authority_incarnation,
+                current_authority_incarnation,
+            }) if authority_incarnation == active_authority_incarnation
+                && current_authority_incarnation == restarted.snapshot().authority_incarnation()
+        ));
+
+        let restart_epoch = restarted.snapshot().cluster_epoch();
+        let current = restarted
+            .heartbeat(
+                heartbeat_from_record(&restarted, 1, restart_epoch, 153),
+                153,
+            )
+            .unwrap();
+        assert!(current.serving());
+        restarted
+            .authorize_node_service(NodeId::new(1), node_incarnation, restart_epoch, 154)
+            .unwrap();
+    }
+
+    #[test]
     fn pg_primary_authorization_fails_closed_for_peering_and_wrong_primary() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

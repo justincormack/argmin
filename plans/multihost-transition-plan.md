@@ -7357,8 +7357,9 @@ Status:
   current-epoch observation, and peering completion all happen. The same
   deterministic set now also covers non-PG node-service authorization tokens:
   an epoch bump fences a token issued under the old map, old observed-epoch
-  requests fail closed, and the node can receive a fresh authorization only
-  after heartbeating the current epoch.
+  requests fail closed, authority restart fences stale tokens by incarnation,
+  and the node can receive a fresh authorization only after heartbeating the
+  current epoch.
 - Extended the deterministic epoch-transition fault regressions to cover an
   acting-set change. A metadata-write token issued to the old active primary is
   fenced by the epoch bump, both old and new primaries fail closed while the PG
