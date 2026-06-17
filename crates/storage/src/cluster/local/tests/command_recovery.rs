@@ -1672,6 +1672,55 @@ fn peering_reconstruction_gather_uses_primary_retained_suffix_for_lagging_replic
 }
 
 #[test]
+fn peering_reconstruction_gather_fails_closed_when_replica_is_ahead_of_primary() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "peering-ahead-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "peering-ahead-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &first)
+            .unwrap();
+    }
+    map.node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .apply_metadata_command_and_record(1, &second)
+        .unwrap();
+
+    let err = cluster
+        .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::ReplicaAheadOfPrimary {
+                node_id,
+                replica_log_index: 2,
+                primary_log_index: 1,
+            }
+        ) if node_id == NodeId::new(1)
+    ));
+}
+
+#[test]
 fn peering_replay_catches_up_lagging_replicas_from_primary_retained_entries() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
