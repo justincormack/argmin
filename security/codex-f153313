@@ -1,0 +1,245 @@
+Active PG proof fencing causes post-write heartbeat DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/8e6f08651fcc81918b711b67546d616e?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: f153313
+Author: justin@specialbusservice.com
+Created: 16/06/2026, 20:31:29
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit 0243d939960c40b91920a6ff181b768948f98269
+(https://github.com/justincormack/argmin/commit/0243d939960c40b91920a6ff181b768948f98269).
+
+The Active PG metadata proof is now treated as an activation floor rather than
+an immutable exact heartbeat value. Active heartbeat, active route export, PG
+operation authorization, and file-backed state validation accept observations
+whose applied log index has advanced beyond the peering-time proof, while still
+rejecting older proofs and divergent proofs at the activation log index. This
+allows normal metadata-mutating operations to advance the live storage-node
+proof without breaking heartbeat lease renewal.
+
+Regression coverage was added for accepting post-peering metadata progress,
+rejecting same-index proof divergence, and loading persisted Active observations
+whose metadata proof has advanced beyond the stored activation floor.
+
+# Summary
+Introduced bug: the commit adds an exact equality check between Active heartbeat proofs and the immutable peering-time proof. That is incompatible with the existing heartbeat producer, which reports live metadata state that changes during normal operation.
+The new validation compares every Active PG heartbeat against pg.active_metadata_proof, which is captured once when peering completes. However, NodeHeartbeat construction reads the PG's current metadata_command_replica_state and uses the current applied_log_index, applied_log_hash, and state_digest. Normal metadata operations update those fields. As a result, after an Active PG successfully processes a metadata-changing operation such as object PUT, bucket metadata update, multipart state change, or delete marker insertion, the next storage-node heartbeat for that PG will carry a newer proof and fail PgActiveMetadataProofMismatch. The refresh loop records the error and does not install a renewed lease; once the existing heartbeat lease expires, the control plane can mark the node/PG unavailable or peering. An authenticated writer can therefore repeatedly disrupt availability in control-plane deployments by issuing normal metadata-mutating requests.
+
+# Validation
+## Rubric
+- [x] Peering completion records a fixed active_metadata_proof and does not update it during later Active operation.
+- [x] Active heartbeat validation compares the heartbeat metadata_proof for exact equality against that fixed proof and returns PgActiveMetadataProofMismatch on progress.
+- [x] Storage-node heartbeat construction uses the current metadata_command_replica_state, not the peering-time proof.
+- [x] Normal metadata command application updates applied_log_index, applied_log_hash, and state_digest, so later heartbeats can legitimately differ.
+- [x] A rejected heartbeat occurs before lease renewal; repeated rejection allows the old lease to expire and forces the active PG back to Peering/unavailable.
+## Report
+Validated the finding as a logic/availability vulnerability. I added a focused integration PoC at crates/storage/tests/active_proof_availability_poc.rs. The PoC creates a one-node control plane, completes PG peering with PgMetadataProof(42,0xabc,0xdef), then submits an Active heartbeat with progressed proof PgMetadataProof(43,0xabd,0xdf0), modeling normal metadata-log progress. The heartbeat is rejected with ControlPlaneError::PgActiveMetadataProofMismatch, the previous lease deadline remains 2100, and expire_heartbeat_leases(2101) moves the active PG back to Peering.
+
+Key code evidence: complete_pg_peering stores active_metadata_proof once at crates/storage/src/control_plane.rs:1391-1401. heartbeat calls validate_pg_heartbeat_observations before mutating/renewing lease at crates/storage/src/control_plane.rs:1509-1513. validate_pg_heartbeat_observations rejects any Active heartbeat whose metadata_proof differs from the stored peering proof at crates/storage/src/control_plane.rs:3670-3683. Storage-node heartbeats are built from current metadata_command_replica_state at crates/storage/src/node.rs:1147-1162. Metadata commands update applied_log_index/applied_log_hash/state_digest in crates/storage/src/pg_store/metadata.rs:671-693 and crates/storage/src/pg_store/command_log.rs:2540-2557. Lease expiry marks expired nodes unavailable and peering_pgs at crates/storage/src/control_plane.rs:1596-1626.
+
+Dynamic reproduction command: CARGO_TARGET_DIR=/workspace/argmin/target-validation cargo test -p storage --test active_proof_availability_poc -- --nocapture. Output: running 1 test; test active_pg_metadata_progress_prevents_heartbeat_lease_renewal_and_expires_pg ... ok; 1 passed.
+
+Debugger validation: lldb breakpoint at control_plane.rs:3676 stopped immediately before the mismatch return. It showed expected = PgMetadataProof { applied_log_index = 42, applied_log_hash = 2748, state_digest = 3567 } and actual observation.metadata_proof = PgMetadataProof { applied_log_index = 43, applied_log_hash = 2749, state_digest = 3568 }. Backtrace: validate_pg_heartbeat_observations -> SingleAuthorityControlPlane::heartbeat at control_plane.rs:1509 -> PoC test at active_proof_availability_poc.rs:66. This confirms the vulnerable equality check rejects normal metadata progress before lease renewal. Crash attempt was not applicable because this is not a memory-safety crash bug; the targeted debug test reproduced the availability failure. Valgrind was attempted but unavailable in the container.
+
+# Evidence
+crates/storage/src/control_plane.rs (L1391 to 1401)
+  Note: complete_pg_peering stores active_metadata_proof once from the peering observations; this proof is not updated as the PG later processes metadata commands.
+```
+        let active_metadata_proof =
+            validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
+
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record validated before peering completion");
+        record.state = PgState::Active;
+        record.active_primary = Some(primary);
+        record.active_metadata_proof = Some(active_metadata_proof);
+```
+
+crates/storage/src/control_plane.rs (L3670 to 3684)
+  Note: Newly introduced validation rejects any Active heartbeat whose reported metadata_proof differs from the fixed active_metadata_proof.
+```
+        if pg.state == PgState::Active && observation.state == PgState::Active {
+            let expected = pg.active_metadata_proof.ok_or(
+                ControlPlaneError::ActivePgMissingMetadataProof {
+                    pg_id: observation.pg_id.get(),
+                },
+            )?;
+            if observation.metadata_proof != expected {
+                return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                    pg_id: observation.pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                    expected,
+                    actual: observation.metadata_proof,
+                });
+            }
+```
+
+crates/storage/src/node.rs (L1147 to 1161)
+  Note: Storage nodes build heartbeat observations from the current metadata_command_replica_state, not from the peering-time proof.
+```
+    pub fn pg_heartbeat_observation(
+        &self,
+        pg_id: PgId,
+        state: PgState,
+    ) -> Result<NodePgHeartbeatObservation, StoreError> {
+        let pg = self.get_pg(pg_id.get())?;
+        let metadata_state = pg.metadata_command_replica_state()?;
+        Ok(NodePgHeartbeatObservation {
+            pg_id,
+            state,
+            metadata_proof: PgMetadataProof::new(
+                metadata_state.applied_log_index,
+                metadata_state.applied_log_hash,
+                metadata_state.state_digest,
+            ),
+```
+
+crates/storage/src/pg_store/command_log.rs (L2540 to 2556)
+  Note: Updating the metadata command replica state changes applied_log_index, applied_log_hash, and state_digest, making later heartbeat proofs differ from the peering-time proof.
+```
+    pub(super) fn update_metadata_command_replica_state(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
+        let (state_digest, digest_revision) = self.cached_metadata_state_digest_with_revision()?;
+        self.execute_cached(
+            "UPDATE metadata_command_replica_state \
+			 SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 \
+             WHERE singleton = 0",
+            params![
+                cluster_epoch.get() as i64,
+                applied_log_index as i64,
+                applied_log_hash as i64,
+                state_digest as i64,
+            ],
+```
+
+crates/storage/src/pg_store/metadata.rs (L671 to 709)
+  Note: Normal metadata command application records the command and updates the metadata command replica state used by heartbeats.
+```
+    pub(crate) fn apply_metadata_command_and_record(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| {
+                BucketSnapshotLoadError::Metadata(MetadataError::Db {
+                    context: "apply metadata command and record (begin txn)",
+                    source,
+                })
+            })?;
+
+        let result = (|| match self
+            .metadata_command_acceptance(node_id, command)
+            .map_err(BucketSnapshotLoadError::Store)?
+        {
+            MetadataCommandAcceptance::Apply => {
+                self.apply_metadata_command(command)
+                    .map_err(BucketSnapshotLoadError::Metadata)?;
+                self.record_metadata_command_applied_inner(node_id, command)
+                    .map_err(BucketSnapshotLoadError::Store)
+            }
+            MetadataCommandAcceptance::AlreadyApplied => {
+                let record = self
+                    .record_metadata_command_applied_inner(node_id, command)
+                    .map_err(BucketSnapshotLoadError::Store)?;
+                if record.state.applied_log_index >= command.id().log_index().get()
+                    && self
+                        .cleanup_already_applied_metadata_command_terminal_staging(command)
+                        .map_err(BucketSnapshotLoadError::Metadata)?
+                {
+                    self.update_metadata_command_replica_state(
+                        record.state.cluster_epoch,
+                        record.state.applied_log_index,
+                        record.state.applied_log_hash,
+                    )
+                    .map_err(BucketSnapshotLoadError::Store)
+```
+
+crates/storage/src/storage_node_server.rs (L982 to 1003)
+  Note: The storage node refresh loop treats heartbeat submission failure as an error and does not renew the lease on failed attempts, leading to lease expiry if the new validation keeps rejecting heartbeats.
+```
+            .spawn(move || loop {
+                let result = self.refresh_and_install_control_plane_runtime_map(
+                    &mut control_plane,
+                    node_incarnation,
+                    requested_lease_duration_ms,
+                    authority_now_ms(),
+                );
+                {
+                    let mut status = worker_status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    status.attempts += 1;
+                    match result {
+                        Ok(lease) => {
+                            status.successes += 1;
+                            status.last_lease = Some(lease);
+                            status.last_error = None;
+                        }
+                        Err(error) => {
+                            status.failures += 1;
+                            status.last_error = Some(error.to_string());
+                        }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The original medium rating is appropriate. Static evidence and the provided executable validation PoC show a real logic flaw: Active PG heartbeat validation compares a live post-write metadata proof to a stale peering-time proof, preventing lease renewal and causing PG peering/unavailability after expiry. Reachability from the S3 threat model is credible through authenticated PutObject and other metadata-mutating operations, but exploitation requires valid write privilege and a control-plane deployment rather than the default legacy-local mode. Impact is significant runtime availability disruption but not RCE, auth bypass, data exfiltration, or permanent data loss, so high/critical would be overstated.
+## Likelihood
+high - Exploitation is simple once the service is in a control-plane deployment and the attacker has write credentials: perform normal metadata-mutating writes and wait for heartbeat lease expiry. Likelihood is reduced because the vulnerable path is non-default/transition control-plane functionality and strong S3 authentication/authorization is required for normal writes. | Remote network vector
+## Impact
+medium - An authenticated writer can cause affected control-plane deployments to stop renewing storage-node heartbeat leases after normal metadata mutations. Lease expiry marks nodes unavailable and moves PGs to Peering, disrupting availability for other clients. The impact is availability-only, with no demonstrated confidentiality/integrity compromise or code execution.
+## Assumptions
+- The affected deployment uses the control-plane/multihost process roles or ARGMIN_CONTROL_PLANE_SOCKET_PATH; the default legacy-local mode does not exercise this heartbeat lease path.
+- The attacker has valid S3 write privileges to at least one bucket/key, or the target bucket is intentionally configured to allow writes.
+- The S3 frontend is reachable to the attacker over a network path configured by ARGMIN_LISTEN_ADDR.
+- control-plane enabled deployment
+- active placement group after peering
+- valid S3 write access to cause a metadata-mutating operation
+- heartbeat lease expiry after rejected refresh attempts
+## Path
+S3 PUT -> Coordinator::put_object -> metadata command applied -> live metadata proof changes -> heartbeat carries new proof -> control plane expects old peering proof -> heartbeat rejected -> lease expires -> PG Peering/Unavailable
+## Path evidence
+- `crates/storage/src/control_plane.rs:1391-1401` - Peering completion stores active_metadata_proof once on the PG record.
+- `crates/storage/src/control_plane.rs:1509-1513` - Heartbeat processing validates PG observations before the lease-renewal mutation.
+- `crates/storage/src/control_plane.rs:3670-3683` - Active heartbeat proof must exactly equal the stored active_metadata_proof, causing rejection after normal metadata progress.
+- `crates/storage/src/node.rs:1147-1161` - Storage-node heartbeat observations are constructed from the current metadata_command_replica_state.
+- `crates/storage/src/pg_store/metadata.rs:671-693` - Applying a normal metadata command records it as applied.
+- `crates/storage/src/pg_store/command_log.rs:2540-2558` - Recording metadata command progress updates applied_log_index, applied_log_hash, and state_digest used by heartbeat proofs.
+- `crates/storage/src/storage_node_server.rs:982-1003` - The storage-node refresh loop counts heartbeat/refresh errors and does not install a new lease on failure.
+- `crates/storage/src/control_plane.rs:1596-1626` - Expired heartbeat leases mark nodes unavailable and move PGs to peering.
+- `crates/server-http/src/http/router.rs:646-649` - PUT with an object key routes to the S3 PutObject operation.
+- `crates/server-http/src/http/mod.rs:1607-1624` - The HTTP PutObject handler calls Coordinator::put_object with attacker-controlled object body/metadata after authentication and request parsing.
+- `crates/server-core/src/coordinator/put.rs:24-68` - Coordinator::put_object authorizes the write and then commits it through storage.
+- `crates/storage/src/cluster/request_ops.rs:984-997` - Storage metadata commands are applied to the placement-group acting set.
+- `crates/argmin-s3/src/config.rs:271-288` - Control-plane socket and heartbeat timing are runtime configuration, with a default 1000 ms heartbeat lease when enabled.
+- `crates/argmin-s3/src/main.rs:982-998` - Frontend deployments can spawn a control-plane runtime-map refresh loop using the configured control-plane socket.
+## Narrative
+The finding is a real availability bug in the control-plane runtime path. complete_pg_peering stores active_metadata_proof once, but storage-node heartbeats are built from the PG's current metadata_command_replica_state. Normal authenticated writes such as PutObject apply metadata commands and update that replica state. The new Active heartbeat equality check therefore rejects healthy post-write heartbeats as PgActiveMetadataProofMismatch. The refresh loop records the error instead of installing a renewed lease; when expire_heartbeat_leases runs after the deadline, it marks the node unavailable and moves affected PGs to Peering. This is reachable through the normal S3 write path for deployments using the control-plane roles, but it requires write privileges and a non-default deployment mode, supporting medium rather than high severity.
+## Controls
+- AWS SigV4 authentication via authenticate_request
+- Coordinator bucket/object authorization before PutObject commit
+- Control-plane RPC is via Unix socket, not directly exposed as HTTP
+- Control-plane socket directory is validated as private when created
+- Max connection and in-flight request limits exist, but they do not prevent a low-rate authenticated metadata-progress trigger
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or load-balancer manifests were present, so actual public exposure could not be proven from repository artifacts.
+- The static review did not execute a full end-to-end HTTP/control-plane deployment; it relies on code reachability plus the provided executable control-plane validation PoC.
+- README documentation still emphasizes legacy-local/single-process operation, so real-world prevalence of control-plane deployments is uncertain.
+- Public-write bucket configurations could lower the privilege requirement, but no concrete deployment policy was present in the repository.
