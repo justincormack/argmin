@@ -322,7 +322,7 @@ impl ClusterControlSnapshot {
         &self,
         pg_id: PgId,
         now_ms: u64,
-        just_activated: bool,
+        refreshing_node_id: NodeId,
     ) -> Result<PgRouteSnapshot, ControlPlaneError> {
         let record = self
             .pg(pg_id)
@@ -367,8 +367,16 @@ impl ClusterControlSnapshot {
                 cluster_epoch: self.cluster_epoch,
             });
         }
-        if !just_activated {
-            validate_pg_primary_active_observation(self, pg_id, primary)?;
+        match validate_pg_primary_active_observation(self, pg_id, primary) {
+            Ok(()) => {}
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation { .. })
+                if refreshing_node_id == primary =>
+            {
+                // The selected primary may still be running the previous Peering route
+                // map. Let only that primary receive the Active handoff map so it can
+                // install the route and report the current Active observation.
+            }
+            Err(error) => return Err(error),
         }
         Ok(PgRouteSnapshot {
             cluster_epoch: self.cluster_epoch,
@@ -422,7 +430,7 @@ impl ClusterControlSnapshot {
         &self,
         pg_id: PgId,
         now_ms: u64,
-        just_activated_pgs: &BTreeSet<PgId>,
+        refreshing_node_id: NodeId,
     ) -> Result<PgRouteSnapshot, ControlPlaneError> {
         let record = self
             .pg(pg_id)
@@ -431,7 +439,7 @@ impl ClusterControlSnapshot {
             return self.active_pg_route_for_storage_node_refresh(
                 pg_id,
                 now_ms,
-                just_activated_pgs.contains(&pg_id),
+                refreshing_node_id,
             );
         }
         self.pg_route(pg_id, now_ms)
@@ -447,12 +455,12 @@ impl ClusterControlSnapshot {
     fn pg_routes_for_storage_node_refresh(
         &self,
         now_ms: u64,
-        just_activated_pgs: &BTreeSet<PgId>,
+        refreshing_node_id: NodeId,
     ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         self.pgs
             .values()
             .map(|record| {
-                self.pg_route_for_storage_node_refresh(record.pg_id, now_ms, just_activated_pgs)
+                self.pg_route_for_storage_node_refresh(record.pg_id, now_ms, refreshing_node_id)
             })
             .collect()
     }
@@ -465,9 +473,9 @@ impl ClusterControlSnapshot {
     fn runtime_map_for_storage_node_refresh(
         &self,
         now_ms: u64,
-        just_activated_pgs: &BTreeSet<PgId>,
+        refreshing_node_id: NodeId,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms, just_activated_pgs)?;
+        let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms, refreshing_node_id)?;
         self.runtime_map_from_pg_routes(pg_routes)
     }
 
@@ -1998,7 +2006,7 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         }
         let runtime_map = self
             .snapshot
-            .runtime_map_for_storage_node_refresh(authority_now_ms, &just_activated_pgs)?;
+            .runtime_map_for_storage_node_refresh(authority_now_ms, node_id)?;
         Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
     }
 }
@@ -5210,6 +5218,95 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_refresh_hands_active_route_to_primary_after_non_primary_completes_peering() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(77), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        let proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+
+        for node_id in [1, 2] {
+            let now_ms = 2_000 + u64::from(node_id);
+            let mut heartbeat = heartbeat_from_record(&authority, node_id, peering_epoch, now_ms);
+            heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: PgId::new(77),
+                state: PgState::Peering,
+                metadata_proof: proof,
+                has_pending_metadata_command: false,
+            }];
+            if node_id == 1 {
+                authority.heartbeat(heartbeat, now_ms).unwrap();
+            } else {
+                assert!(matches!(
+                    authority.refresh_node_heartbeat(heartbeat, now_ms),
+                    Err(ControlPlaneError::PgPrimaryMissingActiveObservation {
+                        pg_id: 77,
+                        node_id: 1,
+                        ..
+                    })
+                ));
+            }
+        }
+        let active_epoch = authority.snapshot().cluster_epoch();
+        assert!(active_epoch > peering_epoch);
+        let active_pg = authority.snapshot().pg(PgId::new(77)).unwrap();
+        assert_eq!(active_pg.state(), PgState::Active);
+        assert_eq!(active_pg.active_primary(), Some(NodeId::new(1)));
+        assert!(matches!(
+            authority.snapshot().runtime_map(2_003),
+            Err(ControlPlaneError::PgHasNoServingPrimary { pg_id: 77, .. })
+        ));
+
+        let stale_primary_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_004);
+        let primary_handoff = authority
+            .refresh_node_heartbeat(stale_primary_heartbeat, 2_004)
+            .unwrap();
+        assert!(
+            !primary_handoff.lease().serving(),
+            "the primary still has to observe the new epoch before serving"
+        );
+        let route = primary_handoff
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(77))
+            .unwrap();
+        assert_eq!(route.cluster_epoch(), active_epoch);
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+
+        let mut active_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_005);
+        active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(77),
+            state: PgState::Active,
+            metadata_proof: proof,
+            has_pending_metadata_command: false,
+        }];
+        let active_refresh = authority
+            .refresh_node_heartbeat(active_heartbeat, 2_005)
+            .unwrap();
+        assert!(active_refresh.lease().serving());
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(77), 2_006),
+            Some(NodeId::new(1))
+        );
+        assert!(authority.snapshot().runtime_map(2_006).is_ok());
+    }
+
+    #[test]
     fn active_pg_primary_is_bound_by_peering_completion() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -5438,7 +5535,7 @@ mod tests {
         assert!(matches!(
             authority
                 .snapshot()
-                .runtime_map_for_storage_node_refresh(2_031, &BTreeSet::new()),
+                .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1)),
             Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                 pg_id: 22,
                 node_id: 1,
