@@ -7537,10 +7537,11 @@ Shard repair design:
   corrupt shards, reconstruct from at least `k` valid shards, then write the
   repaired shard through normal routed shard IO with current epoch/location
   validation rather than hiding repair as an implicit read side effect.
-- Added a read-time repair precondition regression for checksum-corrupt placed
-  shards. A same-size corrupt shard now has explicit coverage proving that the
-  read path treats the shard as unavailable and reconstructs the full segment
-  from the remaining EC set before returning bytes.
+- Added read-time repair precondition regressions for missing and
+  checksum-corrupt placed shards. A physically absent shard and a same-size
+  corrupt shard now have explicit coverage proving that the read path treats the
+  shard as unavailable and reconstructs the full segment from the remaining EC
+  set before returning bytes.
 
 Exit criteria:
 

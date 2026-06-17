@@ -1691,6 +1691,54 @@ fn placed_segment_recovery_treats_checksum_corrupt_shard_as_recoverable() {
 }
 
 #[test]
+fn placed_segment_recovery_treats_missing_shard_as_recoverable() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"phase-eleven-missing-shard-payload");
+    let shard_path = cluster
+        .test_payload_shard_file_path(
+            segment.written.data_pg_id,
+            segment.written.ec,
+            &segment.segment_okh,
+            segment.generation_id,
+            0,
+        )
+        .unwrap();
+    std::fs::remove_file(&shard_path).unwrap();
+
+    let mut recovered = Vec::new();
+    cluster
+        .read_segment_payload_stored_bytes_into(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: segment.written.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.generation_id,
+                stored_size: segment.payload.len(),
+                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                ec: segment.written.ec,
+            },
+            &mut recovered,
+        )
+        .unwrap();
+
+    assert_eq!(recovered, segment.payload);
+}
+
+#[test]
 fn payload_shard_io_rejects_unknown_pg_before_touching_node_store() {
     let tmp = test_util::tempdir();
     let node_ids = [
