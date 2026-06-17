@@ -15,7 +15,7 @@ pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
-const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8;
+const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
@@ -735,6 +735,7 @@ pub struct NodePgObservationRecord {
     observed_epoch: ClusterEpoch,
     observed_at_ms: u64,
     metadata_proof: PgMetadataProof,
+    has_pending_metadata_command: bool,
 }
 
 impl NodePgObservationRecord {
@@ -762,6 +763,11 @@ impl NodePgObservationRecord {
     pub fn metadata_proof(&self) -> PgMetadataProof {
         self.metadata_proof
     }
+
+    #[must_use]
+    pub fn has_pending_metadata_command(&self) -> bool {
+        self.has_pending_metadata_command
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,6 +775,7 @@ pub struct NodePgHeartbeatObservation {
     pub pg_id: PgId,
     pub state: PgState,
     pub metadata_proof: PgMetadataProof,
+    pub has_pending_metadata_command: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1450,7 +1457,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 Err(
                     ControlPlaneError::PgPeeringMissingObservation { .. }
                     | ControlPlaneError::PgPeeringObservationNotPeering { .. }
-                    | ControlPlaneError::PgPeeringMetadataProofMismatch { .. },
+                    | ControlPlaneError::PgPeeringMetadataProofMismatch { .. }
+                    | ControlPlaneError::PgPeeringPendingMetadataCommand { .. },
                 ) => {}
                 Err(error) => return Err(error),
             }
@@ -1568,6 +1576,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                         observed_epoch: heartbeat.observed_epoch,
                         observed_at_ms: authority_now_ms,
                         metadata_proof: observation.metadata_proof,
+                        has_pending_metadata_command: observation.has_pending_metadata_command,
                     },
                 );
             }
@@ -2358,6 +2367,7 @@ fn write_node_heartbeat(
         write_u32(out, observation.pg_id.get());
         write_pg_state(out, observation.state);
         write_pg_metadata_proof(out, observation.metadata_proof);
+        write_u8(out, u8::from(observation.has_pending_metadata_command));
     }
     Ok(())
 }
@@ -2378,6 +2388,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
             pg_id: PgId::new(reader.read_u32()?),
             state: read_pg_state(reader)?,
             metadata_proof: read_pg_metadata_proof(reader)?,
+            has_pending_metadata_command: reader.read_bool()?,
         });
     }
     Ok(NodeHeartbeat {
@@ -2879,6 +2890,15 @@ pub enum ControlPlaneError {
     },
 
     #[error(
+        "node {node_id} reported unresolved pending metadata command for PG {pg_id} in cluster epoch {cluster_epoch}"
+    )]
+    PgPeeringPendingMetadataCommand {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "node {node_id} reported Active PG {pg_id} metadata proof {actual:?} in cluster epoch {cluster_epoch}, expected active proof {expected:?}"
     )]
     PgActiveMetadataProofMismatch {
@@ -2970,7 +2990,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=7\n");
+    out.push_str("version=8\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -3057,7 +3077,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
 
 fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{}",
         node_id.as_u32(),
         record.pg_id.get(),
         pg_state_as_str(record.state),
@@ -3065,7 +3085,8 @@ fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> S
         record.observed_at_ms,
         record.metadata_proof.applied_log_index,
         record.metadata_proof.applied_log_hash,
-        record.metadata_proof.state_digest
+        record.metadata_proof.state_digest,
+        u8::from(record.has_pending_metadata_command)
     )
 }
 
@@ -3135,10 +3156,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             let state_version = version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
             })?;
-            if state_version != 7 {
+            if state_version != 8 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 7 required",
+                    "control-plane state version 8 required",
                 ));
             }
             let (epoch, node_id, observation) = parse_history_node_pg_record(line_number, value)?;
@@ -3176,10 +3197,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             let state_version = version.ok_or_else(|| {
                 parse_error(line_number, "version must precede history PG records")
             })?;
-            if state_version != 7 {
+            if state_version != 8 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 7 required",
+                    "control-plane state version 8 required",
                 ));
             }
             let (epoch, record) = parse_history_pg_record(line_number, value)?;
@@ -3201,10 +3222,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
             let state_version = version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
             })?;
-            if state_version != 7 {
+            if state_version != 8 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 7 required",
+                    "control-plane state version 8 required",
                 ));
             }
             let (node_id, observation) = parse_node_pg_record(line_number, value)?;
@@ -3222,10 +3243,10 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
         } else if let Some(value) = line.strip_prefix("pg=") {
             let state_version = version
                 .ok_or_else(|| parse_error(line_number, "version must precede PG records"))?;
-            if state_version != 7 {
+            if state_version != 8 {
                 return Err(parse_error(
                     line_number,
-                    "control-plane state version 7 required",
+                    "control-plane state version 8 required",
                 ));
             }
             let record = parse_pg_record(line_number, value)?;
@@ -3241,7 +3262,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if version != 7 {
+    if version != 8 {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -3332,6 +3353,12 @@ fn validate_current_pg_observations(
                 ));
             }
             if pg.state == PgState::Active && observation.state == PgState::Active {
+                if observation.has_pending_metadata_command {
+                    return Err(parse_error(
+                        line,
+                        "active node PG observation must not have pending metadata command",
+                    ));
+                }
                 let Some(expected) = pg.active_metadata_proof else {
                     return Err(parse_error(line, "active PG is missing metadata proof"));
                 };
@@ -3468,10 +3495,10 @@ fn parse_node_pg_record(
     value: &str,
 ) -> Result<(NodeId, NodePgObservationRecord), ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 8 {
+    if fields.len() != 9 {
         return Err(parse_error(
             line,
-            "node PG observation record must have eight fields",
+            "node PG observation record must have nine fields",
         ));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
@@ -3485,6 +3512,7 @@ fn parse_node_pg_record(
         applied_log_hash: parse_u64(line, fields[6], "applied log hash")?,
         state_digest: parse_u64(line, fields[7], "state digest")?,
     };
+    let has_pending_metadata_command = parse_bool_u8(line, fields[8], "pending metadata command")?;
     Ok((
         node_id,
         NodePgObservationRecord {
@@ -3493,6 +3521,7 @@ fn parse_node_pg_record(
             observed_epoch,
             observed_at_ms,
             metadata_proof,
+            has_pending_metadata_command,
         },
     ))
 }
@@ -3633,6 +3662,14 @@ fn parse_option_u32(
     }
 }
 
+fn parse_bool_u8(line: usize, value: &str, field: &'static str) -> Result<bool, ControlPlaneError> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(parse_error(line, &format!("{field} must be 0 or 1"))),
+    }
+}
+
 fn parse_option_cluster_epoch(
     line: usize,
     value: &str,
@@ -3700,6 +3737,13 @@ fn validate_pg_heartbeat_observations(
             });
         }
         if pg.state == PgState::Active && observation.state == PgState::Active {
+            if observation.has_pending_metadata_command {
+                return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                    pg_id: observation.pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                });
+            }
             let expected = pg.active_metadata_proof.ok_or(
                 ControlPlaneError::ActivePgMissingMetadataProof {
                     pg_id: observation.pg_id.get(),
@@ -3758,6 +3802,13 @@ fn validate_pg_peering_observations(
                 state: observation.state,
             });
         }
+        if observation.has_pending_metadata_command {
+            return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: pg_id.get(),
+                node_id: node_id.as_u32(),
+                cluster_epoch: snapshot.cluster_epoch,
+            });
+        }
         match expected_proof {
             Some(expected) if observation.metadata_proof != expected => {
                 return Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
@@ -3796,6 +3847,7 @@ fn primary_has_current_pg_state(
         .is_some_and(|observation| {
             observation.observed_epoch == snapshot.cluster_epoch
                 && observation.state == expected_state
+                && !observation.has_pending_metadata_command
                 && (expected_state != PgState::Active
                     || Some(observation.metadata_proof) == expected_active_proof)
         })
@@ -3838,6 +3890,13 @@ fn validate_pg_primary_active_observation(
             node_id: primary.as_u32(),
             cluster_epoch: snapshot.cluster_epoch,
             state: observation.state,
+        });
+    }
+    if observation.has_pending_metadata_command {
+        return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+            cluster_epoch: snapshot.cluster_epoch,
         });
     }
     if observation.metadata_proof != expected_proof {
@@ -4111,6 +4170,7 @@ mod tests {
             pg_id: PgId::new(pg_id),
             state,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(heartbeat, now_ms).unwrap()
     }
@@ -4347,6 +4407,30 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_rejects_malformed_heartbeat_pending_command_boolean() {
+        let mut payload = Vec::new();
+        write_u32(&mut payload, 1);
+        write_u64(&mut payload, 1);
+        write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_u64(&mut payload, 100);
+        write_u32(&mut payload, 1);
+        write_u32(&mut payload, 7);
+        write_pg_state(&mut payload, PgState::Peering);
+        write_pg_metadata_proof(&mut payload, PgMetadataProof::new(10, 11, 12));
+        write_u8(&mut payload, 2);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_node_heartbeat(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("invalid boolean value 2")
+        ));
+    }
+
+    #[test]
     fn control_plane_rpc_rejects_oversized_runtime_node_count_before_allocation() {
         let mut payload = Vec::new();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
@@ -4536,7 +4620,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=7\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-,-,-,-\n",
+            "version=8\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-,-,-,-\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -4554,7 +4638,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=7\n",
+                "version=8\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -4593,7 +4677,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=7\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
+            "version=8\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -4611,7 +4695,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=7\n",
+                "version=8\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
@@ -4639,7 +4723,7 @@ mod tests {
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,peering,2,100,0,0,0\n",
+                "node_pg=1,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
         )
@@ -4648,7 +4732,7 @@ mod tests {
         assert!(matches!(
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
-                if message == "control-plane state version 7 required"
+                if message == "control-plane state version 8 required"
         ));
     }
 
@@ -4659,12 +4743,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=7\n",
+                "version=8\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node=2,active,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
-                "node_pg=2,7,peering,2,100,0,0,0\n",
+                "node_pg=2,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
         )
@@ -4684,11 +4768,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=7\n",
+                "version=8\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,peering,2,100,0,0,0\n",
+                "node_pg=1,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
         )
@@ -4708,11 +4792,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=7\n",
+                "version=8\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,active,2,100,9,10,12\n",
+                "node_pg=1,7,active,2,100,9,10,12,0\n",
                 "pg=7,active,1,1,9,10,11\n",
             ),
         )
@@ -4723,6 +4807,30 @@ mod tests {
             Err(ControlPlaneError::Parse { message, .. })
                 if message
                     == "active node PG observation metadata proof does not match PG active proof"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_active_pg_observation_with_pending_metadata_command() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=8\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node_pg=1,7,active,2,100,9,10,11,1\n",
+                "pg=7,active,1,1,9,10,11\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "active node PG observation must not have pending metadata command"
         ));
     }
 
@@ -5048,6 +5156,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         let refresh = authority
             .refresh_node_heartbeat(peering_heartbeat, 2_000)
@@ -5082,6 +5191,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         let refresh = authority
             .refresh_node_heartbeat(active_heartbeat, 2_002)
@@ -5259,6 +5369,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: accepted_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -5276,6 +5387,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: accepted_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(active_heartbeat, 2_020).unwrap();
         assert!(authority
@@ -5855,6 +5967,7 @@ mod tests {
             pg_id: PgId::new(31),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         authority
             .heartbeat(shorter_lease, current_valid_until - 20)
@@ -6946,6 +7059,7 @@ mod tests {
             pg_id: PgId::new(17),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(shorter_lease, 3_061).unwrap();
         assert!(authorization.lease_deadline_ms() > 3_066);
@@ -7034,6 +7148,7 @@ mod tests {
                 applied_log_hash: 10,
                 state_digest: 11,
             },
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
 
@@ -7111,6 +7226,7 @@ mod tests {
                 pg_id: PgId::new(19),
                 state: PgState::Peering,
                 metadata_proof,
+                has_pending_metadata_command: false,
             }];
             authority
                 .heartbeat(heartbeat, 2_000 + u64::from(node_id))
@@ -7138,6 +7254,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Peering,
             metadata_proof: matching_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(heartbeat, 2_060).unwrap();
         authority
@@ -7155,6 +7272,67 @@ mod tests {
         let persisted_pg = persisted.pg(PgId::new(19)).unwrap();
         assert_eq!(persisted_pg.active_primary(), Some(NodeId::new(1)));
         assert_eq!(persisted_pg.active_metadata_proof(), Some(matching_proof));
+    }
+
+    #[test]
+    fn complete_pg_peering_rejects_pending_metadata_command_observation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(29), vec![NodeId::new(1)])
+            .unwrap();
+
+        let proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let mut heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(29),
+            state: PgState::Peering,
+            metadata_proof: proof,
+            has_pending_metadata_command: true,
+        }];
+        authority.heartbeat(heartbeat, 2_000).unwrap();
+
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(29),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_050,
+            ),
+            Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 29,
+                node_id: 1,
+                ..
+            })
+        ));
+
+        let mut heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_060);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(29),
+            state: PgState::Peering,
+            metadata_proof: proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(heartbeat, 2_060).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(29),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_070,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -7181,6 +7359,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Peering,
             metadata_proof: accepted_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -7203,6 +7382,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Active,
             metadata_proof: different_proof,
+            has_pending_metadata_command: false,
         }];
         assert!(matches!(
             authority.heartbeat(mismatched_active, 2_020),
@@ -7227,6 +7407,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Active,
             metadata_proof: accepted_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(matching_active, 2_030).unwrap();
         let observation = authority
@@ -7263,6 +7444,7 @@ mod tests {
             pg_id: PgId::new(16),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         let response = authority.heartbeat(stale, 2_000).unwrap();
         assert!(!response.serving());
@@ -7296,11 +7478,13 @@ mod tests {
                 pg_id: PgId::new(17),
                 state: PgState::Peering,
                 metadata_proof: PgMetadataProof::empty(),
+                has_pending_metadata_command: false,
             },
             NodePgHeartbeatObservation {
                 pg_id: PgId::new(17),
                 state: PgState::Peering,
                 metadata_proof: PgMetadataProof::empty(),
+                has_pending_metadata_command: false,
             },
         ];
         assert!(matches!(
@@ -7317,6 +7501,7 @@ mod tests {
             pg_id: PgId::new(99),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         assert!(matches!(
             authority.heartbeat(unknown, 2_001),
@@ -7329,6 +7514,7 @@ mod tests {
             pg_id: PgId::new(17),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         assert!(matches!(
             authority.heartbeat(wrong_node, 2_002),
@@ -7357,6 +7543,7 @@ mod tests {
             pg_id: PgId::new(18),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
         assert!(authority
@@ -7416,6 +7603,7 @@ mod tests {
             pg_id: PgId::new(18),
             state: PgState::Peering,
             metadata_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
         assert!(authority
@@ -7477,6 +7665,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Peering,
             metadata_proof: active_metadata_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -7493,6 +7682,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Active,
             metadata_proof: active_metadata_proof,
+            has_pending_metadata_command: false,
         }];
         let active = authority.heartbeat(active_heartbeat, 2_002).unwrap();
         let active_epoch = active.cluster_epoch();
@@ -7528,6 +7718,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Active,
             metadata_proof: active_metadata_proof,
+            has_pending_metadata_command: false,
         }];
         let refresh = restarted
             .refresh_node_heartbeat(stale_active_heartbeat, 2_003)
@@ -7559,6 +7750,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Peering,
             metadata_proof: active_metadata_proof,
+            has_pending_metadata_command: false,
         }];
         let refresh = restarted
             .refresh_node_heartbeat(current_peering_heartbeat, 2_005)
@@ -8154,6 +8346,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
         }];
         let refresh = authority
             .refresh_node_heartbeat(stale_active_heartbeat, active_valid_until_ms + 1)
@@ -8420,6 +8613,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: node_two_proof,
+            has_pending_metadata_command: false,
         }];
         authority.heartbeat(node_two_peering, 2_011).unwrap();
         authority
@@ -8436,6 +8630,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Active,
             metadata_proof: node_two_proof,
+            has_pending_metadata_command: false,
         }];
         let new_active = authority.heartbeat(new_active_heartbeat, 2_013).unwrap();
         let new_epoch = new_active.cluster_epoch();

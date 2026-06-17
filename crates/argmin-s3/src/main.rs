@@ -1337,6 +1337,7 @@ mod tests {
                 pg_id: PgId::new(0),
                 state: PgState::Peering,
                 metadata_proof: PgMetadataProof::empty(),
+                has_pending_metadata_command: false,
             };
             for now_ms in 1_000..1_004 {
                 let observed_epoch = authority.snapshot().cluster_epoch();
@@ -1377,6 +1378,7 @@ mod tests {
                             pg_id: PgId::new(0),
                             state: PgState::Active,
                             metadata_proof: PgMetadataProof::empty(),
+                            has_pending_metadata_command: false,
                         }],
                     },
                     1_003,

@@ -23,6 +23,11 @@ use crate::control_plane::{NodeHeartbeat, NodePgHeartbeatObservation, PgMetadata
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
+#[cfg(test)]
+use crate::metadata_command::{
+    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+    MetadataCommandPayload,
+};
 use crate::pg_store::{PgStore, ScavengerShardFileScan};
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
@@ -1156,6 +1161,9 @@ impl SharedStorageNode {
             node_id.as_u32(),
             metadata_epoch,
         )?;
+        let has_pending_metadata_command = pg
+            .pending_metadata_command_slot(node_id.as_u32(), metadata_epoch)?
+            .is_some();
         Ok(NodePgHeartbeatObservation {
             pg_id,
             state,
@@ -1164,6 +1172,7 @@ impl SharedStorageNode {
                 metadata_state.applied_log_hash,
                 metadata_state.state_digest,
             ),
+            has_pending_metadata_command,
         })
     }
 
@@ -1837,6 +1846,49 @@ mod tests {
             observation.metadata_proof.state_digest,
             metadata_state.state_digest
         );
+        assert!(!observation.has_pending_metadata_command);
+    }
+
+    #[test]
+    fn shared_node_pg_heartbeat_observation_reports_pending_metadata_command() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let bucket = bucket_name("pending-heartbeat");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+            ),
+        );
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+        }
+
+        let observation = node
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
+            .unwrap();
+
+        assert!(observation.has_pending_metadata_command);
     }
 
     #[test]

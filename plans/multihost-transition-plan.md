@@ -7360,7 +7360,7 @@ Status:
   Runtime-map active routes, storage-node refresh routes outside the explicit
   just-activated handoff, PG-operation authorization, and serving-primary
   selection now fail closed if the bound primary's current Active observation
-  does not match the PG's accepted peering proof, and version 7 state files
+  does not match the PG's accepted peering proof, and version 8 state files
   reject current Active observations with a mismatched proof.
 - Tightened existing-node membership changes to fence active service before the
   new epoch is exposed. Any membership transition now moves affected Active PGs
@@ -7375,6 +7375,13 @@ Status:
   digest while preserving any pending slot, so a corrupted local replica cannot
   be treated as a valid peering participant just because the cached proof row
   still exists.
+- Extended PG heartbeat observations with explicit unresolved pending-metadata
+  command state. Peering completion, automatic ready-peering completion, active
+  heartbeat ingestion, active route export, and persisted state loading now
+  fail closed if an otherwise matching metadata proof still has a pending
+  command slot. This closes the first pending-command part of Phase 11 peering:
+  equal applied log/digest proof is not enough to mark a PG `Active` while any
+  participating serving member still reports in-flight metadata command state.
 - Current remaining Phase 11 work is now concentrated in the distributed
   correctness layers above the control-plane/runtime-map plumbing: real
   command-log reconstruction during PG peering, deterministic epoch-transition
