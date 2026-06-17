@@ -1721,6 +1721,52 @@ fn peering_reconstruction_gather_fails_closed_when_replica_is_ahead_of_primary()
 }
 
 #[test]
+fn peering_reconstruction_gather_fails_closed_on_stale_replica_epoch() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "peering-stale-epoch-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+    }
+
+    let current_epoch = ClusterEpoch::new(2).unwrap();
+    map.epoch = current_epoch;
+    for route in map.pg_routes.values_mut() {
+        route.cluster_epoch = current_epoch;
+    }
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::StaleReplicaEpoch {
+                node_id,
+                replica_epoch: ClusterEpoch::INITIAL,
+                cluster_epoch,
+            }
+        ) if node_id == NodeId::new(0) && cluster_epoch == current_epoch
+    ));
+}
+
+#[test]
 fn peering_replay_catches_up_lagging_replicas_from_primary_retained_entries() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

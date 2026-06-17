@@ -7507,9 +7507,9 @@ PG peering reconstruction design:
   while the PG route is `Peering` without weakening normal mutating RPC
   validation. Focused tests cover an already-converged acting set, a lagging
   replica that requires catch-up from the primary retained suffix, a Peering
-  route-map gather, a replica ahead of the selected primary, a Peering
-  storage-node retained-log RPC, and a pending command that leaves the PG
-  failed closed in peering.
+  route-map gather, a stale replica epoch, a replica ahead of the selected
+  primary, a Peering storage-node retained-log RPC, and a pending command that
+  leaves the PG failed closed in peering.
 
 Exit criteria:
 
