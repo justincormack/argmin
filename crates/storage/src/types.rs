@@ -2110,6 +2110,70 @@ pub struct MultipartReclaimRecord {
     pub parts: Vec<MultipartReclaimPartRecord>,
 }
 
+impl MultipartReclaimRecord {
+    #[must_use]
+    pub fn from_object_parts(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        created_at: u64,
+        parts: &[ObjectPartRecord],
+        streaming_segments: &[MultipartPartSegmentRecord],
+    ) -> Self {
+        use std::collections::BTreeMap;
+
+        let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
+            BTreeMap::new();
+        for segment in streaming_segments {
+            segments_by_part
+                .entry(segment.part_number)
+                .or_default()
+                .push(MultipartReclaimPartSegmentRecord {
+                    part_number: segment.part_number,
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                });
+        }
+
+        Self {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at,
+            parts: parts
+                .iter()
+                .map(|part| {
+                    if part.part_okh == [0u8; 16] {
+                        MultipartReclaimPartRecord::Segments {
+                            part_number: part.part_number,
+                            segments: segments_by_part
+                                .remove(&part.part_number)
+                                .unwrap_or_default(),
+                        }
+                    } else {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_number: part.part_number,
+                            part_okh: part.part_okh,
+                            part_vid: part.part_vid,
+                            data_pg_id: part.data_pg_id,
+                            ec: EcShape {
+                                k: part.ec_k,
+                                m: part.ec_m,
+                            },
+                        }
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A payload shard set whose data PG is explicit in durable metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShardScavengerPlacedShardSetReference {

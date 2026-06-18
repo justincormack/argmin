@@ -213,21 +213,20 @@ use crate::types::{
     ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
     ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsReq, ListedMultipartParts,
     LiveObjectRecord, MultipartCompletionPreflight, MultipartCompletionSnapshot,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-    PayloadReclaimRoot, PgId, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq,
-    SessionId, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference, StoredObject,
-    StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord,
-    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadRecordPage,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
-    UploadId, UploadState, VersionId, WriteAck,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEtag, ObjectKey, ObjectLayout,
+    ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
+    ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+    PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, StoredObject, StreamPutCommitInput,
+    StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord, StreamUploadPartStorageSnapshot,
+    StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
 };
 
 mod interface;
@@ -806,7 +805,7 @@ fn snapshot_live_object_payload_reclaim_command(
                 }
             }
             Ok(ObjectPayloadReclaimCommand::Multipart(
-                multipart_reclaim_from_parts(
+                MultipartReclaimRecord::from_object_parts(
                     bucket,
                     key,
                     record.generation_id,
@@ -894,67 +893,6 @@ fn live_delete_command_target(
         layout: record.layout,
         payload,
     })
-}
-
-fn multipart_reclaim_from_parts(
-    bucket: &BucketName,
-    key: &ObjectKey,
-    generation_id: GenerationId,
-    created_at: u64,
-    parts: &[ObjectPartRecord],
-    streaming_segments: &[MultipartPartSegmentRecord],
-) -> MultipartReclaimRecord {
-    use std::collections::BTreeMap;
-
-    let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
-        BTreeMap::new();
-    for segment in streaming_segments {
-        segments_by_part
-            .entry(segment.part_number)
-            .or_default()
-            .push(MultipartReclaimPartSegmentRecord {
-                part_number: segment.part_number,
-                segment_index: segment.segment_index,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                data_pg_id: segment.data_pg_id,
-                ec: EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
-                },
-            });
-    }
-
-    MultipartReclaimRecord {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        generation_id,
-        created_at,
-        parts: parts
-            .iter()
-            .map(|part| {
-                if part.part_okh == [0u8; 16] {
-                    MultipartReclaimPartRecord::Segments {
-                        part_number: part.part_number,
-                        segments: segments_by_part
-                            .remove(&part.part_number)
-                            .unwrap_or_default(),
-                    }
-                } else {
-                    MultipartReclaimPartRecord::ShardSet {
-                        part_number: part.part_number,
-                        part_okh: part.part_okh,
-                        part_vid: part.part_vid,
-                        data_pg_id: part.data_pg_id,
-                        ec: EcShape {
-                            k: part.ec_k,
-                            m: part.ec_m,
-                        },
-                    }
-                }
-            })
-            .collect(),
-    }
 }
 
 fn pending_bucket_command_matches_current(
