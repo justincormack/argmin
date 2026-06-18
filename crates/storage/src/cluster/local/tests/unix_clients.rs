@@ -1,5 +1,8 @@
 use super::*;
-use crate::PlacedSegmentShardRepairRecord;
+use crate::{
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord,
+};
 
 struct RecordingPlacedShardClient {
     node_id: NodeId,
@@ -169,6 +172,34 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         _pg_id: PgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
         Ok(Vec::new())
+    }
+
+    fn acquire_placed_segment_shard_repair_claim(
+        &self,
+        _pg_id: PgId,
+        _request: &PlacedSegmentShardRepairClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
+        Ok(None)
+    }
+
+    fn complete_placed_segment_shard_repair_claim(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+        _claim: &PlacedSegmentShardRepairClaimRecord,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    fn record_placed_segment_shard_repair_claim_error(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+        _claim: &PlacedSegmentShardRepairClaimRecord,
+        _last_error: &str,
+        _next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
     }
 
     fn resolve_placed_segment_shard_repair(

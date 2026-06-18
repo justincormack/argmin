@@ -961,6 +961,28 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
         pg_id: PgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError>;
 
+    fn acquire_placed_segment_shard_repair_claim(
+        &self,
+        pg_id: PgId,
+        request: &PlacedSegmentShardRepairClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError>;
+
+    fn complete_placed_segment_shard_repair_claim(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardRepairClaimRecord,
+    ) -> Result<bool, StoreError>;
+
+    fn record_placed_segment_shard_repair_claim_error(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardRepairClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError>;
+
     fn resolve_placed_segment_shard_repair(
         &self,
         pg_id: PgId,

@@ -53,15 +53,7 @@ impl PgStore {
         validate_placed_segment_shard_repair_work_item(work_item)?;
         validate_placed_segment_shard_repair_pg(self.pg_id(), work_item)?;
         if let Some(last_error) = last_error {
-            if last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
-                return Err(StoreError::PayloadShardSetMismatch {
-                    reason: format!(
-                        "durable repair last_error length {} exceeds {}",
-                        last_error.len(),
-                        PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN
-                    ),
-                });
-            }
+            validate_placed_segment_shard_repair_last_error(last_error)?;
         }
         let now = Self::now_secs();
         self.conn
@@ -78,7 +70,7 @@ impl PgStore {
                   ec_m = excluded.ec_m, \
                   last_seen_at = excluded.last_seen_at, \
                   observation_count = placed_segment_shard_repairs.observation_count + 1, \
-                  last_error = excluded.last_error",
+                  last_error = COALESCE(excluded.last_error, placed_segment_shard_repairs.last_error)",
                 params![
                     work_item.request.data_pg_id as i64,
                     work_item.request.segment_okh.as_slice(),
@@ -121,14 +113,7 @@ impl PgStore {
                 params![PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT as i64],
                 |row| {
                     Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
+                        placed_segment_shard_repair_work_item_from_row(row)?,
                         row.get::<_, i64>(8)?,
                         row.get::<_, i64>(9)?,
                         row.get::<_, i64>(10)?,
@@ -143,49 +128,13 @@ impl PgStore {
 
         let mut repairs = Vec::new();
         for row in rows {
-            let (
-                data_pg_id,
-                segment_okh,
-                segment_vid,
-                stored_size,
-                segment_crc64,
-                ec_k,
-                ec_m,
-                shard_index,
-                first_seen_at,
-                last_seen_at,
-                observation_count,
-                last_error,
-            ) = row.map_err(|source| StoreError::Db {
-                context: "read placed segment shard repair",
-                source,
-            })?;
-            let segment_okh: [u8; 16] =
-                segment_okh
-                    .try_into()
-                    .map_err(|_| StoreError::PayloadShardSetMismatch {
-                        reason: "durable repair row has invalid segment OKH length".to_string(),
-                    })?;
+            let (work_item, first_seen_at, last_seen_at, observation_count, last_error) = row
+                .map_err(|source| StoreError::Db {
+                    context: "read placed segment shard repair",
+                    source,
+                })?;
             repairs.push(PlacedSegmentShardRepairRecord {
-                work_item: PlacedSegmentShardRepairWorkItem {
-                    request: SegmentStoredBytesRequest {
-                        data_pg_id: data_pg_id as u32,
-                        segment_okh,
-                        segment_vid: GenerationId::new(segment_vid as u64).ok_or_else(|| {
-                            StoreError::PayloadShardSetMismatch {
-                                reason: "durable repair row has invalid segment version"
-                                    .to_string(),
-                            }
-                        })?,
-                        stored_size: stored_size as usize,
-                        segment_crc64: segment_crc64.map(|crc| crc as u64),
-                        ec: EcShape {
-                            k: ec_k as u8,
-                            m: ec_m as u8,
-                        },
-                    },
-                    shard_index: ShardIndex::new(shard_index as u8),
-                },
+                work_item,
                 first_seen_at: first_seen_at as u64,
                 last_seen_at: last_seen_at as u64,
                 observation_count: observation_count as u64,
@@ -214,6 +163,233 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "resolve placed segment shard repair",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
+    pub fn acquire_placed_segment_shard_repair_claim(
+        &self,
+        request: &PlacedSegmentShardRepairClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
+        validate_placed_segment_shard_repair_claim_identity(
+            &request.claim_id,
+            &request.owner_token,
+        )?;
+        let Some(lease_deadline_value) = request.lease_deadline else {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "durable repair claim lease deadline is required".to_string(),
+            });
+        };
+        if lease_deadline_value <= request.claimed_at {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "durable repair claim lease deadline must be after claimed_at".to_string(),
+            });
+        }
+        let claimed_at = durable_repair_u64_to_i64(
+            request.claimed_at,
+            "acquire placed segment shard repair claim claimed_at",
+        )?;
+        let lease_deadline = durable_repair_u64_to_i64(
+            lease_deadline_value,
+            "acquire placed segment shard repair claim lease_deadline",
+        )?;
+        let now = durable_repair_u64_to_i64(
+            request.now,
+            "acquire placed segment shard repair claim now",
+        )?;
+
+        self.with_durable_repair_txn(
+            "acquire placed segment shard repair claim (begin txn)",
+            "acquire placed segment shard repair claim (commit txn)",
+            |store| {
+                let existing_sql = durable_repair_claim_select_sql(
+                    "claim_id = ?1 AND owner_token = ?2 AND cluster_epoch = ?3",
+                );
+                if let Some(existing) = store
+                    .conn
+                    .query_row(
+                        &existing_sql,
+                        params![
+                            &request.claim_id,
+                            &request.owner_token,
+                            request.cluster_epoch.get()
+                        ],
+                        placed_segment_shard_repair_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| StoreError::Db {
+                        context: "load existing placed segment shard repair claim",
+                        source,
+                    })?
+                {
+                    return Ok(Some(existing));
+                }
+
+                let candidate = store
+                    .conn
+                    .query_row(
+                        "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
+                                ec_k, ec_m, shard_index \
+                         FROM placed_segment_shard_repairs \
+                         WHERE next_attempt_after <= ?1 \
+                           AND (claim_id IS NULL OR (lease_deadline IS NOT NULL AND lease_deadline <= ?1)) \
+                         ORDER BY last_seen_at, segment_okh, segment_vid, shard_index \
+                         LIMIT 1",
+                        params![now],
+                        placed_segment_shard_repair_work_item_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| StoreError::Db {
+                        context: "load claimable placed segment shard repair",
+                        source,
+                    })?;
+
+                let Some(candidate) = candidate else {
+                    return Ok(None);
+                };
+                store
+                    .conn
+                    .execute(
+                        "UPDATE placed_segment_shard_repairs \
+                         SET claim_id = ?4, owner_token = ?5, cluster_epoch = ?6, \
+                             claimed_at = ?7, lease_deadline = ?8, \
+                             attempt_count = attempt_count + 1 \
+                         WHERE segment_okh = ?1 AND segment_vid = ?2 AND shard_index = ?3",
+                        params![
+                            candidate.request.segment_okh.as_slice(),
+                            candidate.request.segment_vid.get() as i64,
+                            candidate.shard_index.get() as i64,
+                            &request.claim_id,
+                            &request.owner_token,
+                            request.cluster_epoch.get(),
+                            claimed_at,
+                            lease_deadline,
+                        ],
+                    )
+                    .map_err(|source| StoreError::Db {
+                        context: "install placed segment shard repair claim",
+                        source,
+                    })?;
+
+                let reload_sql = durable_repair_claim_select_sql(
+                    "claim_id = ?1 AND owner_token = ?2 AND cluster_epoch = ?3",
+                );
+                store
+                    .conn
+                    .query_row(
+                        &reload_sql,
+                        params![
+                            &request.claim_id,
+                            &request.owner_token,
+                            request.cluster_epoch.get()
+                        ],
+                        placed_segment_shard_repair_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| StoreError::Db {
+                        context: "reload placed segment shard repair claim",
+                        source,
+                    })
+            },
+        )
+    }
+
+    pub fn complete_placed_segment_shard_repair_claim(
+        &self,
+        claim: &PlacedSegmentShardRepairClaimRecord,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_repair_claim_record(self.pg_id(), claim)?;
+        let updated = self
+            .conn
+            .execute(
+                "DELETE FROM placed_segment_shard_repairs \
+                 WHERE segment_okh = ?1 AND segment_vid = ?2 AND shard_index = ?3 \
+                   AND claim_id = ?4 AND owner_token = ?5 AND cluster_epoch = ?6",
+                params![
+                    claim.work_item.request.segment_okh.as_slice(),
+                    claim.work_item.request.segment_vid.get() as i64,
+                    claim.work_item.shard_index.get() as i64,
+                    claim.claim_id,
+                    claim.owner_token,
+                    claim.cluster_epoch.get(),
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "complete placed segment shard repair claim",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
+    fn with_durable_repair_txn<T>(
+        &self,
+        begin_context: &'static str,
+        commit_context: &'static str,
+        body: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if !self.conn.is_autocommit() {
+            return body(self);
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| StoreError::Db {
+                context: begin_context,
+                source,
+            })?;
+        let result = body(self);
+        match result {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|source| StoreError::Db {
+                        context: commit_context,
+                        source,
+                    })?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_placed_segment_shard_repair_claim_error(
+        &self,
+        claim: &PlacedSegmentShardRepairClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_repair_claim_record(self.pg_id(), claim)?;
+        validate_placed_segment_shard_repair_last_error(last_error)?;
+        let next_attempt_after = durable_repair_u64_to_i64(
+            next_attempt_after,
+            "record placed segment shard repair claim error next_attempt_after",
+        )?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE placed_segment_shard_repairs \
+                 SET claim_id = NULL, owner_token = NULL, cluster_epoch = NULL, \
+                     claimed_at = NULL, lease_deadline = NULL, \
+                     next_attempt_after = ?7, last_error = ?8 \
+                 WHERE segment_okh = ?1 AND segment_vid = ?2 AND shard_index = ?3 \
+                   AND claim_id = ?4 AND owner_token = ?5 AND cluster_epoch = ?6",
+                params![
+                    claim.work_item.request.segment_okh.as_slice(),
+                    claim.work_item.request.segment_vid.get() as i64,
+                    claim.work_item.shard_index.get() as i64,
+                    claim.claim_id,
+                    claim.owner_token,
+                    claim.cluster_epoch.get(),
+                    next_attempt_after,
+                    last_error,
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "record placed segment shard repair claim error",
                 source,
             })?;
         Ok(updated > 0)
@@ -1154,9 +1330,170 @@ fn validate_placed_segment_shard_repair_work_item(
     Ok(())
 }
 
+fn validate_placed_segment_shard_repair_claim_identity(
+    claim_id: &str,
+    owner_token: &str,
+) -> Result<(), StoreError> {
+    if claim_id.is_empty() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "durable repair claim id is empty".to_string(),
+        });
+    }
+    if owner_token.is_empty() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "durable repair owner token is empty".to_string(),
+        });
+    }
+    if claim_id.len() > PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair claim id length {} exceeds {}",
+                claim_id.len(),
+                PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN
+            ),
+        });
+    }
+    if owner_token.len() > PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair owner token length {} exceeds {}",
+                owner_token.len(),
+                PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_repair_claim_record(
+    pg_id: u32,
+    claim: &PlacedSegmentShardRepairClaimRecord,
+) -> Result<(), StoreError> {
+    validate_placed_segment_shard_repair_work_item(&claim.work_item)?;
+    validate_placed_segment_shard_repair_pg(pg_id, &claim.work_item)?;
+    validate_placed_segment_shard_repair_claim_identity(&claim.claim_id, &claim.owner_token)
+}
+
+fn validate_placed_segment_shard_repair_last_error(last_error: &str) -> Result<(), StoreError> {
+    if last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair last_error length {} exceeds {}",
+                last_error.len(),
+                PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn durable_repair_u64_to_i64(value: u64, context: &'static str) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|source| StoreError::Db {
+        context,
+        source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+    })
+}
+
+fn durable_repair_claim_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
+                ec_k, ec_m, shard_index, claim_id, owner_token, cluster_epoch, claimed_at, \
+                lease_deadline, attempt_count, last_error \
+         FROM placed_segment_shard_repairs \
+         WHERE {where_clause} \
+         ORDER BY last_seen_at, segment_okh, segment_vid, shard_index \
+         LIMIT 1"
+    )
+}
+
+fn placed_segment_shard_repair_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<PlacedSegmentShardRepairClaimRecord, rusqlite::Error> {
+    let work_item = placed_segment_shard_repair_work_item_from_row(row)?;
+    let cluster_epoch = row.get::<_, i64>(10)?;
+    let cluster_epoch = ClusterEpoch::new(cluster_epoch as u64).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::other(
+                "durable repair claim row has invalid cluster epoch",
+            )),
+        )
+    })?;
+    Ok(PlacedSegmentShardRepairClaimRecord {
+        work_item,
+        claim_id: row.get(8)?,
+        owner_token: row.get(9)?,
+        cluster_epoch,
+        claimed_at: row.get::<_, i64>(11)? as u64,
+        lease_deadline: row
+            .get::<_, Option<i64>>(12)?
+            .map(|deadline| deadline as u64),
+        attempt_count: row.get::<_, i64>(13)? as u64,
+        last_error: row.get(14)?,
+    })
+}
+
+fn placed_segment_shard_repair_work_item_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<PlacedSegmentShardRepairWorkItem, rusqlite::Error> {
+    let segment_okh = row.get::<_, Vec<u8>>(1)?;
+    let segment_okh: [u8; 16] = segment_okh.try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::other(
+                "durable repair row has invalid segment OKH length",
+            )),
+        )
+    })?;
+    let segment_vid = row.get::<_, i64>(2)?;
+    let segment_vid = GenerationId::new(segment_vid as u64).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::other(
+                "durable repair row has invalid segment version",
+            )),
+        )
+    })?;
+    Ok(PlacedSegmentShardRepairWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id: row.get::<_, i64>(0)? as u32,
+            segment_okh,
+            segment_vid,
+            stored_size: row.get::<_, i64>(3)? as usize,
+            segment_crc64: row.get::<_, Option<i64>>(4)?.map(|crc| crc as u64),
+            ec: EcShape {
+                k: row.get::<_, i64>(5)? as u8,
+                m: row.get::<_, i64>(6)? as u8,
+            },
+        },
+        shard_index: ShardIndex::new(row.get::<_, i64>(7)? as u8),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repair_claim_acquire(
+        claim_id: &str,
+        owner_token: &str,
+        epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> PlacedSegmentShardRepairClaimAcquire {
+        PlacedSegmentShardRepairClaimAcquire {
+            claim_id: claim_id.to_string(),
+            owner_token: owner_token.to_string(),
+            cluster_epoch: epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        }
+    }
 
     #[test]
     fn placed_segment_shard_repair_rows_are_durable_and_coalesced() {
@@ -1180,13 +1517,16 @@ mod tests {
         store
             .record_placed_segment_shard_repair(&work_item, Some("second"))
             .unwrap();
+        store
+            .record_placed_segment_shard_repair(&work_item, None)
+            .unwrap();
 
         drop(store);
         let reopened = PgStore::open(tmp.path(), 7).unwrap();
         let repairs = reopened.list_placed_segment_shard_repairs().unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].work_item, work_item);
-        assert_eq!(repairs[0].observation_count, 2);
+        assert_eq!(repairs[0].observation_count, 3);
         assert_eq!(repairs[0].last_error.as_deref(), Some("second"));
 
         assert!(reopened
@@ -1250,6 +1590,227 @@ mod tests {
         ));
         assert!(matches!(
             store.resolve_placed_segment_shard_repair(&work_item),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_claim_is_single_owner_and_retries_after_backoff() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xA9; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: Some(0x1234),
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+        };
+        let epoch = ClusterEpoch::new(7).unwrap();
+
+        assert!(store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-0",
+                "worker-0",
+                epoch,
+                9,
+                Some(19),
+                9
+            ))
+            .unwrap()
+            .is_none());
+        store
+            .record_placed_segment_shard_repair(&work_item, None)
+            .unwrap();
+
+        let claim = store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-1",
+                "worker-1",
+                epoch,
+                10,
+                Some(20),
+                10,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.work_item, work_item);
+        assert_eq!(claim.attempt_count, 1);
+
+        assert_eq!(
+            store
+                .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                    "claim-1",
+                    "worker-1",
+                    epoch,
+                    11,
+                    Some(21),
+                    11,
+                ))
+                .unwrap()
+                .unwrap(),
+            claim
+        );
+        assert!(store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                12,
+                Some(22),
+                12,
+            ))
+            .unwrap()
+            .is_none());
+
+        assert!(store
+            .record_placed_segment_shard_repair_claim_error(&claim, "repair failed", 30)
+            .unwrap());
+        store
+            .record_placed_segment_shard_repair(&work_item, None)
+            .unwrap();
+        assert_eq!(
+            store.list_placed_segment_shard_repairs().unwrap()[0]
+                .last_error
+                .as_deref(),
+            Some("repair failed")
+        );
+        assert!(store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                29,
+                Some(39),
+                29,
+            ))
+            .unwrap()
+            .is_none());
+
+        let retry = store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                30,
+                Some(40),
+                30,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.work_item, work_item);
+        assert_eq!(retry.attempt_count, 2);
+        assert_eq!(retry.last_error.as_deref(), Some("repair failed"));
+        assert!(!store
+            .complete_placed_segment_shard_repair_claim(&claim)
+            .unwrap());
+        assert!(store
+            .complete_placed_segment_shard_repair_claim(&retry)
+            .unwrap());
+        assert!(store
+            .list_placed_segment_shard_repairs()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_claim_can_be_stolen_after_expiry() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xAA; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: Some(0x1234),
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+        };
+        let epoch = ClusterEpoch::new(7).unwrap();
+        store
+            .record_placed_segment_shard_repair(&work_item, None)
+            .unwrap();
+        let first = store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-1",
+                "worker-1",
+                epoch,
+                10,
+                Some(20),
+                10,
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert!(store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                19,
+                Some(29),
+                19,
+            ))
+            .unwrap()
+            .is_none());
+        let stolen = store
+            .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                20,
+                Some(30),
+                20,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stolen.work_item, work_item);
+        assert_eq!(stolen.attempt_count, 2);
+        assert!(!store
+            .complete_placed_segment_shard_repair_claim(&first)
+            .unwrap());
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_claim_requires_finite_forward_lease() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xAB; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: Some(0x1234),
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+        };
+        let epoch = ClusterEpoch::new(7).unwrap();
+        store
+            .record_placed_segment_shard_repair(&work_item, None)
+            .unwrap();
+
+        assert!(matches!(
+            store.acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-1", "worker-1", epoch, 10, None, 10
+            )),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+        assert!(matches!(
+            store.acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
+                "claim-1",
+                "worker-1",
+                epoch,
+                10,
+                Some(10),
+                10
+            )),
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));
     }

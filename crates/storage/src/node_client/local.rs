@@ -163,6 +163,41 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
         pg.list_placed_segment_shard_repairs()
     }
 
+    fn acquire_placed_segment_shard_repair_claim(
+        &self,
+        pg_id: PgId,
+        request: &PlacedSegmentShardRepairClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.acquire_placed_segment_shard_repair_claim(request)
+    }
+
+    fn complete_placed_segment_shard_repair_claim(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardRepairClaimRecord,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_repair_claim_epoch(pg_id, cluster_epoch, claim)?;
+        validate_placed_segment_shard_repair_route(pg_id, &claim.work_item)?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.complete_placed_segment_shard_repair_claim(claim)
+    }
+
+    fn record_placed_segment_shard_repair_claim_error(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardRepairClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_repair_claim_epoch(pg_id, cluster_epoch, claim)?;
+        validate_placed_segment_shard_repair_route(pg_id, &claim.work_item)?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_placed_segment_shard_repair_claim_error(claim, last_error, next_attempt_after)
+    }
+
     fn resolve_placed_segment_shard_repair(
         &self,
         pg_id: PgId,
@@ -186,6 +221,21 @@ fn validate_placed_segment_shard_repair_route(
                 work_item.request.data_pg_id,
                 pg_id.get()
             ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_repair_claim_epoch(
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    claim: &PlacedSegmentShardRepairClaimRecord,
+) -> Result<(), StoreError> {
+    if claim.cluster_epoch != cluster_epoch {
+        return Err(StoreError::StalePayloadOperation {
+            pg_id: pg_id.get(),
+            operation_epoch: claim.cluster_epoch,
+            current_epoch: cluster_epoch,
         });
     }
     Ok(())

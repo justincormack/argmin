@@ -7582,12 +7582,20 @@ Shard repair design:
   observations are coalesced, explicit repair resolves repaired rows, and the
   Unix storage-node RPC boundary exposes bounded-batch record/list/resolve
   operations for multihost workers.
-- Remaining shard-repair queue work: add claim/retry/backoff semantics for the
-  bounded repair worker, wire background scrub findings into the same durable
-  queue, and decide whether completed repair verification should persist richer
-  per-shard outcome telemetry. Background scan cursor/progress does not need to
-  be durable; a scanner can restart from a random or rotating point because any
-  actual damaged shard it finds is recorded in the durable repair queue.
+- Added durable claim/retry/backoff semantics for placed shard repair rows.
+  Workers acquire single-owner claims on data-PG repair rows with epoch-fenced
+  owner tokens, lease deadlines, attempt counts, and `next_attempt_after`
+  backoff. Failed claims preserve `last_error` while releasing ownership for a
+  later retry; duplicate read/scrub observations update the observation count
+  without erasing retry evidence. The local store, `StorageCluster`, Unix
+  storage-node RPC boundary, and RPC payload round-trips all expose this claim,
+  complete, and error flow.
+- Remaining shard-repair queue work: wire background scrub findings into the
+  same durable queue, and decide whether completed repair verification should
+  persist richer per-shard outcome telemetry. Background scan cursor/progress
+  does not need to be durable; a scanner can restart from a random or rotating
+  point because any actual damaged shard it finds is recorded in the durable
+  repair queue.
 
 Exit criteria:
 

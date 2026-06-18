@@ -32,19 +32,21 @@ use crate::{
         ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
         ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
         ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-        PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-        PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SegmentStoredBytesRequest,
-        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
-        ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-        ShardScavengerObservationReason, ShardScavengerObservationRecord,
-        ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
-        ShardScavengerRoutedMultipartPartReference, StorageClass, StoredLegalHoldStatus,
-        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
-        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
+        PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+        PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+        PublicAccessBlockConfig, SegmentStoredBytesRequest, SerializedMetadataBlob,
+        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+        ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+        ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+        ShardScavengerPlacedShardSetReference, ShardScavengerRoutedMultipartPartReference,
+        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
+        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+        VersionId, WriteAck, PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN,
         PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT,
-        SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
+        PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN, SESSION_ID_LEN, SHARD_KEY_LEN,
+        UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -108,6 +110,38 @@ const STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_RECORD_PAYLOAD_LEN: usize =
         + 1
         + 4
         + PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN;
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_CLAIM_RECORD_MIN_LEN: usize =
+    STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN + 4 + 4 + 8 + 8 + 1 + 8 + 1;
+const STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN
+        + 8
+        + 8
+        + 1
+        + 8
+        + 8
+        + 1
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN;
+const STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN
+        + 8
+        + 1
+        + 8
+        + 8;
+const STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_ERROR_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_RECORD_PAYLOAD_LEN
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN
+        + 8;
 const STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN: usize =
@@ -568,6 +602,9 @@ pub(crate) enum StorageRpcMessageKind {
     PlacedSegmentShardRepairRecord = 128,
     PlacedSegmentShardRepairs = 129,
     PlacedSegmentShardRepairResolve = 130,
+    PlacedSegmentShardRepairClaimAcquire = 131,
+    PlacedSegmentShardRepairClaimComplete = 132,
+    PlacedSegmentShardRepairClaimError = 133,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,6 +807,13 @@ impl StorageRpcMessageKind {
             Self::PlacedSegmentShardRepairRecord => "placed segment shard repair record",
             Self::PlacedSegmentShardRepairs => "placed segment shard repairs",
             Self::PlacedSegmentShardRepairResolve => "placed segment shard repair resolve",
+            Self::PlacedSegmentShardRepairClaimAcquire => {
+                "placed segment shard repair claim acquire"
+            }
+            Self::PlacedSegmentShardRepairClaimComplete => {
+                "placed segment shard repair claim complete"
+            }
+            Self::PlacedSegmentShardRepairClaimError => "placed segment shard repair claim error",
         }
     }
 
@@ -905,6 +949,9 @@ impl StorageRpcMessageKind {
             128 => Ok(Self::PlacedSegmentShardRepairRecord),
             129 => Ok(Self::PlacedSegmentShardRepairs),
             130 => Ok(Self::PlacedSegmentShardRepairResolve),
+            131 => Ok(Self::PlacedSegmentShardRepairClaimAcquire),
+            132 => Ok(Self::PlacedSegmentShardRepairClaimComplete),
+            133 => Ok(Self::PlacedSegmentShardRepairClaimError),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -2643,6 +2690,35 @@ pub(crate) struct StorageRpcPlacedSegmentShardRepairItemRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse {
+    pub(crate) record: Option<PlacedSegmentShardRepairClaimRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentShardRepairClaimRecordRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) claim: PlacedSegmentShardRepairClaimRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentShardRepairClaimErrorRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) claim: PlacedSegmentShardRepairClaimRecord,
+    pub(crate) last_error: String,
+    pub(crate) next_attempt_after: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcReadHandleAcquireRequest {
     pub(crate) read_operation_id: String,
     pub(crate) locations: Vec<ShardLocation>,
@@ -3026,6 +3102,16 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::PlacedSegmentShardRepairs => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardRepairClaimAcquire => {
+            STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardRepairClaimComplete => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+                + STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardRepairClaimError => {
+            STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_CLAIM_ERROR_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ClaimHeartbeat => STORAGE_RPC_MAX_CLAIM_HEARTBEAT_PAYLOAD_LEN,
         StorageRpcMessageKind::ClaimRelease => STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN,
@@ -8940,6 +9026,157 @@ pub(crate) fn decode_placed_segment_shard_repair_item_request(
     Ok(StorageRpcPlacedSegmentShardRepairItemRequest { route, work_item })
 }
 
+pub(crate) fn encode_placed_segment_shard_repair_claim_acquire_request(
+    request: &StorageRpcPlacedSegmentShardRepairClaimAcquireRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_placed_segment_shard_repair_claim_identity(&request.claim_id, &request.owner_token)?;
+    let Some(lease_deadline) = request.lease_deadline else {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim lease deadline is required",
+        ));
+    };
+    if lease_deadline <= request.claimed_at {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim lease deadline must be after claimed time",
+        ));
+    }
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_string(&mut out, &request.claim_id);
+    put_string(&mut out, &request.owner_token);
+    put_u64(&mut out, request.claimed_at);
+    put_optional_u64(&mut out, request.lease_deadline);
+    put_u64(&mut out, request.now);
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repair_claim_acquire_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentShardRepairClaimAcquireRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let claim_id = decoder.read_string_with_limit(
+        PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN,
+        StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+    )?;
+    let owner_token = decoder.read_string_with_limit(
+        PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN,
+        StorageRpcPayloadError::InvalidDurableClaimToken("owner token exceeds maximum length"),
+    )?;
+    let claimed_at = decoder.read_u64()?;
+    let lease_deadline = decoder.read_optional_u64()?;
+    let now = decoder.read_u64()?;
+    decoder.finish()?;
+    let request = StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
+        route,
+        claim_id,
+        owner_token,
+        claimed_at,
+        lease_deadline,
+        now,
+    };
+    encode_placed_segment_shard_repair_claim_acquire_request(&request)?;
+    Ok(request)
+}
+
+pub(crate) fn encode_placed_segment_shard_repair_claim_optional_record_response(
+    response: &StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.record {
+        Some(record) => {
+            validate_placed_segment_shard_repair_claim_record(record)?;
+            put_u8(&mut out, 1);
+            put_placed_segment_shard_repair_claim_record(&mut out, record);
+        }
+        None => put_u8(&mut out, 0),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repair_claim_optional_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let record = decoder.read_placed_segment_shard_repair_claim_record()?;
+            validate_placed_segment_shard_repair_claim_record(&record)?;
+            Some(record)
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+                "placed segment repair claim optional record tag must be 0 or 1",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse { record })
+}
+
+pub(crate) fn encode_placed_segment_shard_repair_claim_record_request(
+    request: &StorageRpcPlacedSegmentShardRepairClaimRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_placed_segment_shard_repair_claim_record(&request.claim)?;
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_placed_segment_shard_repair_claim_record(&mut out, &request.claim);
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repair_claim_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentShardRepairClaimRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let claim = decoder.read_placed_segment_shard_repair_claim_record()?;
+    decoder.finish()?;
+    let request = StorageRpcPlacedSegmentShardRepairClaimRecordRequest { route, claim };
+    encode_placed_segment_shard_repair_claim_record_request(&request)?;
+    Ok(request)
+}
+
+pub(crate) fn encode_placed_segment_shard_repair_claim_error_request(
+    request: &StorageRpcPlacedSegmentShardRepairClaimErrorRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_placed_segment_shard_repair_claim_record(&request.claim)?;
+    if request.last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: request.last_error.len(),
+            limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+        });
+    }
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_placed_segment_shard_repair_claim_record(&mut out, &request.claim);
+    put_string(&mut out, &request.last_error);
+    put_u64(&mut out, request.next_attempt_after);
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repair_claim_error_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentShardRepairClaimErrorRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let claim = decoder.read_placed_segment_shard_repair_claim_record()?;
+    let last_error = decoder.read_string_with_limit(
+        PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN + 1,
+            limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+        },
+    )?;
+    let next_attempt_after = decoder.read_u64()?;
+    decoder.finish()?;
+    let request = StorageRpcPlacedSegmentShardRepairClaimErrorRequest {
+        route,
+        claim,
+        last_error,
+        next_attempt_after,
+    };
+    encode_placed_segment_shard_repair_claim_error_request(&request)?;
+    Ok(request)
+}
+
 pub(crate) fn encode_placed_segment_shard_repairs_response(
     repairs: &[PlacedSegmentShardRepairRecord],
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -10183,6 +10420,63 @@ fn validate_claim_token(token: &StorageRpcDurableClaimToken) -> Result<(), Stora
         return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
             "owner token must not be empty",
         ));
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_repair_claim_identity(
+    claim_id: &str,
+    owner_token: &str,
+) -> Result<(), StorageRpcPayloadError> {
+    if claim_id.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim id must not be empty",
+        ));
+    }
+    if owner_token.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "owner token must not be empty",
+        ));
+    }
+    if claim_id.len() > PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "claim id exceeds maximum length",
+        ));
+    }
+    if owner_token.len() > PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "owner token exceeds maximum length",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_repair_claim_record(
+    record: &PlacedSegmentShardRepairClaimRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_placed_segment_shard_repair_claim_identity(&record.claim_id, &record.owner_token)?;
+    if record.attempt_count == 0 {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "placed segment repair claim attempt count must be nonzero",
+        ));
+    }
+    let Some(lease_deadline) = record.lease_deadline else {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "placed segment repair claim lease deadline is required",
+        ));
+    };
+    if lease_deadline <= record.claimed_at {
+        return Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+            "placed segment repair claim lease deadline must be after claimed time",
+        ));
+    }
+    if let Some(last_error) = record.last_error.as_deref() {
+        if last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
+            return Err(StorageRpcPayloadError::PayloadTooLarge {
+                len: last_error.len(),
+                limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+            });
+        }
     }
     Ok(())
 }
@@ -12676,6 +12970,35 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
+    fn read_placed_segment_shard_repair_claim_record(
+        &mut self,
+    ) -> Result<PlacedSegmentShardRepairClaimRecord, StorageRpcPayloadError> {
+        Ok(PlacedSegmentShardRepairClaimRecord {
+            work_item: self.read_placed_segment_shard_repair_work_item()?,
+            claim_id: self.read_string_with_limit(
+                PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN,
+                StorageRpcPayloadError::InvalidDurableClaimToken("claim id exceeds maximum length"),
+            )?,
+            owner_token: self.read_string_with_limit(
+                PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN,
+                StorageRpcPayloadError::InvalidDurableClaimToken(
+                    "owner token exceeds maximum length",
+                ),
+            )?,
+            cluster_epoch: self.read_cluster_epoch()?,
+            claimed_at: self.read_u64()?,
+            lease_deadline: self.read_optional_u64()?,
+            attempt_count: self.read_u64()?,
+            last_error: self.read_optional_string_with_limit(
+                PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+                StorageRpcPayloadError::PayloadTooLarge {
+                    len: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN + 1,
+                    limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+                },
+            )?,
+        })
+    }
+
     fn read_scavenger_payload_reference(
         &mut self,
     ) -> Result<ShardScavengerPayloadReference, StorageRpcPayloadError> {
@@ -14274,6 +14597,20 @@ fn put_placed_segment_shard_repair_record(
     put_optional_string(out, repair.last_error.as_deref());
 }
 
+fn put_placed_segment_shard_repair_claim_record(
+    out: &mut Vec<u8>,
+    claim: &PlacedSegmentShardRepairClaimRecord,
+) {
+    put_placed_segment_shard_repair_work_item(out, &claim.work_item);
+    put_string(out, &claim.claim_id);
+    put_string(out, &claim.owner_token);
+    put_u64(out, claim.cluster_epoch.get());
+    put_u64(out, claim.claimed_at);
+    put_optional_u64(out, claim.lease_deadline);
+    put_u64(out, claim.attempt_count);
+    put_optional_string(out, claim.last_error.as_deref());
+}
+
 fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavengerPayloadReference) {
     match reference {
         ShardScavengerPayloadReference::Placed(reference) => {
@@ -15535,7 +15872,10 @@ mod tests {
             record_request
         );
 
-        let item_request = StorageRpcPlacedSegmentShardRepairItemRequest { route, work_item };
+        let item_request = StorageRpcPlacedSegmentShardRepairItemRequest {
+            route: route.clone(),
+            work_item,
+        };
         let item_bytes = encode_placed_segment_shard_repair_item_request(&item_request)
             .expect("repair item request should encode");
         assert_eq!(
@@ -15565,6 +15905,96 @@ mod tests {
             )
             .unwrap(),
             vec![repair]
+        );
+
+        let claim_acquire = StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
+            route: route.clone(),
+            claim_id: "claim-1".to_string(),
+            owner_token: "worker-1".to_string(),
+            claimed_at: 10,
+            lease_deadline: Some(20),
+            now: 10,
+        };
+        let claim_acquire_bytes =
+            encode_placed_segment_shard_repair_claim_acquire_request(&claim_acquire)
+                .expect("repair claim acquire request should encode");
+        assert_eq!(
+            decode_placed_segment_shard_repair_claim_acquire_request(&claim_acquire_bytes).unwrap(),
+            claim_acquire
+        );
+        let missing_lease_acquire = StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
+            route: route.clone(),
+            claim_id: "claim-1".to_string(),
+            owner_token: "worker-1".to_string(),
+            claimed_at: 10,
+            lease_deadline: None,
+            now: 10,
+        };
+        assert!(matches!(
+            encode_placed_segment_shard_repair_claim_acquire_request(&missing_lease_acquire),
+            Err(StorageRpcPayloadError::InvalidDurableClaimToken(_))
+        ));
+
+        let claim = PlacedSegmentShardRepairClaimRecord {
+            work_item,
+            claim_id: "claim-1".to_string(),
+            owner_token: "worker-1".to_string(),
+            cluster_epoch: route.cluster_epoch,
+            claimed_at: 10,
+            lease_deadline: Some(20),
+            attempt_count: 1,
+            last_error: Some("previous failure".to_string()),
+        };
+        let claim_response = StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse {
+            record: Some(claim.clone()),
+        };
+        assert_eq!(
+            decode_placed_segment_shard_repair_claim_optional_record_response(
+                &encode_placed_segment_shard_repair_claim_optional_record_response(&claim_response)
+                    .unwrap()
+            )
+            .unwrap(),
+            claim_response
+        );
+        let missing_lease_claim = PlacedSegmentShardRepairClaimRecord {
+            lease_deadline: None,
+            ..claim.clone()
+        };
+        assert!(matches!(
+            encode_placed_segment_shard_repair_claim_optional_record_response(
+                &StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse {
+                    record: Some(missing_lease_claim)
+                }
+            ),
+            Err(StorageRpcPayloadError::InvalidDurableClaimToken(_))
+        ));
+
+        let claim_record_request = StorageRpcPlacedSegmentShardRepairClaimRecordRequest {
+            route: route.clone(),
+            claim: claim.clone(),
+        };
+        assert_eq!(
+            decode_placed_segment_shard_repair_claim_record_request(
+                &encode_placed_segment_shard_repair_claim_record_request(&claim_record_request)
+                    .unwrap()
+            )
+            .unwrap(),
+            claim_record_request
+        );
+
+        let claim_error_request = StorageRpcPlacedSegmentShardRepairClaimErrorRequest {
+            route,
+            claim,
+            last_error: "repair still failed".to_string(),
+            next_attempt_after: 30,
+        };
+        assert_eq!(
+            decode_placed_segment_shard_repair_claim_error_request(
+                &encode_placed_segment_shard_repair_claim_error_request(&claim_error_request)
+                    .unwrap()
+            )
+            .unwrap(),
+            claim_error_request
         );
 
         let mut bad = item_bytes;

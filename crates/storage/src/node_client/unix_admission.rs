@@ -447,6 +447,9 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ShardAckValidate
         | StorageRpcMessageKind::ShardAckLoad
         | StorageRpcMessageKind::PlacedSegmentShardRepairRecord
+        | StorageRpcMessageKind::PlacedSegmentShardRepairClaimAcquire
+        | StorageRpcMessageKind::PlacedSegmentShardRepairClaimComplete
+        | StorageRpcMessageKind::PlacedSegmentShardRepairClaimError
         | StorageRpcMessageKind::PlacedSegmentShardRepairResolve
         | StorageRpcMessageKind::BucketWriteReservationValidate
         | StorageRpcMessageKind::BucketWriteReservationHeartbeat

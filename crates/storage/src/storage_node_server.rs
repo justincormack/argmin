@@ -71,7 +71,11 @@ use crate::storage_rpc::{
     decode_object_payload_reclaim_claim_record_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
     decode_object_read_snapshot_request, decode_object_request,
-    decode_object_tags_for_subject_request, decode_placed_segment_shard_repair_item_request,
+    decode_object_tags_for_subject_request,
+    decode_placed_segment_shard_repair_claim_acquire_request,
+    decode_placed_segment_shard_repair_claim_error_request,
+    decode_placed_segment_shard_repair_claim_record_request,
+    decode_placed_segment_shard_repair_item_request,
     decode_placed_segment_shard_repair_record_request, decode_proof_release_request,
     decode_put_object_metadata_command_build_request, decode_put_object_metadata_snapshot_request,
     decode_read_handle_acquire_request, decode_read_handle_release_request,
@@ -120,6 +124,7 @@ use crate::storage_rpc::{
     encode_object_payload_reclaim_response, encode_object_read_auth_subject_response,
     encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
     encode_object_version_response, encode_payload_reclaim_root_response,
+    encode_placed_segment_shard_repair_claim_optional_record_response,
     encode_placed_segment_shard_repairs_response, encode_put_object_metadata_snapshot_response,
     encode_read_handle_acquire_response, encode_read_handle_release_response,
     encode_scavenger_list_files_response, encode_scavenger_observations_response,
@@ -215,30 +220,34 @@ use crate::storage_rpc::{
     StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest,
     StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
     StorageRpcObjectTagsForSubjectResponse, StorageRpcObjectVersionResponse,
-    StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentShardRepairItemRequest,
-    StorageRpcPlacedSegmentShardRepairRecordRequest, StorageRpcProofReleaseRequest,
-    StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
-    StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcPutObjectMetadataSnapshotResponse,
-    StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
-    StorageRpcReadHandleReleaseRequest, StorageRpcReadHandleReleaseResponse,
-    StorageRpcScavengerListFilesRequest, StorageRpcScavengerObservationKeyRequest,
-    StorageRpcScavengerObservationRecordRequest, StorageRpcShardAckBatchRequest,
-    StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
-    StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
-    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPartFinalizeSnapshotResponse,
-    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
-    StorageRpcStreamPutFinalizeSnapshotResponse, StorageRpcStreamSegmentAppendPrepareOutcome,
-    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamSegmentAppendPrepareResponse,
-    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadMatchResponse,
-    StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSegmentsResponse,
-    StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
-    StorageRpcStreamUploadSessionResponse, StorageRpcStreamUploadsListRequest,
-    StorageRpcStreamUploadsListResponse, StorageRpcStreamUploadsPgListRequest,
-    STORAGE_RPC_FRAME_ENCODING_VERSION,
+    StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentShardRepairClaimAcquireRequest,
+    StorageRpcPlacedSegmentShardRepairClaimErrorRequest,
+    StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse,
+    StorageRpcPlacedSegmentShardRepairClaimRecordRequest,
+    StorageRpcPlacedSegmentShardRepairItemRequest, StorageRpcPlacedSegmentShardRepairRecordRequest,
+    StorageRpcProofReleaseRequest, StorageRpcPutObjectMetadataCommandBuildRequest,
+    StorageRpcPutObjectMetadataSnapshotOutcome, StorageRpcPutObjectMetadataSnapshotRequest,
+    StorageRpcPutObjectMetadataSnapshotResponse, StorageRpcReadHandleAcquireRequest,
+    StorageRpcReadHandleAcquireResponse, StorageRpcReadHandleReleaseRequest,
+    StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
+    StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
+    StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
+    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
+    StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
+    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
+    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamSegmentAppendPrepareResponse, StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamUploadMatchResponse, StorageRpcStreamUploadSegmentsOutcome,
+    StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
+    StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
+    StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsListResponse,
+    StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_FRAME_ENCODING_VERSION,
 };
 use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
+use crate::types::{PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord};
 use crate::{
     BucketName, BucketWriteDrainError, EcShape, NodeId, ObjectPgActionError, ShardKey,
     ShardLocation,
@@ -2249,6 +2258,35 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::PlacedSegmentShardRepairResolve => {
                 match decode_placed_segment_shard_repair_item_request(&frame.payload) {
                     Ok(request) => self.placed_segment_shard_repair_resolve_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardRepairClaimAcquire => {
+                match decode_placed_segment_shard_repair_claim_acquire_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_repair_claim_acquire_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardRepairClaimComplete => {
+                match decode_placed_segment_shard_repair_claim_record_request(&frame.payload) {
+                    Ok(request) => {
+                        self.placed_segment_shard_repair_claim_complete_response(request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardRepairClaimError => {
+                match decode_placed_segment_shard_repair_claim_error_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_repair_claim_error_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6435,6 +6473,128 @@ impl StorageNodeConnectionHandler {
         }
     }
 
+    fn placed_segment_shard_repair_claim_acquire_response(
+        &self,
+        request: StorageRpcPlacedSegmentShardRepairClaimAcquireRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(
+            request.route.pg_id,
+            "placed segment shard repair claim acquire",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let acquire = PlacedSegmentShardRepairClaimAcquire {
+            claim_id: request.claim_id,
+            owner_token: request.owner_token,
+            cluster_epoch: request.route.cluster_epoch,
+            claimed_at: request.claimed_at,
+            lease_deadline: request.lease_deadline,
+            now: request.now,
+        };
+        match local_client.acquire_placed_segment_shard_repair_claim(request.route.pg_id, &acquire)
+        {
+            Ok(record) => {
+                let payload = encode_placed_segment_shard_repair_claim_optional_record_response(
+                    &StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse { record },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_repair_claim_complete_response(
+        &self,
+        request: StorageRpcPlacedSegmentShardRepairClaimRecordRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(
+            request.route.pg_id,
+            "placed segment shard repair claim complete",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = validate_placed_segment_shard_repair_claim_route_epoch(
+            request.route.pg_id,
+            request.route.cluster_epoch,
+            &request.claim,
+        ) {
+            return encode_storage_rpc_error_response(&store_error_response(error));
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client.complete_placed_segment_shard_repair_claim(
+            request.route.pg_id,
+            request.route.cluster_epoch,
+            &request.claim,
+        ) {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_repair_claim_error_response(
+        &self,
+        request: StorageRpcPlacedSegmentShardRepairClaimErrorRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(
+            request.route.pg_id,
+            "placed segment shard repair claim error",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = validate_placed_segment_shard_repair_claim_route_epoch(
+            request.route.pg_id,
+            request.route.cluster_epoch,
+            &request.claim,
+        ) {
+            return encode_storage_rpc_error_response(&store_error_response(error));
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client.record_placed_segment_shard_repair_claim_error(
+            request.route.pg_id,
+            request.route.cluster_epoch,
+            &request.claim,
+            &request.last_error,
+            request.next_attempt_after,
+        ) {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
     fn metadata_command_replica_state_response(
         &self,
         session: &StorageNodeSession<'_>,
@@ -8410,6 +8570,21 @@ fn shard_delete_in_progress_response(message: String) -> StorageRpcErrorResponse
     }
 }
 
+fn validate_placed_segment_shard_repair_claim_route_epoch(
+    pg_id: PgId,
+    route_epoch: ClusterEpoch,
+    claim: &PlacedSegmentShardRepairClaimRecord,
+) -> Result<(), StoreError> {
+    if claim.cluster_epoch != route_epoch {
+        return Err(StoreError::StalePayloadOperation {
+            pg_id: pg_id.get(),
+            operation_epoch: claim.cluster_epoch,
+            current_epoch: route_epoch,
+        });
+    }
+    Ok(())
+}
+
 fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
     StorageRpcErrorResponse {
         code: StorageRpcErrorCode::Internal,
@@ -8915,9 +9090,50 @@ mod tests {
     };
     use crate::traits::{PgMetadataStore, ShardStore};
     use crate::types::{
-        DataPgId, GenerationId, PgId, ShardIndex, ShardKey, ShardScavengerObservationKey,
-        ShardScavengerObservationReason, ShardScavengerObservationRecord, VersionId,
+        DataPgId, GenerationId, PgId, PlacedSegmentShardRepairClaimRecord,
+        PlacedSegmentShardRepairWorkItem, SegmentStoredBytesRequest, ShardIndex, ShardKey,
+        ShardScavengerObservationKey, ShardScavengerObservationReason,
+        ShardScavengerObservationRecord, VersionId,
     };
+
+    #[test]
+    fn placed_segment_shard_repair_claim_route_epoch_must_match_claim_epoch() {
+        let route_epoch = ClusterEpoch::new(2).unwrap();
+        let claim_epoch = ClusterEpoch::new(1).unwrap();
+        let claim = PlacedSegmentShardRepairClaimRecord {
+            work_item: PlacedSegmentShardRepairWorkItem {
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: 7,
+                    segment_okh: [0xAC; 16],
+                    segment_vid: GenerationId::new(42).unwrap(),
+                    stored_size: 1024,
+                    segment_crc64: Some(0x1234),
+                    ec: EcShape { k: 4, m: 2 },
+                },
+                shard_index: ShardIndex::new(5),
+            },
+            claim_id: "claim-1".to_string(),
+            owner_token: "worker-1".to_string(),
+            cluster_epoch: claim_epoch,
+            claimed_at: 10,
+            lease_deadline: Some(20),
+            attempt_count: 1,
+            last_error: None,
+        };
+
+        assert!(matches!(
+            validate_placed_segment_shard_repair_claim_route_epoch(
+                PgId::new(7),
+                route_epoch,
+                &claim
+            ),
+            Err(StoreError::StalePayloadOperation {
+                operation_epoch,
+                current_epoch,
+                ..
+            }) if operation_epoch == claim_epoch && current_epoch == route_epoch
+        ));
+    }
 
     fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
         StorageNodeProcessConfig {
