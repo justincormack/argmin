@@ -6,7 +6,10 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, ObjectAttributes, ObjectOwnership, Tag, Tagging,
     VersioningConfiguration,
 };
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket,
+    SendRetryingOperationAborted, CTX,
+};
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
@@ -151,7 +154,7 @@ fn test_same_account_constrained_user_cannot_manage_boe_object_tags() {
             .bucket(&bucket)
             .key(key)
             .tagging(tagging("owner", "set"))
-            .send()
+            .send_retrying_operation_aborted("set BOE object tags during constrained setup")
             .await
             .unwrap();
 
@@ -401,7 +404,7 @@ fn test_same_account_constrained_user_cannot_manage_boe_object_version_tags() {
             .key(key)
             .version_id(&version_id)
             .tagging(tagging("owner", "version"))
-            .send()
+            .send_retrying_operation_aborted("set BOE object version tags during constrained setup")
             .await
             .unwrap();
 

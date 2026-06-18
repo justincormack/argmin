@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, ObjectAttributes, ObjectOwnership, Tag, Tagging,
     VersioningConfiguration,
 };
-use s3_tests::{cleanup_versioned_bucket, unique_bucket, CTX};
+use s3_tests::{cleanup_versioned_bucket, unique_bucket, SendRetryingOperationAborted, CTX};
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
@@ -308,7 +308,7 @@ fn test_same_account_root_and_non_root_boe_object_tagging_admin() {
                 .bucket(&bucket)
                 .key("non-root-object")
                 .tagging(simple_tagging("root"))
-                .send()
+                .send_retrying_operation_aborted("root PutObjectTagging on BOE object")
         })
         .await;
         eventually_ok("root DeleteObjectTagging on BOE object version", || {
@@ -372,7 +372,7 @@ fn test_same_account_root_and_non_root_boe_object_tagging_admin() {
                 .bucket(&bucket)
                 .key("root-object")
                 .tagging(simple_tagging("owner"))
-                .send()
+                .send_retrying_operation_aborted("non-root PutObjectTagging on BOE object")
         })
         .await;
         let updated = eventually_ok(
