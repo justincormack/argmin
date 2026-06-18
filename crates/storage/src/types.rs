@@ -1558,7 +1558,7 @@ pub struct SegmentStoredBytesRequest {
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub stored_size: usize,
-    pub segment_crc64: Option<u64>,
+    pub segment_crc64: u64,
     pub ec: EcShape,
 }
 
@@ -2192,6 +2192,8 @@ pub(crate) struct ShardScavengerRoutedMultipartPartReference {
     pub key: ObjectKey,
     pub object_generation_id: GenerationId,
     pub part_number: u32,
+    pub stored_size: u64,
+    pub crc64: u64,
     pub part_okh: [u8; 16],
     pub part_vid: GenerationId,
     pub ec: EcShape,
@@ -2968,7 +2970,7 @@ pub struct CommitDirectPutObjectReq {
     pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
     pub segment_index: u32,
-    pub segment_crc64: Option<u64>,
+    pub segment_crc64: u64,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
@@ -3279,6 +3281,8 @@ pub struct MultipartPartRecord {
     pub part_number: u32,
     pub generation: u32,
     pub size: u64,
+    /// CRC64-NVME over the logical part bytes used for internal storage repair.
+    pub payload_crc64: u64,
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
     /// 16-byte object key hash for shard keys.
@@ -3368,6 +3372,8 @@ pub struct ObjectPartRecord {
     pub version_id: VersionId,
     pub part_number: u32,
     pub size: u64,
+    /// CRC64-NVME over the logical part bytes used for internal storage repair.
+    pub payload_crc64: u64,
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
     pub part_okh: [u8; 16],
@@ -3636,7 +3642,7 @@ pub struct PrepareStreamUploadSegmentAppendReq {
     pub segment_index: u32,
     pub size: u64,
     /// CRC64-NVME over the logical segment bytes.
-    pub segment_crc64: Option<u64>,
+    pub segment_crc64: u64,
     /// 16-byte object key hash for shard keys.
     pub segment_okh: [u8; 16],
 }
@@ -3648,7 +3654,7 @@ pub struct StreamUploadSegmentRecord {
     pub segment_index: u32,
     pub size: u64,
     /// CRC64-NVME over the logical segment bytes.
-    pub segment_crc64: Option<u64>,
+    pub segment_crc64: u64,
     /// 16-byte object key hash for shard keys.
     pub segment_okh: [u8; 16],
     /// Payload generation for shard keys.
@@ -3712,7 +3718,7 @@ pub struct ObjectSegmentRecord {
     pub segment_index: u32,
     pub size: u64,
     /// CRC64-NVME over the logical segment bytes.
-    pub segment_crc64: Option<u64>,
+    pub segment_crc64: u64,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
@@ -3731,7 +3737,7 @@ pub struct MultipartPartSegmentRecord {
     pub segment_index: u32,
     pub size: u64,
     /// CRC64-NVME over the logical segment bytes.
-    pub segment_crc64: Option<u64>,
+    pub segment_crc64: u64,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,

@@ -8,10 +8,10 @@ impl PgStore {
     pub(super) fn row_to_object_part(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<ObjectPartRecord> {
-        let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
+        let part_okh = Self::blob_to_okh(row.get(8)?, 8)?;
         let checksum = row
-            .get::<_, Option<Vec<u8>>>(12)?
-            .map(|blob| Self::blob_to_checksum(blob, 12))
+            .get::<_, Option<Vec<u8>>>(13)?
+            .map(|blob| Self::blob_to_checksum(blob, 13))
             .transpose()?;
         Ok(ObjectPartRecord {
             bucket: row.get(0)?,
@@ -19,13 +19,14 @@ impl PgStore {
             version_id: PgStore::parse_version_id(row.get::<_, i64>(2)?, 2)?,
             part_number: row.get::<_, i64>(3)? as u32,
             size: row.get::<_, i64>(4)? as u64,
-            etag: row.get(5)?,
-            etag_kind: Self::parse_enum(row.get::<_, u8>(6)?, 6, "etag_kind", EtagKind::from_u8)?,
+            payload_crc64: row.get::<_, i64>(5)? as u64,
+            etag: row.get(6)?,
+            etag_kind: Self::parse_enum(row.get::<_, u8>(7)?, 7, "etag_kind", EtagKind::from_u8)?,
             part_okh,
-            part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
-            ec_k: row.get::<_, u8>(9)?,
-            ec_m: row.get::<_, u8>(10)?,
-            data_pg_id: row.get::<_, i64>(11)? as u32,
+            part_vid: Self::parse_generation_id(row.get::<_, i64>(9)?, 9, "part_vid")?,
+            ec_k: row.get::<_, u8>(10)?,
+            ec_m: row.get::<_, u8>(11)?,
+            data_pg_id: row.get::<_, i64>(12)? as u32,
             checksum,
         })
     }
@@ -36,7 +37,7 @@ impl PgStore {
     ) -> rusqlite::Result<ObjectPartRangeRecord> {
         Ok(ObjectPartRangeRecord {
             part: Self::row_to_object_part(row)?,
-            object_offset_start: row.get::<_, i64>(13)? as u64,
+            object_offset_start: row.get::<_, i64>(14)? as u64,
         })
     }
 
@@ -52,29 +53,31 @@ impl PgStore {
         })
     }
 
-    /// Map a row with columns (upload_id, part_number, generation, size, etag,
-    /// etag_kind, part_okh, part_vid, ec_k, ec_m, last_modified) to a
+    /// Map a row with columns (upload_id, part_number, generation, size,
+    /// payload_crc64, etag, etag_kind, part_okh, part_vid, ec_k, ec_m,
+    /// last_modified, checksum) to a
     /// MultipartPartRecord.
     pub(super) fn row_to_multipart_part(
         row: &rusqlite::Row<'_>,
     ) -> Result<MultipartPartRecord, rusqlite::Error> {
-        let part_okh = Self::blob_to_okh(row.get(6)?, 6)?;
+        let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
         let checksum = row
-            .get::<_, Option<Vec<u8>>>(11)?
-            .map(|blob| Self::blob_to_checksum(blob, 11))
+            .get::<_, Option<Vec<u8>>>(12)?
+            .map(|blob| Self::blob_to_checksum(blob, 12))
             .transpose()?;
         Ok(MultipartPartRecord {
             upload_id: row.get(0)?,
             part_number: row.get::<_, i64>(1)? as u32,
             generation: row.get::<_, i64>(2)? as u32,
             size: row.get::<_, i64>(3)? as u64,
-            etag: row.get(4)?,
-            etag_kind: Self::parse_enum(row.get::<_, u8>(5)?, 5, "etag_kind", EtagKind::from_u8)?,
+            payload_crc64: row.get::<_, i64>(4)? as u64,
+            etag: row.get(5)?,
+            etag_kind: Self::parse_enum(row.get::<_, u8>(6)?, 6, "etag_kind", EtagKind::from_u8)?,
             part_okh,
-            part_vid: Self::parse_generation_id(row.get::<_, i64>(7)?, 7, "part_vid")?,
-            ec_k: row.get::<_, u8>(8)?,
-            ec_m: row.get::<_, u8>(9)?,
-            last_modified: row.get::<_, i64>(10)? as u64,
+            part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
+            ec_k: row.get::<_, u8>(9)?,
+            ec_m: row.get::<_, u8>(10)?,
+            last_modified: row.get::<_, i64>(11)? as u64,
             checksum,
         })
     }

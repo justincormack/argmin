@@ -9084,7 +9084,7 @@ mod tests {
                     segment_okh: [0xAC; 16],
                     segment_vid: GenerationId::new(42).unwrap(),
                     stored_size: 1024,
-                    segment_crc64: Some(0x1234),
+                    segment_crc64: 0x1234,
                     ec: EcShape { k: 4, m: 2 },
                 },
                 shard_index: ShardIndex::new(5),

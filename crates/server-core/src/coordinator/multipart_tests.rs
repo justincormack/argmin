@@ -9104,10 +9104,10 @@ fn object_segments_integrity_readback() {
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
     assert_eq!(segments[0].size, 8);
-    assert!(segments[0].segment_crc64.is_some());
+    assert_ne!(segments[0].segment_crc64, 0);
     assert_eq!(segments[1].segment_index, 1);
     assert_eq!(segments[1].size, 8);
-    assert!(segments[1].segment_crc64.is_some());
+    assert_ne!(segments[1].segment_crc64, 0);
 
     // Verify full readback via coordinator.
     let result = coord
@@ -9171,7 +9171,7 @@ fn get_object_rejects_bad_segment_crc64() {
             )
             .unwrap();
         assert_eq!(segments.len(), 1);
-        segments[0].segment_crc64 = Some(segments[0].segment_crc64.unwrap() ^ 1);
+        segments[0].segment_crc64 ^= 1;
 
         coord
             .storage_node()

@@ -232,7 +232,7 @@ impl Coordinator {
                         metadata_blob,
                         system_metadata_blob,
                         segment_index,
-                        segment_crc64: Some(checksum::crc64::checksum(&storage_bytes)),
+                        segment_crc64: checksum::crc64::checksum(&storage_bytes),
                         segment_okh,
                         segment_vid,
                         data_pg_id: written_segment.data_pg_id,

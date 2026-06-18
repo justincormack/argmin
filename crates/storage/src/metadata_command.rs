@@ -2100,7 +2100,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.read_u32()?;
         self.read_u64()?;
-        self.skip_optional_u64()?;
+        self.read_u64()?;
         self.read_bytes()?;
         self.read_nonzero_u64("object segment VID")?;
         self.read_u32()?;
@@ -2116,7 +2116,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             version_id: self.read_version_id()?,
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64_value()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_bytes("object segment OKH")?,
             segment_vid: self.read_generation_id("object segment VID")?,
             data_pg_id: self.read_u32()?,
@@ -2130,6 +2130,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()?;
         self.read_u64()?;
         self.read_u32()?;
+        self.read_u64()?;
         self.read_u64()?;
         self.read_bytes()?;
         self.read_valid_u8("etag kind", 0..=1)?;
@@ -2148,6 +2149,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             version_id: self.read_version_id()?,
             part_number: self.read_u32()?,
             size: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             etag: self.read_bytes()?.to_vec(),
             etag_kind: EtagKind::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid etag kind".to_string())?,
@@ -2165,6 +2167,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u32()?;
         self.read_u32()?;
         self.read_u64()?;
+        self.read_u64()?;
         self.read_bytes()?;
         self.read_valid_u8("etag kind", 0..=1)?;
         self.read_bytes()?;
@@ -2181,6 +2184,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             part_number: self.read_u32()?,
             generation: self.read_u32()?,
             size: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             etag: self.read_bytes()?.to_vec(),
             etag_kind: EtagKind::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid etag kind".to_string())?,
@@ -2205,7 +2209,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u32()?;
         self.read_u32()?;
         self.read_u64()?;
-        self.skip_optional_u64()?;
+        self.read_u64()?;
         self.read_bytes()?;
         self.read_nonzero_u64("multipart part segment VID")?;
         self.read_u32()?;
@@ -2223,7 +2227,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             part_number: self.read_u32()?,
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64_value()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_bytes("multipart part segment OKH")?,
             segment_vid: self.read_generation_id("multipart part segment VID")?,
             data_pg_id: self.read_u32()?,
@@ -2320,7 +2324,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()?;
         self.read_u32()?;
         self.read_u64()?;
-        self.skip_optional_u64()?;
+        self.read_u64()?;
         self.read_bytes()?;
         self.read_nonzero_u64("stream upload segment VID")?;
         self.read_u32()?;
@@ -2334,7 +2338,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             session_id: self.read_session_id()?,
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64_value()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_bytes("stream upload segment OKH")?,
             segment_vid: self.read_generation_id("stream upload segment VID")?,
             data_pg_id: self.read_u32()?,
@@ -3466,7 +3470,7 @@ fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     encode_version_id(out, segment.version_id);
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
-    encode_optional_u64(out, segment.segment_crc64);
+    put_u64(out, segment.segment_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -3480,6 +3484,7 @@ fn encode_object_part(out: &mut Vec<u8>, part: &ObjectPartRecord) {
     encode_version_id(out, part.version_id);
     put_u32(out, part.part_number);
     put_u64(out, part.size);
+    put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
@@ -3498,6 +3503,7 @@ fn encode_multipart_part(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     put_u32(out, part.part_number);
     put_u32(out, part.generation);
     put_u64(out, part.size);
+    put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
@@ -3519,7 +3525,7 @@ fn encode_multipart_part_segment(out: &mut Vec<u8>, segment: &MultipartPartSegme
     put_u32(out, segment.part_number);
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
-    encode_optional_u64(out, segment.segment_crc64);
+    put_u64(out, segment.segment_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -3545,7 +3551,7 @@ fn encode_stream_upload_segment(out: &mut Vec<u8>, segment: &StreamUploadSegment
     put_str(out, segment.session_id.as_str());
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
-    encode_optional_u64(out, segment.segment_crc64);
+    put_u64(out, segment.segment_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -4712,7 +4718,7 @@ mod tests {
             version_id: VersionId::Null,
             segment_index: 0,
             size: 11,
-            segment_crc64: Some(9),
+            segment_crc64: 9,
             segment_okh: [7; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
@@ -4771,6 +4777,7 @@ mod tests {
             version_id: VersionId::Null,
             part_number: 2,
             size: 13,
+            payload_crc64: 99,
             etag: vec![4; 8],
             etag_kind: crate::types::EtagKind::Crc64,
             part_okh: [0; 16],
@@ -4819,6 +4826,7 @@ mod tests {
             part_number: 2,
             generation: 1,
             size: 13,
+            payload_crc64: 99,
             etag: vec![4; 8],
             etag_kind: crate::types::EtagKind::Crc64,
             part_okh: [0; 16],
@@ -4833,7 +4841,7 @@ mod tests {
             session_id: stream_session_id.clone(),
             segment_index: 3,
             size: 17,
-            segment_crc64: Some(12),
+            segment_crc64: 12,
             segment_okh: [12; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
@@ -4848,7 +4856,7 @@ mod tests {
             part_number: 2,
             segment_index: 0,
             size: 13,
-            segment_crc64: Some(10),
+            segment_crc64: 10,
             segment_okh: [10; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
@@ -5274,9 +5282,9 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0xc7362129e5a4a420,
-                0xdee5402ffb12ce7e,
-                0xd44aa9d008b3d4a6,
+                0x1e712152d885dc1f,
+                0x0bf1842505b04e6d,
+                0x9e66539a1d4f1ec7,
                 0x903cf2da427ff645,
                 0x22e816661cec7274,
                 0xe7353d51b6609ac8,
@@ -5289,13 +5297,13 @@ mod tests {
                 0x48fb53d34217c071,
                 0x60d07b32ba40633a,
                 0x5905759308d55e48,
-                0xe480fc355cba3a12,
+                0x46fa27c26df043f8,
                 0x2d6608601fded1d8,
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,
-                0x8d3e5d6cb995e021,
-                0xa52f8b4c0ffcf759,
-                0x386d1fe2b146db69,
+                0x7dbd565565a4a8d6,
+                0xddc42690979914a4,
+                0xe73984452d023876,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,
                 0xba43f79ea2af20cb,

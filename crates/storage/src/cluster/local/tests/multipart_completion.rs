@@ -649,7 +649,7 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
                 session_id: replacement_session_id.clone(),
                 segment_index: 0,
                 size: replacement_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(replacement_payload)),
+                segment_crc64: checksum::crc64::checksum(replacement_payload),
                 segment_okh: replacement_okh,
             },
         )
@@ -1228,7 +1228,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh,
             },
         )
@@ -1261,6 +1261,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                 part_number: 1,
                 generation,
                 size: payload.len() as u64,
+                payload_crc64: 0,
                 etag: vec![0x55; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],

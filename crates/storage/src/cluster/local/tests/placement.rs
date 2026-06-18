@@ -486,7 +486,7 @@ fn stale_storage_cluster_payload_read_reports_data_pg() {
                 segment_okh: [53; 16],
                 segment_vid: crate::GenerationId::MIN,
                 stored_size: 0,
-                segment_crc64: Some(0),
+                segment_crc64: 0,
                 ec: ec_shape,
             },
             &mut dst,
@@ -1629,7 +1629,7 @@ fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.generation_id,
                     stored_size: segment.payload.len(),
-                    segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                    segment_crc64: checksum::crc64::checksum(&segment.payload),
                     ec: segment.written.ec,
                 },
                 &mut recovered,
@@ -1686,7 +1686,7 @@ fn placed_segment_recovery_treats_checksum_corrupt_shard_as_recoverable() {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &mut recovered,
@@ -1734,7 +1734,7 @@ fn placed_segment_recovery_treats_missing_shard_as_recoverable() {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &mut recovered,
@@ -1782,7 +1782,7 @@ fn placed_segment_recovery_rejects_more_missing_shards_than_ec_can_tolerate() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
         stored_size: segment.payload.len(),
-        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
     let mut recovered = Vec::new();
@@ -1849,7 +1849,7 @@ fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shard
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &shard_indices,
@@ -1879,7 +1879,7 @@ fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shard
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &mut read_back,
@@ -1939,7 +1939,7 @@ fn placed_segment_payload_shard_repair_targets_identifies_and_clears_missing_and
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
         stored_size: segment.payload.len(),
-        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
     let targets = cluster
@@ -1984,7 +1984,7 @@ fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
             segment_okh: [7; 16],
             segment_vid: crate::GenerationId::MIN,
             stored_size: 1,
-            segment_crc64: Some(0),
+            segment_crc64: 0,
             ec: EcShape { k: 0, m: 1 },
         })
         .unwrap_err();
@@ -2018,7 +2018,7 @@ fn repair_placed_segment_payload_shards_if_needed_noops_for_clean_segment() {
             segment_okh: segment.segment_okh,
             segment_vid: segment.generation_id,
             stored_size: segment.payload.len(),
-            segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+            segment_crc64: checksum::crc64::checksum(&segment.payload),
             ec: segment.written.ec,
         })
         .unwrap();
@@ -2077,7 +2077,7 @@ fn repair_placed_segment_payload_shards_if_needed_repairs_identified_targets() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
         stored_size: segment.payload.len(),
-        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
     let repaired = cluster
@@ -2139,7 +2139,7 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
         stored_size: segment.payload.len(),
-        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
 
@@ -2213,7 +2213,7 @@ fn repair_placed_segment_payload_shard_queues_other_failed_shards_after_verifica
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
         stored_size: segment.payload.len(),
-        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
 
@@ -2289,7 +2289,7 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &[shard_index],
@@ -2317,7 +2317,7 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &mut read_back,
@@ -2378,7 +2378,7 @@ fn repair_placed_segment_payload_shards_rejects_non_active_pg_route_without_writ
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.generation_id,
                     stored_size: segment.payload.len(),
-                    segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                    segment_crc64: checksum::crc64::checksum(&segment.payload),
                     ec: segment.written.ec,
                 },
                 &[shard_index],
@@ -2439,7 +2439,7 @@ fn repair_placed_segment_payload_shards_rejects_stale_operation_epoch_without_wr
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
                 stored_size: segment.payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+                segment_crc64: checksum::crc64::checksum(&segment.payload),
                 ec: segment.written.ec,
             },
             &[shard_index],
@@ -2483,7 +2483,7 @@ fn repair_placed_segment_payload_shards_rejects_invalid_target_sets() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
         stored_size: segment.payload.len(),
-        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
 

@@ -619,6 +619,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         version_id: VersionId::Null,
         part_number: 1,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [1u8; 16],
@@ -705,6 +706,7 @@ fn list_completed_multipart_upload_records_for_bucket_page_paginates() {
             version_id: VersionId::Null,
             part_number: 1,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![completion_order as u8],
             etag_kind: EtagKind::Crc64,
             part_okh: [completion_order as u8; 16],
@@ -2122,6 +2124,7 @@ fn mpu_part_checksum_round_trip() {
             part_number: 1,
             generation: 0,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -2145,6 +2148,7 @@ fn mpu_part_checksum_round_trip() {
             part_number: 2,
             generation: 0,
             size: 512,
+            payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
             part_okh: [2u8; 16],
@@ -2175,6 +2179,7 @@ fn mpu_object_part_checksum_round_trip() {
                 version_id: VersionId::from_u64(1),
                 part_number: 1,
                 size: 5 * 1024 * 1024,
+                payload_crc64: 0,
                 etag: vec![0xAA],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [1u8; 16],
@@ -2190,6 +2195,7 @@ fn mpu_object_part_checksum_round_trip() {
                 version_id: VersionId::from_u64(1),
                 part_number: 2,
                 size: 1024,
+                payload_crc64: 0,
                 etag: vec![0xBB],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [2u8; 16],
@@ -2271,6 +2277,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             version_id: VersionId::Null,
             part_number: 1,
             size: 5 * 1024 * 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -2286,6 +2293,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             version_id: VersionId::Null,
             part_number: 2,
             size: 1024 * 1024,
+            payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
             part_okh: [2u8; 16],
@@ -2386,6 +2394,7 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         version_id: VersionId::Null,
         part_number: 1,
         size: 32,
+        payload_crc64: 0,
         etag: vec![7; 8],
         etag_kind: EtagKind::Crc64,
         part_okh: [3; 16],
@@ -2486,6 +2495,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         version_id,
         part_number: 1,
         size: 64,
+        payload_crc64: 0,
         etag: vec![8; 8],
         etag_kind: EtagKind::Crc64,
         part_okh: [4; 16],
@@ -2580,6 +2590,7 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
                     version_id: VersionId::Null,
                     part_number: 1,
                     size: 8,
+                    payload_crc64: 0,
                     etag: vec![1; 8],
                     etag_kind: EtagKind::Crc64,
                     part_okh: [1; 16],
@@ -2699,6 +2710,7 @@ fn mpu_delete_upload_cascades_parts() {
             part_number: 1,
             generation: 0,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -2770,6 +2782,7 @@ fn mpu_upsert_part_and_get() {
             part_number: 1,
             generation: 0,
             size: 5 * 1024 * 1024,
+            payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
             part_okh: [2u8; 16],
@@ -2798,6 +2811,7 @@ fn mpu_upsert_part_and_get() {
             part_number: 1,
             generation: 1,
             size: 6 * 1024 * 1024,
+            payload_crc64: 0,
             etag: vec![0xCC],
             etag_kind: EtagKind::Crc64,
             part_okh: [3u8; 16],
@@ -2848,6 +2862,7 @@ fn mpu_list_parts_pagination() {
                 part_number: i,
                 generation: 0,
                 size: 1024 * i as u64,
+                payload_crc64: 0,
                 etag: vec![i as u8],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [i as u8; 16],
@@ -3150,6 +3165,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             part_number: 1,
             generation: 0,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -3192,6 +3208,7 @@ fn mpu_corrupted_object_part_okh_returns_error() {
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -3340,6 +3357,7 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
             part_number: 1,
             generation: 0,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -3382,6 +3400,7 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [1u8; 16],
@@ -3426,6 +3445,7 @@ fn mpu_commit_and_get_object_parts() {
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 5 * 1024 * 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -3441,6 +3461,7 @@ fn mpu_commit_and_get_object_parts() {
             version_id: VersionId::from_u64(1),
             part_number: 2,
             size: 3 * 1024 * 1024,
+            payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
             part_okh: [2u8; 16],
@@ -3491,6 +3512,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 5 * mib,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -3506,6 +3528,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             version_id: VersionId::from_u64(1),
             part_number: 2,
             size: 3 * mib,
+            payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
             part_okh: [2u8; 16],
@@ -3521,6 +3544,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             version_id: VersionId::from_u64(1),
             part_number: 3,
             size: 2 * mib,
+            payload_crc64: 0,
             etag: vec![0xCC],
             etag_kind: EtagKind::Crc64,
             part_okh: [3u8; 16],
@@ -3574,6 +3598,7 @@ fn mpu_delete_object_parts() {
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 1024,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [1u8; 16],
@@ -3642,6 +3667,7 @@ fn make_part(upload_id: &str, part_number: u32, generation: u32) -> MultipartPar
         part_number,
         generation,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [part_number as u8; 16],
@@ -3710,6 +3736,7 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [1u8; 16],
@@ -3909,6 +3936,7 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [1u8; 16],
@@ -4091,6 +4119,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [1u8; 16],
@@ -5251,7 +5280,7 @@ fn stream_segment_append_and_list() {
                 session_id: stream_session_id("sess-segments"),
                 segment_index: i,
                 size: (i as u64 + 1) * 1000,
-                segment_crc64: Some((i as u64) + 10),
+                segment_crc64: (i as u64) + 10,
                 segment_okh: [i as u8; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 data_pg_id: i,
@@ -5271,8 +5300,8 @@ fn stream_segment_append_and_list() {
     assert_eq!(segments[1].size, 2000);
     assert_eq!(segments[2].segment_index, 2);
     assert_eq!(segments[2].size, 3000);
-    assert_eq!(segments[0].segment_crc64, Some(10));
-    assert_eq!(segments[2].segment_crc64, Some(12));
+    assert_eq!(segments[0].segment_crc64, 10);
+    assert_eq!(segments[2].segment_crc64, 12);
     assert_eq!(segments[0].segment_okh, [0u8; 16]);
     assert_eq!(segments[2].data_pg_id, 2);
 }
@@ -5309,7 +5338,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         session_id: stream_session_id("sess-publish"),
         segment_index: 0,
         size: 4,
-        segment_crc64: Some(99),
+        segment_crc64: 99,
         segment_okh: [0x44; 16],
         segment_vid: GenerationId::new(1).unwrap(),
         data_pg_id: 0,
@@ -5349,7 +5378,7 @@ fn stream_segment_cascade_delete() {
             session_id: stream_session_id("sess-cascade"),
             segment_index: 0,
             size: 4096,
-            segment_crc64: None,
+            segment_crc64: 0,
             segment_okh: [0xAA; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             data_pg_id: 0,
@@ -5400,7 +5429,7 @@ fn put_object_with_segments_persists_manifest() {
                     version_id: VersionId::Null,
                     segment_index: 0,
                     size: 4_000_000,
-                    segment_crc64: None,
+                    segment_crc64: 0,
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::MIN,
                     data_pg_id: 0,
@@ -5413,7 +5442,7 @@ fn put_object_with_segments_persists_manifest() {
                     version_id: VersionId::Null,
                     segment_index: 1,
                     size: 2_000_000,
-                    segment_crc64: None,
+                    segment_crc64: 0,
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::MIN,
                     data_pg_id: 0,
@@ -5469,7 +5498,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
-                segment_crc64: None,
+                segment_crc64: 0,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::MIN,
                 data_pg_id: 0,
@@ -5505,7 +5534,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 200,
-                segment_crc64: None,
+                segment_crc64: 0,
                 segment_okh: [2; 16],
                 segment_vid: GenerationId::MIN,
                 data_pg_id: 1,
@@ -5558,7 +5587,7 @@ fn delete_object_segments_cleanup() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
-                segment_crc64: None,
+                segment_crc64: 0,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 data_pg_id: 0,
@@ -5591,17 +5620,17 @@ fn multipart_part_segments_crud() {
     let conn = store.connection();
     conn.execute(
         "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
-          segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
+         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
+          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, 41, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
         [multipart_upload_id("uid-1").into_string()],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
-          segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
+         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
+          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, 42, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
         [multipart_upload_id("uid-1").into_string()],
     )
     .unwrap();
@@ -5618,8 +5647,10 @@ fn multipart_part_segments_crud() {
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
     assert_eq!(segments[0].size, 4_000_000);
+    assert_eq!(segments[0].segment_crc64, 41);
     assert_eq!(segments[1].segment_index, 1);
     assert_eq!(segments[1].size, 2_000_000);
+    assert_eq!(segments[1].segment_crc64, 42);
 
     // Delete
     store
@@ -5668,6 +5699,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         part_number: 1,
         generation,
         size,
+        payload_crc64: 0,
         etag: vec![1],
         etag_kind: EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -5685,7 +5717,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         part_number: 1,
         segment_index,
         size,
-        segment_crc64: Some(u64::from(fill) + u64::from(segment_index)),
+        segment_crc64: u64::from(fill) + u64::from(segment_index),
         segment_okh: [fill; 16],
         segment_vid: GenerationId::MIN,
         data_pg_id: 0,
@@ -5707,8 +5739,8 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         .unwrap();
     assert_eq!(prev_gen, Some(0));
     assert_eq!(prev_segments.len(), 2);
-    assert_eq!(prev_segments[0].segment_crc64, Some(0x11));
-    assert_eq!(prev_segments[1].segment_crc64, Some(0x23));
+    assert_eq!(prev_segments[0].segment_crc64, 0x11);
+    assert_eq!(prev_segments[1].segment_crc64, 0x23);
     assert_eq!(prev_segments[0].segment_okh, [0x11; 16]);
     assert_eq!(prev_segments[1].segment_okh, [0x22; 16]);
 
@@ -5722,7 +5754,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-1"))
         .unwrap();
     assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].segment_crc64, Some(0x33));
+    assert_eq!(segments[0].segment_crc64, 0x33);
     assert_eq!(segments[0].segment_okh, [0x33; 16]);
 }
 
@@ -5755,6 +5787,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         part_number: 1,
         generation: 0,
         size,
+        payload_crc64: 0,
         etag: vec![1],
         etag_kind: EtagKind::Crc64,
         part_okh: [0xAA; 16],
@@ -5788,7 +5821,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             part_number: 1,
             segment_index: i,
             size: 1000,
-            segment_crc64: None,
+            segment_crc64: 0,
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             data_pg_id: i,
@@ -5837,7 +5870,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         part_number: 1,
         segment_index: 0,
         size: 5000,
-        segment_crc64: None,
+        segment_crc64: 0,
         segment_okh: [0x22; 16],
         segment_vid: GenerationId::new(2).unwrap(),
         data_pg_id: 0,
@@ -5916,6 +5949,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
                 part_number: 1,
                 generation: 0,
                 size: 100,
+                payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [0xAA; 16],
@@ -5981,6 +6015,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 part_number: 1,
                 generation: 0,
                 size: 2000,
+                payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [0xAA; 16],
@@ -5999,7 +6034,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     part_number: 1,
                     segment_index: 0,
                     size: 1000,
-                    segment_crc64: None,
+                    segment_crc64: 0,
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
                     data_pg_id: 0,
@@ -6014,7 +6049,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     part_number: 1,
                     segment_index: 1,
                     size: 1000,
-                    segment_crc64: None,
+                    segment_crc64: 0,
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
                     data_pg_id: 1,
@@ -6059,6 +6094,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 part_number: 1,
                 generation: 0,
                 size: 0,
+                payload_crc64: 0,
                 etag: vec![2],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [0xBB; 16],
@@ -6542,6 +6578,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 part_number: 1,
                 generation: 0,
                 size: 100,
+                payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [0xAA; 16],
@@ -6559,7 +6596,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 part_number: 99, // wrong!
                 segment_index: 0,
                 size: 100,
-                segment_crc64: None,
+                segment_crc64: 0,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 data_pg_id: 0,
@@ -6622,6 +6659,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 part_number: 1,
                 generation: 0,
                 size: 100,
+                payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
                 part_okh: [0xAA; 16],
@@ -6639,7 +6677,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 part_number: 1,
                 segment_index: 0,
                 size: 100,
-                segment_crc64: None,
+                segment_crc64: 0,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 data_pg_id: 0,
@@ -6665,9 +6703,9 @@ fn malformed_segment_okh_returns_db_error() {
     let conn = store.connection();
     conn.execute(
         "INSERT INTO object_segments \
-         (bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
-          data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 0, 0, 100, X'AABB', 1, 0, 4, 2)",
+         (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
+          segment_vid, data_pg_id, ec_k, ec_m) \
+         VALUES ('bucket', 'k', 0, 0, 100, 99, X'AABB', 1, 0, 4, 2)",
         [],
     )
     .unwrap();
@@ -6689,9 +6727,9 @@ fn malformed_multipart_segment_okh_returns_db_error() {
     let conn = store.connection();
     conn.execute(
         "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
-          segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
+         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
+          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'AABB', 1, 0, 4, 2)",
         [multipart_upload_id("mpu-bad").into_string()],
     )
     .unwrap();
@@ -7907,6 +7945,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             part_number: 1,
             generation: 0,
             size: 100,
+            payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
             part_okh: [
@@ -7927,8 +7966,8 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
+          segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
         [multipart_upload_id("mpu-seg").into_string()],
     )
     .unwrap();
@@ -8314,6 +8353,7 @@ fn complete_multipart_commit_no_such_upload() {
         version_id: VersionId::Null,
         part_number: 1,
         size: 1024,
+        payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_okh: [1u8; 16],
@@ -8643,6 +8683,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         version_id: VersionId::Versioned(NonZeroU64::new(1).unwrap()),
         part_number: 1,
         size: 32,
+        payload_crc64: 0,
         etag: vec![5; 8],
         etag_kind: EtagKind::Crc64,
         part_okh: [9; 16],

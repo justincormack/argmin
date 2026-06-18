@@ -1725,7 +1725,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: first_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(first_payload)),
+                segment_crc64: checksum::crc64::checksum(first_payload),
                 segment_okh: [0x38; 16],
             },
         )
@@ -1756,7 +1756,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                 session_id: session_id.clone(),
                 segment_index: 1,
                 size: second_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(second_payload)),
+                segment_crc64: checksum::crc64::checksum(second_payload),
                 segment_okh: [0x39; 16],
             },
         )
@@ -1867,7 +1867,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
                     stored_size: payload.len(),
-                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_crc64: checksum::crc64::checksum(payload),
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -1962,7 +1962,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x3b; 16],
             },
         )
@@ -2018,6 +2018,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 part_number: 1,
                 generation: 0,
                 size: staging_segments.iter().map(|segment| segment.size).sum(),
+                payload_crc64: 0,
                 etag: vec![0x3b; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
@@ -2110,7 +2111,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 stored_size: payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 ec: EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -2991,7 +2992,7 @@ fn multipart_abort_zero_apply_leaves_upload_in_progress_before_retry() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: staged_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(staged_payload)),
+                segment_crc64: checksum::crc64::checksum(staged_payload),
                 segment_okh: staged_okh,
             },
         )

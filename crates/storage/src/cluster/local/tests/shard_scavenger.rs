@@ -458,7 +458,7 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
             segment_okh,
             segment_vid: generation_id,
             stored_size: payload.len(),
-            segment_crc64: Some(checksum::crc64::checksum(payload)),
+            segment_crc64: checksum::crc64::checksum(payload),
             ec: written.ec,
         },
         shard_index: misplaced_shard.shard_index(),

@@ -2555,7 +2555,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
         object_lock: crate::ObjectLockState::default(),
         encryption: crate::ObjectEncryption::None,
         segment_index: 0,
-        segment_crc64: Some(checksum::crc64::checksum(payload)),
+        segment_crc64: checksum::crc64::checksum(payload),
         segment_okh,
         segment_vid: generation_id,
         data_pg_id: written.data_pg_id,

@@ -34,7 +34,7 @@ pub(super) struct ReadRuntime {
 pub(super) struct SegmentPayloadRecord {
     pub(super) segment_index: u32,
     pub(super) size: u64,
-    pub(super) segment_crc64: Option<u64>,
+    pub(super) segment_crc64: u64,
     pub(super) segment_okh: [u8; 16],
     pub(super) segment_vid: GenerationId,
     pub(super) data_pg_id: u32,
@@ -532,7 +532,7 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
             vec![SegmentPayloadRecord {
                 segment_index: 0,
                 size: part.size,
-                segment_crc64: None,
+                segment_crc64: part.payload_crc64,
                 segment_okh: part.part_okh,
                 segment_vid: part.part_vid,
                 data_pg_id: part.data_pg_id,

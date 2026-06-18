@@ -7596,6 +7596,14 @@ Shard repair design:
   missing its expected file, and emits the same in-memory wake hint used by
   read-discovered repair work. References without enough repair proof still
   suppress false orphan observations but remain observation-only.
+- Clarified the checksum layering used by repair. Client/API checksums remain
+  optional, but when supplied they are semantic object/part metadata and must be
+  persisted and validated on reads according to S3 behavior. Internal storage
+  CRC64 is separate and mandatory for data-plane stored items: direct object
+  segments, stream-upload segments, multipart-part segments, whole placed
+  multipart parts, and completed object parts now carry a non-optional CRC64
+  used by read validation, EC reconstruction, scrub findings, and durable shard
+  repair scheduling.
 - Remaining shard-repair queue work: decide whether completed repair
   verification should persist richer per-shard outcome telemetry. Background
   scan cursor/progress does not need to be durable; a scanner can restart from a

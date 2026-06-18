@@ -6558,8 +6558,8 @@ impl StorageCluster {
                             data_pg_id,
                             okh: reference.part_okh,
                             generation_id: reference.part_vid,
-                            stored_size: 0,
-                            crc64: None,
+                            stored_size: reference.stored_size,
+                            crc64: Some(reference.crc64),
                             ec: reference.ec,
                         };
                         self.extend_referenced_shard_set(&mut scan, &reference)?;
@@ -6586,7 +6586,7 @@ impl StorageCluster {
             segment_okh: reference.okh,
             segment_vid: reference.generation_id,
             stored_size: reference.stored_size as usize,
-            segment_crc64: Some(crc64),
+            segment_crc64: crc64,
             ec: reference.ec,
         });
         for key in
@@ -7121,10 +7121,6 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        let Some(expected_crc64) = req.segment_crc64 else {
-            return Ok(false);
-        };
-
         let locations = self.segment_payload_locations(&req)?;
         let k = req.ec.k as usize;
         let padded = req.stored_size.div_ceil(k) * k;
@@ -7188,7 +7184,7 @@ impl StorageCluster {
 
         dst.truncate(req.stored_size);
         let actual_crc64 = checksum::crc64::checksum(dst);
-        Ok(actual_crc64 == expected_crc64)
+        Ok(actual_crc64 == req.segment_crc64)
     }
 
     fn try_read_placed_segment_recovery_into(
@@ -7294,14 +7290,12 @@ impl StorageCluster {
             }
         }
         dst.truncate(req.stored_size);
-        if let Some(expected_crc64) = req.segment_crc64 {
-            let actual_crc64 = checksum::crc64::checksum(dst);
-            if actual_crc64 != expected_crc64 {
-                return Err(StoreError::IntegrityError {
-                    expected: expected_crc64,
-                    actual: actual_crc64,
-                });
-            }
+        let actual_crc64 = checksum::crc64::checksum(dst);
+        if actual_crc64 != req.segment_crc64 {
+            return Err(StoreError::IntegrityError {
+                expected: req.segment_crc64,
+                actual: actual_crc64,
+            });
         }
         if schedule_repair_on_recovery {
             for shard_index in repair_targets {

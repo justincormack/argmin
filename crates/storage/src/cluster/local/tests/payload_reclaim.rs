@@ -140,7 +140,7 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh,
             },
         )
@@ -182,7 +182,7 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
                 segment_okh: segment_record.segment_okh,
                 segment_vid: segment_record.segment_vid,
                 stored_size: payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 ec: EcShape {
                     k: segment_record.ec_k,
                     m: segment_record.ec_m,

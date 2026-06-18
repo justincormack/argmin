@@ -101,9 +101,9 @@ const STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_SCAVENGER_PAYLOAD_REFERENCE_MIN_LEN: usize = 1 + 4 + 16 + 8 + 2;
 const STORAGE_RPC_SCAVENGER_OBSERVATION_MIN_LEN: usize =
     STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
-const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN: usize = 4 + 16 + 8 + 8 + 1 + 2 + 1;
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN: usize = 4 + 16 + 8 + 8 + 8 + 2 + 1;
 const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MAX_LEN: usize =
-    STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN + 8;
+    STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN;
 const STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN: usize =
     STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN + 8 + 8 + 8 + 1;
 const STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_RECORD_PAYLOAD_LEN: usize =
@@ -316,22 +316,22 @@ const STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 1 + 8 + 4 + 16;
+    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 8 + 4 + 16;
 const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_ABORT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
-const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
+const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
-    4 + 4 + 8 + 4 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
+    4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
-    4 + SESSION_ID_LEN + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
+    4 + SESSION_ID_LEN + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
-    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1;
+    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
-    4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 1 + 4 + 16 + 8 + 4 + 2;
+    4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 4
@@ -10463,11 +10463,6 @@ fn validate_placed_segment_shard_repair_claim_identity(
 fn validate_placed_segment_shard_repair_work_item(
     work_item: &PlacedSegmentShardRepairWorkItem,
 ) -> Result<(), StorageRpcPayloadError> {
-    if work_item.request.segment_crc64.is_none() {
-        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-            "placed segment repair work item requires segment CRC64",
-        ));
-    }
     let total = work_item
         .request
         .ec
@@ -11652,7 +11647,7 @@ impl<'a> StorageRpcDecoder<'a> {
         let object_lock = self.read_object_lock_state()?;
         let encryption = self.read_object_encryption()?;
         let segment_index = self.read_u32()?;
-        let segment_crc64 = self.read_optional_u64()?;
+        let segment_crc64 = self.read_u64()?;
         let segment_okh_bytes = self.read_bytes()?;
         let segment_okh: [u8; 16] = segment_okh_bytes.try_into().map_err(|_| {
             StorageRpcPayloadError::InvalidObjectMetadataRequest(
@@ -11822,7 +11817,7 @@ impl<'a> StorageRpcDecoder<'a> {
             session_id: self.read_session_id()?,
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_16_bytes("stream segment append OKH")?,
         })
     }
@@ -12144,7 +12139,7 @@ impl<'a> StorageRpcDecoder<'a> {
             session_id: self.read_session_id()?,
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_16_bytes("stream upload segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
@@ -12421,6 +12416,7 @@ impl<'a> StorageRpcDecoder<'a> {
             part_number: self.read_u32()?,
             generation: self.read_u32()?,
             size: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             etag: self.read_bytes()?.to_vec(),
             etag_kind: EtagKind::from_u8(self.read_u8()?).ok_or(
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid etag kind"),
@@ -12590,7 +12586,7 @@ impl<'a> StorageRpcDecoder<'a> {
             version_id: VersionId::from_u64(self.read_u64()?),
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_16_bytes("object segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
@@ -12606,6 +12602,7 @@ impl<'a> StorageRpcDecoder<'a> {
             version_id: VersionId::from_u64(self.read_u64()?),
             part_number: self.read_u32()?,
             size: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             etag: self.read_bytes()?.to_vec(),
             etag_kind: EtagKind::from_u8(self.read_u8()?).ok_or(
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid etag kind"),
@@ -12630,7 +12627,7 @@ impl<'a> StorageRpcDecoder<'a> {
             part_number: self.read_u32()?,
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
-            segment_crc64: self.read_optional_u64()?,
+            segment_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_16_bytes("multipart part segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
@@ -12960,7 +12957,7 @@ impl<'a> StorageRpcDecoder<'a> {
             segment_okh: self.read_16_bytes()?,
             segment_vid: self.read_generation_id()?,
             stored_size: self.read_u64()? as usize,
-            segment_crc64: self.read_optional_u64()?,
+            segment_crc64: self.read_u64()?,
             ec: self.read_ec_shape()?,
         })
     }
@@ -13045,6 +13042,8 @@ impl<'a> StorageRpcDecoder<'a> {
                     key: self.read_object_key()?,
                     object_generation_id: self.read_generation_id()?,
                     part_number: self.read_u32()?,
+                    stored_size: self.read_u64()?,
+                    crc64: self.read_u64()?,
                     part_okh: self.read_16_bytes()?,
                     part_vid: self.read_generation_id()?,
                     ec: self.read_ec_shape()?,
@@ -13765,7 +13764,7 @@ fn put_commit_direct_put_object_req(out: &mut Vec<u8>, request: &CommitDirectPut
     put_object_lock_state(out, request.object_lock);
     put_object_encryption(out, &request.encryption);
     put_u32(out, request.segment_index);
-    put_optional_u64(out, request.segment_crc64);
+    put_u64(out, request.segment_crc64);
     put_bytes(out, &request.segment_okh);
     put_u64(out, request.segment_vid.get());
     put_u32(out, request.data_pg_id);
@@ -13873,7 +13872,7 @@ fn put_prepare_stream_segment_append_req(
     put_string(out, request.session_id.as_str());
     put_u32(out, request.segment_index);
     put_u64(out, request.size);
-    put_optional_u64(out, request.segment_crc64);
+    put_u64(out, request.segment_crc64);
     put_bytes(out, &request.segment_okh);
 }
 
@@ -13978,7 +13977,7 @@ fn put_stream_upload_segment_record(out: &mut Vec<u8>, segment: &StreamUploadSeg
     put_string(out, segment.session_id.as_str());
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
-    put_optional_u64(out, segment.segment_crc64);
+    put_u64(out, segment.segment_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -14193,6 +14192,7 @@ fn put_multipart_part_record(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     put_u32(out, part.part_number);
     put_u32(out, part.generation);
     put_u64(out, part.size);
+    put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
@@ -14449,7 +14449,7 @@ fn put_object_segment_record(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_u64(out, segment.version_id.to_u64());
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
-    put_optional_u64(out, segment.segment_crc64);
+    put_u64(out, segment.segment_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -14463,6 +14463,7 @@ fn put_object_part_record(out: &mut Vec<u8>, part: &ObjectPartRecord) {
     put_u64(out, part.version_id.to_u64());
     put_u32(out, part.part_number);
     put_u64(out, part.size);
+    put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
@@ -14484,7 +14485,7 @@ fn put_multipart_part_segment_record(out: &mut Vec<u8>, segment: &MultipartPartS
     put_u32(out, segment.part_number);
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
-    put_optional_u64(out, segment.segment_crc64);
+    put_u64(out, segment.segment_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -14602,7 +14603,7 @@ fn put_segment_stored_bytes_request(out: &mut Vec<u8>, request: &SegmentStoredBy
     out.extend_from_slice(&request.segment_okh);
     put_u64(out, request.segment_vid.get());
     put_u64(out, request.stored_size as u64);
-    put_optional_u64(out, request.segment_crc64);
+    put_u64(out, request.segment_crc64);
     put_ec_shape(out, request.ec);
 }
 
@@ -14656,6 +14657,8 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_string(out, reference.key.as_str());
             put_u64(out, reference.object_generation_id.get());
             put_u32(out, reference.part_number);
+            put_u64(out, reference.stored_size);
+            put_u64(out, reference.crc64);
             out.extend_from_slice(&reference.part_okh);
             put_u64(out, reference.part_vid.get());
             put_ec_shape(out, reference.ec);
@@ -15884,7 +15887,7 @@ mod tests {
                 segment_okh: [0x5A; 16],
                 segment_vid: GenerationId::new(88).unwrap(),
                 stored_size: 4096,
-                segment_crc64: Some(0xCAFE),
+                segment_crc64: 0xCAFE,
                 ec: EcShape { k: 2, m: 1 },
             },
             shard_index: ShardIndex::new(2),
@@ -15936,49 +15939,6 @@ mod tests {
             .unwrap(),
             vec![repair]
         );
-        let missing_crc_work_item = PlacedSegmentShardRepairWorkItem {
-            request: SegmentStoredBytesRequest {
-                segment_crc64: None,
-                ..work_item.request
-            },
-            shard_index: work_item.shard_index,
-        };
-        assert!(matches!(
-            encode_placed_segment_shard_repair_item_request(
-                &StorageRpcPlacedSegmentShardRepairItemRequest {
-                    route: route.clone(),
-                    work_item: missing_crc_work_item,
-                }
-            ),
-            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(_))
-        ));
-        assert!(matches!(
-            encode_placed_segment_shard_repairs_response(&[PlacedSegmentShardRepairRecord {
-                work_item: missing_crc_work_item,
-                first_seen_at: 10,
-                last_seen_at: 20,
-                observation_count: 1,
-                last_error: None,
-            }]),
-            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(_))
-        ));
-        let mut missing_crc_response = Vec::new();
-        put_u32(&mut missing_crc_response, 1);
-        put_placed_segment_shard_repair_record(
-            &mut missing_crc_response,
-            &PlacedSegmentShardRepairRecord {
-                work_item: missing_crc_work_item,
-                first_seen_at: 10,
-                last_seen_at: 20,
-                observation_count: 1,
-                last_error: None,
-            },
-        );
-        assert!(matches!(
-            decode_placed_segment_shard_repairs_response(&missing_crc_response),
-            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(_))
-        ));
-
         let claim_acquire = StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
             route: route.clone(),
             claim_id: "claim-1".to_string(),
@@ -16168,6 +16128,8 @@ mod tests {
                     key: crate::tests::object_key("scavenger-codec-key"),
                     object_generation_id: GenerationId::new(6).unwrap(),
                     part_number: 7,
+                    stored_size: 8192,
+                    crc64: 0xCAFE,
                     part_okh: [8; 16],
                     part_vid: GenerationId::new(9).unwrap(),
                     ec: EcShape { k: 4, m: 2 },
@@ -17956,6 +17918,7 @@ mod tests {
             version_id: VersionId::from_u64(7),
             part_number: 1,
             size: 12,
+            payload_crc64: 99,
             etag: vec![8; 16],
             etag_kind: EtagKind::MultipartComposite,
             part_okh: [3; 16],
@@ -17973,7 +17936,7 @@ mod tests {
             part_number: 1,
             segment_index: 0,
             size: 12,
-            segment_crc64: Some(99),
+            segment_crc64: 99,
             segment_okh: [4; 16],
             segment_vid: GenerationId::new(12).unwrap(),
             data_pg_id: 5,
@@ -18098,7 +18061,7 @@ mod tests {
             object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
             segment_index: 0,
-            segment_crc64: Some(99),
+            segment_crc64: 99,
             segment_okh: [7; 16],
             segment_vid: GenerationId::new(10).unwrap(),
             data_pg_id: 3,

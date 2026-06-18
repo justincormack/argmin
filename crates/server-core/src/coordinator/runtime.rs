@@ -1683,7 +1683,7 @@ mod tests {
         let segment = SegmentPayloadRecord {
             segment_index: 0,
             size: 0,
-            segment_crc64: Some(0),
+            segment_crc64: 0,
             segment_okh: [61; 16],
             segment_vid: GenerationId::MIN,
             data_pg_id: 0,

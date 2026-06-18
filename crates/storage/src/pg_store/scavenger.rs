@@ -76,7 +76,7 @@ impl PgStore {
                     work_item.request.segment_okh.as_slice(),
                     work_item.request.segment_vid.get() as i64,
                     work_item.request.stored_size as i64,
-                    work_item.request.segment_crc64.map(|crc| crc as i64),
+                    work_item.request.segment_crc64 as i64,
                     work_item.request.ec.k as i64,
                     work_item.request.ec.m as i64,
                     work_item.shard_index.get() as i64,
@@ -674,7 +674,7 @@ impl PgStore {
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, part_okh, part_vid, size, NULL, ec_k, ec_m \
+            "SELECT data_pg_id, part_okh, part_vid, size, payload_crc64, ec_k, ec_m \
              FROM object_parts WHERE part_okh != zeroblob(16)",
             "list object part shard scavenger references",
         )?;
@@ -850,7 +850,7 @@ impl PgStore {
                 segment.segment_okh,
                 segment.segment_vid,
                 segment.size,
-                segment.segment_crc64,
+                Some(segment.segment_crc64),
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -873,7 +873,7 @@ impl PgStore {
                 part.part_okh,
                 part.part_vid,
                 part.size,
-                None,
+                Some(part.payload_crc64),
                 EcShape {
                     k: part.ec_k,
                     m: part.ec_m,
@@ -901,7 +901,7 @@ impl PgStore {
             segment.segment_okh,
             segment.segment_vid,
             segment.size,
-            segment.segment_crc64,
+            Some(segment.segment_crc64),
             EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
@@ -920,7 +920,7 @@ impl PgStore {
                 segment.segment_okh,
                 segment.segment_vid,
                 segment.size,
-                segment.segment_crc64,
+                Some(segment.segment_crc64),
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -946,6 +946,8 @@ impl PgStore {
                     key: key.clone(),
                     object_generation_id,
                     part_number: part.part_number,
+                    stored_size: part.size,
+                    crc64: part.payload_crc64,
                     part_okh: part.part_okh,
                     part_vid: part.part_vid,
                     ec: EcShape {
@@ -1121,7 +1123,7 @@ impl PgStore {
             .conn
             .prepare_cached(
                 "SELECT u.bucket, u.key, u.object_generation_id, p.part_number, \
-                 p.part_okh, p.part_vid, p.ec_k, p.ec_m \
+                 p.size, p.payload_crc64, p.part_okh, p.part_vid, p.ec_k, p.ec_m \
                  FROM multipart_parts p \
                  JOIN multipart_uploads u ON u.upload_id = p.upload_id \
                  WHERE p.part_okh != zeroblob(16)",
@@ -1129,7 +1131,7 @@ impl PgStore {
             .map_err(|source| StoreError::Db { context, source })?;
         let rows = stmt
             .query_map([], |row| {
-                let okh_blob: Vec<u8> = row.get(4)?;
+                let okh_blob: Vec<u8> = row.get(6)?;
                 Ok(ShardScavengerPayloadReference::RoutedMultipartPart(
                     ShardScavengerRoutedMultipartPartReference {
                         bucket: row.get(0)?,
@@ -1140,15 +1142,17 @@ impl PgStore {
                             "multipart upload object generation",
                         )?,
                         part_number: row.get(3)?,
-                        part_okh: PgStore::parse_okh_blob(&okh_blob, 4)?,
+                        stored_size: row.get::<_, i64>(4)? as u64,
+                        crc64: row.get::<_, i64>(5)? as u64,
+                        part_okh: PgStore::parse_okh_blob(&okh_blob, 6)?,
                         part_vid: PgStore::parse_generation_id(
-                            row.get::<_, i64>(5)?,
-                            5,
+                            row.get::<_, i64>(7)?,
+                            7,
                             "multipart part payload generation",
                         )?,
                         ec: EcShape {
-                            k: row.get(6)?,
-                            m: row.get(7)?,
+                            k: row.get(8)?,
+                            m: row.get(9)?,
                         },
                     },
                 ))
@@ -1324,11 +1328,6 @@ fn validate_placed_segment_shard_repair_pg(
 fn validate_placed_segment_shard_repair_work_item(
     work_item: &PlacedSegmentShardRepairWorkItem,
 ) -> Result<(), StoreError> {
-    if work_item.request.segment_crc64.is_none() {
-        return Err(StoreError::PayloadShardSetMismatch {
-            reason: "durable repair work item requires segment CRC64".to_string(),
-        });
-    }
     if work_item.request.ec.k == 0 {
         return Err(StoreError::PayloadShardSetMismatch {
             reason: "durable repair work item has invalid EC k=0".to_string(),
@@ -1491,7 +1490,7 @@ fn placed_segment_shard_repair_work_item_from_row(
             segment_okh,
             segment_vid,
             stored_size: row.get::<_, i64>(3)? as usize,
-            segment_crc64: row.get::<_, Option<i64>>(4)?.map(|crc| crc as u64),
+            segment_crc64: row.get::<_, i64>(4)? as u64,
             ec: EcShape {
                 k: row.get::<_, i64>(5)? as u8,
                 m: row.get::<_, i64>(6)? as u8,
@@ -1541,7 +1540,7 @@ mod tests {
                 segment_okh: [0xA7; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 stored_size: 1024,
-                segment_crc64: Some(0x1234),
+                segment_crc64: 0x1234,
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
@@ -1575,6 +1574,122 @@ mod tests {
     }
 
     #[test]
+    fn shard_scavenger_payload_references_include_part_size_and_crc() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO object_parts \
+                 (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, \
+                  etag, etag_kind, part_okh, part_vid, ec_k, ec_m, data_pg_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "bucket",
+                    "object",
+                    0i64,
+                    1i64,
+                    0i64,
+                    1234i64,
+                    0xAABB_i64,
+                    b"etag".as_slice(),
+                    0i64,
+                    [0x11u8; 16].as_slice(),
+                    9i64,
+                    4i64,
+                    2i64,
+                    7i64,
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, bucket, key, initiated_at, state, metadata_blob, system_metadata_blob, \
+                  owner_principal, owner_canonical_id, acl_grants, public_read, \
+                  object_generation_id, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "u".repeat(128),
+                    "bucket",
+                    "multipart",
+                    10i64,
+                    0i64,
+                    b"".as_slice(),
+                    b"".as_slice(),
+                    "owner",
+                    "c".repeat(32),
+                    "",
+                    0i64,
+                    22i64,
+                    0i64,
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_parts \
+                 (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m, last_modified) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "u".repeat(128),
+                    2i64,
+                    0i64,
+                    5678i64,
+                    0xCCDD_i64,
+                    b"etag".as_slice(),
+                    0i64,
+                    [0x22u8; 16].as_slice(),
+                    10i64,
+                    4i64,
+                    2i64,
+                    11i64,
+                ],
+            )
+            .unwrap();
+
+        let references = store.list_shard_scavenger_payload_references().unwrap();
+        let object_part = references
+            .iter()
+            .find_map(|reference| match reference {
+                ShardScavengerPayloadReference::Placed(reference)
+                    if reference.okh == [0x11; 16] =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .expect("object part placed reference should be listed");
+        assert_eq!(object_part.stored_size, 1234);
+        assert_eq!(object_part.crc64, Some(0xAABB));
+
+        let routed_part = references
+            .iter()
+            .find_map(|reference| match reference {
+                ShardScavengerPayloadReference::RoutedMultipartPart(reference)
+                    if reference.part_okh == [0x22; 16] =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .expect("multipart part routed reference should be listed");
+        assert_eq!(routed_part.bucket.as_str(), "bucket");
+        assert_eq!(routed_part.key.as_str(), "multipart");
+        assert_eq!(
+            routed_part.object_generation_id,
+            GenerationId::new(22).unwrap()
+        );
+        assert_eq!(routed_part.part_number, 2);
+        assert_eq!(routed_part.stored_size, 5678);
+        assert_eq!(routed_part.crc64, 0xCCDD);
+    }
+
+    #[test]
     fn placed_segment_shard_repair_list_is_bounded() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
@@ -1588,7 +1703,7 @@ mod tests {
                     segment_okh: okh,
                     segment_vid: GenerationId::new(42).unwrap(),
                     stored_size: 1024,
-                    segment_crc64: Some(index as u64),
+                    segment_crc64: index as u64,
                     ec: EcShape { k: 4, m: 2 },
                 },
                 shard_index: ShardIndex::new(5),
@@ -1614,7 +1729,7 @@ mod tests {
                 segment_okh: [0xA8; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 stored_size: 1024,
-                segment_crc64: Some(0x1234),
+                segment_crc64: 0x1234,
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
@@ -1631,36 +1746,10 @@ mod tests {
     }
 
     #[test]
-    fn placed_segment_shard_repair_requires_segment_crc64() {
+    fn placed_segment_shard_repair_schema_rejects_missing_crc_row() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
-        let work_item = PlacedSegmentShardRepairWorkItem {
-            request: SegmentStoredBytesRequest {
-                data_pg_id: 7,
-                segment_okh: [0xAC; 16],
-                segment_vid: GenerationId::new(42).unwrap(),
-                stored_size: 1024,
-                segment_crc64: None,
-                ec: EcShape { k: 4, m: 2 },
-            },
-            shard_index: ShardIndex::new(5),
-        };
-
-        assert!(matches!(
-            store.record_placed_segment_shard_repair(&work_item, None),
-            Err(StoreError::PayloadShardSetMismatch { .. })
-        ));
-        assert!(matches!(
-            store.resolve_placed_segment_shard_repair(&work_item),
-            Err(StoreError::PayloadShardSetMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn placed_segment_shard_repair_list_rejects_malformed_missing_crc_row() {
-        let tmp = test_util::tempdir();
-        let store = PgStore::open(tmp.path(), 7).unwrap();
-        store
+        let err = store
             .conn
             .execute(
                 "INSERT INTO placed_segment_shard_repairs \
@@ -1680,15 +1769,8 @@ mod tests {
                     1i64,
                 ],
             )
-            .unwrap();
-
-        assert!(matches!(
-            store.list_placed_segment_shard_repairs(),
-            Err(StoreError::Db {
-                context: "read placed segment shard repair",
-                ..
-            })
-        ));
+            .unwrap_err();
+        assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
     }
 
     #[test]
@@ -1701,7 +1783,7 @@ mod tests {
                 segment_okh: [0xA9; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 stored_size: 1024,
-                segment_crc64: Some(0x1234),
+                segment_crc64: 0x1234,
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
@@ -1823,7 +1905,7 @@ mod tests {
                 segment_okh: [0xAA; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 stored_size: 1024,
-                segment_crc64: Some(0x1234),
+                segment_crc64: 0x1234,
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
@@ -1883,7 +1965,7 @@ mod tests {
                 segment_okh: [0xAB; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 stored_size: 1024,
-                segment_crc64: Some(0x1234),
+                segment_crc64: 0x1234,
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),

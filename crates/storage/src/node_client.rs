@@ -296,6 +296,7 @@ pub(crate) fn complete_multipart_expected_object_parts(
             version_id,
             part_number: part.part_number,
             size: part.size,
+            payload_crc64: part.payload_crc64,
             etag: part.etag.clone(),
             etag_kind: part.etag_kind,
             part_okh: part.part_okh,

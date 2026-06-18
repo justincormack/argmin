@@ -504,7 +504,7 @@ impl Coordinator {
                     session_id: session_id.clone(),
                     segment_index,
                     size: logical_size,
-                    segment_crc64: Some(checksum::crc64::checksum(data)),
+                    segment_crc64: checksum::crc64::checksum(data),
                     segment_okh,
                 },
             )

@@ -500,7 +500,7 @@ impl PgStore {
                         segment.session_id,
                         segment.segment_index,
                         segment.size as i64,
-                        segment.segment_crc64.map(|v| v as i64),
+                        segment.segment_crc64 as i64,
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
                         segment.data_pg_id,

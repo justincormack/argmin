@@ -618,7 +618,7 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [89; 16],
             },
         )
@@ -707,7 +707,7 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 stored_size: payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 ec: EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -779,7 +779,7 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0xd4; 16],
             },
         )
@@ -889,7 +889,7 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [98; 16],
             },
         )
@@ -999,7 +999,7 @@ fn stream_abort_pending_drain_cleans_terminal_stream_session() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x45; 16],
             },
         )
@@ -1124,7 +1124,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: first_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(first_payload)),
+                segment_crc64: checksum::crc64::checksum(first_payload),
                 segment_okh: [0x4b; 16],
             },
         )
@@ -1156,7 +1156,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 session_id: session_id.clone(),
                 segment_index: 1,
                 size: second_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(second_payload)),
+                segment_crc64: checksum::crc64::checksum(second_payload),
                 segment_okh: [0x4c; 16],
             },
         )
@@ -1246,7 +1246,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
                     stored_size: payload.len(),
-                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_crc64: checksum::crc64::checksum(payload),
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -1378,7 +1378,7 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(payload_crc64),
+                segment_crc64: payload_crc64,
                 segment_okh: [0x49; 16],
             },
         )
@@ -1697,7 +1697,7 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(payload_crc64),
+                segment_crc64: payload_crc64,
                 segment_okh: [0x4c; 16],
             },
         )
@@ -1897,7 +1897,7 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(payload_crc64),
+                segment_crc64: payload_crc64,
                 segment_okh: [0x76; 16],
             },
         )
@@ -2064,7 +2064,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x47; 16],
             },
         )
@@ -2118,6 +2118,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
+        payload_crc64: 0,
         etag: vec![0x47; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2264,7 +2265,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x4b; 16],
             },
         )
@@ -2292,6 +2293,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
+        payload_crc64: 0,
         etag: vec![0x4b; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2462,7 +2464,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x4e; 16],
             },
         )
@@ -2490,6 +2492,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
+        payload_crc64: 0,
         etag: vec![0x4e; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2664,7 +2667,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x4d; 16],
             },
         )
@@ -2692,6 +2695,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
+        payload_crc64: 0,
         etag: vec![0x4d; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2880,7 +2884,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x59; 16],
             },
         )
@@ -2970,6 +2974,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                     .existing_part_generation
                     .map_or(0, |generation| generation + 1),
                 size: payload.len() as u64,
+                payload_crc64: 0,
                 etag: vec![0x59; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
@@ -3043,7 +3048,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 stored_size: payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(payload)),
+                segment_crc64: checksum::crc64::checksum(payload),
                 ec: EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -3112,7 +3117,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: first_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(first_payload)),
+                segment_crc64: checksum::crc64::checksum(first_payload),
                 segment_okh: [0x5a; 16],
             },
         )
@@ -3143,7 +3148,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 session_id: session_id.clone(),
                 segment_index: 1,
                 size: second_payload.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(second_payload)),
+                segment_crc64: checksum::crc64::checksum(second_payload),
                 segment_okh: [0x5d; 16],
             },
         )
@@ -3292,6 +3297,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                     .iter()
                     .map(|segment| segment.size)
                     .sum(),
+                payload_crc64: 0,
                 etag: vec![0x5a; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
@@ -3383,7 +3389,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
                     stored_size: payload.len(),
-                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_crc64: checksum::crc64::checksum(payload),
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
@@ -3507,7 +3513,7 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
                 segment_okh: first_segment.segment_okh,
                 segment_vid: first_segment.segment_vid,
                 stored_size: first_payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(first_payload)),
+                segment_crc64: checksum::crc64::checksum(first_payload),
                 ec: EcShape {
                     k: first_segment.ec_k,
                     m: first_segment.ec_m,
@@ -3529,7 +3535,7 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
                 segment_okh: second_segment.segment_okh,
                 segment_vid: second_segment.segment_vid,
                 stored_size: second_payload.len(),
-                segment_crc64: Some(checksum::crc64::checksum(second_payload)),
+                segment_crc64: checksum::crc64::checksum(second_payload),
                 ec: EcShape {
                     k: second_segment.ec_k,
                     m: second_segment.ec_m,
@@ -3575,7 +3581,7 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
         session_id: session_id.clone(),
         segment_index: 0,
         size: 16,
-        segment_crc64: Some(1),
+        segment_crc64: 1,
         segment_okh: [42; 16],
     };
 
@@ -3616,7 +3622,7 @@ fn stream_segment_prepare_allocates_vid_after_validation() {
         session_id: session_id.clone(),
         segment_index: 0,
         size: 16,
-        segment_crc64: Some(1),
+        segment_crc64: 1,
         segment_okh: [42; 16],
     };
 

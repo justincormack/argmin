@@ -367,7 +367,7 @@ fn upload_copied_test_multipart_part(
                     session_id: session_id.clone(),
                     segment_index: u32::try_from(segment_index).unwrap(),
                     size: payload.len() as u64,
-                    segment_crc64: Some(checksum::crc64::checksum(payload)),
+                    segment_crc64: checksum::crc64::checksum(payload),
                     segment_okh,
                 },
             )
@@ -417,6 +417,7 @@ fn upload_copied_test_multipart_part(
                     part_number,
                     generation,
                     size,
+                    payload_crc64: 0,
                     etag: vec![payload_seed; 8],
                     etag_kind: crate::EtagKind::Crc64,
                     part_okh: [0u8; 16],

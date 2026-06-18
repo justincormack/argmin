@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_repairs (
     segment_okh         BLOB NOT NULL CHECK (length(segment_okh) = 16),
     segment_vid         INTEGER NOT NULL CHECK (segment_vid > 0),
     stored_size         INTEGER NOT NULL CHECK (stored_size >= 0),
-    segment_crc64       INTEGER,
+    segment_crc64       INTEGER NOT NULL,
     ec_k                INTEGER NOT NULL CHECK (ec_k > 0),
     ec_m                INTEGER NOT NULL CHECK (ec_m >= 0),
     shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     part_number      INTEGER NOT NULL,
     generation       INTEGER NOT NULL,
     size             INTEGER NOT NULL,
+    payload_crc64    INTEGER NOT NULL,
     etag             BLOB NOT NULL,
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
     part_okh         BLOB NOT NULL,
@@ -229,6 +230,7 @@ CREATE TABLE IF NOT EXISTS object_parts (
     part_number      INTEGER NOT NULL,
     object_offset_start INTEGER NOT NULL,
     size             INTEGER NOT NULL,
+    payload_crc64    INTEGER NOT NULL,
     etag             BLOB NOT NULL,
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
     part_okh         BLOB NOT NULL,
@@ -301,7 +303,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     session_id    TEXT NOT NULL,
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
-    segment_crc64 INTEGER,
+    segment_crc64 INTEGER NOT NULL,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,
@@ -319,7 +321,7 @@ CREATE TABLE IF NOT EXISTS object_segments (
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
-    segment_crc64 INTEGER,
+    segment_crc64 INTEGER NOT NULL,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,
@@ -483,7 +485,7 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     part_number   INTEGER NOT NULL,
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
-    segment_crc64 INTEGER,
+    segment_crc64 INTEGER NOT NULL,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,
@@ -753,6 +755,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
+    migrate_part_payload_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
     migrate_acl_grant_columns(conn)?;
     migrate_object_write_sequence_columns(conn)?;
@@ -904,9 +907,9 @@ fn migrate_object_became_noncurrent_columns(conn: &Connection) -> Result<(), rus
 
 fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     let migrations = [
-        "ALTER TABLE stream_upload_segments ADD COLUMN segment_crc64 INTEGER",
-        "ALTER TABLE object_segments ADD COLUMN segment_crc64 INTEGER",
-        "ALTER TABLE multipart_part_segments ADD COLUMN segment_crc64 INTEGER",
+        "ALTER TABLE stream_upload_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE object_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE multipart_part_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
     ];
     for sql in &migrations {
         match conn.execute(sql, []) {
@@ -919,6 +922,22 @@ fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error>
             Err(e) => return Err(e),
         }
     }
+    Ok(())
+}
+
+fn migrate_part_payload_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "multipart_parts",
+        "payload_crc64",
+        "ALTER TABLE multipart_parts ADD COLUMN payload_crc64 INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "object_parts",
+        "payload_crc64",
+        "ALTER TABLE object_parts ADD COLUMN payload_crc64 INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 

@@ -1177,6 +1177,7 @@ impl Coordinator {
                         part_number,
                         generation,
                         size: total_size,
+                        payload_crc64: crc64,
                         etag: crc64_to_etag_bytes(crc64),
                         etag_kind: storage::EtagKind::Crc64,
                         part_okh: [0u8; 16],

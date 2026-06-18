@@ -526,7 +526,7 @@ fn stream_put_abort_cleans_segment_committed_during_abort_window() {
                         session_id: hook_session_id.clone(),
                         segment_index,
                         size: data.len() as u64,
-                        segment_crc64: Some(checksum::crc64::checksum(data)),
+                        segment_crc64: checksum::crc64::checksum(data),
                         segment_okh: storage::stream_segment_key_hash(
                             &hook_session_id,
                             segment_index,
