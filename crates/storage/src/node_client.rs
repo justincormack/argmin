@@ -199,12 +199,14 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsPgListRequest,
 };
 use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
+#[cfg(test)]
+use crate::types::BucketSnapshotTagsRequest;
 use crate::types::{
     AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord,
     BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot,
-    BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
-    CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+    BucketSnapshotPair, BucketSnapshotRequest, BucketState, BucketSubresourceKind,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
+    CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
     CompletedMultipartUploadRecordPage, CreateBucketConfig, CreateMultipartUploadReq,
     CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
     EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
@@ -255,29 +257,6 @@ pub(crate) use unix_admission::{
     UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
-
-fn merge_bucket_snapshot_pair_request(
-    source: BucketSnapshotRequest,
-    destination: BucketSnapshotRequest,
-) -> BucketSnapshotRequest {
-    BucketSnapshotRequest {
-        policy: source.policy || destination.policy,
-        tags: match (source.tags, destination.tags) {
-            (BucketSnapshotTagsRequest::Always, _) | (_, BucketSnapshotTagsRequest::Always) => {
-                BucketSnapshotTagsRequest::Always
-            }
-            (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
-            | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
-                BucketSnapshotTagsRequest::IfBucketAbacEnabled
-            }
-            (BucketSnapshotTagsRequest::NotRequested, BucketSnapshotTagsRequest::NotRequested) => {
-                BucketSnapshotTagsRequest::NotRequested
-            }
-        },
-        lifecycle: source.lifecycle || destination.lifecycle,
-        cors: source.cors || destination.cors,
-    }
-}
 
 fn load_multipart_upload_from_pg(
     pg: &crate::PgStore,

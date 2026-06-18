@@ -1731,7 +1731,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         if source.0 == destination.0 {
-            let merged_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
+            let merged_request = source.1.union(destination.1);
             let bucket = <Self as StorageNodeClient>::load_bucket_snapshot(
                 self,
                 source_pg_id,

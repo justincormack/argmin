@@ -2104,7 +2104,7 @@ impl UnixStorageNodeClient {
                         "same-bucket response for distinct bucket request".to_string(),
                     )));
                 }
-                let expected_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
+                let expected_request = source.1.union(destination.1);
                 if bucket.bucket.name != *source.0 || bucket.request != expected_request {
                     return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
                         "validate bucket snapshot pair response",

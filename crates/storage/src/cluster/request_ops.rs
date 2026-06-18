@@ -616,29 +616,6 @@ impl VersionCursor {
     }
 }
 
-fn merge_bucket_snapshot_pair_request(
-    source: BucketSnapshotRequest,
-    destination: BucketSnapshotRequest,
-) -> BucketSnapshotRequest {
-    BucketSnapshotRequest {
-        policy: source.policy || destination.policy,
-        tags: match (source.tags, destination.tags) {
-            (BucketSnapshotTagsRequest::Always, _) | (_, BucketSnapshotTagsRequest::Always) => {
-                BucketSnapshotTagsRequest::Always
-            }
-            (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
-            | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
-                BucketSnapshotTagsRequest::IfBucketAbacEnabled
-            }
-            (BucketSnapshotTagsRequest::NotRequested, BucketSnapshotTagsRequest::NotRequested) => {
-                BucketSnapshotTagsRequest::NotRequested
-            }
-        },
-        lifecycle: source.lifecycle || destination.lifecycle,
-        cors: source.cors || destination.cors,
-    }
-}
-
 fn conflicting_pending_metadata_command(context: &'static str) -> BucketSnapshotLoadError {
     StoreError::MetadataCommandContention { context }.into()
 }
@@ -2702,7 +2679,7 @@ impl super::StorageCluster {
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         if source.0 == destination.0 {
-            let merged_request = merge_bucket_snapshot_pair_request(source.1, destination.1);
+            let merged_request = source.1.union(destination.1);
             let bucket = self.load_bucket_snapshot(source.0, merged_request)?;
             return Ok(BucketSnapshotPair::Same {
                 bucket: Box::new(bucket),

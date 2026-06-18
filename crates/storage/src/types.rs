@@ -2373,6 +2373,17 @@ impl BucketSnapshotTagsRequest {
             Self::Always => true,
         }
     }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Always, _) | (_, Self::Always) => Self::Always,
+            (Self::IfBucketAbacEnabled, _) | (_, Self::IfBucketAbacEnabled) => {
+                Self::IfBucketAbacEnabled
+            }
+            (Self::NotRequested, Self::NotRequested) => Self::NotRequested,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2381,6 +2392,18 @@ pub struct BucketSnapshotRequest {
     pub tags: BucketSnapshotTagsRequest,
     pub lifecycle: bool,
     pub cors: bool,
+}
+
+impl BucketSnapshotRequest {
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            policy: self.policy || other.policy,
+            tags: self.tags.union(other.tags),
+            lifecycle: self.lifecycle || other.lifecycle,
+            cors: self.cors || other.cors,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
