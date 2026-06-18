@@ -1552,7 +1552,7 @@ pub struct EcShape {
     pub m: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SegmentStoredBytesRequest {
     pub data_pg_id: u32,
     pub segment_okh: [u8; 16],
@@ -1560,6 +1560,12 @@ pub struct SegmentStoredBytesRequest {
     pub stored_size: usize,
     pub segment_crc64: Option<u64>,
     pub ec: EcShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlacedSegmentShardRepairWorkItem {
+    pub request: SegmentStoredBytesRequest,
+    pub shard_index: ShardIndex,
 }
 
 /// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.

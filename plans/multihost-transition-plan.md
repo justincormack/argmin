@@ -7568,6 +7568,13 @@ Shard repair design:
   segment, repairs all identified targets for mixed missing/corrupt shards, and
   keeps the same fail-closed behavior as the underlying inspection and repair
   boundaries.
+- Added a read-recovery repair scheduling boundary. Normal placed-segment reads
+  still use EC reconstruction on the foreground path, but when a successful
+  reconstruction observes missing, wrong-size, or checksum-corrupt shards it
+  enqueues deduplicated shard-repair work for later processing instead of
+  repairing inline. The explicit repair primitive reconstructs without
+  recursively scheduling itself, then verifies the full EC set after writing
+  requested repairs so any other bad shards are queued too.
 
 Exit criteria:
 

@@ -28,7 +28,8 @@ use crate::node_client::{
 use crate::pg_topology::PgTopology;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
-    PgState, ReclaimWorkItem, ShardIndex, ShardKey, SharedStorageNode, WriteAck, WrittenShardAck,
+    PgState, PlacedSegmentShardRepairWorkItem, ReclaimWorkItem, ShardIndex, ShardKey,
+    SharedStorageNode, WriteAck, WrittenShardAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -883,6 +884,7 @@ impl From<&PgRouteSnapshot> for LocalPgRoute {
 #[derive(Debug)]
 pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+    placed_segment_shard_repair_queue: (Mutex<LocalPlacedSegmentShardRepairQueueState>, Condvar),
     metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<Mutex<()>>>>,
     metadata_command_recovery_flights:
         Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
@@ -957,6 +959,12 @@ struct LocalReclaimQueueState {
     queued_bucket_deletes: HashSet<BucketName>,
 }
 
+#[derive(Debug)]
+struct LocalPlacedSegmentShardRepairQueueState {
+    work_queue: VecDeque<PlacedSegmentShardRepairWorkItem>,
+    queued: HashSet<PlacedSegmentShardRepairWorkItem>,
+}
+
 impl LocalClusterRuntimeState {
     fn new() -> Self {
         Self {
@@ -967,6 +975,13 @@ impl LocalClusterRuntimeState {
                     outstanding_objects: HashMap::new(),
                     object_payload_outstanding_by_pg: HashMap::new(),
                     queued_bucket_deletes: HashSet::new(),
+                }),
+                Condvar::new(),
+            ),
+            placed_segment_shard_repair_queue: (
+                Mutex::new(LocalPlacedSegmentShardRepairQueueState {
+                    work_queue: VecDeque::new(),
+                    queued: HashSet::new(),
                 }),
                 Condvar::new(),
             ),
@@ -1119,6 +1134,33 @@ impl LocalClusterRuntimeState {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "deduplicate");
             false
         }
+    }
+
+    pub(crate) fn enqueue_placed_segment_shard_repair(
+        &self,
+        work_item: PlacedSegmentShardRepairWorkItem,
+    ) -> bool {
+        let (state_lock, cv) = &self.placed_segment_shard_repair_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.queued.insert(work_item) {
+            return false;
+        }
+        state.work_queue.push_back(work_item);
+        cv.notify_one();
+        true
+    }
+
+    pub(crate) fn try_take_placed_segment_shard_repair_work(
+        &self,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        let mut state = self
+            .placed_segment_shard_repair_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let work = state.work_queue.pop_front()?;
+        state.queued.remove(&work);
+        Some(work)
     }
 
     pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
