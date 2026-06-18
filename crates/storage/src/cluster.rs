@@ -6831,6 +6831,67 @@ impl StorageCluster {
             })
     }
 
+    pub fn placed_segment_payload_shard_repair_targets(
+        &self,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<Vec<ShardIndex>, StoreError> {
+        self.require_current_payload_operation_epoch(req.data_pg_id)?;
+        let ec_config =
+            EcConfig::new(req.ec.k, req.ec.m).map_err(|error| StoreError::ErasureCoding {
+                context: "inspect placed segment repair targets EC shape",
+                reason: error.to_string(),
+            })?;
+        let k = usize::from(req.ec.k);
+        let m = usize::from(req.ec.m);
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+        if shard_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
+        let locations = self
+            .place_payload_shards(data_pg, req.ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        let mut repair_targets = Vec::new();
+
+        for shard_index in 0..ec_config.total_shards() as u8 {
+            let shard_key = ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index);
+            let needs_repair = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
+                Ok(ack) if ack.stored_size == shard_size as u64 => {
+                    let location = locations
+                        .get(usize::from(shard_index))
+                        .copied()
+                        .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                            reason: format!(
+                                "inspect shard index {} outside {} placed shards",
+                                shard_index,
+                                locations.len()
+                            ),
+                        })?;
+                    match self.read_payload_shard(location, &shard_key, ack) {
+                        Ok(_) => false,
+                        Err(error) => {
+                            placed_segment_recoverable_shard_error(error)?;
+                            true
+                        }
+                    }
+                }
+                Ok(_) | Err(StoreError::NotFound) => true,
+                Err(error) => return Err(error),
+            };
+            if needs_repair {
+                repair_targets.push(ShardIndex::new(shard_index));
+            }
+        }
+
+        if repair_targets.len() > m {
+            return Err(StoreError::NotFound);
+        }
+        Ok(repair_targets)
+    }
+
     pub fn repair_placed_segment_payload_shards(
         &self,
         req: SegmentStoredBytesRequest,

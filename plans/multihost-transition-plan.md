@@ -7558,6 +7558,11 @@ Shard repair design:
   `Peering`, `Degraded`, `Backfilling`, or `Inconsistent`, and does not write
   through a stale cluster handle whose operation epoch no longer matches the
   current route map.
+- Added segment-level shard repair target inspection. The storage cluster can
+  now scan the full placed EC set for a segment, identify missing ack, missing
+  file, wrong-size, or checksum-corrupt shards as repair targets, fail closed
+  when more than `m` shards are unavailable, and return clean after the batch
+  repair primitive rewrites the identified targets.
 
 Exit criteria:
 
