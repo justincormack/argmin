@@ -697,7 +697,7 @@ async fn complete_single_part_upload(
                 .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete single part upload in bucket policy test")
         .await
         .unwrap();
 }
@@ -3259,14 +3259,13 @@ fn test_bucket_policy_copy_object_source_existing_tag_condition() {
             .unwrap();
 
         for key in [public_key, private_key] {
-            client
-                .put_object()
-                .bucket(&src_bucket)
-                .key(key)
-                .body(ByteStream::from_static(b"copy-source"))
-                .send()
-                .await
-                .unwrap();
+            s3_tests::put_object_retrying_operation_aborted(
+                client,
+                &src_bucket,
+                key,
+                b"copy-source".to_vec(),
+            )
+            .await;
         }
 
         client
@@ -3274,7 +3273,9 @@ fn test_bucket_policy_copy_object_source_existing_tag_condition() {
             .bucket(&src_bucket)
             .key(public_key)
             .tagging(simple_bucket_tagging("security", "public"))
-            .send()
+            .send_retrying_operation_aborted(
+                "put public source tag for copy object bucket policy test",
+            )
             .await
             .unwrap();
         client
@@ -3282,7 +3283,9 @@ fn test_bucket_policy_copy_object_source_existing_tag_condition() {
             .bucket(&src_bucket)
             .key(private_key)
             .tagging(simple_bucket_tagging("security", "private"))
-            .send()
+            .send_retrying_operation_aborted(
+                "put private source tag for copy object bucket policy test",
+            )
             .await
             .unwrap();
 
@@ -11331,18 +11334,17 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .unwrap();
 
         for (key, body) in [
-            ("public/foo", ByteStream::from_static(b"public/foo")),
-            ("public/bar", ByteStream::from_static(b"public/bar")),
-            ("private/foo", ByteStream::from_static(b"private/foo")),
+            ("public/foo", b"public/foo".as_slice()),
+            ("public/bar", b"public/bar".as_slice()),
+            ("private/foo", b"private/foo".as_slice()),
         ] {
-            client
-                .put_object()
-                .bucket(&src_bucket)
-                .key(key)
-                .body(body)
-                .send()
-                .await
-                .unwrap();
+            s3_tests::put_object_retrying_operation_aborted(
+                client,
+                &src_bucket,
+                key,
+                body.to_vec(),
+            )
+            .await;
         }
 
         let src_policy = json!({
@@ -11359,13 +11361,13 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(src_policy)
-            .send()
+            .send_retrying_operation_aborted("put source bucket policy for upload part copy")
             .await
             .unwrap();
         client
             .get_bucket_policy()
             .bucket(&src_bucket)
-            .send()
+            .send_retrying_operation_aborted("get source bucket policy for upload part copy")
             .await
             .unwrap();
         let source_probe = get_object_eventually(alt_client, &src_bucket, "public/foo").await;
@@ -11376,7 +11378,9 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .create_multipart_upload()
             .bucket(&dst_bucket)
             .key("copied")
-            .send()
+            .send_retrying_operation_aborted(
+                "create destination multipart upload for upload part copy",
+            )
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap().to_string();
@@ -11403,7 +11407,9 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .create_multipart_upload()
             .bucket(&dst_bucket)
             .key("copied2")
-            .send()
+            .send_retrying_operation_aborted(
+                "create second destination multipart upload for upload part copy",
+            )
             .await
             .unwrap();
         let second_upload_id = second_upload.upload_id().unwrap().to_string();
@@ -11429,7 +11435,9 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .create_multipart_upload()
             .bucket(&dst_bucket)
             .key("copied-denied")
-            .send()
+            .send_retrying_operation_aborted(
+                "create denied destination multipart upload for upload part copy",
+            )
             .await
             .unwrap();
         let denied_upload_id = denied_upload.upload_id().unwrap().to_string();
@@ -11445,25 +11453,25 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        let response = alt_client
-            .get_object()
-            .bucket(&dst_bucket)
-            .key("copied")
-            .send()
-            .await
-            .unwrap();
-        let body = response.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"public/foo");
+        let body = s3_tests::get_object_body_retrying_operation_aborted(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            None,
+            "get copied object in upload part copy test",
+        )
+        .await;
+        assert_eq!(body.as_slice(), b"public/foo");
 
-        let response = alt_client
-            .get_object()
-            .bucket(&dst_bucket)
-            .key("copied2")
-            .send()
-            .await
-            .unwrap();
-        let body = response.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"public/bar");
+        let body = s3_tests::get_object_body_retrying_operation_aborted(
+            alt_client,
+            &dst_bucket,
+            "copied2",
+            None,
+            "get second copied object in upload part copy test",
+        )
+        .await;
+        assert_eq!(body.as_slice(), b"public/bar");
 
         cleanup_with_client(
             alt_client,
@@ -11492,14 +11500,13 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
             .unwrap();
 
         for key in [public_key, private_key] {
-            client
-                .put_object()
-                .bucket(&src_bucket)
-                .key(key)
-                .body(ByteStream::from_static(b"copy-source"))
-                .send()
-                .await
-                .unwrap();
+            s3_tests::put_object_retrying_operation_aborted(
+                client,
+                &src_bucket,
+                key,
+                b"copy-source".to_vec(),
+            )
+            .await;
         }
 
         client
@@ -11507,7 +11514,9 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
             .bucket(&src_bucket)
             .key(public_key)
             .tagging(simple_bucket_tagging("security", "public"))
-            .send()
+            .send_retrying_operation_aborted(
+                "put public source tag for upload part copy bucket policy test",
+            )
             .await
             .unwrap();
         client
@@ -11515,7 +11524,9 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
             .bucket(&src_bucket)
             .key(private_key)
             .tagging(simple_bucket_tagging("security", "private"))
-            .send()
+            .send_retrying_operation_aborted(
+                "put private source tag for upload part copy bucket policy test",
+            )
             .await
             .unwrap();
 
@@ -11538,7 +11549,7 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(src_policy)
-            .send()
+            .send_retrying_operation_aborted("put source tag bucket policy for upload part copy")
             .await
             .unwrap();
 
@@ -11570,7 +11581,7 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
             .create_multipart_upload()
             .bucket(&dst_bucket)
             .key("copied")
-            .send()
+            .send_retrying_operation_aborted("create tagged-source destination multipart upload")
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap().to_string();
@@ -11597,7 +11608,9 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
             .create_multipart_upload()
             .bucket(&dst_bucket)
             .key("copied-denied")
-            .send()
+            .send_retrying_operation_aborted(
+                "create denied tagged-source destination multipart upload",
+            )
             .await
             .unwrap();
         let denied_upload_id = denied_upload.upload_id().unwrap().to_string();
@@ -11614,15 +11627,15 @@ fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        let response = alt_client
-            .get_object()
-            .bucket(&dst_bucket)
-            .key("copied")
-            .send()
-            .await
-            .unwrap();
-        let body = response.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"copy-source");
+        let body = s3_tests::get_object_body_retrying_operation_aborted(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            None,
+            "get tagged-source copied object",
+        )
+        .await;
+        assert_eq!(body.as_slice(), b"copy-source");
 
         cleanup_with_client(alt_client, &dst_bucket, &["copied", "copied-denied"]).await;
         cleanup(&src_bucket, &[public_key, private_key]).await;
@@ -11642,17 +11655,16 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
         s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
 
         for (key, body) in [
-            ("public/foo", ByteStream::from_static(b"public/foo")),
-            ("private/foo", ByteStream::from_static(b"private/foo")),
+            ("public/foo", b"public/foo".as_slice()),
+            ("private/foo", b"private/foo".as_slice()),
         ] {
-            client
-                .put_object()
-                .bucket(&src_bucket)
-                .key(key)
-                .body(body)
-                .send()
-                .await
-                .unwrap();
+            s3_tests::put_object_retrying_operation_aborted(
+                client,
+                &src_bucket,
+                key,
+                body.to_vec(),
+            )
+            .await;
         }
 
         let src_policy = json!({
@@ -11669,7 +11681,9 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(src_policy)
-            .send()
+            .send_retrying_operation_aborted(
+                "put source copy-source bucket policy for upload part copy",
+            )
             .await
             .unwrap();
 
@@ -11700,7 +11714,9 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
             .put_bucket_policy()
             .bucket(&dst_bucket)
             .policy(dst_policy)
-            .send()
+            .send_retrying_operation_aborted(
+                "put destination copy-source bucket policy for upload part copy",
+            )
             .await
             .unwrap();
 
@@ -11711,7 +11727,9 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
                     .create_multipart_upload()
                     .bucket(&dst_bucket)
                     .key("copied")
-                    .send()
+                    .send_retrying_operation_aborted(
+                        "create copy-source-conditioned destination multipart upload",
+                    )
             },
         )
         .await;
@@ -11742,7 +11760,9 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
                     .create_multipart_upload()
                     .bucket(&dst_bucket)
                     .key("copied-denied")
-                    .send()
+                    .send_retrying_operation_aborted(
+                        "create denied copy-source-conditioned multipart upload",
+                    )
             },
         )
         .await;
@@ -11760,15 +11780,15 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        let response = client
-            .get_object()
-            .bucket(&dst_bucket)
-            .key("copied")
-            .send()
-            .await
-            .unwrap();
-        let body = response.body.collect().await.unwrap().into_bytes();
-        assert_eq!(body.as_ref(), b"public/foo");
+        let body = s3_tests::get_object_body_retrying_operation_aborted(
+            client,
+            &dst_bucket,
+            "copied",
+            None,
+            "get copy-source-conditioned copied object",
+        )
+        .await;
+        assert_eq!(body.as_slice(), b"public/foo");
 
         cleanup_with_client(client, &dst_bucket, &["copied", "copied-denied"]).await;
         cleanup(&src_bucket, &["public/foo", "private/foo"]).await;
@@ -11787,14 +11807,13 @@ fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition(
         s3_tests::create_bucket(client, &src_bucket).await.unwrap();
         s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
 
-        client
-            .put_object()
-            .bucket(&src_bucket)
-            .key("src")
-            .body(ByteStream::from_static(b"copy-source"))
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            "src",
+            b"copy-source".to_vec(),
+        )
+        .await;
 
         let src_policy = json!({
             "Version": "2012-10-17",
@@ -11810,7 +11829,9 @@ fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition(
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(src_policy)
-            .send()
+            .send_retrying_operation_aborted(
+                "put source metadata-directive bucket policy for upload part copy",
+            )
             .await
             .unwrap();
 
@@ -11841,7 +11862,9 @@ fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition(
             .put_bucket_policy()
             .bucket(&dst_bucket)
             .policy(dst_policy)
-            .send()
+            .send_retrying_operation_aborted(
+                "put destination metadata-directive bucket policy for upload part copy",
+            )
             .await
             .unwrap();
 
@@ -11849,7 +11872,9 @@ fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition(
             .create_multipart_upload()
             .bucket(&dst_bucket)
             .key("copied")
-            .send()
+            .send_retrying_operation_aborted(
+                "create metadata-directive destination multipart upload",
+            )
             .await
             .unwrap();
         let upload_id = upload.upload_id().unwrap().to_string();
