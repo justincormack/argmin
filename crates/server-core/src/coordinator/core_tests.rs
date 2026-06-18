@@ -1943,6 +1943,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
             object_reclaim_and_bucket_finalize: true,
             lifecycle: true,
             shard_scavenger: true,
+            shard_repair: true,
             stream_session: true,
         }
     );
@@ -8574,6 +8575,99 @@ fn shard_scavenger_worker_records_audit_observations() {
         assert!(
             start.elapsed() < TEST_EVENT_TIMEOUT,
             "shard scavenger worker did not record file-without-row observations; observations={observations:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_only_shard_repair_sweeper(tmp.path());
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"background shard repair worker payload";
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let segment = coord
+        .storage_node()
+        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("put object should create one segment");
+    let corrupt_shard_index = 0;
+    let corrupt_path = shard_file_path(&coord, "bucket", "key", corrupt_shard_index);
+    corrupt_shard_on_disk(&coord, "bucket", "key", corrupt_shard_index);
+    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+
+    let start = std::time::Instant::now();
+    loop {
+        let repairs = coord
+            .storage_node()
+            .list_placed_segment_shard_repairs(segment.data_pg_id)
+            .unwrap();
+        if repairs.is_empty() {
+            let repaired = coord
+                .get_object(&GetObjectRequest {
+                    sse_customer: None,
+                    object: object_version_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    cond: NO_READ,
+                })
+                .unwrap();
+            assert_eq!(repaired.body.read_all().unwrap(), data);
+            let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
+            assert_ne!(
+                repaired_bytes, corrupt_bytes,
+                "repair should rewrite the corrupt shard file"
+            );
+            return;
+        }
+        assert!(
+            start.elapsed() < TEST_EVENT_TIMEOUT,
+            "shard repair worker did not repair and drain row; repairs={repairs:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }

@@ -55,7 +55,8 @@ use self::request_types::{AuthorizedWriteTags, BucketCreateOutcome};
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
 use self::runtime::{
-    LifecycleSweeper, ReclaimSweeper, ShardScavengerSweeper, StreamSessionSweeper,
+    LifecycleSweeper, ReclaimSweeper, ShardRepairSweeper, ShardScavengerSweeper,
+    StreamSessionSweeper,
 };
 #[cfg(test)]
 use self::test_hooks::*;
@@ -462,6 +463,7 @@ pub struct Coordinator {
     managed_key_provider: Option<StaticManagedKeyProvider>,
     _reclaim_sweeper: ReclaimSweeper,
     _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,
+    _shard_repair_sweeper: Arc<ShardRepairSweeper>,
     _stream_session_sweeper: Arc<StreamSessionSweeper>,
     _lifecycle_sweeper: Arc<LifecycleSweeper>,
 }

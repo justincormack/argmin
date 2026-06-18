@@ -34,6 +34,7 @@ use crate::{
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
+const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
 
@@ -1166,6 +1167,35 @@ impl LocalClusterRuntimeState {
         let work = state.work_queue.pop_front()?;
         state.queued.remove(&work);
         Some(work)
+    }
+
+    pub(crate) fn wait_for_placed_segment_shard_repair_work_poll(
+        &self,
+        stop: &AtomicBool,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        let (state_lock, cv) = &self.placed_segment_shard_repair_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.work_queue.is_empty() && !stop.load(Ordering::SeqCst) {
+            let (next_state, _) = cv
+                .wait_timeout(
+                    state,
+                    Duration::from_millis(
+                        LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS,
+                    ),
+                )
+                .unwrap_or_else(|e| e.into_inner());
+            state = next_state;
+        }
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        let work = state.work_queue.pop_front()?;
+        state.queued.remove(&work);
+        Some(work)
+    }
+
+    pub(crate) fn wake_placed_segment_shard_repair_workers(&self) {
+        self.placed_segment_shard_repair_queue.1.notify_all();
     }
 
     pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {

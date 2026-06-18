@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,12 +32,18 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleS
 static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
 > = OnceLock::new();
+static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<ShardRepairSweeper>>>> =
+    OnceLock::new();
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
 > = OnceLock::new();
+static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
+const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 
@@ -108,6 +114,12 @@ pub(super) struct LifecycleSweeper {
 pub(super) struct ShardScavengerSweeper {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
+    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(super) struct ShardRepairSweeper {
+    pub(super) storage_node: Arc<StorageCluster>,
+    pub(super) stop: Arc<AtomicBool>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -304,6 +316,16 @@ impl Drop for ShardScavengerSweeper {
     }
 }
 
+impl Drop for ShardRepairSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.storage_node.wake_placed_segment_shard_repair_workers();
+        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl Drop for StreamSessionSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -447,6 +469,147 @@ impl ShardScavengerSweeper {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(true)),
             wake: Arc::new((Mutex::new(true), Condvar::new())),
+            handle: Mutex::new(None),
+        })
+    }
+}
+
+impl ShardRepairSweeper {
+    pub(super) fn acquire_shared(
+        storage_cluster: &Arc<StorageCluster>,
+    ) -> Result<Arc<Self>, ServerError> {
+        let registry = SHARD_REPAIR_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardRepairSweeper>>> =
+            lock_mutex_unpoisoned(registry);
+        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+
+        let key = storage_cluster.process_local_registry_key();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(Arc::clone(storage_cluster))?;
+        registry.insert(key, Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let sweeper = Arc::new(Self {
+            storage_node: Arc::clone(&storage_cluster),
+            stop: Arc::clone(&stop),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-shard-repair".to_string())
+            .spawn(move || {
+                let owner_token = format!(
+                    "shard-repair-worker-{}",
+                    storage_cluster.process_local_registry_key()
+                );
+                let mut next_durable_scan_at = Instant::now();
+                while !stop.load(Ordering::SeqCst) {
+                    let now = Instant::now();
+                    if now >= next_durable_scan_at {
+                        if let Err(error) =
+                            storage_cluster.enqueue_durable_placed_segment_shard_repair_work()
+                        {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "shard_repair_durable_scan_error",
+                                Some(format_args!("error={error}")),
+                            );
+                        }
+                        next_durable_scan_at = now + SHARD_REPAIR_DURABLE_SCAN_INTERVAL;
+                    }
+
+                    let Some(work_item) = storage_cluster
+                        .try_take_placed_segment_shard_repair_work()
+                        .or_else(|| {
+                            storage_cluster.wait_for_placed_segment_shard_repair_work(&stop)
+                        })
+                    else {
+                        break;
+                    };
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let now_ms = Coordinator::now_millis();
+                    let claim_id = format!(
+                        "shard-repair-{}-{}-{}-{}",
+                        storage_cluster.process_local_registry_key(),
+                        work_item.request.data_pg_id,
+                        work_item.shard_index.get(),
+                        SHARD_REPAIR_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let claim = match storage_cluster.acquire_placed_segment_shard_repair_claim(
+                        work_item.request.data_pg_id,
+                        &claim_id,
+                        &owner_token,
+                        now_ms,
+                        now_ms.saturating_add(SHARD_REPAIR_CLAIM_LEASE_MILLIS),
+                        now_ms,
+                    ) {
+                        Ok(Some(claim)) => claim,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "shard_repair_claim_error",
+                                Some(format_args!("error={error}")),
+                            );
+                            continue;
+                        }
+                    };
+
+                    match storage_cluster
+                        .repair_placed_segment_payload_shards_if_needed(claim.work_item.request)
+                    {
+                        Ok(_) => {
+                            if let Err(error) =
+                                storage_cluster.complete_placed_segment_shard_repair_claim(&claim)
+                            {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "shard_repair_complete_error",
+                                    Some(format_args!("error={error}")),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            let next_attempt_after = Coordinator::now_millis()
+                                .saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
+                            if let Err(record_error) = storage_cluster
+                                .record_placed_segment_shard_repair_claim_error(
+                                    &claim,
+                                    &error.to_string(),
+                                    next_attempt_after,
+                                )
+                            {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "shard_repair_record_error_failed",
+                                    Some(format_args!(
+                                        "repair_error={error} record_error={record_error}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start shard repair worker: {e}"),
+            })?;
+        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
+        Ok(sweeper)
+    }
+
+    pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Arc<Self> {
+        Arc::new(Self {
+            storage_node: storage_cluster,
+            stop: Arc::new(AtomicBool::new(true)),
             handle: Mutex::new(None),
         })
     }

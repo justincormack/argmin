@@ -149,6 +149,26 @@ pub(crate) fn setup_coordinator_with_pg_count_without_background_sweepers(
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap()
+}
+
+pub(crate) fn setup_coordinator_with_only_shard_repair_sweeper(dir: &Path) -> Coordinator {
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
+        storage_cluster,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            ShardRepairSweeper::acquire_shared,
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
@@ -231,6 +251,7 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_backgr
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )

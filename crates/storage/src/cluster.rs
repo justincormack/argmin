@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread;
 use std::thread::JoinHandle;
@@ -52,11 +53,12 @@ use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
-    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PgState,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+    PrepareStreamUploadSegmentAppendReq, SegmentStoredBytesRequest, SessionId, ShardIndex,
+    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
     StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
@@ -6828,6 +6830,39 @@ impl StorageCluster {
         self.local_map
             .runtime_state()
             .try_take_placed_segment_shard_repair_work()
+    }
+
+    pub fn wait_for_placed_segment_shard_repair_work(
+        &self,
+        stop: &AtomicBool,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        self.local_map
+            .runtime_state()
+            .wait_for_placed_segment_shard_repair_work_poll(stop)
+    }
+
+    pub fn wake_placed_segment_shard_repair_workers(&self) {
+        self.local_map
+            .runtime_state()
+            .wake_placed_segment_shard_repair_workers();
+    }
+
+    pub fn enqueue_durable_placed_segment_shard_repair_work(&self) -> Result<usize, StoreError> {
+        let mut enqueued = 0usize;
+        for route in self.local_pg_routes() {
+            if route.state() != PgState::Active {
+                continue;
+            }
+            for repair in self.list_placed_segment_shard_repairs(route.pg_id().get())? {
+                if self.enqueue_placed_segment_shard_repair(
+                    repair.work_item.request,
+                    repair.work_item.shard_index,
+                ) {
+                    enqueued += 1;
+                }
+            }
+        }
+        Ok(enqueued)
     }
 
     pub fn list_placed_segment_shard_repairs(
