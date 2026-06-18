@@ -47,6 +47,47 @@ fn lock_bucket_scoped_hook_test() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+fn placed_segment_shard_repair_work_item(index: usize) -> PlacedSegmentShardRepairWorkItem {
+    let mut segment_okh = [0u8; 16];
+    segment_okh[..8].copy_from_slice(&(index as u64).to_be_bytes());
+    PlacedSegmentShardRepairWorkItem {
+        request: crate::SegmentStoredBytesRequest {
+            data_pg_id: 7,
+            segment_okh,
+            segment_vid: GenerationId::new(42).unwrap(),
+            stored_size: 1024,
+            segment_crc64: Some(index as u64),
+            ec: EcShape { k: 4, m: 2 },
+        },
+        shard_index: ShardIndex::new((index % 6) as u8),
+    }
+}
+
+#[test]
+fn placed_segment_shard_repair_hint_queue_is_bounded() {
+    let state = LocalClusterRuntimeState::new();
+    for index in 0..LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT {
+        assert!(
+            state.enqueue_placed_segment_shard_repair(placed_segment_shard_repair_work_item(index))
+        );
+    }
+
+    assert!(
+        !state.enqueue_placed_segment_shard_repair(placed_segment_shard_repair_work_item(
+            LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT
+        ))
+    );
+    assert!(!state.enqueue_placed_segment_shard_repair(placed_segment_shard_repair_work_item(0)));
+
+    for index in 0..LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT {
+        assert_eq!(
+            state.try_take_placed_segment_shard_repair_work(),
+            Some(placed_segment_shard_repair_work_item(index))
+        );
+    }
+    assert!(state.try_take_placed_segment_shard_repair_work().is_none());
+}
+
 fn acquire_test_bucket_write_proof(
     cluster: &crate::StorageCluster,
     bucket: &crate::BucketName,

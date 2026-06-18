@@ -35,6 +35,7 @@ use crate::{
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalNodeStoreConfig {
@@ -1142,9 +1143,13 @@ impl LocalClusterRuntimeState {
     ) -> bool {
         let (state_lock, cv) = &self.placed_segment_shard_repair_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.queued.insert(work_item) {
+        if state.queued.contains(&work_item) {
             return false;
         }
+        if state.work_queue.len() >= LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT {
+            return false;
+        }
+        state.queued.insert(work_item);
         state.work_queue.push_back(work_item);
         cv.notify_one();
         true
