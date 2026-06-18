@@ -6544,6 +6544,9 @@ impl StorageCluster {
                     ShardScavengerPayloadReference::Placed(reference) => {
                         self.extend_referenced_shard_set(&mut scan, &reference)?;
                     }
+                    ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+                        self.extend_reclaim_referenced_shard_set(&mut scan, &reference)?;
+                    }
                     ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
                         let data_pg_id = self
                             .local_map
@@ -6559,7 +6562,7 @@ impl StorageCluster {
                             okh: reference.part_okh,
                             generation_id: reference.part_vid,
                             stored_size: reference.stored_size,
-                            crc64: Some(reference.crc64),
+                            crc64: reference.crc64,
                             ec: reference.ec,
                         };
                         self.extend_referenced_shard_set(&mut scan, &reference)?;
@@ -6576,37 +6579,66 @@ impl StorageCluster {
         scan: &mut ShardScavengerReferenceScan,
         reference: &ShardScavengerPlacedShardSetReference,
     ) -> Result<(), StoreError> {
-        let data_pg = DataPgId::new(PgId::new(reference.data_pg_id));
-        let placement_key = segment_payload_placement_key(&reference.okh, reference.generation_id);
-        let locations = self
-            .place_payload_shards(data_pg, reference.ec, &placement_key)
-            .map_err(cluster_build_error_to_store)?;
-        let repair_request = reference.crc64.map(|crc64| SegmentStoredBytesRequest {
+        self.extend_referenced_shard_locations(
+            scan,
+            reference.data_pg_id,
+            reference.okh,
+            reference.generation_id,
+            reference.ec,
+        )?;
+        let request = SegmentStoredBytesRequest {
             data_pg_id: reference.data_pg_id,
             segment_okh: reference.okh,
             segment_vid: reference.generation_id,
             stored_size: reference.stored_size as usize,
-            segment_crc64: crc64,
+            segment_crc64: reference.crc64,
             ec: reference.ec,
-        });
+        };
         for key in
             Self::payload_shard_set_keys(&reference.okh, reference.generation_id, reference.ec)
         {
+            scan.repair_work_by_shard.insert(
+                (reference.data_pg_id, key.clone()),
+                PlacedSegmentShardRepairWorkItem {
+                    request,
+                    shard_index: key.shard_index(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn extend_reclaim_referenced_shard_set(
+        &self,
+        scan: &mut ShardScavengerReferenceScan,
+        reference: &crate::types::ShardScavengerReclaimShardSetReference,
+    ) -> Result<(), StoreError> {
+        self.extend_referenced_shard_locations(
+            scan,
+            reference.data_pg_id,
+            reference.okh,
+            reference.generation_id,
+            reference.ec,
+        )
+    }
+
+    fn extend_referenced_shard_locations(
+        &self,
+        scan: &mut ShardScavengerReferenceScan,
+        data_pg_id: u32,
+        okh: [u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) -> Result<(), StoreError> {
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let placement_key = segment_payload_placement_key(&okh, generation_id);
+        let locations = self
+            .place_payload_shards(data_pg, ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        for key in Self::payload_shard_set_keys(&okh, generation_id, ec) {
             let location = Self::placed_payload_shard_location(&locations, &key)?;
-            scan.locations.insert((
-                location.node_id().as_u32(),
-                reference.data_pg_id,
-                key.clone(),
-            ));
-            if let Some(request) = repair_request {
-                scan.repair_work_by_shard.insert(
-                    (reference.data_pg_id, key.clone()),
-                    PlacedSegmentShardRepairWorkItem {
-                        request,
-                        shard_index: key.shard_index(),
-                    },
-                );
-            }
+            scan.locations
+                .insert((location.node_id().as_u32(), data_pg_id, key.clone()));
         }
         Ok(())
     }

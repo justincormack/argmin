@@ -38,12 +38,13 @@ use crate::{
         SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
         ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
         ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-        ShardScavengerPlacedShardSetReference, ShardScavengerRoutedMultipartPartReference,
-        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
-        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
-        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-        VersionId, WriteAck, PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN,
+        ShardScavengerPlacedShardSetReference, ShardScavengerReclaimShardSetReference,
+        ShardScavengerRoutedMultipartPartReference, StorageClass, StoredLegalHoldStatus,
+        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
+        PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN,
         PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT,
         PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN, SESSION_ID_LEN, SHARD_KEY_LEN,
         UPLOAD_ID_LEN,
@@ -13032,7 +13033,7 @@ impl<'a> StorageRpcDecoder<'a> {
                     okh: self.read_16_bytes()?,
                     generation_id: self.read_generation_id()?,
                     stored_size: self.read_u64()?,
-                    crc64: self.read_optional_u64()?,
+                    crc64: self.read_u64()?,
                     ec: self.read_ec_shape()?,
                 },
             )),
@@ -13046,6 +13047,14 @@ impl<'a> StorageRpcDecoder<'a> {
                     crc64: self.read_u64()?,
                     part_okh: self.read_16_bytes()?,
                     part_vid: self.read_generation_id()?,
+                    ec: self.read_ec_shape()?,
+                },
+            )),
+            2 => Ok(ShardScavengerPayloadReference::ReclaimOnly(
+                ShardScavengerReclaimShardSetReference {
+                    data_pg_id: self.read_u32()?,
+                    okh: self.read_16_bytes()?,
+                    generation_id: self.read_generation_id()?,
                     ec: self.read_ec_shape()?,
                 },
             )),
@@ -14648,7 +14657,7 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             out.extend_from_slice(&reference.okh);
             put_u64(out, reference.generation_id.get());
             put_u64(out, reference.stored_size);
-            put_optional_u64(out, reference.crc64);
+            put_u64(out, reference.crc64);
             put_ec_shape(out, reference.ec);
         }
         ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
@@ -14661,6 +14670,13 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_u64(out, reference.crc64);
             out.extend_from_slice(&reference.part_okh);
             put_u64(out, reference.part_vid.get());
+            put_ec_shape(out, reference.ec);
+        }
+        ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+            put_u8(out, 2);
+            put_u32(out, reference.data_pg_id);
+            out.extend_from_slice(&reference.okh);
+            put_u64(out, reference.generation_id.get());
             put_ec_shape(out, reference.ec);
         }
     }
@@ -16119,7 +16135,13 @@ mod tests {
                 okh: [7; 16],
                 generation_id: GenerationId::new(5).unwrap(),
                 stored_size: 4096,
-                crc64: Some(0xBEEF),
+                crc64: 0xBEEF,
+                ec: EcShape { k: 2, m: 1 },
+            }),
+            ShardScavengerPayloadReference::ReclaimOnly(ShardScavengerReclaimShardSetReference {
+                data_pg_id: 4,
+                okh: [9; 16],
+                generation_id: GenerationId::new(10).unwrap(),
                 ec: EcShape { k: 2, m: 1 },
             }),
             ShardScavengerPayloadReference::RoutedMultipartPart(

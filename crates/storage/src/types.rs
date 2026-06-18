@@ -2181,7 +2181,20 @@ pub(crate) struct ShardScavengerPlacedShardSetReference {
     pub okh: [u8; 16],
     pub generation_id: GenerationId,
     pub stored_size: u64,
-    pub crc64: Option<u64>,
+    pub crc64: u64,
+    pub ec: EcShape,
+}
+
+/// A payload shard set referenced only by reclaim metadata.
+///
+/// Reclaim references prevent live shard-scavenger scans from treating cleanup
+/// work as an unreferenced orphan, but they do not contain enough authoritative
+/// payload metadata to schedule data repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShardScavengerReclaimShardSetReference {
+    pub data_pg_id: u32,
+    pub okh: [u8; 16],
+    pub generation_id: GenerationId,
     pub ec: EcShape,
 }
 
@@ -2203,6 +2216,7 @@ pub(crate) struct ShardScavengerRoutedMultipartPartReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShardScavengerPayloadReference {
     Placed(ShardScavengerPlacedShardSetReference),
+    ReclaimOnly(ShardScavengerReclaimShardSetReference),
     RoutedMultipartPart(ShardScavengerRoutedMultipartPartReference),
 }
 

@@ -690,21 +690,21 @@ impl PgStore {
              FROM multipart_part_segments",
             "list multipart part segment shard scavenger references",
         )?;
-        self.extend_scavenger_placed_references(
+        self.extend_scavenger_reclaim_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, 0, NULL, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
              FROM object_segment_reclaim_segments",
             "list object segment reclaim shard scavenger references",
         )?;
-        self.extend_scavenger_placed_references(
+        self.extend_scavenger_reclaim_references(
             &mut references,
-            "SELECT data_pg_id, part_okh, part_vid, 0, NULL, ec_k, ec_m \
+            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
              FROM multipart_reclaim_parts WHERE storage_kind = 0",
             "list multipart reclaim part shard scavenger references",
         )?;
-        self.extend_scavenger_placed_references(
+        self.extend_scavenger_reclaim_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, 0, NULL, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
              FROM multipart_reclaim_part_segments",
             "list multipart reclaim segment shard scavenger references",
         )?;
@@ -850,7 +850,7 @@ impl PgStore {
                 segment.segment_okh,
                 segment.segment_vid,
                 segment.size,
-                Some(segment.segment_crc64),
+                segment.segment_crc64,
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -873,7 +873,7 @@ impl PgStore {
                 part.part_okh,
                 part.part_vid,
                 part.size,
-                Some(part.payload_crc64),
+                part.payload_crc64,
                 EcShape {
                     k: part.ec_k,
                     m: part.ec_m,
@@ -901,7 +901,7 @@ impl PgStore {
             segment.segment_okh,
             segment.segment_vid,
             segment.size,
-            Some(segment.segment_crc64),
+            segment.segment_crc64,
             EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
@@ -920,7 +920,7 @@ impl PgStore {
                 segment.segment_okh,
                 segment.segment_vid,
                 segment.size,
-                Some(segment.segment_crc64),
+                segment.segment_crc64,
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -966,13 +966,11 @@ impl PgStore {
         match payload {
             ObjectPayloadReclaimCommand::Segments(reclaim) => {
                 for segment in &reclaim.segments {
-                    Self::push_placed_reference(
+                    Self::push_reclaim_reference(
                         references,
                         segment.data_pg_id,
                         segment.segment_okh,
                         segment.segment_vid,
-                        0,
-                        None,
                         segment.ec,
                     );
                 }
@@ -986,24 +984,20 @@ impl PgStore {
                             data_pg_id,
                             ec,
                             ..
-                        } => Self::push_placed_reference(
+                        } => Self::push_reclaim_reference(
                             references,
                             *data_pg_id,
                             *part_okh,
                             *part_vid,
-                            0,
-                            None,
                             *ec,
                         ),
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
                             for segment in segments {
-                                Self::push_placed_reference(
+                                Self::push_reclaim_reference(
                                     references,
                                     segment.data_pg_id,
                                     segment.segment_okh,
                                     segment.segment_vid,
-                                    0,
-                                    None,
                                     segment.ec,
                                 );
                             }
@@ -1020,7 +1014,7 @@ impl PgStore {
         okh: [u8; 16],
         generation_id: GenerationId,
         stored_size: u64,
-        crc64: Option<u64>,
+        crc64: u64,
         ec: EcShape,
     ) {
         references.push(ShardScavengerPayloadReference::Placed(
@@ -1030,6 +1024,23 @@ impl PgStore {
                 generation_id,
                 stored_size,
                 crc64,
+                ec,
+            },
+        ));
+    }
+
+    fn push_reclaim_reference(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        data_pg_id: u32,
+        okh: [u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) {
+        references.push(ShardScavengerPayloadReference::ReclaimOnly(
+            ShardScavengerReclaimShardSetReference {
+                data_pg_id,
+                okh,
+                generation_id,
                 ec,
             },
         ));
@@ -1099,10 +1110,46 @@ impl PgStore {
                             "shard scavenger reference generation",
                         )?,
                         stored_size: row.get::<_, i64>(3)? as u64,
-                        crc64: row.get::<_, Option<i64>>(4)?.map(|crc| crc as u64),
+                        crc64: row.get::<_, i64>(4)? as u64,
                         ec: EcShape {
                             k: row.get(5)?,
                             m: row.get(6)?,
+                        },
+                    },
+                ))
+            })
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+        }
+        Ok(())
+    }
+
+    fn extend_scavenger_reclaim_references(
+        &self,
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        sql: &'static str,
+        context: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let okh_blob: Vec<u8> = row.get(1)?;
+                Ok(ShardScavengerPayloadReference::ReclaimOnly(
+                    ShardScavengerReclaimShardSetReference {
+                        data_pg_id: row.get(0)?,
+                        okh: PgStore::parse_okh_blob(&okh_blob, 1)?,
+                        generation_id: PgStore::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "shard scavenger reclaim reference generation",
+                        )?,
+                        ec: EcShape {
+                            k: row.get(3)?,
+                            m: row.get(4)?,
                         },
                     },
                 ))
@@ -1651,6 +1698,21 @@ mod tests {
                 ],
             )
             .unwrap();
+        store
+            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                bucket: crate::tests::bucket_name("bucket"),
+                key: crate::tests::object_key("reclaim"),
+                generation_id: GenerationId::new(33).unwrap(),
+                created_at: 12,
+                segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: 0,
+                    segment_okh: [0x33; 16],
+                    segment_vid: GenerationId::new(44).unwrap(),
+                    data_pg_id: 7,
+                    ec: EcShape { k: 4, m: 2 },
+                }],
+            })
+            .unwrap();
 
         let references = store.list_shard_scavenger_payload_references().unwrap();
         let object_part = references
@@ -1665,7 +1727,7 @@ mod tests {
             })
             .expect("object part placed reference should be listed");
         assert_eq!(object_part.stored_size, 1234);
-        assert_eq!(object_part.crc64, Some(0xAABB));
+        assert_eq!(object_part.crc64, 0xAABB);
 
         let routed_part = references
             .iter()
@@ -1687,6 +1749,21 @@ mod tests {
         assert_eq!(routed_part.part_number, 2);
         assert_eq!(routed_part.stored_size, 5678);
         assert_eq!(routed_part.crc64, 0xCCDD);
+
+        let reclaim = references
+            .iter()
+            .find_map(|reference| match reference {
+                ShardScavengerPayloadReference::ReclaimOnly(reference)
+                    if reference.okh == [0x33; 16] =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .expect("object segment reclaim reference should be listed");
+        assert_eq!(reclaim.data_pg_id, 7);
+        assert_eq!(reclaim.generation_id, GenerationId::new(44).unwrap());
+        assert_eq!(reclaim.ec, EcShape { k: 4, m: 2 });
     }
 
     #[test]
