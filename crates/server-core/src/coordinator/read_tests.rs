@@ -655,24 +655,17 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
     let data = vec![1u8, 2, 3, 4];
     let ptr = data.as_ptr();
     let len = data.len();
-    let mut reader = SegmentListReader {
+    let mut reader = SegmentListReader::test_loaded_segment(
         runtime,
-        bucket: "bucket".to_string(),
-        key: "key".to_string(),
-        segments: vec![],
-        next_segment_index: 0,
-        loaded_segment: Some((Arc::new(SharedPayloadBuffer::from_unpooled(data)), 0, len)),
-        sse_customer_request: None,
-        expected_crc64: None,
-        expected_verified_size: 0,
-        verified_size: 0,
-        verified_crc64: checksum::crc64::Hasher::new(),
-    };
+        "bucket".to_string(),
+        "key".to_string(),
+        data,
+    );
 
     let chunk = reader.next_chunk(len).unwrap().unwrap();
     assert_eq!(chunk.as_ref(), [1u8, 2, 3, 4]);
     assert_eq!(chunk.as_ref().as_ptr(), ptr);
-    assert!(reader.loaded_segment.is_none());
+    assert!(reader.test_loaded_segment_is_none());
     assert!(reader.next_chunk(len).unwrap().is_none());
 }
 

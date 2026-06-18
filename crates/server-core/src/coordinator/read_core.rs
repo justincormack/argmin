@@ -7,6 +7,8 @@ use storage::{
 
 use super::object_state::SnapshottedMultipartPart;
 use super::payload::{PayloadBufferPool, SharedPayloadBuffer};
+#[cfg(test)]
+use super::test_hooks::maybe_run_object_segments_first_segment_hook;
 use super::TRACE_TARGET;
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerValidatorConfig, StaticManagedKeyProvider};
@@ -69,19 +71,27 @@ pub(super) struct MultipartPartReadLayout {
 }
 
 pub(super) struct SegmentListReader {
-    pub(super) runtime: ReadRuntime,
+    runtime: ReadRuntime,
     #[cfg_attr(not(any(test, feature = "deep-tracing")), allow(dead_code))]
-    pub(super) bucket: String,
+    bucket: String,
     #[cfg_attr(not(any(test, feature = "deep-tracing")), allow(dead_code))]
-    pub(super) key: String,
-    pub(super) segments: Vec<SegmentSliceRecord>,
-    pub(super) next_segment_index: usize,
-    pub(super) loaded_segment: Option<(Arc<SharedPayloadBuffer>, usize, usize)>,
-    pub(super) sse_customer_request: Option<SseCustomerRequest>,
-    pub(super) expected_crc64: Option<u64>,
-    pub(super) expected_verified_size: usize,
-    pub(super) verified_size: usize,
-    pub(super) verified_crc64: checksum::crc64::Hasher,
+    key: String,
+    segments: Vec<SegmentSliceRecord>,
+    next_segment_index: usize,
+    loaded_segment: Option<(Arc<SharedPayloadBuffer>, usize, usize)>,
+    sse_customer_request: Option<SseCustomerRequest>,
+    verification: SegmentListVerification,
+    verified_size: usize,
+    verified_crc64: checksum::crc64::Hasher,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SegmentListVerification {
+    StoredSegmentCrcOnly,
+    FullPayloadCrc {
+        expected_size: usize,
+        expected_crc64: u64,
+    },
 }
 
 #[cfg_attr(not(feature = "deep-tracing"), allow(dead_code))]
@@ -92,13 +102,13 @@ pub(super) struct SnapshottedMultipartPartRange {
 }
 
 pub(super) struct MultipartReader {
-    pub(super) runtime: ReadRuntime,
-    pub(super) bucket: String,
-    pub(super) key: String,
-    pub(super) parts: Vec<SnapshottedMultipartPartRange>,
-    pub(super) next_part_index: usize,
-    pub(super) current_part: Option<SegmentListReader>,
-    pub(super) sse_customer_request: Option<SseCustomerRequest>,
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    parts: Vec<SnapshottedMultipartPartRange>,
+    next_part_index: usize,
+    current_part: Option<SegmentListReader>,
+    sse_customer_request: Option<SseCustomerRequest>,
 }
 
 pub(super) struct ReadObjectContext<'a> {
@@ -144,6 +154,275 @@ impl std::fmt::Debug for ReadHandle {
             .field("bytes_emitted", &self.bytes_emitted)
             .field("expected_crc64", &self.expected_crc64)
             .finish_non_exhaustive()
+    }
+}
+
+impl SegmentListReader {
+    fn new_stored_segment_crc_checked(
+        runtime: ReadRuntime,
+        bucket: String,
+        key: String,
+        segments: Vec<SegmentSliceRecord>,
+        sse_customer_request: Option<SseCustomerRequest>,
+    ) -> Self {
+        Self {
+            runtime,
+            bucket,
+            key,
+            segments,
+            next_segment_index: 0,
+            loaded_segment: None,
+            sse_customer_request,
+            verification: SegmentListVerification::StoredSegmentCrcOnly,
+            verified_size: 0,
+            verified_crc64: checksum::crc64::Hasher::new(),
+        }
+    }
+
+    fn new_full_payload_crc_checked(
+        runtime: ReadRuntime,
+        bucket: String,
+        key: String,
+        segments: Vec<SegmentSliceRecord>,
+        sse_customer_request: Option<SseCustomerRequest>,
+        expected_size: usize,
+        expected_crc64: u64,
+    ) -> Self {
+        Self {
+            runtime,
+            bucket,
+            key,
+            segments,
+            next_segment_index: 0,
+            loaded_segment: None,
+            sse_customer_request,
+            verification: SegmentListVerification::FullPayloadCrc {
+                expected_size,
+                expected_crc64,
+            },
+            verified_size: 0,
+            verified_crc64: checksum::crc64::Hasher::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_loaded_segment(
+        runtime: ReadRuntime,
+        bucket: String,
+        key: String,
+        data: Vec<u8>,
+    ) -> Self {
+        let len = data.len();
+        Self {
+            runtime,
+            bucket,
+            key,
+            segments: vec![],
+            next_segment_index: 0,
+            loaded_segment: Some((Arc::new(SharedPayloadBuffer::from_unpooled(data)), 0, len)),
+            sse_customer_request: None,
+            verification: SegmentListVerification::StoredSegmentCrcOnly,
+            verified_size: 0,
+            verified_crc64: checksum::crc64::Hasher::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_loaded_segment_is_none(&self) -> bool {
+        self.loaded_segment.is_none()
+    }
+
+    pub(super) fn next_chunk(
+        &mut self,
+        target_size: usize,
+    ) -> Result<Option<ReadChunk>, ServerError> {
+        loop {
+            if let Some((loaded, offset, end_offset)) = &mut self.loaded_segment {
+                if *offset < *end_offset {
+                    let end = (*offset + target_size).min(*end_offset);
+                    let out = ReadChunk::from_shared_range(Arc::clone(loaded), *offset, end);
+                    if end == *end_offset {
+                        self.loaded_segment = None;
+                    } else {
+                        *offset = end;
+                    }
+                    return Ok(Some(out));
+                }
+                self.loaded_segment = None;
+            }
+
+            if self.next_segment_index >= self.segments.len() {
+                if let SegmentListVerification::FullPayloadCrc {
+                    expected_size,
+                    expected_crc64,
+                } = self.verification
+                {
+                    if self.verified_size != expected_size {
+                        return Err(ServerError::IntegrityError {
+                            bucket: self.bucket.clone(),
+                            key: self.key.clone(),
+                            expected: expected_size as u64,
+                            actual: self.verified_size as u64,
+                        });
+                    }
+                    let actual_crc64 = self.verified_crc64.finalize();
+                    if actual_crc64 != expected_crc64 {
+                        return Err(ServerError::IntegrityError {
+                            bucket: self.bucket.clone(),
+                            key: self.key.clone(),
+                            expected: expected_crc64,
+                            actual: actual_crc64,
+                        });
+                    }
+                }
+                return Ok(None);
+            }
+
+            let slice = self.segments[self.next_segment_index].clone();
+            #[cfg(feature = "deep-tracing")]
+            if let Some(trace) = observability::current_context() {
+                let read_object_offset_start =
+                    slice.segment_object_offset_start + slice.start_offset;
+                let read_object_offset_end_exclusive =
+                    slice.segment_object_offset_start + slice.end_offset;
+                let read_object_offset_len =
+                    read_object_offset_end_exclusive - read_object_offset_start;
+                let read_segment_offset_len = slice.end_offset - slice.start_offset;
+                if let Some(part_layout) = slice.part_number.zip(slice.part_order).zip(
+                    slice
+                        .part_object_offset_start
+                        .zip(slice.part_object_offset_end_exclusive),
+                ) {
+                    let (
+                        (part_number, part_order),
+                        (part_object_offset_start, part_object_offset_end_exclusive),
+                    ) = part_layout;
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "read_segment_layout",
+                        Some(format_args!(
+                            "bucket={:?} key={:?} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} data_pg_id={} ec_k={} ec_m={}",
+                            self.bucket,
+                            self.key,
+                            part_order,
+                            part_number,
+                            part_object_offset_start,
+                            part_object_offset_end_exclusive - part_object_offset_start,
+                            part_object_offset_end_exclusive,
+                            slice.segment_index,
+                            slice.payload.size,
+                            slice.segment_object_offset_start,
+                            slice.segment_object_offset_end_exclusive,
+                            read_object_offset_start,
+                            read_object_offset_len,
+                            read_object_offset_end_exclusive,
+                            slice.start_offset,
+                            read_segment_offset_len,
+                            slice.end_offset,
+                            slice.payload.data_pg_id,
+                            slice.payload.ec_k,
+                            slice.payload.ec_m,
+                        )),
+                    );
+                } else {
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "read_segment_layout",
+                        Some(format_args!(
+                            "bucket={:?} key={:?} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} data_pg_id={} ec_k={} ec_m={}",
+                            self.bucket,
+                            self.key,
+                            slice.segment_index,
+                            slice.payload.size,
+                            slice.segment_object_offset_start,
+                            slice.segment_object_offset_end_exclusive,
+                            read_object_offset_start,
+                            read_object_offset_len,
+                            read_object_offset_end_exclusive,
+                            slice.start_offset,
+                            read_segment_offset_len,
+                            slice.end_offset,
+                            slice.payload.data_pg_id,
+                            slice.payload.ec_k,
+                            slice.payload.ec_m,
+                        )),
+                    );
+                }
+            }
+
+            let data = self.runtime.read_checked_segment_payload(
+                &slice.payload,
+                slice.part_number,
+                self.sse_customer_request.as_ref(),
+            )?;
+            if matches!(
+                self.verification,
+                SegmentListVerification::FullPayloadCrc { .. }
+            ) {
+                self.verified_size += data.len();
+                self.verified_crc64.update(data.as_ref());
+            }
+            self.next_segment_index += 1;
+            self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
+            #[cfg(test)]
+            if self.next_segment_index == 1 {
+                maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
+            }
+        }
+    }
+}
+
+impl MultipartReader {
+    pub(super) fn next_chunk(
+        &mut self,
+        target_size: usize,
+    ) -> Result<Option<ReadChunk>, ServerError> {
+        loop {
+            if let Some(current) = &mut self.current_part {
+                let chunk = current.next_chunk(target_size)?;
+                if chunk.is_some() {
+                    return Ok(chunk);
+                }
+                self.current_part = None;
+            }
+
+            if self.next_part_index >= self.parts.len() {
+                return Ok(None);
+            }
+
+            let part = self.parts[self.next_part_index].clone();
+            self.next_part_index += 1;
+            #[cfg(feature = "deep-tracing")]
+            if let Some(trace) = observability::current_context() {
+                let _ = observability::event_in_context(
+                    &trace,
+                    TRACE_TARGET,
+                    "read_multipart_part_layout",
+                    Some(format_args!(
+                        "bucket={:?} key={:?} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_count={}",
+                        self.bucket,
+                        self.key,
+                        part.layout.part_order,
+                        part.layout.part_number,
+                        part.layout.object_offset_start,
+                        part.layout.object_offset_end_exclusive - part.layout.object_offset_start,
+                        part.layout.object_offset_end_exclusive,
+                        part.segments.len(),
+                    )),
+                );
+            }
+            self.current_part = Some(SegmentListReader::new_full_payload_crc_checked(
+                self.runtime.clone(),
+                self.bucket.clone(),
+                self.key.clone(),
+                part.segments,
+                self.sse_customer_request.clone(),
+                part.layout.part_size,
+                part.layout.payload_crc64,
+            ));
+        }
     }
 }
 
@@ -314,18 +593,23 @@ impl ReadHandle {
             bytes_emitted: 0,
             expected_crc64,
             crc64: checksum::crc64::Hasher::new(),
-            inner: ReadHandleInner::Segments(SegmentListReader {
-                runtime,
-                bucket: bucket_owned,
-                key: key_owned,
-                segments,
-                next_segment_index: 0,
-                loaded_segment: None,
-                sse_customer_request,
-                expected_crc64,
-                expected_verified_size: expected_size,
-                verified_size: 0,
-                verified_crc64: checksum::crc64::Hasher::new(),
+            inner: ReadHandleInner::Segments(match expected_crc64 {
+                Some(expected_crc64) => SegmentListReader::new_full_payload_crc_checked(
+                    runtime,
+                    bucket_owned,
+                    key_owned,
+                    segments,
+                    sse_customer_request,
+                    expected_size,
+                    expected_crc64,
+                ),
+                None => SegmentListReader::new_stored_segment_crc_checked(
+                    runtime,
+                    bucket_owned,
+                    key_owned,
+                    segments,
+                    sse_customer_request,
+                ),
             }),
         })
     }
@@ -363,19 +647,13 @@ impl ReadHandle {
             bytes_emitted: 0,
             expected_crc64: None,
             crc64: checksum::crc64::Hasher::new(),
-            inner: ReadHandleInner::Segments(SegmentListReader {
+            inner: ReadHandleInner::Segments(SegmentListReader::new_stored_segment_crc_checked(
                 runtime,
-                bucket: bucket_owned,
-                key: key_owned,
+                bucket_owned,
+                key_owned,
                 segments,
-                next_segment_index: 0,
-                loaded_segment: None,
                 sse_customer_request,
-                expected_crc64: None,
-                expected_verified_size: expected_size,
-                verified_size: 0,
-                verified_crc64: checksum::crc64::Hasher::new(),
-            }),
+            )),
         })
     }
 

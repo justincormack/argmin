@@ -42,8 +42,6 @@ pub use self::infra::BackgroundWorkerMode;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
 use self::payload::PayloadBufferPool;
-#[cfg(test)]
-use self::payload::SharedPayloadBuffer;
 use self::read_core::{
     segment_payloads_from_object_segments, ReadObjectContext, SegmentPayloadRecord,
 };
