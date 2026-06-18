@@ -18,15 +18,16 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
-    BucketMetadataNodeClient, BucketWriteReservationNodeClient,
-    BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
-    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
-    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
-    BuildDeleteSpecificObjectVersionCommandReq, BuildDirectPutCommitCommandReq,
-    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
-    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
-    CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
-    LocalStorageNodeClient, MarkBucketDeletingCommandBuild, ObjectGenerationMetadataNodeClient,
+    complete_multipart_expected_object_parts, BucketMetadataNodeClient,
+    BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
+    BuildAuthorizedAbortMultipartUploadCommandReq, BuildCompleteMultipartObjectCommandReq,
+    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
+    BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
+    BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
+    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
+    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
+    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, LocalStorageNodeClient,
+    MarkBucketDeletingCommandBuild, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
     ShardScavengerNodeClient,
@@ -5144,35 +5145,11 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let expected_object_parts: Vec<crate::types::ObjectPartRecord> = request
-            .request
-            .part_records
-            .iter()
-            .map(|part| crate::types::ObjectPartRecord {
-                bucket: request.request.bucket.clone(),
-                key: request.request.key.clone(),
-                version_id: request.version_id,
-                part_number: part.part_number,
-                size: part.size,
-                etag: part.etag.clone(),
-                etag_kind: part.etag_kind,
-                part_okh: part.part_okh,
-                part_vid: part.part_vid,
-                ec_k: part.ec_k,
-                ec_m: part.ec_m,
-                data_pg_id: self
-                    .node
-                    .pg_topology()
-                    .object_generation_multipart_part_data_pg(
-                        &request.request.bucket,
-                        &request.request.key,
-                        request.request.generation_id,
-                        part.part_number,
-                    )
-                    .get(),
-                checksum: part.checksum.clone(),
-            })
-            .collect();
+        let expected_object_parts = complete_multipart_expected_object_parts(
+            &request.request,
+            request.version_id,
+            self.node.pg_topology(),
+        );
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let response =
             match ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(

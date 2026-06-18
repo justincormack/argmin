@@ -3194,37 +3194,11 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
             let parts_count =
                 std::num::NonZeroU32::new(u32::try_from(hook_req.part_records.len()).unwrap())
                     .unwrap();
-            let object_parts = hook_req
-                .part_records
-                .iter()
-                .map(|part| {
-                    let data_pg_id = primary
-                        .storage_node()
-                        .pg_topology()
-                        .object_generation_multipart_part_data_pg(
-                            &hook_bucket,
-                            &hook_key,
-                            hook_req.generation_id,
-                            part.part_number,
-                        )
-                        .get();
-                    crate::ObjectPartRecord {
-                        bucket: hook_bucket.clone(),
-                        key: hook_key.clone(),
-                        version_id: crate::VersionId::Null,
-                        part_number: part.part_number,
-                        size: part.size,
-                        etag: part.etag.clone(),
-                        etag_kind: part.etag_kind,
-                        part_okh: part.part_okh,
-                        part_vid: part.part_vid,
-                        ec_k: part.ec_k,
-                        ec_m: part.ec_m,
-                        data_pg_id,
-                        checksum: part.checksum.clone(),
-                    }
-                })
-                .collect::<Vec<_>>();
+            let object_parts = crate::node_client::complete_multipart_expected_object_parts(
+                &hook_req,
+                crate::VersionId::Null,
+                primary.storage_node().pg_topology(),
+            );
             let mut selected_streaming_segments =
                 crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
                     &*pg,

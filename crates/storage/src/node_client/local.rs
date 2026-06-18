@@ -3288,37 +3288,11 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);
             }
         }
-        let object_parts = complete
-            .part_records
-            .iter()
-            .map(|part| {
-                let data_pg_id = self
-                    .storage_node
-                    .pg_topology()
-                    .object_generation_multipart_part_data_pg(
-                        &complete.bucket,
-                        &complete.key,
-                        complete.generation_id,
-                        part.part_number,
-                    )
-                    .get();
-                ObjectPartRecord {
-                    bucket: complete.bucket.clone(),
-                    key: complete.key.clone(),
-                    version_id: request.version_id,
-                    part_number: part.part_number,
-                    size: part.size,
-                    etag: part.etag.clone(),
-                    etag_kind: part.etag_kind,
-                    part_okh: part.part_okh,
-                    part_vid: part.part_vid,
-                    ec_k: part.ec_k,
-                    ec_m: part.ec_m,
-                    data_pg_id,
-                    checksum: part.checksum.clone(),
-                }
-            })
-            .collect();
+        let object_parts = complete_multipart_expected_object_parts(
+            complete,
+            request.version_id,
+            self.storage_node.pg_topology(),
+        );
         if object_parts != request.expected_object_parts {
             return Err(ObjectPgActionError::InvalidRequest {
                 reason: "complete multipart expected object parts do not match topology"

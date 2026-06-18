@@ -24,12 +24,12 @@ use crate::metadata_command::{
 };
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
-    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
-    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
-    BuildDeleteSpecificObjectVersionCommandReq, BuildInsertDeleteMarkerCommandReq,
-    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
-    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    complete_multipart_expected_object_parts, BuildCompleteMultipartObjectCommandReq,
+    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
+    BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
+    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
+    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
+    CreateStreamUploadPrecondition, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;
@@ -9731,33 +9731,11 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
-            let expected_object_parts: Vec<ObjectPartRecord> = req
-                .part_records
-                .iter()
-                .map(|part| ObjectPartRecord {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    version_id,
-                    part_number: part.part_number,
-                    size: part.size,
-                    etag: part.etag.clone(),
-                    etag_kind: part.etag_kind,
-                    part_okh: part.part_okh,
-                    part_vid: part.part_vid,
-                    ec_k: part.ec_k,
-                    ec_m: part.ec_m,
-                    data_pg_id: self
-                        .local_map
-                        .object_generation_multipart_part_data_pg(
-                            &bucket,
-                            &key,
-                            req.generation_id,
-                            part.part_number,
-                        )
-                        .get(),
-                    checksum: part.checksum.clone(),
-                })
-                .collect();
+            let expected_object_parts = complete_multipart_expected_object_parts(
+                &req,
+                version_id,
+                self.local_map.pg_topology(),
+            );
             let command = match mutation_client.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
                     pg_id,

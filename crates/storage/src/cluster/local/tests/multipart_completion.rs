@@ -2387,29 +2387,11 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
                 second_outcome.version_id
             )
             .unwrap(),
-            vec![crate::ObjectPartRecord {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: second_outcome.version_id,
-                part_number: second_req.part_records[0].part_number,
-                size: second_req.part_records[0].size,
-                etag: second_req.part_records[0].etag.clone(),
-                etag_kind: second_req.part_records[0].etag_kind,
-                part_okh: second_req.part_records[0].part_okh,
-                part_vid: second_req.part_records[0].part_vid,
-                ec_k: second_req.part_records[0].ec_k,
-                ec_m: second_req.part_records[0].ec_m,
-                data_pg_id: node
-                    .pg_topology()
-                    .object_generation_multipart_part_data_pg(
-                        &bucket,
-                        &key,
-                        second_req.generation_id,
-                        second_req.part_records[0].part_number,
-                    )
-                    .get(),
-                checksum: second_req.part_records[0].checksum.clone(),
-            }]
+            crate::node_client::complete_multipart_expected_object_parts(
+                &second_req,
+                second_outcome.version_id,
+                node.pg_topology(),
+            )
         );
         assert_eq!(
             crate::PgMetadataStore::get_multipart_part_segments(

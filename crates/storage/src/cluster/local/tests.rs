@@ -1011,36 +1011,11 @@ fn pending_multipart_completion_command_for_test(
         .expect("seeded upload is still in progress");
     let parts_count =
         std::num::NonZeroU32::new(u32::try_from(req.part_records.len()).unwrap()).unwrap();
-    let topology = primary.storage_node().pg_topology();
-    let object_parts = req
-        .part_records
-        .iter()
-        .map(|part| {
-            let data_pg_id = topology
-                .object_generation_multipart_part_data_pg(
-                    &req.bucket,
-                    &req.key,
-                    req.generation_id,
-                    part.part_number,
-                )
-                .get();
-            crate::ObjectPartRecord {
-                bucket: req.bucket.clone(),
-                key: req.key.clone(),
-                version_id: crate::VersionId::Null,
-                part_number: part.part_number,
-                size: part.size,
-                etag: part.etag.clone(),
-                etag_kind: part.etag_kind,
-                part_okh: part.part_okh,
-                part_vid: part.part_vid,
-                ec_k: part.ec_k,
-                ec_m: part.ec_m,
-                data_pg_id,
-                checksum: part.checksum.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
+    let object_parts = crate::node_client::complete_multipart_expected_object_parts(
+        req,
+        crate::VersionId::Null,
+        primary.storage_node().pg_topology(),
+    );
     let mut selected_streaming_segments =
         crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(&*pg, &req.upload_id)
             .unwrap();

@@ -26,6 +26,7 @@ use crate::metadata_command::{
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
+use crate::pg_topology::PgTopology;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_response,
     decode_bucket_delete_finalize_claim_optional_record_response,
@@ -279,6 +280,39 @@ fn storage_rpc_response_error(
             message: format!("{code:?}: {}", error.message),
         },
     }
+}
+
+pub(crate) fn complete_multipart_expected_object_parts(
+    request: &CompleteMultipartCommitRequest,
+    version_id: VersionId,
+    topology: &PgTopology,
+) -> Vec<ObjectPartRecord> {
+    request
+        .part_records
+        .iter()
+        .map(|part| ObjectPartRecord {
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+            version_id,
+            part_number: part.part_number,
+            size: part.size,
+            etag: part.etag.clone(),
+            etag_kind: part.etag_kind,
+            part_okh: part.part_okh,
+            part_vid: part.part_vid,
+            ec_k: part.ec_k,
+            ec_m: part.ec_m,
+            data_pg_id: topology
+                .object_generation_multipart_part_data_pg(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                    part.part_number,
+                )
+                .get(),
+            checksum: part.checksum.clone(),
+        })
+        .collect()
 }
 
 fn load_multipart_upload_from_pg(

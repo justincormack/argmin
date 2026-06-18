@@ -1697,6 +1697,10 @@ impl LocalClusterMap {
         &self.pg_ids
     }
 
+    pub(crate) fn pg_topology(&self) -> &PgTopology {
+        &self.pg_topology
+    }
+
     pub fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
     }
