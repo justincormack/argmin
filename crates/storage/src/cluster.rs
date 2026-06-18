@@ -6892,6 +6892,14 @@ impl StorageCluster {
         Ok(repair_targets)
     }
 
+    pub fn repair_placed_segment_payload_shards_if_needed(
+        &self,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let repair_targets = self.placed_segment_payload_shard_repair_targets(req)?;
+        self.repair_placed_segment_payload_shards(req, &repair_targets)
+    }
+
     pub fn repair_placed_segment_payload_shards(
         &self,
         req: SegmentStoredBytesRequest,

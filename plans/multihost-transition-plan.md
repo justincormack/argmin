@@ -7563,6 +7563,11 @@ Shard repair design:
   file, wrong-size, or checksum-corrupt shards as repair targets, fail closed
   when more than `m` shards are unavailable, and return clean after the batch
   repair primitive rewrites the identified targets.
+- Added a segment-level repair orchestration helper that performs target
+  inspection and batch repair in one storage-cluster call. It no-ops for a clean
+  segment, repairs all identified targets for mixed missing/corrupt shards, and
+  keeps the same fail-closed behavior as the underlying inspection and repair
+  boundaries.
 
 Exit criteria:
 

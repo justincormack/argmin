@@ -1987,6 +1987,114 @@ fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
 }
 
 #[test]
+fn repair_placed_segment_payload_shards_if_needed_noops_for_clean_segment() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"phase-eleven-clean-repair-noop");
+
+    let repaired = cluster
+        .repair_placed_segment_payload_shards_if_needed(crate::SegmentStoredBytesRequest {
+            data_pg_id: segment.written.data_pg_id,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.generation_id,
+            stored_size: segment.payload.len(),
+            segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+            ec: segment.written.ec,
+        })
+        .unwrap();
+
+    assert!(repaired.is_empty());
+}
+
+#[test]
+fn repair_placed_segment_payload_shards_if_needed_repairs_identified_targets() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"phase-eleven-orchestrated-repair");
+    let missing_shard = ShardIndex::new(0);
+    let corrupt_shard = ShardIndex::new(1);
+    let missing_path = cluster
+        .test_payload_shard_file_path(
+            segment.written.data_pg_id,
+            segment.written.ec,
+            &segment.segment_okh,
+            segment.generation_id,
+            missing_shard.get(),
+        )
+        .unwrap();
+    let corrupt_path = cluster
+        .test_payload_shard_file_path(
+            segment.written.data_pg_id,
+            segment.written.ec,
+            &segment.segment_okh,
+            segment.generation_id,
+            corrupt_shard.get(),
+        )
+        .unwrap();
+    let corrupt_size = segment
+        .payload
+        .len()
+        .div_ceil(usize::from(segment.written.ec.k));
+    std::fs::remove_file(&missing_path).unwrap();
+    std::fs::write(&corrupt_path, vec![0xAB; corrupt_size]).unwrap();
+
+    let req = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: Some(checksum::crc64::checksum(&segment.payload)),
+        ec: segment.written.ec,
+    };
+    let repaired = cluster
+        .repair_placed_segment_payload_shards_if_needed(req)
+        .unwrap();
+
+    assert_eq!(repaired.len(), 2);
+    assert_eq!(
+        repaired
+            .iter()
+            .map(|written| written.key.shard_index())
+            .collect::<Vec<_>>(),
+        vec![missing_shard, corrupt_shard]
+    );
+    assert_eq!(
+        cluster
+            .placed_segment_payload_shard_repair_targets(req)
+            .unwrap(),
+        Vec::<ShardIndex>::new()
+    );
+}
+
+#[test]
 fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard() {
     let tmp = test_util::tempdir();
     let node_ids = [
