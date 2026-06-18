@@ -8365,7 +8365,7 @@ fn empty_object() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
-    test_helpers::put_object(
+    let put = test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -8382,6 +8382,16 @@ fn empty_object() {
         },
     )
     .unwrap();
+    let segments = coord
+        .storage_node()
+        .test_get_object_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("empty"),
+            put.version_id,
+        )
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].size, 0);
 
     let obj = coord
         .get_object(&GetObjectRequest {

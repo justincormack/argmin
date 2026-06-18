@@ -243,3 +243,65 @@ impl SharedStorageNode {
         sessions
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erasure_coded_segment_shard_payload_sizes_match_ceiling_division() {
+        let ec = SharedStorageNode::DEFAULT_EC_SHAPE;
+        let node = SharedStorageNode::topology_only(&[0], ec).unwrap();
+        let segment_okh = [0xAB; 16];
+        let segment_vid = GenerationId::new(1).expect("positive segment generation id");
+        let total_shards = usize::from(ec.k + ec.m);
+
+        for len in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16] {
+            let payload = (0..len).map(|i| i as u8).collect::<Vec<_>>();
+            let expected_shard_size = len.div_ceil(usize::from(ec.k));
+            let mut observed_sizes = Vec::new();
+
+            let written = node
+                .write_erasure_coded_segment_shards_with(
+                    &segment_okh,
+                    segment_vid,
+                    &payload,
+                    ec,
+                    |shards| {
+                        observed_sizes = shards
+                            .iter()
+                            .map(|(_, shard_payload)| shard_payload.len())
+                            .collect();
+                        Ok(shards
+                            .iter()
+                            .map(|(key, shard_payload)| {
+                                (
+                                    key.clone(),
+                                    WriteAck {
+                                        stored_size: shard_payload.len() as u64,
+                                        crc64: checksum::crc64::checksum(shard_payload),
+                                    },
+                                )
+                            })
+                            .collect())
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(observed_sizes.len(), total_shards, "payload len {len}");
+            assert!(
+                observed_sizes
+                    .iter()
+                    .all(|&size| size == expected_shard_size),
+                "payload len {len}: expected all shard payloads to be {expected_shard_size} bytes, got {observed_sizes:?}"
+            );
+            assert_eq!(written.len(), total_shards, "payload len {len}");
+            assert!(
+                written
+                    .iter()
+                    .all(|written| written.ack.stored_size == expected_shard_size as u64),
+                "payload len {len}: expected all write acks to be {expected_shard_size} bytes, got {written:?}"
+            );
+        }
+    }
+}
