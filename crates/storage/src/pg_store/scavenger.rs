@@ -1301,6 +1301,11 @@ fn validate_placed_segment_shard_repair_pg(
 fn validate_placed_segment_shard_repair_work_item(
     work_item: &PlacedSegmentShardRepairWorkItem,
 ) -> Result<(), StoreError> {
+    if work_item.request.segment_crc64.is_none() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "durable repair work item requires segment CRC64".to_string(),
+        });
+    }
     if work_item.request.ec.k == 0 {
         return Err(StoreError::PayloadShardSetMismatch {
             reason: "durable repair work item has invalid EC k=0".to_string(),
@@ -1457,7 +1462,7 @@ fn placed_segment_shard_repair_work_item_from_row(
             )),
         )
     })?;
-    Ok(PlacedSegmentShardRepairWorkItem {
+    let work_item = PlacedSegmentShardRepairWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: row.get::<_, i64>(0)? as u32,
             segment_okh,
@@ -1470,7 +1475,15 @@ fn placed_segment_shard_repair_work_item_from_row(
             },
         },
         shard_index: ShardIndex::new(row.get::<_, i64>(7)? as u8),
-    })
+    };
+    validate_placed_segment_shard_repair_work_item(&work_item).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Null,
+            Box::new(std::io::Error::other(error.to_string())),
+        )
+    })?;
+    Ok(work_item)
 }
 
 #[cfg(test)]
@@ -1591,6 +1604,67 @@ mod tests {
         assert!(matches!(
             store.resolve_placed_segment_shard_repair(&work_item),
             Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_requires_segment_crc64() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xAC; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: None,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+        };
+
+        assert!(matches!(
+            store.record_placed_segment_shard_repair(&work_item, None),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+        assert!(matches!(
+            store.resolve_placed_segment_shard_repair(&work_item),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_list_rejects_malformed_missing_crc_row() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO placed_segment_shard_repairs \
+                 (data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, ec_k, ec_m, \
+                  shard_index, first_seen_at, last_seen_at, observation_count, last_error) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                params![
+                    7i64,
+                    [0xADu8; 16].as_slice(),
+                    42i64,
+                    1024i64,
+                    4i64,
+                    2i64,
+                    5i64,
+                    10i64,
+                    20i64,
+                    1i64,
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.list_placed_segment_shard_repairs(),
+            Err(StoreError::Db {
+                context: "read placed segment shard repair",
+                ..
+            })
         ));
     }
 
