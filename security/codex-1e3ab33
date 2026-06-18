@@ -1,0 +1,156 @@
+Repair RPC rejects valid records without CRC
+Link: https://chatgpt.com/codex/cloud/security/findings/53a4d04c90588191bc05741c1e6c47af?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1e3ab33
+Author: justin@specialbusservice.com
+Created: 18/06/2026, 12:29:00
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Resolution
+Fixed in commit [6d76aca9](https://github.com/justincormack/argmin/commit/6d76aca9) (`Require CRC for durable shard repairs`).
+
+The repair queue now treats `segment_crc64` as required for placed-segment shard repair work items. The fix splits the storage RPC repair work-item size accounting into true minimum and maximum encoded lengths, so structurally complete short payloads are decoded far enough to receive a semantic validation error instead of a generic `Truncated` error. Repair work items missing the segment CRC are rejected at RPC encode/decode boundaries, claim-record validation, PgStore record/resolve validation, and durable row load.
+
+The PgStore list path now validates rows through the shared durable repair work-item validator before returning them, so a malformed persisted row with `segment_crc64 = NULL` fails closed as a typed store read error before it can reach `encode_placed_segment_shard_repairs_response`.
+
+Regression coverage was added for the RPC missing-CRC path, API-level durable repair insertion/resolve rejection, and direct malformed-row listing rejection.
+
+# Summary
+Introduced a reliability/availability bug in the newly added durable placed-shard repair RPC path. It does not appear to be a security vulnerability under the provided threat model because the affected interface is internal storage-node RPC/repair maintenance rather than an unauthenticated external S3 request path.
+The commit adds RPC encoding/decoding for durable placed segment shard repair records. The decoder first checks whether the declared record count can fit in the remaining payload by dividing by STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN. However, that constant is not actually the minimum record size: it includes an optional CRC64 as if it were always present. A valid encoded record with segment_crc64 = None and last_error = None is smaller than the constant. The encoder can produce exactly such records because both fields are optional, and the cluster scheduler records repairs with last_error set to None. As a result, a legitimate PlacedSegmentShardRepairs response containing repairs for segments without CRC64 can fail decoding with Truncated, preventing clients from listing/loading durable repair work over RPC.
+
+# Validation
+## Rubric
+- [x] Confirm the introduced constants and decoder preflight check use a declared minimum record length that includes optional CRC64 bytes.
+- [x] Confirm optional fields are actually encoded as 1-byte None tags, making valid records shorter than that constant.
+- [x] Exercise the real encode_placed_segment_shard_repairs_response and decode_placed_segment_shard_repairs_response path with segment_crc64=None and last_error=None.
+- [x] Show the encoded payload length is valid but below the flawed minimum and that decoding returns Err(Truncated).
+- [x] Attempt compiled-stack validation methods: direct failing PoC/test, valgrind/ASan availability checks, and non-interactive debugger tracing.
+## Report
+Validated the suspected reliability bug dynamically. I added a targeted unit-test PoC inside crates/storage/src/storage_rpc.rs that constructs a PlacedSegmentShardRepairRecord with segment_crc64: None and last_error: None, encodes it with encode_placed_segment_shard_repairs_response, then decodes it with decode_placed_segment_shard_repairs_response. The encoder produced encoded_total_len=69, i.e. 4-byte count plus 65-byte record, while STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN is 73. The decoder preflight check at crates/storage/src/storage_rpc.rs:8974-8993 therefore computes remaining_len / 73 == 0 and returns Err(Truncated) for count=1 before reading the valid record. This matches the finding. Relevant code evidence: constants at crates/storage/src/storage_rpc.rs:102-104 include the optional CRC64 payload in the supposed minimum length; read_optional_u64 at crates/storage/src/storage_rpc.rs:10922-10929 permits None as a 1-byte tag; put_optional_u64 at crates/storage/src/storage_rpc.rs:14394-14402 writes None as only one byte; put_segment_stored_bytes_request at crates/storage/src/storage_rpc.rs:14249-14255 uses that optional encoder; scheduler path at crates/storage/src/cluster.rs:7353-7366 records last_error as None. Cargo test output showed left: Err(Truncated), right: Ok([...segment_crc64: None..., last_error: None...]). LLDB stopped at the flawed preflight check and showed count = 1, bytes.length = 69, decoder.cursor = 4, confirming remaining payload was 65 bytes and the oversized 73-byte minimum caused rejection. Valgrind was unavailable in the container, and Rust ASan required nightly (-Z sanitizer=address), unavailable on the stable toolchain; this is a logic/availability bug rather than memory corruption.
+
+# Evidence
+crates/storage/src/cluster.rs (L7353 to 7366)
+  Note: The new scheduler records durable repair rows with last_error set to None, producing the shortest form when the segment request also has no CRC64.
+```
+    fn schedule_placed_segment_shard_repair(
+        &self,
+        request: SegmentStoredBytesRequest,
+        shard_index: ShardIndex,
+    ) -> Result<(), StoreError> {
+        let pg_id = PgId::new(request.data_pg_id);
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request,
+            shard_index,
+        };
+        self.metadata_pg_primary_shard_ack_client(pg_id)?
+            .record_placed_segment_shard_repair(pg_id, &work_item, None)?;
+        self.enqueue_placed_segment_shard_repair(request, shard_index);
+        Ok(())
+```
+
+crates/storage/src/storage_rpc.rs (L102 to 104)
+  Note: The so-called minimum placed segment repair record length is calculated using STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN, which includes the optional CRC64 payload as if it were always present.
+```
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN: usize = 4 + 16 + 8 + 8 + 1 + 8 + 2 + 1;
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN: usize =
+    STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN + 8 + 8 + 8 + 1;
+```
+
+crates/storage/src/storage_rpc.rs (L10922 to 10929)
+  Note: Optional u64 values can be encoded as only a one-byte None tag, meaning a repair work item with no segment_crc64 is shorter than the constant assumes.
+```
+    fn read_optional_u64(&mut self) -> Result<Option<u64>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u64()?)),
+            _ => Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional u64 tag",
+            )),
+        }
+```
+
+crates/storage/src/storage_rpc.rs (L14249 to 14255)
+  Note: The repair work item encoder writes segment_crc64 through put_optional_u64, so valid records can omit the eight-byte CRC64 value.
+```
+fn put_segment_stored_bytes_request(out: &mut Vec<u8>, request: &SegmentStoredBytesRequest) {
+    put_u32(out, request.data_pg_id);
+    out.extend_from_slice(&request.segment_okh);
+    put_u64(out, request.segment_vid.get());
+    put_u64(out, request.stored_size as u64);
+    put_optional_u64(out, request.segment_crc64);
+    put_ec_shape(out, request.ec);
+```
+
+crates/storage/src/storage_rpc.rs (L8974 to 8993)
+  Note: The decoder uses the oversized minimum length in a preflight count/remaining-length check, so valid shorter records can be rejected as Truncated before individual records are decoded.
+```
+pub(crate) fn decode_placed_segment_shard_repairs_response(
+    bytes: &[u8],
+) -> Result<Vec<PlacedSegmentShardRepairRecord>, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()? as usize;
+    if count > PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT,
+        });
+    }
+    if count > decoder.remaining_len() / STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut repairs = Vec::with_capacity(count);
+    for _ in 0..count {
+        repairs.push(decoder.read_placed_segment_shard_repair_record()?);
+    }
+    decoder.finish()?;
+    Ok(repairs)
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The underlying bug is real and validated: optional fields can encode to fewer bytes than the decoder's preflight minimum, causing Err(Truncated) for valid PlacedSegmentShardRepairs responses. But severity for security purposes should be ignored because the attack path is internal storage maintenance over a private Unix socket, not an exposed public S3/auth/data boundary. The likely effect is repair queue listing/maintenance degradation, which is a reliability issue rather than a security vulnerability under the repository threat model.
+## Likelihood
+ignore - The bug is plausible during normal internal repair operations, but exploitation by a realistic in-scope attacker is unlikely because the affected RPC is local/internal, protected by private socket-directory requirements, and the relevant input is not directly controlled through the public S3 API.
+## Impact
+ignore - Impact is limited to failure to list/load durable placed-shard repair records in an internal maintenance path. No code execution, auth bypass, object data disclosure, cross-tenant boundary violation, arbitrary file access, or secret exposure is demonstrated.
+## Assumptions
+- Repository artifacts are the only source of truth; no cloud APIs or runtime deployment inspection were used.
+- The relevant production binary is argmin-s3, which exposes S3-compatible HTTP while storage-node RPC is implemented over local Unix domain sockets.
+- A local user with filesystem access to the private storage-node socket directory is not considered the primary remote attacker in the provided threat model.
+- Durable placed-segment shard repair records exist with segment_crc64=None and last_error=None
+- A frontend/storage process lists those repair records through the internal storage-node Unix RPC PlacedSegmentShardRepairs path
+- The response decoder executes before individual records are decoded
+## Path
+Internal scheduler -> Unix storage RPC PlacedSegmentShardRepairs -> valid short optional-field record -> oversized min-length preflight -> Err(Truncated) repair listing failure
+## Path evidence
+- `crates/storage/src/storage_rpc.rs:102-104` - The supposed minimum record length is based on STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN, which includes optional CRC64 bytes as if present.
+- `crates/storage/src/storage_rpc.rs:8974-8993` - The decoder rejects responses in a preflight count/remaining-length check before reading individual valid records.
+- `crates/storage/src/storage_rpc.rs:10922-10929` - Optional u64 decoding accepts None as only a one-byte tag, proving valid records can be shorter than the constant assumes.
+- `crates/storage/src/storage_rpc.rs:14249-14255` - SegmentStoredBytesRequest encodes segment_crc64 through put_optional_u64.
+- `crates/storage/src/storage_rpc.rs:14394-14402` - put_optional_u64 writes None as one byte and Some as tag plus eight-byte value.
+- `crates/storage/src/cluster.rs:7353-7366` - The scheduler records durable placed-shard repair work with last_error=None, producing a short valid record when segment_crc64 is also None.
+- `crates/storage/src/node_client/unix_rpc.rs:319-333` - The affected decoder is used by the internal Unix storage-node client for PlacedSegmentShardRepairs responses.
+- `crates/storage/src/node_client/unix_rpc.rs:705-711` - The storage-node client connects using UnixStream to a socket path rather than a public TCP endpoint.
+- `crates/storage/src/storage_node_server.rs:838-846` - The storage-node server validates the socket directory and binds a UnixListener for internal RPC.
+- `crates/storage/src/storage_node_server.rs:8721-8746` - The storage-node socket parent directory must be private; directories with group/other permissions are rejected.
+- `crates/argmin-s3/src/config.rs:190-195` - The public S3 listener is separately configured by ARGMIN_LISTEN_ADDR, while storage-node communication uses a socket path.
+- `crates/argmin-s3/src/main.rs:888-902` - The HTTP listener binds the S3 service endpoint; the vulnerable repair RPC decoder is not an HTTP request parser or handler.
+## Narrative
+The finding is a validated real bug, but the evidence supports a reliability/availability issue rather than a security vulnerability. The constant named as the minimum placed-segment repair record length includes bytes for an optional CRC64 value, while the encoder and decoder represent None as a one-byte tag. The scheduler also records new durable repair rows with last_error=None. A valid response can therefore be shorter than the flawed minimum and be rejected by decode_placed_segment_shard_repairs_response as Truncated. However, this path is reached through internal storage-node Unix RPC, whose socket directory is required to be private, and no external S3 HTTP/authz/data boundary impact is shown.
+## Controls
+- Public S3 HTTP requests use SigV4 authentication through authenticate_request, but the vulnerable path is not an S3 HTTP endpoint.
+- Storage-node RPC uses Unix domain sockets, not a public TCP listener.
+- Storage-node socket parent directories are required to be private, rejecting group/other-accessible directories.
+- Storage-node server validates PG route and primary PG before serving placed-shard repair listings.
+- Unix storage-node RPC admission limits exist for request admission/backpressure.
+## Blindspots
+- No deployment manifests or IaC were present to confirm actual production listener exposure or filesystem permissions.
+- Static review did not fully trace whether an external S3 client can indirectly influence segment_crc64=None in repair records, but no direct attacker-controlled path to the internal decoder was found.
+- Operational consequences of failed repair listing may vary by deployment size and repair workflow, but no severe security impact is evidenced.
