@@ -1055,25 +1055,7 @@ impl UnixStorageNodeClient {
         kind: StorageRpcMessageKind,
         error: StorageRpcErrorResponse,
     ) -> StoreError {
-        if error.code == StorageRpcErrorCode::ShardDeleteInProgress {
-            return StoreError::StorageRpcShardDeleteInProgress {
-                node_id: self.node_id.as_u32(),
-                operation: kind.operation_name(),
-                message: error.message,
-            };
-        }
-        if error.code == StorageRpcErrorCode::ResourceExhausted {
-            return StoreError::StorageRpcResourceExhausted {
-                node_id: self.node_id.as_u32(),
-                operation: kind.operation_name(),
-                message: error.message,
-            };
-        }
-        StoreError::StorageRpc {
-            node_id: self.node_id.as_u32(),
-            operation: kind.operation_name(),
-            message: format!("{:?}: {}", error.code, error.message),
-        }
+        storage_rpc_response_error(self.node_id, kind, error)
     }
 
     pub(crate) fn bucket_snapshot_rpc_response_error(

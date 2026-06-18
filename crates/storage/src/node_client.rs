@@ -257,6 +257,30 @@ pub(crate) use unix_admission::{
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
 
+fn storage_rpc_response_error(
+    node_id: NodeId,
+    kind: StorageRpcMessageKind,
+    error: StorageRpcErrorResponse,
+) -> StoreError {
+    match error.code {
+        StorageRpcErrorCode::ShardDeleteInProgress => StoreError::StorageRpcShardDeleteInProgress {
+            node_id: node_id.as_u32(),
+            operation: kind.operation_name(),
+            message: error.message,
+        },
+        StorageRpcErrorCode::ResourceExhausted => StoreError::StorageRpcResourceExhausted {
+            node_id: node_id.as_u32(),
+            operation: kind.operation_name(),
+            message: error.message,
+        },
+        code => StoreError::StorageRpc {
+            node_id: node_id.as_u32(),
+            operation: kind.operation_name(),
+            message: format!("{code:?}: {}", error.message),
+        },
+    }
+}
+
 fn load_multipart_upload_from_pg(
     pg: &crate::PgStore,
     bucket: &BucketName,

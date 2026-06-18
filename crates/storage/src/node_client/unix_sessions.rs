@@ -165,25 +165,7 @@ impl UnixStorageNodeReadHandleSession {
         kind: StorageRpcMessageKind,
         error: StorageRpcErrorResponse,
     ) -> StoreError {
-        if error.code == StorageRpcErrorCode::ShardDeleteInProgress {
-            return StoreError::StorageRpcShardDeleteInProgress {
-                node_id: self.node_id.as_u32(),
-                operation: kind.operation_name(),
-                message: error.message,
-            };
-        }
-        if error.code == StorageRpcErrorCode::ResourceExhausted {
-            return StoreError::StorageRpcResourceExhausted {
-                node_id: self.node_id.as_u32(),
-                operation: kind.operation_name(),
-                message: error.message,
-            };
-        }
-        StoreError::StorageRpc {
-            node_id: self.node_id.as_u32(),
-            operation: kind.operation_name(),
-            message: format!("{:?}: {}", error.code, error.message),
-        }
+        storage_rpc_response_error(self.node_id, kind, error)
     }
 
     fn rpc_payload_error(&self, operation: &'static str, message: String) -> StoreError {
@@ -283,18 +265,7 @@ impl UnixStorageNodeMetadataCommandSession {
         kind: StorageRpcMessageKind,
         error: StorageRpcErrorResponse,
     ) -> StoreError {
-        if error.code == StorageRpcErrorCode::ResourceExhausted {
-            return StoreError::StorageRpcResourceExhausted {
-                node_id: self.node_id.as_u32(),
-                operation: kind.operation_name(),
-                message: error.message,
-            };
-        }
-        StoreError::StorageRpc {
-            node_id: self.node_id.as_u32(),
-            operation: kind.operation_name(),
-            message: format!("{:?}: {}", error.code, error.message),
-        }
+        storage_rpc_response_error(self.node_id, kind, error)
     }
 
     fn rpc_payload_error(&self, operation: &'static str, message: String) -> StoreError {
@@ -1283,6 +1254,20 @@ mod tests {
                 operation: "metadata command PG lock acquire",
                 ref message,
             } if message.contains("session limit")
+        ));
+
+        let err = StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::ShardDeleteInProgress,
+            message: "shard is being deleted".to_string(),
+        };
+        assert!(matches!(
+            metadata_session
+                .rpc_response_error(StorageRpcMessageKind::MetadataCommandPgLockAcquire, err),
+            StoreError::StorageRpcShardDeleteInProgress {
+                node_id: 9,
+                operation: "metadata command PG lock acquire",
+                ref message,
+            } if message.contains("being deleted")
         ));
     }
 }
