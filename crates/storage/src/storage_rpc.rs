@@ -13034,6 +13034,8 @@ impl<'a> StorageRpcDecoder<'a> {
                     data_pg_id: self.read_u32()?,
                     okh: self.read_16_bytes()?,
                     generation_id: self.read_generation_id()?,
+                    stored_size: self.read_u64()?,
+                    crc64: self.read_optional_u64()?,
                     ec: self.read_ec_shape()?,
                 },
             )),
@@ -14644,6 +14646,8 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_u32(out, reference.data_pg_id);
             out.extend_from_slice(&reference.okh);
             put_u64(out, reference.generation_id.get());
+            put_u64(out, reference.stored_size);
+            put_optional_u64(out, reference.crc64);
             put_ec_shape(out, reference.ec);
         }
         ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
@@ -16154,6 +16158,8 @@ mod tests {
                 data_pg_id: 3,
                 okh: [7; 16],
                 generation_id: GenerationId::new(5).unwrap(),
+                stored_size: 4096,
+                crc64: Some(0xBEEF),
                 ec: EcShape { k: 2, m: 1 },
             }),
             ShardScavengerPayloadReference::RoutedMultipartPart(

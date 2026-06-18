@@ -668,40 +668,43 @@ impl PgStore {
         let mut references = Vec::new();
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM object_segments",
+            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, ec_k, ec_m \
+             FROM object_segments",
             "list object segment shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
+            "SELECT data_pg_id, part_okh, part_vid, size, NULL, ec_k, ec_m \
              FROM object_parts WHERE part_okh != zeroblob(16)",
             "list object part shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM stream_upload_segments",
+            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, ec_k, ec_m \
+             FROM stream_upload_segments",
             "list stream upload segment shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m FROM multipart_part_segments",
+            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, ec_k, ec_m \
+             FROM multipart_part_segments",
             "list multipart part segment shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, 0, NULL, ec_k, ec_m \
              FROM object_segment_reclaim_segments",
             "list object segment reclaim shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
+            "SELECT data_pg_id, part_okh, part_vid, 0, NULL, ec_k, ec_m \
              FROM multipart_reclaim_parts WHERE storage_kind = 0",
             "list multipart reclaim part shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, 0, NULL, ec_k, ec_m \
              FROM multipart_reclaim_part_segments",
             "list multipart reclaim segment shard scavenger references",
         )?;
@@ -846,6 +849,8 @@ impl PgStore {
                 segment.data_pg_id,
                 segment.segment_okh,
                 segment.segment_vid,
+                segment.size,
+                segment.segment_crc64,
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -867,6 +872,8 @@ impl PgStore {
                 part.data_pg_id,
                 part.part_okh,
                 part.part_vid,
+                part.size,
+                None,
                 EcShape {
                     k: part.ec_k,
                     m: part.ec_m,
@@ -893,6 +900,8 @@ impl PgStore {
             segment.data_pg_id,
             segment.segment_okh,
             segment.segment_vid,
+            segment.size,
+            segment.segment_crc64,
             EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
@@ -910,6 +919,8 @@ impl PgStore {
                 segment.data_pg_id,
                 segment.segment_okh,
                 segment.segment_vid,
+                segment.size,
+                segment.segment_crc64,
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -958,6 +969,8 @@ impl PgStore {
                         segment.data_pg_id,
                         segment.segment_okh,
                         segment.segment_vid,
+                        0,
+                        None,
                         segment.ec,
                     );
                 }
@@ -976,6 +989,8 @@ impl PgStore {
                             *data_pg_id,
                             *part_okh,
                             *part_vid,
+                            0,
+                            None,
                             *ec,
                         ),
                         MultipartReclaimPartRecord::Segments { segments, .. } => {
@@ -985,6 +1000,8 @@ impl PgStore {
                                     segment.data_pg_id,
                                     segment.segment_okh,
                                     segment.segment_vid,
+                                    0,
+                                    None,
                                     segment.ec,
                                 );
                             }
@@ -1000,6 +1017,8 @@ impl PgStore {
         data_pg_id: u32,
         okh: [u8; 16],
         generation_id: GenerationId,
+        stored_size: u64,
+        crc64: Option<u64>,
         ec: EcShape,
     ) {
         references.push(ShardScavengerPayloadReference::Placed(
@@ -1007,6 +1026,8 @@ impl PgStore {
                 data_pg_id,
                 okh,
                 generation_id,
+                stored_size,
+                crc64,
                 ec,
             },
         ));
@@ -1075,9 +1096,11 @@ impl PgStore {
                             2,
                             "shard scavenger reference generation",
                         )?,
+                        stored_size: row.get::<_, i64>(3)? as u64,
+                        crc64: row.get::<_, Option<i64>>(4)?.map(|crc| crc as u64),
                         ec: EcShape {
-                            k: row.get(3)?,
-                            m: row.get(4)?,
+                            k: row.get(5)?,
+                            m: row.get(6)?,
                         },
                     },
                 ))

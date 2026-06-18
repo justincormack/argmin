@@ -2180,6 +2180,8 @@ pub(crate) struct ShardScavengerPlacedShardSetReference {
     pub data_pg_id: u32,
     pub okh: [u8; 16],
     pub generation_id: GenerationId,
+    pub stored_size: u64,
+    pub crc64: Option<u64>,
     pub ec: EcShape,
 }
 

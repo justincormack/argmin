@@ -7590,12 +7590,17 @@ Shard repair design:
   without erasing retry evidence. The local store, `StorageCluster`, Unix
   storage-node RPC boundary, and RPC payload round-trips all expose this claim,
   complete, and error flow.
-- Remaining shard-repair queue work: wire background scrub findings into the
-  same durable queue, and decide whether completed repair verification should
-  persist richer per-shard outcome telemetry. Background scan cursor/progress
-  does not need to be durable; a scanner can restart from a random or rotating
-  point because any actual damaged shard it finds is recorded in the durable
-  repair queue.
+- Wired background scrub findings into the durable placed-shard repair queue.
+  The shard scavenger now carries stored-size/CRC proof for repairable placed
+  segment references, records durable repair rows when a referenced shard row is
+  missing its expected file, and emits the same in-memory wake hint used by
+  read-discovered repair work. References without enough repair proof still
+  suppress false orphan observations but remain observation-only.
+- Remaining shard-repair queue work: decide whether completed repair
+  verification should persist richer per-shard outcome telemetry. Background
+  scan cursor/progress does not need to be durable; a scanner can restart from a
+  random or rotating point because any actual damaged shard it finds is recorded
+  in the durable repair queue.
 
 Exit criteria:
 

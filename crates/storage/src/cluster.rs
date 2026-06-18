@@ -57,9 +57,9 @@ use crate::types::{
     PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
     SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
     ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, StreamUploadCommandRecord, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, VersionId, WriteAck,
-    WrittenShardAck,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
+    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -281,6 +281,13 @@ pub struct MetadataCommandApplyContextTestHookGuard {
 const TRACE_TARGET: &str = "storage";
 
 type ShardScavengerLocationIdentity = (u32, u32, ShardKey);
+type ShardScavengerRepairIdentity = (u32, ShardKey);
+
+#[derive(Debug, Default)]
+struct ShardScavengerReferenceScan {
+    locations: HashSet<ShardScavengerLocationIdentity>,
+    repair_work_by_shard: HashMap<ShardScavengerRepairIdentity, PlacedSegmentShardRepairWorkItem>,
+}
 
 fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectPgActionError {
     ObjectPgActionError::Store(StoreError::MetadataCommandContention { context })
@@ -6269,15 +6276,15 @@ impl StorageCluster {
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
         let referenced_scan = self.collect_shard_scavenger_referenced_shards();
         let mut reference_scan_errors = Vec::new();
-        let referenced_shards = match referenced_scan {
-            Ok(referenced_shards) => referenced_shards,
+        let referenced_scan = match referenced_scan {
+            Ok(referenced_scan) => referenced_scan,
             Err(error) => {
                 reference_scan_errors.push(format!("reference scan failed: {error}"));
-                HashSet::new()
+                ShardScavengerReferenceScan::default()
             }
         };
         let mut expected_nodes_by_shard: HashMap<(u32, ShardKey), HashSet<u32>> = HashMap::new();
-        for (node_id, data_pg_id, shard_key) in &referenced_shards {
+        for (node_id, data_pg_id, shard_key) in &referenced_scan.locations {
             expected_nodes_by_shard
                 .entry((*data_pg_id, shard_key.clone()))
                 .or_default()
@@ -6385,7 +6392,7 @@ impl StorageCluster {
                         continue;
                     };
                     let shard_identity = (node_id, data_pg_id, file.key.clone());
-                    if referenced_shards.contains(&shard_identity) {
+                    if referenced_scan.locations.contains(&shard_identity) {
                         continue;
                     }
                     active_observations.insert(observation_key.clone());
@@ -6434,6 +6441,16 @@ impl StorageCluster {
                                 last_error: None,
                             },
                         )?;
+                        if let Some(work_item) = referenced_scan
+                            .repair_work_by_shard
+                            .get(&(data_pg_id, row.key.clone()))
+                            .copied()
+                        {
+                            self.schedule_placed_segment_shard_repair(
+                                work_item.request,
+                                work_item.shard_index,
+                            )?;
+                        }
                     }
                     continue;
                 }
@@ -6513,8 +6530,8 @@ impl StorageCluster {
 
     fn collect_shard_scavenger_referenced_shards(
         &self,
-    ) -> Result<HashSet<ShardScavengerLocationIdentity>, StoreError> {
-        let mut referenced = HashSet::new();
+    ) -> Result<ShardScavengerReferenceScan, StoreError> {
+        let mut scan = ShardScavengerReferenceScan::default();
         for route in self.local_pg_routes() {
             let node = self
                 .local_map
@@ -6525,13 +6542,7 @@ impl StorageCluster {
             {
                 match reference {
                     ShardScavengerPayloadReference::Placed(reference) => {
-                        self.extend_referenced_shard_set(
-                            &mut referenced,
-                            reference.data_pg_id,
-                            &reference.okh,
-                            reference.generation_id,
-                            reference.ec,
-                        )?;
+                        self.extend_referenced_shard_set(&mut scan, &reference)?;
                     }
                     ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
                         let data_pg_id = self
@@ -6543,37 +6554,59 @@ impl StorageCluster {
                                 reference.part_number,
                             )
                             .get();
-                        self.extend_referenced_shard_set(
-                            &mut referenced,
+                        let reference = ShardScavengerPlacedShardSetReference {
                             data_pg_id,
-                            &reference.part_okh,
-                            reference.part_vid,
-                            reference.ec,
-                        )?;
+                            okh: reference.part_okh,
+                            generation_id: reference.part_vid,
+                            stored_size: 0,
+                            crc64: None,
+                            ec: reference.ec,
+                        };
+                        self.extend_referenced_shard_set(&mut scan, &reference)?;
                     }
                 }
             }
         }
 
-        Ok(referenced)
+        Ok(scan)
     }
 
     fn extend_referenced_shard_set(
         &self,
-        referenced: &mut HashSet<ShardScavengerLocationIdentity>,
-        data_pg_id: u32,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        ec: EcShape,
+        scan: &mut ShardScavengerReferenceScan,
+        reference: &ShardScavengerPlacedShardSetReference,
     ) -> Result<(), StoreError> {
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
-        let placement_key = segment_payload_placement_key(okh, generation_id);
+        let data_pg = DataPgId::new(PgId::new(reference.data_pg_id));
+        let placement_key = segment_payload_placement_key(&reference.okh, reference.generation_id);
         let locations = self
-            .place_payload_shards(data_pg, ec, &placement_key)
+            .place_payload_shards(data_pg, reference.ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
-        for key in Self::payload_shard_set_keys(okh, generation_id, ec) {
+        let repair_request = reference.crc64.map(|crc64| SegmentStoredBytesRequest {
+            data_pg_id: reference.data_pg_id,
+            segment_okh: reference.okh,
+            segment_vid: reference.generation_id,
+            stored_size: reference.stored_size as usize,
+            segment_crc64: Some(crc64),
+            ec: reference.ec,
+        });
+        for key in
+            Self::payload_shard_set_keys(&reference.okh, reference.generation_id, reference.ec)
+        {
             let location = Self::placed_payload_shard_location(&locations, &key)?;
-            referenced.insert((location.node_id().as_u32(), data_pg_id, key));
+            scan.locations.insert((
+                location.node_id().as_u32(),
+                reference.data_pg_id,
+                key.clone(),
+            ));
+            if let Some(request) = repair_request {
+                scan.repair_work_by_shard.insert(
+                    (reference.data_pg_id, key.clone()),
+                    PlacedSegmentShardRepairWorkItem {
+                        request,
+                        shard_index: key.shard_index(),
+                    },
+                );
+            }
         }
         Ok(())
     }

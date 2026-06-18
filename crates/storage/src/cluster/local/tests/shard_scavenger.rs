@@ -447,6 +447,28 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         }),
         "same shard key on the wrong node must remain a distinct physical observation"
     );
+
+    let repair_rows = cluster
+        .list_placed_segment_shard_repairs(written.data_pg_id)
+        .unwrap();
+    assert_eq!(repair_rows.len(), 1);
+    let expected_work = crate::PlacedSegmentShardRepairWorkItem {
+        request: crate::SegmentStoredBytesRequest {
+            data_pg_id: written.data_pg_id,
+            segment_okh,
+            segment_vid: generation_id,
+            stored_size: payload.len(),
+            segment_crc64: Some(checksum::crc64::checksum(payload)),
+            ec: written.ec,
+        },
+        shard_index: misplaced_shard.shard_index(),
+    };
+    assert_eq!(repair_rows[0].work_item, expected_work);
+    assert_eq!(repair_rows[0].observation_count, 1);
+    assert_eq!(
+        cluster.try_take_placed_segment_shard_repair_work(),
+        Some(expected_work)
+    );
 }
 
 #[test]
