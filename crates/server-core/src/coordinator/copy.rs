@@ -315,22 +315,12 @@ impl Coordinator {
             &dst_authorized,
         )?;
         let dst_write_encryption = &dst_authorized.write_encryption;
-        let not_found = |e: ServerError| match e {
-            ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                bucket: src_bucket.to_string(),
-                key: src_key.to_string(),
-            },
-            other => other,
-        };
         let copy_result = (|| {
             let mut crc64 = checksum::crc64::Hasher::new();
             let mut total_size = 0u64;
             let mut segment_index = 0u32;
 
-            while let Some(chunk) = source_body
-                .next_chunk(INTERNAL_SEGMENT_SIZE)
-                .map_err(not_found)?
-            {
+            while let Some(chunk) = source_body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
                 total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
                     ServerError::InternalError {
                         reason: "copy size overflow".to_string(),
@@ -432,13 +422,6 @@ impl Coordinator {
             source,
             destination,
         } = self.authorize_upload_part_copy_with_storage_node(&storage_node, req)?;
-        let not_found = |e: ServerError| match e {
-            ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                bucket: src_bucket.to_string(),
-                key: src_key.to_string(),
-            },
-            other => other,
-        };
 
         let mut source_body = {
             let src_stored = source.stored.clone();
@@ -539,10 +522,7 @@ impl Coordinator {
                 .checksum_algorithm
                 .map(StreamingChecksumAccumulator::new);
 
-            while let Some(chunk) = source_body
-                .next_chunk(INTERNAL_SEGMENT_SIZE)
-                .map_err(not_found)?
-            {
+            while let Some(chunk) = source_body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
                 total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
                     ServerError::InternalError {
                         reason: "upload part copy size overflow".to_string(),

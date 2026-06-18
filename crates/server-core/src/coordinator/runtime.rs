@@ -1565,22 +1565,11 @@ impl SegmentListReader {
                 }
             }
 
-            let data = self
-                .runtime
-                .read_segment_payload(
-                    &slice.payload,
-                    slice.part_number,
-                    self.sse_customer_request.as_ref(),
-                )
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: self.bucket.clone(),
-                            key: self.key.clone(),
-                        }
-                    }
-                    other => other,
-                })?;
+            let data = self.runtime.read_segment_payload(
+                &slice.payload,
+                slice.part_number,
+                self.sse_customer_request.as_ref(),
+            )?;
             self.next_segment_index += 1;
             self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
             #[cfg(test)]

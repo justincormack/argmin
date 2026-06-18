@@ -9394,7 +9394,12 @@ fn ec_drop_m_plus_one_shards_fails() {
         })
         .unwrap();
     let err = obj.body.read_all().unwrap_err();
-    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    assert!(
+        matches!(err, ServerError::Store(storage::StoreError::NotFound)),
+        "unrecoverable payload loss must not be reported as NoSuchKey: {err:?}"
+    );
+    assert_eq!(err.http_status(), 500);
+    assert_eq!(err.s3_error_code(), "InternalError");
 }
 
 #[test]

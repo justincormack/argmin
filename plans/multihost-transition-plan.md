@@ -7575,6 +7575,17 @@ Shard repair design:
   repairing inline. The explicit repair primitive reconstructs without
   recursively scheduling itself, then verifies the full EC set after writing
   requested repairs so any other bad shards are queued too.
+- Next shard-repair slice: make repair scheduling durable. Read-discovered
+  shard failures and background scrub findings are correctness risks, so their
+  repair roots should be persisted in the affected data PG before the in-memory
+  worker hint is enough. The in-memory queue should become only a wake/cache
+  optimization over durable `PlacedSegmentShardRepairWorkItem` rows, matching
+  the reclaim-queue rule above. The durable root should be idempotent and keyed
+  by segment identity plus shard index, carry the segment EC/size/checksum data
+  needed to call the repair primitive, and be claimable/retryable by a bounded
+  repair worker. Background scan cursor/progress does not need to be durable;
+  a scanner can restart from a random or rotating point because any actual
+  damaged shard it finds is recorded in the durable repair queue.
 
 Exit criteria:
 

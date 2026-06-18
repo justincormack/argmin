@@ -68,7 +68,9 @@ pub(super) struct MultipartPartReadLayout {
 
 pub(super) struct SegmentListReader {
     pub(super) runtime: ReadRuntime,
+    #[cfg_attr(not(any(test, feature = "deep-tracing")), allow(dead_code))]
     pub(super) bucket: String,
+    #[cfg_attr(not(any(test, feature = "deep-tracing")), allow(dead_code))]
     pub(super) key: String,
     pub(super) segments: Vec<SegmentSliceRecord>,
     pub(super) next_segment_index: usize,
