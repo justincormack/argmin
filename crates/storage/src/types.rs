@@ -1568,6 +1568,18 @@ pub struct PlacedSegmentShardRepairWorkItem {
     pub shard_index: ShardIndex,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardRepairRecord {
+    pub work_item: PlacedSegmentShardRepairWorkItem,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub observation_count: u64,
+    pub last_error: Option<String>,
+}
+
+pub const PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT: usize = 1024;
+pub const PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN: usize = 4096;
+
 /// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.
 ///
 /// Eliminates the correlated `etag: Vec<u8>` + `etag_kind: EtagKind` +

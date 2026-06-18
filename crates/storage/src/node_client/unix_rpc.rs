@@ -284,6 +284,89 @@ impl UnixStorageNodeClient {
         }
     }
 
+    pub(crate) fn record_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcPlacedSegmentShardRepairRecordRequest {
+            route: self.bucket_pg_request(pg_id),
+            work_item: *work_item,
+            last_error: last_error.map(ToOwned::to_owned),
+        };
+        let payload =
+            encode_placed_segment_shard_repair_record_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard repair record request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardRepairRecord,
+            payload,
+        )?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate placed segment shard repair record response",
+                "placed segment shard repair record response payload must be empty".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn list_placed_segment_shard_repairs(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
+        let request = self.bucket_pg_request(pg_id);
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode placed segment shard repairs request",
+                error.to_string(),
+            )
+        })?;
+        let response =
+            self.rpc_request(StorageRpcMessageKind::PlacedSegmentShardRepairs, payload)?;
+        decode_placed_segment_shard_repairs_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode placed segment shard repairs response",
+                error.to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn resolve_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcPlacedSegmentShardRepairItemRequest {
+            route: self.bucket_pg_request(pg_id),
+            work_item: *work_item,
+        };
+        let payload =
+            encode_placed_segment_shard_repair_item_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard repair resolve request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardRepairResolve,
+            payload,
+        )?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate placed segment shard repair resolve response",
+                "placed segment shard repair resolve response payload must be empty".to_string(),
+            ))
+        }
+    }
+
     fn encode_shard_ack_batch(
         &self,
         pg_id: PgId,
@@ -409,6 +492,32 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
         UnixStorageNodeClient::delete_written_shard_ack(self, pg_id, key)
+    }
+
+    fn record_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::record_placed_segment_shard_repair(
+            self, pg_id, work_item, last_error,
+        )
+    }
+
+    fn list_placed_segment_shard_repairs(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
+        UnixStorageNodeClient::list_placed_segment_shard_repairs(self, pg_id)
+    }
+
+    fn resolve_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::resolve_placed_segment_shard_repair(self, pg_id, work_item)
     }
 }
 

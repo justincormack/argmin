@@ -36,6 +36,24 @@ CREATE TABLE IF NOT EXISTS shard_scavenger_observations (
     PRIMARY KEY (node_id, data_pg_id, shard_index, shard_key)
 )";
 
+/// Durable repair queue for placed segment shards observed missing or corrupt.
+const CREATE_PLACED_SEGMENT_SHARD_REPAIRS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS placed_segment_shard_repairs (
+    data_pg_id          INTEGER NOT NULL CHECK (data_pg_id >= 0),
+    segment_okh         BLOB NOT NULL CHECK (length(segment_okh) = 16),
+    segment_vid         INTEGER NOT NULL CHECK (segment_vid > 0),
+    stored_size         INTEGER NOT NULL CHECK (stored_size >= 0),
+    segment_crc64       INTEGER,
+    ec_k                INTEGER NOT NULL CHECK (ec_k > 0),
+    ec_m                INTEGER NOT NULL CHECK (ec_m >= 0),
+    shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
+    first_seen_at       INTEGER NOT NULL CHECK (first_seen_at >= 0),
+    last_seen_at        INTEGER NOT NULL CHECK (last_seen_at >= 0),
+    observation_count   INTEGER NOT NULL CHECK (observation_count > 0),
+    last_error          TEXT,
+    PRIMARY KEY (segment_okh, segment_vid, shard_index)
+)";
+
 /// Per-PG object metadata table.
 const CREATE_OBJECTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS objects (
@@ -668,6 +686,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(PG_PRAGMAS)?;
     conn.execute(CREATE_SHARDS_TABLE, [])?;
     conn.execute(CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE, [])?;
+    conn.execute(CREATE_PLACED_SEGMENT_SHARD_REPAIRS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_VERSION_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_WRITE_COUNTERS_TABLE, [])?;

@@ -7575,17 +7575,19 @@ Shard repair design:
   repairing inline. The explicit repair primitive reconstructs without
   recursively scheduling itself, then verifies the full EC set after writing
   requested repairs so any other bad shards are queued too.
-- Next shard-repair slice: make repair scheduling durable. Read-discovered
-  shard failures and background scrub findings are correctness risks, so their
-  repair roots should be persisted in the affected data PG before the in-memory
-  worker hint is enough. The in-memory queue should become only a wake/cache
-  optimization over durable `PlacedSegmentShardRepairWorkItem` rows, matching
-  the reclaim-queue rule above. The durable root should be idempotent and keyed
-  by segment identity plus shard index, carry the segment EC/size/checksum data
-  needed to call the repair primitive, and be claimable/retryable by a bounded
-  repair worker. Background scan cursor/progress does not need to be durable;
-  a scanner can restart from a random or rotating point because any actual
-  damaged shard it finds is recorded in the durable repair queue.
+- Made read-discovered repair scheduling durable. Successful read recovery now
+  records an idempotent `PlacedSegmentShardRepairWorkItem` row in the affected
+  data PG before enqueueing the in-memory wake hint and fails rather than
+  dropping repair evidence if durable scheduling cannot be recorded; duplicate
+  observations are coalesced, explicit repair resolves repaired rows, and the
+  Unix storage-node RPC boundary exposes bounded-batch record/list/resolve
+  operations for multihost workers.
+- Remaining shard-repair queue work: add claim/retry/backoff semantics for the
+  bounded repair worker, wire background scrub findings into the same durable
+  queue, and decide whether completed repair verification should persist richer
+  per-shard outcome telemetry. Background scan cursor/progress does not need to
+  be durable; a scanner can restart from a random or rotating point because any
+  actual damaged shard it finds is recorded in the durable repair queue.
 
 Exit criteria:
 

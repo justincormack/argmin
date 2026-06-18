@@ -2162,6 +2162,12 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
     assert!(cluster
         .try_take_placed_segment_shard_repair_work()
         .is_none());
+    let durable_repairs = cluster
+        .list_placed_segment_shard_repairs(req.data_pg_id)
+        .unwrap();
+    assert_eq!(durable_repairs.len(), 1);
+    assert_eq!(durable_repairs[0].work_item, work);
+    assert_eq!(durable_repairs[0].observation_count, 2);
 }
 
 #[test]

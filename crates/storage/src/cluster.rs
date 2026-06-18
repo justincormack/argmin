@@ -52,10 +52,10 @@ use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, SegmentStoredBytesRequest, SessionId, ShardIndex,
-    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardScavengerPayloadReference, StreamUploadCommandRecord, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, VersionId, WriteAck,
     WrittenShardAck,
@@ -6827,6 +6827,15 @@ impl StorageCluster {
             .try_take_placed_segment_shard_repair_work()
     }
 
+    pub fn list_placed_segment_shard_repairs(
+        &self,
+        data_pg_id: u32,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
+        let pg_id = PgId::new(data_pg_id);
+        self.metadata_pg_primary_shard_ack_client(pg_id)?
+            .list_placed_segment_shard_repairs(pg_id)
+    }
+
     pub fn repair_placed_segment_payload_shard(
         &self,
         req: SegmentStoredBytesRequest,
@@ -7020,6 +7029,9 @@ impl StorageCluster {
                 },
             })?;
         self.verify_repaired_placed_segment_payload_shards(req, shard_indices)?;
+        for shard_index in shard_indices {
+            self.resolve_placed_segment_shard_repair(req, *shard_index)?;
+        }
         Ok(repaired)
     }
 
@@ -7044,7 +7056,7 @@ impl StorageCluster {
             }
         }
         for shard_index in remaining_targets {
-            self.enqueue_placed_segment_shard_repair(req, shard_index);
+            self.schedule_placed_segment_shard_repair(req, shard_index)?;
         }
         Ok(())
     }
@@ -7260,7 +7272,7 @@ impl StorageCluster {
         }
         if schedule_repair_on_recovery {
             for shard_index in repair_targets {
-                self.enqueue_placed_segment_shard_repair(req, shard_index);
+                self.schedule_placed_segment_shard_repair(req, shard_index)?;
             }
         }
         Ok(true)
@@ -7336,6 +7348,36 @@ impl StorageCluster {
                 request,
                 shard_index,
             })
+    }
+
+    fn schedule_placed_segment_shard_repair(
+        &self,
+        request: SegmentStoredBytesRequest,
+        shard_index: ShardIndex,
+    ) -> Result<(), StoreError> {
+        let pg_id = PgId::new(request.data_pg_id);
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request,
+            shard_index,
+        };
+        self.metadata_pg_primary_shard_ack_client(pg_id)?
+            .record_placed_segment_shard_repair(pg_id, &work_item, None)?;
+        self.enqueue_placed_segment_shard_repair(request, shard_index);
+        Ok(())
+    }
+
+    fn resolve_placed_segment_shard_repair(
+        &self,
+        request: SegmentStoredBytesRequest,
+        shard_index: ShardIndex,
+    ) -> Result<(), StoreError> {
+        let pg_id = PgId::new(request.data_pg_id);
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request,
+            shard_index,
+        };
+        self.metadata_pg_primary_shard_ack_client(pg_id)?
+            .resolve_placed_segment_shard_repair(pg_id, &work_item)
     }
 
     fn load_payload_shard_ack(

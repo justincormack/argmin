@@ -40,6 +40,185 @@ fn is_canonical_shard_prefix(prefix: &str) -> bool {
 }
 
 impl PgStore {
+    /// Persist a placed segment shard repair candidate.
+    ///
+    /// The in-memory repair queue is only a wake hint. This durable row is the
+    /// authoritative record that a recovered read or scrub observed a shard
+    /// needing reconstruction.
+    pub fn record_placed_segment_shard_repair(
+        &self,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        validate_placed_segment_shard_repair_work_item(work_item)?;
+        validate_placed_segment_shard_repair_pg(self.pg_id(), work_item)?;
+        if let Some(last_error) = last_error {
+            if last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "durable repair last_error length {} exceeds {}",
+                        last_error.len(),
+                        PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN
+                    ),
+                });
+            }
+        }
+        let now = Self::now_secs();
+        self.conn
+            .execute(
+                "INSERT INTO placed_segment_shard_repairs \
+                 (data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, ec_k, ec_m, \
+                  shard_index, first_seen_at, last_seen_at, observation_count, last_error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 1, ?10) \
+                 ON CONFLICT(segment_okh, segment_vid, shard_index) DO UPDATE SET \
+                  data_pg_id = excluded.data_pg_id, \
+                  stored_size = excluded.stored_size, \
+                  segment_crc64 = excluded.segment_crc64, \
+                  ec_k = excluded.ec_k, \
+                  ec_m = excluded.ec_m, \
+                  last_seen_at = excluded.last_seen_at, \
+                  observation_count = placed_segment_shard_repairs.observation_count + 1, \
+                  last_error = excluded.last_error",
+                params![
+                    work_item.request.data_pg_id as i64,
+                    work_item.request.segment_okh.as_slice(),
+                    work_item.request.segment_vid.get() as i64,
+                    work_item.request.stored_size as i64,
+                    work_item.request.segment_crc64.map(|crc| crc as i64),
+                    work_item.request.ec.k as i64,
+                    work_item.request.ec.m as i64,
+                    work_item.shard_index.get() as i64,
+                    now as i64,
+                    last_error,
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "record placed segment shard repair",
+                source,
+            })?;
+        Ok(())
+    }
+
+    pub fn list_placed_segment_shard_repairs(
+        &self,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
+                        ec_k, ec_m, shard_index, first_seen_at, last_seen_at, observation_count, \
+                        last_error \
+                 FROM placed_segment_shard_repairs \
+                 ORDER BY last_seen_at, segment_okh, segment_vid, shard_index \
+                 LIMIT ?1",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list placed segment shard repairs (prepare)",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                params![PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                    ))
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list placed segment shard repairs",
+                source,
+            })?;
+
+        let mut repairs = Vec::new();
+        for row in rows {
+            let (
+                data_pg_id,
+                segment_okh,
+                segment_vid,
+                stored_size,
+                segment_crc64,
+                ec_k,
+                ec_m,
+                shard_index,
+                first_seen_at,
+                last_seen_at,
+                observation_count,
+                last_error,
+            ) = row.map_err(|source| StoreError::Db {
+                context: "read placed segment shard repair",
+                source,
+            })?;
+            let segment_okh: [u8; 16] =
+                segment_okh
+                    .try_into()
+                    .map_err(|_| StoreError::PayloadShardSetMismatch {
+                        reason: "durable repair row has invalid segment OKH length".to_string(),
+                    })?;
+            repairs.push(PlacedSegmentShardRepairRecord {
+                work_item: PlacedSegmentShardRepairWorkItem {
+                    request: SegmentStoredBytesRequest {
+                        data_pg_id: data_pg_id as u32,
+                        segment_okh,
+                        segment_vid: GenerationId::new(segment_vid as u64).ok_or_else(|| {
+                            StoreError::PayloadShardSetMismatch {
+                                reason: "durable repair row has invalid segment version"
+                                    .to_string(),
+                            }
+                        })?,
+                        stored_size: stored_size as usize,
+                        segment_crc64: segment_crc64.map(|crc| crc as u64),
+                        ec: EcShape {
+                            k: ec_k as u8,
+                            m: ec_m as u8,
+                        },
+                    },
+                    shard_index: ShardIndex::new(shard_index as u8),
+                },
+                first_seen_at: first_seen_at as u64,
+                last_seen_at: last_seen_at as u64,
+                observation_count: observation_count as u64,
+                last_error,
+            });
+        }
+        Ok(repairs)
+    }
+
+    pub fn resolve_placed_segment_shard_repair(
+        &self,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_repair_work_item(work_item)?;
+        validate_placed_segment_shard_repair_pg(self.pg_id(), work_item)?;
+        let updated = self
+            .conn
+            .execute(
+                "DELETE FROM placed_segment_shard_repairs \
+                 WHERE segment_okh = ?1 AND segment_vid = ?2 AND shard_index = ?3",
+                params![
+                    work_item.request.segment_okh.as_slice(),
+                    work_item.request.segment_vid.get() as i64,
+                    work_item.shard_index.get() as i64,
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "resolve placed segment shard repair",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
     /// Record a non-authoritative shard scavenger audit observation.
     pub fn record_shard_scavenger_observation(
         &self,
@@ -928,9 +1107,152 @@ impl PgStore {
     }
 }
 
+fn validate_placed_segment_shard_repair_pg(
+    pg_id: u32,
+    work_item: &PlacedSegmentShardRepairWorkItem,
+) -> Result<(), StoreError> {
+    if work_item.request.data_pg_id != pg_id {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair work item data PG {} does not match routed PG {}",
+                work_item.request.data_pg_id, pg_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_repair_work_item(
+    work_item: &PlacedSegmentShardRepairWorkItem,
+) -> Result<(), StoreError> {
+    if work_item.request.ec.k == 0 {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "durable repair work item has invalid EC k=0".to_string(),
+        });
+    }
+    let total = work_item
+        .request
+        .ec
+        .k
+        .checked_add(work_item.request.ec.m)
+        .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair work item EC shard count overflow for {}+{}",
+                work_item.request.ec.k, work_item.request.ec.m
+            ),
+        })?;
+    if work_item.shard_index.get() >= total {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair shard index {} outside EC {}+{}",
+                work_item.shard_index.get(),
+                work_item.request.ec.k,
+                work_item.request.ec.m
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_segment_shard_repair_rows_are_durable_and_coalesced() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xA7; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: Some(0x1234),
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+        };
+
+        store
+            .record_placed_segment_shard_repair(&work_item, Some("first"))
+            .unwrap();
+        store
+            .record_placed_segment_shard_repair(&work_item, Some("second"))
+            .unwrap();
+
+        drop(store);
+        let reopened = PgStore::open(tmp.path(), 7).unwrap();
+        let repairs = reopened.list_placed_segment_shard_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].work_item, work_item);
+        assert_eq!(repairs[0].observation_count, 2);
+        assert_eq!(repairs[0].last_error.as_deref(), Some("second"));
+
+        assert!(reopened
+            .resolve_placed_segment_shard_repair(&work_item)
+            .unwrap());
+        assert!(reopened
+            .list_placed_segment_shard_repairs()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_list_is_bounded() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+
+        for index in 0..=PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT {
+            let mut okh = [0u8; 16];
+            okh[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let work_item = PlacedSegmentShardRepairWorkItem {
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: 7,
+                    segment_okh: okh,
+                    segment_vid: GenerationId::new(42).unwrap(),
+                    stored_size: 1024,
+                    segment_crc64: Some(index as u64),
+                    ec: EcShape { k: 4, m: 2 },
+                },
+                shard_index: ShardIndex::new(5),
+            };
+            store
+                .record_placed_segment_shard_repair(&work_item, None)
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.list_placed_segment_shard_repairs().unwrap().len(),
+            PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT
+        );
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_rejects_wrong_data_pg() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 8,
+                segment_okh: [0xA8; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: Some(0x1234),
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+        };
+
+        assert!(matches!(
+            store.record_placed_segment_shard_repair(&work_item, None),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+        assert!(matches!(
+            store.resolve_placed_segment_shard_repair(&work_item),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+    }
 
     #[test]
     fn shard_scavenger_observation_is_location_keyed_and_non_authoritative() {

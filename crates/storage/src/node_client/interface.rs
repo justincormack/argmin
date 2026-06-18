@@ -948,6 +948,24 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
 
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
+
+    fn record_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    fn list_placed_segment_shard_repairs(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError>;
+
+    fn resolve_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardScavengerNodeClient: Send + Sync {

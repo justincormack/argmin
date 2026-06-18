@@ -143,6 +143,52 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.delete_shard_record(key)
     }
+
+    fn record_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        validate_placed_segment_shard_repair_route(pg_id, work_item)?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_placed_segment_shard_repair(work_item, last_error)
+    }
+
+    fn list_placed_segment_shard_repairs(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.list_placed_segment_shard_repairs()
+    }
+
+    fn resolve_placed_segment_shard_repair(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError> {
+        validate_placed_segment_shard_repair_route(pg_id, work_item)?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.resolve_placed_segment_shard_repair(work_item)
+            .map(|_| ())
+    }
+}
+
+fn validate_placed_segment_shard_repair_route(
+    pg_id: PgId,
+    work_item: &PlacedSegmentShardRepairWorkItem,
+) -> Result<(), StoreError> {
+    if work_item.request.data_pg_id != pg_id.get() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair work item data PG {} does not match routed PG {}",
+                work_item.request.data_pg_id,
+                pg_id.get()
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl ShardScavengerNodeClient for LocalStorageNodeClient {

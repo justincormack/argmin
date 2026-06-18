@@ -1,4 +1,5 @@
 use super::*;
+use crate::PlacedSegmentShardRepairRecord;
 
 struct RecordingPlacedShardClient {
     node_id: NodeId,
@@ -152,6 +153,30 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn delete_written_shard_ack(&self, _pg_id: PgId, _key: &ShardKey) -> Result<(), StoreError> {
         Err(StoreError::NotFound)
+    }
+
+    fn record_placed_segment_shard_repair(
+        &self,
+        _pg_id: PgId,
+        _work_item: &PlacedSegmentShardRepairWorkItem,
+        _last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn list_placed_segment_shard_repairs(
+        &self,
+        _pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn resolve_placed_segment_shard_repair(
+        &self,
+        _pg_id: PgId,
+        _work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError> {
+        Ok(())
     }
 }
 

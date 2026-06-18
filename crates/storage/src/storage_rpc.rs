@@ -32,16 +32,19 @@ use crate::{
         ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
         ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
         ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-        PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SerializedMetadataBlob,
-        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-        ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-        ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-        ShardScavengerPlacedShardSetReference, ShardScavengerRoutedMultipartPartReference,
-        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
-        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
-        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-        VersionId, WriteAck, SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
+        PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+        PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SegmentStoredBytesRequest,
+        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
+        ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+        ShardScavengerObservationReason, ShardScavengerObservationRecord,
+        ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
+        ShardScavengerRoutedMultipartPartReference, StorageClass, StoredLegalHoldStatus,
+        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
+        PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT,
+        SESSION_ID_LEN, SHARD_KEY_LEN, UPLOAD_ID_LEN,
     },
     BucketName, NodeId,
 };
@@ -96,6 +99,15 @@ const STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_SCAVENGER_PAYLOAD_REFERENCE_MIN_LEN: usize = 1 + 4 + 16 + 8 + 2;
 const STORAGE_RPC_SCAVENGER_OBSERVATION_MIN_LEN: usize =
     STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN: usize = 4 + 16 + 8 + 8 + 1 + 8 + 2 + 1;
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN: usize =
+    STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN + 8 + 8 + 8 + 1;
+const STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN
+        + 1
+        + 4
+        + PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN;
 const STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN: usize =
@@ -553,6 +565,9 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
     MetadataCommandPeeringReplayApplyAndRecord = 127,
+    PlacedSegmentShardRepairRecord = 128,
+    PlacedSegmentShardRepairs = 129,
+    PlacedSegmentShardRepairResolve = 130,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +767,9 @@ impl StorageRpcMessageKind {
             Self::ObjectPayloadReclaimLoad => "object payload reclaim load",
             Self::ObjectPayloadReclaimClaimAcquire => "object payload reclaim claim acquire",
             Self::ObjectPayloadReclaimClaimRelease => "object payload reclaim claim release",
+            Self::PlacedSegmentShardRepairRecord => "placed segment shard repair record",
+            Self::PlacedSegmentShardRepairs => "placed segment shard repairs",
+            Self::PlacedSegmentShardRepairResolve => "placed segment shard repair resolve",
         }
     }
 
@@ -884,6 +902,9 @@ impl StorageRpcMessageKind {
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
             127 => Ok(Self::MetadataCommandPeeringReplayApplyAndRecord),
+            128 => Ok(Self::PlacedSegmentShardRepairRecord),
+            129 => Ok(Self::PlacedSegmentShardRepairs),
+            130 => Ok(Self::PlacedSegmentShardRepairResolve),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -2609,6 +2630,19 @@ pub(crate) struct StorageRpcScavengerObservationKeyRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentShardRepairRecordRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) work_item: PlacedSegmentShardRepairWorkItem,
+    pub(crate) last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentShardRepairItemRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) work_item: PlacedSegmentShardRepairWorkItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcReadHandleAcquireRequest {
     pub(crate) read_operation_id: String,
     pub(crate) locations: Vec<ShardLocation>,
@@ -2982,6 +3016,16 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ShardScavengerObservationResolve => {
             STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardRepairRecord => {
+            STORAGE_RPC_MAX_PLACED_SEGMENT_REPAIR_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardRepairResolve => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+                + STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardRepairs => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ClaimHeartbeat => STORAGE_RPC_MAX_CLAIM_HEARTBEAT_PAYLOAD_LEN,
         StorageRpcMessageKind::ClaimRelease => STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN,
@@ -8848,6 +8892,107 @@ pub(crate) fn decode_scavenger_observation_key_request(
     Ok(StorageRpcScavengerObservationKeyRequest { route, key })
 }
 
+pub(crate) fn encode_placed_segment_shard_repair_record_request(
+    request: &StorageRpcPlacedSegmentShardRepairRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_placed_segment_shard_repair_work_item(&mut out, &request.work_item);
+    put_optional_string(&mut out, request.last_error.as_deref());
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repair_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentShardRepairRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let work_item = decoder.read_placed_segment_shard_repair_work_item()?;
+    let last_error = decoder.read_optional_string_with_limit(
+        PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN + 1,
+            limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+        },
+    )?;
+    decoder.finish()?;
+    Ok(StorageRpcPlacedSegmentShardRepairRecordRequest {
+        route,
+        work_item,
+        last_error,
+    })
+}
+
+pub(crate) fn encode_placed_segment_shard_repair_item_request(
+    request: &StorageRpcPlacedSegmentShardRepairItemRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_placed_segment_shard_repair_work_item(&mut out, &request.work_item);
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repair_item_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentShardRepairItemRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let work_item = decoder.read_placed_segment_shard_repair_work_item()?;
+    decoder.finish()?;
+    Ok(StorageRpcPlacedSegmentShardRepairItemRequest { route, work_item })
+}
+
+pub(crate) fn encode_placed_segment_shard_repairs_response(
+    repairs: &[PlacedSegmentShardRepairRecord],
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if repairs.len() > PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: repairs.len(),
+            limit: PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(repairs.len()).map_err(|_| StorageRpcPayloadError::PayloadTooLarge {
+            len: repairs.len(),
+            limit: u32::MAX as usize,
+        })?,
+    );
+    for repair in repairs {
+        if let Some(last_error) = repair.last_error.as_deref() {
+            if last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
+                return Err(StorageRpcPayloadError::PayloadTooLarge {
+                    len: last_error.len(),
+                    limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+                });
+            }
+        }
+        put_placed_segment_shard_repair_record(&mut out, repair);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_repairs_response(
+    bytes: &[u8],
+) -> Result<Vec<PlacedSegmentShardRepairRecord>, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()? as usize;
+    if count > PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT,
+        });
+    }
+    if count > decoder.remaining_len() / STORAGE_RPC_PLACED_SEGMENT_REPAIR_RECORD_MIN_LEN {
+        return Err(StorageRpcPayloadError::Truncated);
+    }
+    let mut repairs = Vec::with_capacity(count);
+    for _ in 0..count {
+        repairs.push(decoder.read_placed_segment_shard_repair_record()?);
+    }
+    decoder.finish()?;
+    Ok(repairs)
+}
+
 pub(crate) fn encode_read_handle_acquire_request(
     request: &StorageRpcReadHandleAcquireRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -12479,6 +12624,58 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
+    fn read_segment_stored_bytes_request(
+        &mut self,
+    ) -> Result<SegmentStoredBytesRequest, StorageRpcPayloadError> {
+        Ok(SegmentStoredBytesRequest {
+            data_pg_id: self.read_u32()?,
+            segment_okh: self.read_16_bytes()?,
+            segment_vid: self.read_generation_id()?,
+            stored_size: self.read_u64()? as usize,
+            segment_crc64: self.read_optional_u64()?,
+            ec: self.read_ec_shape()?,
+        })
+    }
+
+    fn read_placed_segment_shard_repair_work_item(
+        &mut self,
+    ) -> Result<PlacedSegmentShardRepairWorkItem, StorageRpcPayloadError> {
+        let request = self.read_segment_stored_bytes_request()?;
+        let shard_index = ShardIndex::new(self.read_u8()?);
+        let total = request.ec.k.checked_add(request.ec.m).ok_or(
+            StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "placed segment repair EC shard count overflow",
+            ),
+        )?;
+        if request.ec.k == 0 || shard_index.get() >= total {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid placed segment shard repair work item",
+            ));
+        }
+        Ok(PlacedSegmentShardRepairWorkItem {
+            request,
+            shard_index,
+        })
+    }
+
+    fn read_placed_segment_shard_repair_record(
+        &mut self,
+    ) -> Result<PlacedSegmentShardRepairRecord, StorageRpcPayloadError> {
+        Ok(PlacedSegmentShardRepairRecord {
+            work_item: self.read_placed_segment_shard_repair_work_item()?,
+            first_seen_at: self.read_u64()?,
+            last_seen_at: self.read_u64()?,
+            observation_count: self.read_u64()?,
+            last_error: self.read_optional_string_with_limit(
+                PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+                StorageRpcPayloadError::PayloadTooLarge {
+                    len: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN + 1,
+                    limit: PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN,
+                },
+            )?,
+        })
+    }
+
     fn read_scavenger_payload_reference(
         &mut self,
     ) -> Result<ShardScavengerPayloadReference, StorageRpcPayloadError> {
@@ -14049,6 +14246,34 @@ fn put_scavenger_observation(out: &mut Vec<u8>, observation: &ShardScavengerObse
     put_optional_u64(out, observation.resolved_at);
 }
 
+fn put_segment_stored_bytes_request(out: &mut Vec<u8>, request: &SegmentStoredBytesRequest) {
+    put_u32(out, request.data_pg_id);
+    out.extend_from_slice(&request.segment_okh);
+    put_u64(out, request.segment_vid.get());
+    put_u64(out, request.stored_size as u64);
+    put_optional_u64(out, request.segment_crc64);
+    put_ec_shape(out, request.ec);
+}
+
+fn put_placed_segment_shard_repair_work_item(
+    out: &mut Vec<u8>,
+    work_item: &PlacedSegmentShardRepairWorkItem,
+) {
+    put_segment_stored_bytes_request(out, &work_item.request);
+    put_u8(out, work_item.shard_index.get());
+}
+
+fn put_placed_segment_shard_repair_record(
+    out: &mut Vec<u8>,
+    repair: &PlacedSegmentShardRepairRecord,
+) {
+    put_placed_segment_shard_repair_work_item(out, &repair.work_item);
+    put_u64(out, repair.first_seen_at);
+    put_u64(out, repair.last_seen_at);
+    put_u64(out, repair.observation_count);
+    put_optional_string(out, repair.last_error.as_deref());
+}
+
 fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavengerPayloadReference) {
     match reference {
         ShardScavengerPayloadReference::Placed(reference) => {
@@ -15277,6 +15502,77 @@ mod tests {
             decode_shard_ack_item_response(&response_bytes).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_rpc_round_trips_and_rejects_bad_shard_index() {
+        let route = StorageRpcBucketPgRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(3),
+        };
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 3,
+                segment_okh: [0x5A; 16],
+                segment_vid: GenerationId::new(88).unwrap(),
+                stored_size: 4096,
+                segment_crc64: Some(0xCAFE),
+                ec: EcShape { k: 2, m: 1 },
+            },
+            shard_index: ShardIndex::new(2),
+        };
+        let record_request = StorageRpcPlacedSegmentShardRepairRecordRequest {
+            route: route.clone(),
+            work_item,
+            last_error: Some("missing shard file".to_string()),
+        };
+
+        let record_bytes = encode_placed_segment_shard_repair_record_request(&record_request)
+            .expect("repair record request should encode");
+        assert_eq!(
+            decode_placed_segment_shard_repair_record_request(&record_bytes).unwrap(),
+            record_request
+        );
+
+        let item_request = StorageRpcPlacedSegmentShardRepairItemRequest { route, work_item };
+        let item_bytes = encode_placed_segment_shard_repair_item_request(&item_request)
+            .expect("repair item request should encode");
+        assert_eq!(
+            decode_placed_segment_shard_repair_item_request(&item_bytes).unwrap(),
+            item_request
+        );
+
+        let repair = PlacedSegmentShardRepairRecord {
+            work_item,
+            first_seen_at: 10,
+            last_seen_at: 20,
+            observation_count: 2,
+            last_error: Some("still bad".to_string()),
+        };
+        assert!(matches!(
+            encode_placed_segment_shard_repairs_response(&vec![
+                repair.clone();
+                PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT
+                    + 1
+            ]),
+            Err(StorageRpcPayloadError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(
+            decode_placed_segment_shard_repairs_response(
+                &encode_placed_segment_shard_repairs_response(std::slice::from_ref(&repair))
+                    .unwrap()
+            )
+            .unwrap(),
+            vec![repair]
+        );
+
+        let mut bad = item_bytes;
+        *bad.last_mut().unwrap() = 3;
+        assert!(matches!(
+            decode_placed_segment_shard_repair_item_request(&bad),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(_))
+        ));
     }
 
     #[test]

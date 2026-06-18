@@ -422,7 +422,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectStreamUploadsPgList
         | StorageRpcMessageKind::ShardScavengerShardRows
         | StorageRpcMessageKind::ShardScavengerPayloadReferences
-        | StorageRpcMessageKind::ShardScavengerObservations => {
+        | StorageRpcMessageKind::ShardScavengerObservations
+        | StorageRpcMessageKind::PlacedSegmentShardRepairs => {
             UnixStorageNodeRpcAdmissionClass::List
         }
 
@@ -445,6 +446,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ShardAckRecord
         | StorageRpcMessageKind::ShardAckValidate
         | StorageRpcMessageKind::ShardAckLoad
+        | StorageRpcMessageKind::PlacedSegmentShardRepairRecord
+        | StorageRpcMessageKind::PlacedSegmentShardRepairResolve
         | StorageRpcMessageKind::BucketWriteReservationValidate
         | StorageRpcMessageKind::BucketWriteReservationHeartbeat
         | StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad

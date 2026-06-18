@@ -28,7 +28,8 @@ use crate::node_client::{
     CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
     LocalStorageNodeClient, MarkBucketDeletingCommandBuild, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardScavengerNodeClient,
+    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
+    ShardScavengerNodeClient,
 };
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
@@ -70,7 +71,8 @@ use crate::storage_rpc::{
     decode_object_payload_reclaim_claim_record_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
     decode_object_read_snapshot_request, decode_object_request,
-    decode_object_tags_for_subject_request, decode_proof_release_request,
+    decode_object_tags_for_subject_request, decode_placed_segment_shard_repair_item_request,
+    decode_placed_segment_shard_repair_record_request, decode_proof_release_request,
     decode_put_object_metadata_command_build_request, decode_put_object_metadata_snapshot_request,
     decode_read_handle_acquire_request, decode_read_handle_release_request,
     decode_scavenger_list_files_request, decode_scavenger_observation_key_request,
@@ -118,12 +120,12 @@ use crate::storage_rpc::{
     encode_object_payload_reclaim_response, encode_object_read_auth_subject_response,
     encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
     encode_object_version_response, encode_payload_reclaim_root_response,
-    encode_put_object_metadata_snapshot_response, encode_read_handle_acquire_response,
-    encode_read_handle_release_response, encode_scavenger_list_files_response,
-    encode_scavenger_observations_response, encode_scavenger_payload_references_response,
-    encode_scavenger_shard_rows_response, encode_shard_ack_item_response,
-    encode_shard_read_range_response, encode_shard_read_response, encode_shard_write_ack,
-    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    encode_placed_segment_shard_repairs_response, encode_put_object_metadata_snapshot_response,
+    encode_read_handle_acquire_response, encode_read_handle_release_response,
+    encode_scavenger_list_files_response, encode_scavenger_observations_response,
+    encode_scavenger_payload_references_response, encode_scavenger_shard_rows_response,
+    encode_shard_ack_item_response, encode_shard_read_range_response, encode_shard_read_response,
+    encode_shard_write_ack, encode_storage_rpc_error_response, encode_storage_rpc_success_response,
     encode_stream_part_finalize_snapshot_response, encode_stream_put_finalize_snapshot_response,
     encode_stream_segment_append_prepare_response, encode_stream_upload_match_response,
     encode_stream_upload_segments_response, encode_stream_upload_session_response,
@@ -213,7 +215,8 @@ use crate::storage_rpc::{
     StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest,
     StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
     StorageRpcObjectTagsForSubjectResponse, StorageRpcObjectVersionResponse,
-    StorageRpcPayloadReclaimRootResponse, StorageRpcProofReleaseRequest,
+    StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentShardRepairItemRequest,
+    StorageRpcPlacedSegmentShardRepairRecordRequest, StorageRpcProofReleaseRequest,
     StorageRpcPutObjectMetadataCommandBuildRequest, StorageRpcPutObjectMetadataSnapshotOutcome,
     StorageRpcPutObjectMetadataSnapshotRequest, StorageRpcPutObjectMetadataSnapshotResponse,
     StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleAcquireResponse,
@@ -2219,6 +2222,33 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ShardScavengerObservationResolve => {
                 match decode_scavenger_observation_key_request(&frame.payload) {
                     Ok(request) => self.shard_scavenger_observation_resolve_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardRepairRecord => {
+                match decode_placed_segment_shard_repair_record_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_repair_record_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardRepairs => {
+                match decode_bucket_pg_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_repairs_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardRepairResolve => {
+                match decode_placed_segment_shard_repair_item_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_repair_resolve_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6325,6 +6355,81 @@ impl StorageNodeConnectionHandler {
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.resolve_shard_scavenger_observation(request.route.pg_id, &request.key) {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_repair_record_response(
+        &self,
+        request: StorageRpcPlacedSegmentShardRepairRecordRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.route.pg_id, "placed segment shard repair record")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client.record_placed_segment_shard_repair(
+            request.route.pg_id,
+            &request.work_item,
+            request.last_error.as_deref(),
+        ) {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_repairs_response(
+        &self,
+        request: StorageRpcBucketPgRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg(request.pg_id, "placed segment shard repairs")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client.list_placed_segment_shard_repairs(request.pg_id) {
+            Ok(repairs) => {
+                let payload = encode_placed_segment_shard_repairs_response(&repairs)?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_repair_resolve_response(
+        &self,
+        request: StorageRpcPlacedSegmentShardRepairItemRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.route.pg_id, "placed segment shard repair resolve")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client
+            .resolve_placed_segment_shard_repair(request.route.pg_id, &request.work_item)
+        {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
