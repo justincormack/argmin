@@ -1,0 +1,169 @@
+Unbounded shard repair queue can exhaust memory
+Link: https://chatgpt.com/codex/cloud/security/findings/631b848530008191a6eb34ff5a9e7353?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 897b622
+Author: justin@specialbusservice.com
+Created: 18/06/2026, 11:07:47
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit [41bd85fd](https://github.com/justincormack/argmin/commit/41bd85fd) (`Bound placed shard repair hint queue`), after the durable repair queue work that made PgStore repair rows the authoritative record.
+
+This finding was partially stale after durable placed-shard repair rows were added: foreground reads no longer rely on the in-memory queue as the only repair evidence, because `schedule_placed_segment_shard_repair` records a durable row before adding the local wake hint. The remaining valid issue was that the wake hint queue itself was still an unbounded `VecDeque`/`HashSet`.
+
+The fix caps the local in-memory placed-shard repair hint queue at `LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT` entries. Duplicate hints are still deduplicated, and once the hint queue is full, new non-duplicate hints are dropped after the durable repair row has already been recorded. That bounds process-memory growth while preserving repair evidence in the durable queue for workers/scrubbers to list and claim.
+
+Regression coverage was added in `placed_segment_shard_repair_hint_queue_is_bounded`, and the existing read-recovery scheduling regression still confirms normal recoverable reads enqueue one durable repair row and one local hint.
+
+# Summary
+Introduced an availability bug: read-discovered repair work is scheduled into an unbounded in-memory queue without capacity controls. Deduplication only limits duplicate entries for the exact same shard repair item, not attacker-driven growth across many objects or segments.
+Normal object reads now call the placed-segment read path with repair scheduling enabled. When recovery succeeds after observing missing, wrong-sized, or corrupt shards, each affected shard is enqueued into a new runtime repair queue. That queue is backed by a VecDeque plus HashSet and only deduplicates identical work items; it does not enforce any global or per-PG limit, does not drop or throttle work, and does not apply backpressure to foreground reads. An authenticated reader, or an anonymous reader of a public bucket, could repeatedly read many distinct objects/segments during a node/disk failure or corruption event and force the server to retain one repair item per affected shard/segment. Because the queue is in process memory, this can lead to memory exhaustion and service unavailability.
+
+# Validation
+## Rubric
+- [x] Confirm normal/read-facing path enables repair scheduling on recovery.
+- [x] Confirm recovery records observed bad/missing shards and enqueues them after successful reconstruction.
+- [x] Confirm queue implementation has no global/per-PG capacity, throttle, drop, or backpressure.
+- [x] Confirm exact-item deduplication does not prevent growth across many distinct segments/objects.
+- [x] Confirm object read handling can reach the storage read path after authorization/public-read checks.
+## Report
+Validated. Rubric-guided checks found that normal reads call `try_read_placed_segment_stored_bytes_into(..., true)` at `crates/storage/src/cluster.rs:6813`; successful recovery then iterates `repair_targets` and enqueues each at `crates/storage/src/cluster.rs:7261-7264`; the queue state is only `VecDeque<PlacedSegmentShardRepairWorkItem>` plus `HashSet<...>` at `crates/storage/src/cluster/local.rs:962-965`; enqueue only exact-deduplicates with `HashSet::insert` and then unconditionally `push_back`s at `crates/storage/src/cluster/local.rs:1139-1150`; object payload reads reach this storage read path at `crates/server-core/src/coordinator/runtime.rs:1385-1401`. I added a bounded PoC unit test that creates 64 distinct committed segments, corrupts shard 0 for each, reads each segment successfully through the foreground read path, and drains the repair queue. Command output: `POC queued_repair_items=64 distinct_segments=64`, proving one retained in-memory item per distinct segment/shard. Direct crash/OOM was not forced to avoid destabilizing the container; the bounded PoC did not crash but demonstrates linear unbounded growth. Valgrind was attempted but unavailable (`bash: command not found: valgrind`). LLDB was available and confirmed the exact foreground read-to-queue chain: breakpoint at `local.rs:1148` (`state.work_queue.push_back(work_item)`) showed stack frames `LocalClusterRuntimeState::enqueue_placed_segment_shard_repair` -> `StorageCluster::enqueue_placed_segment_shard_repair` at `cluster.rs:7335` -> `try_read_placed_segment_recovery_into` at `cluster.rs:7263` -> `try_read_placed_segment_stored_bytes_into(..., schedule_repair_on_recovery=true)` -> `read_segment_payload_stored_bytes_into` at `cluster.rs:6813` -> PoC test. This supports the suspected availability bug: deduplication only suppresses exact duplicate work items, while attacker-driven reads of many distinct degraded/corrupt segments accumulate queue entries without capacity/backpressure.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L1377 to 1397)
+  Note: Object read handling reaches the storage read path used above, making the queue growth reachable from S3 object reads after authorization/public access checks.
+```
+        &self,
+        segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
+        sse_customer_request: Option<&SseCustomerRequest>,
+    ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
+        let k = segment.ec_k as usize;
+        let padded = segment.stored_size().div_ceil(k) * k;
+
+        let mut buf = self.payload_buffer_pool.checkout(padded);
+        self.storage_node
+            .read_segment_payload_stored_bytes_into(
+                SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.stored_size(),
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+```
+
+crates/storage/src/cluster.rs (L6807 to 6814)
+  Note: Normal segment reads now enable repair scheduling by passing true into try_read_placed_segment_stored_bytes_into.
+```
+    pub fn read_segment_payload_stored_bytes_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        self.require_current_payload_operation_epoch(req.data_pg_id)?;
+        match self.try_read_placed_segment_stored_bytes_into(req, dst, true)? {
+            true => Ok(()),
+```
+
+crates/storage/src/cluster.rs (L7261 to 7265)
+  Note: Every successful recovery queues all observed repair targets on the foreground read path.
+```
+        if schedule_repair_on_recovery {
+            for shard_index in repair_targets {
+                self.enqueue_placed_segment_shard_repair(req, shard_index);
+            }
+        }
+```
+
+crates/storage/src/cluster/local.rs (L1139 to 1150)
+  Note: enqueue_placed_segment_shard_repair only deduplicates exact work items and then pushes to the queue; it never bounds, rejects for capacity, or applies backpressure.
+```
+    pub(crate) fn enqueue_placed_segment_shard_repair(
+        &self,
+        work_item: PlacedSegmentShardRepairWorkItem,
+    ) -> bool {
+        let (state_lock, cv) = &self.placed_segment_shard_repair_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.queued.insert(work_item) {
+            return false;
+        }
+        state.work_queue.push_back(work_item);
+        cv.notify_one();
+        true
+```
+
+crates/storage/src/cluster/local.rs (L962 to 966)
+  Note: The new repair queue is an in-memory VecDeque plus HashSet with no configured capacity or per-PG accounting.
+```
+#[derive(Debug)]
+struct LocalPlacedSegmentShardRepairQueueState {
+    work_queue: VecDeque<PlacedSegmentShardRepairWorkItem>,
+    queued: HashSet<PlacedSegmentShardRepairWorkItem>,
+}
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept as medium. Static evidence and the provided executable validation PoC support a real in-scope availability vulnerability: normal GetObject reads can reach an unbounded in-memory repair queue and distinct degraded segments create distinct retained work items. However, this is not high/critical because the impact is denial of service only, not data compromise or privilege escalation; the attacker must already be able to read the objects or rely on public-read ACLs; and the bug only triggers during recoverable degraded/corrupt shard conditions with enough distinct segments. HTTP concurrency limits reduce burst load but do not bound total queued repair work, so they mitigate likelihood somewhat but do not eliminate the issue.
+## Likelihood
+high - The read path is network reachable in normal deployments and may be anonymous for public-read buckets, but exploitation depends on a recoverable shard/node/disk corruption or failure state, many distinct readable segments, and queue growth outpacing any repair/drain behavior. The repository default listen address is localhost and no deployment ingress was found. | Remote network vector
+## Impact
+medium - A successful attack can exhaust argmin-s3 process memory and make the S3 service unavailable. The impact is availability only, with no demonstrated confidentiality, integrity, code execution, or authorization bypass impact, and likely affects the single service/process rather than a broader fleet by itself.
+## Assumptions
+- argmin-s3 is deployed with its HTTP S3 endpoint reachable by the attacker, even though the repository default listen address is 127.0.0.1:9000
+- the attacker has normal GetObject access to many distinct objects or segments, or the target bucket/object ACLs allow anonymous public reads
+- at least one storage shard/node/disk is in a recoverable degraded, missing, wrong-sized, or corrupt state while reads are served
+- repair queue consumption, if externally driven in a deployment, is absent or slower than attacker-driven enqueue growth
+- HTTP GetObject reachability
+- valid read authorization or anonymous public-read object access
+- many distinct readable objects or segments
+- recoverable missing, wrong-sized, corrupt, or unreadable shard condition
+## Path
+Attacker GET /bucket/key(s)
+  -> server-http GetObject dispatch
+  -> Coordinator::get_object / ReadHandle segments
+  -> read_segment_payload_stored_bytes_into(..., schedule=true)
+  -> recovery observes missing/corrupt shard(s)
+  -> enqueue_placed_segment_shard_repair
+  -> VecDeque + HashSet grows without capacity/backpressure
+  -> memory exhaustion / service unavailable
+## Path evidence
+- `crates/storage/src/cluster.rs:6807-6814` - Normal payload segment reads enable repair scheduling by passing true to try_read_placed_segment_stored_bytes_into.
+- `crates/storage/src/cluster.rs:7160-7175` - The recovery path allocates repair_targets and passes it to shard loading.
+- `crates/storage/src/cluster.rs:7296-7322` - Missing, wrong-sized, hook-failed, or read-failed shards are recorded as repair targets when recovery can continue.
+- `crates/storage/src/cluster.rs:7261-7264` - After successful recovery, each repair target is enqueued on the foreground read path.
+- `crates/storage/src/cluster/local.rs:962-966` - Repair queue state consists only of VecDeque and HashSet, with no capacity fields or per-PG accounting.
+- `crates/storage/src/cluster/local.rs:1139-1150` - enqueue_placed_segment_shard_repair only exact-deduplicates and then unconditionally pushes the work item into the queue.
+- `crates/server-http/src/http/mod.rs:1641-1648` - HTTP GetObject is a normal routed S3 operation and derives the requester from request authentication.
+- `crates/server-http/src/http/mod.rs:1781-1790` - GetObject dispatch invokes coordinator.get_object for the requested bucket/key.
+- `crates/server-core/src/coordinator/read.rs:127-144` - Coordinator object reads build a segment-backed ReadHandle for non-empty objects.
+- `crates/server-core/src/coordinator/runtime.rs:1385-1401` - Read runtime calls storage_node.read_segment_payload_stored_bytes_into, reaching the vulnerable storage path.
+- `crates/server-http/src/http/mod.rs:3122-3124` - Missing authentication is converted to AuthContext::anonymous, making public-read bucket/object paths relevant.
+- `crates/server-core/src/coordinator/access_control_tests.rs:6810-6852` - Repository test confirms anonymous GetObject is allowed for public-read objects.
+- `crates/argmin-s3/src/config.rs:101-127` - Runtime configuration includes credentials, default listen address 127.0.0.1:9000, and connection/in-flight limits.
+- `crates/argmin-s3/src/main.rs:888-889` - argmin-s3 binds a TCP listener from configured ARGMIN_LISTEN_ADDR.
+- `crates/argmin-s3/src/main.rs:947-966` - The bound listener is served as HTTP or HTTPS with max connection and max in-flight request parameters, but these do not bound the repair queue.
+## Narrative
+The finding is real and reachable. Normal segment reads call try_read_placed_segment_stored_bytes_into with repair scheduling enabled. If direct reads fail and recovery succeeds, missing/wrong-sized/corrupt/unreadable shards are collected as repair_targets and each target is enqueued. The queue is only an in-memory VecDeque plus HashSet; enqueue exact-deduplicates identical work items, then unconditionally push_back's the new item with no capacity or backpressure. HTTP GetObject reaches this storage read path after authentication/authorization, and repository tests show anonymous public-read objects are valid. The provided validation PoC queued 64 repair items for 64 distinct degraded segments, demonstrating linear growth. Severity remains medium: impact is service availability loss, but exploitation needs read access or public-read objects plus a recoverable degraded/corrupt storage condition and many distinct segments.
+## Controls
+- SigV4 authentication for private object access
+- Bucket/object ACL and policy authorization before reads
+- Anonymous access only for public-read objects
+- Connection semaphore and request semaphore bound concurrent HTTP load
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000
+- Exact-item HashSet deduplication prevents duplicate identical repair items but not distinct segment growth
+## Blindspots
+- Static-only review did not observe a real deployment, so actual ARGMIN_LISTEN_ADDR exposure, TLS termination, reverse proxy controls, and object counts are unknown.
+- No Kubernetes, Docker, Terraform, or ingress manifests were found in the repository checkout, so public exposure cannot be confirmed from repo artifacts.
+- The exact behavior of any out-of-band repair consumer in production deployments was not fully established; repository evidence shows the queue itself is unbounded and only directly drained by try_take_placed_segment_shard_repair_work.
+- The validation PoC demonstrates linear queue growth but intentionally did not force OOM or crash the container.
