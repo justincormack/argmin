@@ -663,6 +663,10 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
         next_segment_index: 0,
         loaded_segment: Some((Arc::new(SharedPayloadBuffer::from_unpooled(data)), 0, len)),
         sse_customer_request: None,
+        expected_crc64: None,
+        expected_verified_size: 0,
+        verified_size: 0,
+        verified_crc64: checksum::crc64::Hasher::new(),
     };
 
     let chunk = reader.next_chunk(len).unwrap().unwrap();

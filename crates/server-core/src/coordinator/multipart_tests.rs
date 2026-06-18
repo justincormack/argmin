@@ -4597,6 +4597,30 @@ fn create_completed_multipart_vec(
         .unwrap()
 }
 
+fn corrupt_committed_part_payload_crc64(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: VersionId,
+    part_number: u32,
+) {
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let mut parts = coord
+        .storage_node()
+        .test_get_object_parts(&bucket_name, &object_key, version_id)
+        .unwrap();
+    let part = parts
+        .iter_mut()
+        .find(|part| part.part_number == part_number)
+        .expect("committed object part exists");
+    part.payload_crc64 ^= 1;
+    coord
+        .storage_node()
+        .test_replace_object_parts(&bucket_name, &object_key, version_id, &parts)
+        .unwrap();
+}
+
 #[test]
 fn get_multipart_object_full() {
     let tmp = test_util::tempdir();
@@ -5235,6 +5259,80 @@ fn read_multipart_range_detects_incomplete_manifest() {
     assert!(
         matches!(err, ServerError::IntegrityError { .. }),
         "expected IntegrityError for incomplete manifest, got {err:?}"
+    );
+}
+
+#[test]
+fn get_object_part_rejects_bad_part_payload_crc64() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let part1 = make_part(0xAA, MIN_PART);
+    let part2 = make_part(0xBB, 100);
+    let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
+
+    corrupt_committed_part_payload_crc64(&coord, "bucket", "key", result.version_id, 1);
+
+    let err = coord
+        .get_object_part(&GetObjectPartRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            cond: &ReadCondition::default(),
+        })
+        .unwrap()
+        .body
+        .read_all()
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::IntegrityError { .. }),
+        "expected IntegrityError for corrupted part crc64, got {err:?}"
+    );
+}
+
+#[test]
+fn get_multipart_range_verifies_whole_containing_part_crc64() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let part1 = make_part(0xAA, INTERNAL_SEGMENT_SIZE + 123);
+    let part2 = make_part(0xBB, 100);
+    let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
+
+    corrupt_committed_part_payload_crc64(&coord, "bucket", "key", result.version_id, 1);
+
+    let err = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range { start: 0, end: 9 },
+            cond: &ReadCondition::default(),
+        })
+        .unwrap()
+        .body
+        .read_all()
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::IntegrityError { .. }),
+        "expected IntegrityError after verifying containing part crc64, got {err:?}"
     );
 }
 

@@ -1651,6 +1651,25 @@ impl SegmentListReader {
             }
 
             if self.next_segment_index >= self.segments.len() {
+                if let Some(expected_crc64) = self.expected_crc64 {
+                    if self.verified_size != self.expected_verified_size {
+                        return Err(ServerError::IntegrityError {
+                            bucket: self.bucket.clone(),
+                            key: self.key.clone(),
+                            expected: self.expected_verified_size as u64,
+                            actual: self.verified_size as u64,
+                        });
+                    }
+                    let actual_crc64 = self.verified_crc64.finalize();
+                    if actual_crc64 != expected_crc64 {
+                        return Err(ServerError::IntegrityError {
+                            bucket: self.bucket.clone(),
+                            key: self.key.clone(),
+                            expected: expected_crc64,
+                            actual: actual_crc64,
+                        });
+                    }
+                }
                 return Ok(None);
             }
 
@@ -1733,6 +1752,10 @@ impl SegmentListReader {
                 slice.part_number,
                 self.sse_customer_request.as_ref(),
             )?;
+            if self.expected_crc64.is_some() {
+                self.verified_size += data.len();
+                self.verified_crc64.update(data.as_ref());
+            }
             self.next_segment_index += 1;
             self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
             #[cfg(test)]
@@ -1790,6 +1813,10 @@ impl MultipartReader {
                 next_segment_index: 0,
                 loaded_segment: None,
                 sse_customer_request: self.sse_customer_request.clone(),
+                expected_crc64: Some(part.layout.payload_crc64),
+                expected_verified_size: part.layout.part_size,
+                verified_size: 0,
+                verified_crc64: checksum::crc64::Hasher::new(),
             });
         }
     }
