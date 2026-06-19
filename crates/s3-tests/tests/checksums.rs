@@ -3,6 +3,7 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType,
     CompletedMultipartUpload, CompletedPart, ObjectAttributes, VersioningConfiguration,
 };
+use checksum::ChecksumAlgorithm as LocalChecksumAlgorithm;
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, err_status, retrying_operation_aborted,
@@ -209,6 +210,26 @@ fn send_signed_post(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) 
     let status = resp.status().as_u16();
     let body_text = resp.body_mut().read_to_string().unwrap_or_default();
     (status, body_text)
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn checksum_base64(algo: LocalChecksumAlgorithm, data: &[u8]) -> String {
+    encode_base64(checksum::compute_checksum(algo, data).bytes())
+}
+
+fn multipart_complete_url(bucket: &str, key: &str, upload_id: &str) -> String {
+    let encoded_upload_id: String =
+        url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+    format!(
+        "{}/{}/{}?uploadId={encoded_upload_id}",
+        CTX.endpoint(),
+        bucket,
+        key
+    )
 }
 
 /// 1024 bytes of 'A'.
@@ -693,6 +714,32 @@ fn get_cksum_from_complete(
         a if *a == ChecksumAlgorithm::Crc64Nvme => {
             resp.checksum_crc64_nvme().map(|s| s.to_string())
         }
+        a if *a == ChecksumAlgorithm::Md5 => resp.checksum_md5().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Sha512 => resp.checksum_sha512().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash64 => resp.checksum_xxhash64().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash3 => resp.checksum_xxhash3().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash128 => resp.checksum_xxhash128().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn get_cksum_from_put(
+    resp: &aws_sdk_s3::operation::put_object::PutObjectOutput,
+    algo: &ChecksumAlgorithm,
+) -> Option<String> {
+    match algo {
+        a if *a == ChecksumAlgorithm::Sha256 => resp.checksum_sha256().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Sha1 => resp.checksum_sha1().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Crc32 => resp.checksum_crc32().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Crc32C => resp.checksum_crc32_c().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Crc64Nvme => {
+            resp.checksum_crc64_nvme().map(|s| s.to_string())
+        }
+        a if *a == ChecksumAlgorithm::Md5 => resp.checksum_md5().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Sha512 => resp.checksum_sha512().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash64 => resp.checksum_xxhash64().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash3 => resp.checksum_xxhash3().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash128 => resp.checksum_xxhash128().map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -709,6 +756,11 @@ fn get_cksum_from_head(
         a if *a == ChecksumAlgorithm::Crc64Nvme => {
             resp.checksum_crc64_nvme().map(|s| s.to_string())
         }
+        a if *a == ChecksumAlgorithm::Md5 => resp.checksum_md5().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Sha512 => resp.checksum_sha512().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash64 => resp.checksum_xxhash64().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash3 => resp.checksum_xxhash3().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash128 => resp.checksum_xxhash128().map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -724,6 +776,13 @@ fn get_cksum_from_checksum(
         a if *a == ChecksumAlgorithm::Crc32C => cksum.checksum_crc32_c().map(|s| s.to_string()),
         a if *a == ChecksumAlgorithm::Crc64Nvme => {
             cksum.checksum_crc64_nvme().map(|s| s.to_string())
+        }
+        a if *a == ChecksumAlgorithm::Md5 => cksum.checksum_md5().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Sha512 => cksum.checksum_sha512().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash64 => cksum.checksum_xxhash64().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash3 => cksum.checksum_xxhash3().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash128 => {
+            cksum.checksum_xxhash128().map(|s| s.to_string())
         }
         _ => None,
     }
@@ -749,6 +808,16 @@ fn completed_part_with_checksum(
         b = b.checksum_crc32_c(cksum);
     } else if *algo == ChecksumAlgorithm::Crc64Nvme {
         b = b.checksum_crc64_nvme(cksum);
+    } else if *algo == ChecksumAlgorithm::Md5 {
+        b = b.checksum_md5(cksum);
+    } else if *algo == ChecksumAlgorithm::Sha512 {
+        b = b.checksum_sha512(cksum);
+    } else if *algo == ChecksumAlgorithm::Xxhash64 {
+        b = b.checksum_xxhash64(cksum);
+    } else if *algo == ChecksumAlgorithm::Xxhash3 {
+        b = b.checksum_xxhash3(cksum);
+    } else if *algo == ChecksumAlgorithm::Xxhash128 {
+        b = b.checksum_xxhash128(cksum);
     }
     b.build()
 }
@@ -769,6 +838,16 @@ fn upload_part_with_checksum(
         builder.checksum_crc32_c(cksum)
     } else if *algo == ChecksumAlgorithm::Crc64Nvme {
         builder.checksum_crc64_nvme(cksum)
+    } else if *algo == ChecksumAlgorithm::Md5 {
+        builder.checksum_md5(cksum)
+    } else if *algo == ChecksumAlgorithm::Sha512 {
+        builder.checksum_sha512(cksum)
+    } else if *algo == ChecksumAlgorithm::Xxhash64 {
+        builder.checksum_xxhash64(cksum)
+    } else if *algo == ChecksumAlgorithm::Xxhash3 {
+        builder.checksum_xxhash3(cksum)
+    } else if *algo == ChecksumAlgorithm::Xxhash128 {
+        builder.checksum_xxhash128(cksum)
     } else {
         builder
     }
@@ -786,6 +865,11 @@ fn get_cksum_from_upload_part(
         a if *a == ChecksumAlgorithm::Crc64Nvme => {
             resp.checksum_crc64_nvme().map(|s| s.to_string())
         }
+        a if *a == ChecksumAlgorithm::Md5 => resp.checksum_md5().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Sha512 => resp.checksum_sha512().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash64 => resp.checksum_xxhash64().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash3 => resp.checksum_xxhash3().map(|s| s.to_string()),
+        a if *a == ChecksumAlgorithm::Xxhash128 => resp.checksum_xxhash128().map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -931,6 +1015,293 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
     );
 
     cleanup(&bucket, &[key]).await;
+}
+
+#[test]
+fn test_complete_multipart_legacy_object_checksum_without_create_algorithm_is_ignored() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-complete-legacy-checksum-without-create";
+        let part_body = b"legacy object checksum header";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+        let etag = part.e_tag().unwrap();
+
+        let url = multipart_complete_url(&bucket, key, &upload_id);
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let wrong_sha256 = encode_base64(&[0u8; 32]);
+        let (status, body_text) = send_signed_post(
+            &url,
+            body.as_bytes(),
+            &[("x-amz-checksum-sha256", wrong_sha256.as_str())],
+        );
+        assert_eq!(status, 200, "body: {body_text}");
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            head.checksum_sha256().is_none(),
+            "unconfigured legacy complete checksum header must not be stored"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-complete-new-checksum-without-create";
+        let part_body = b"new object checksum header";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+        let etag = part.e_tag().unwrap();
+
+        let url = multipart_complete_url(&bucket, key, &upload_id);
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let sha512 = encode_base64(&[0u8; 64]);
+        let (status, body_text) = send_signed_post(
+            &url,
+            body.as_bytes(),
+            &[("x-amz-checksum-sha512", sha512.as_str())],
+        );
+        assert_eq!(status, 400, "body: {body_text}");
+        assert_error_code(&body_text, "InvalidRequest");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_new_part_checksum_without_stored_checksum_is_invalid_part() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-complete-new-part-checksum-without-create";
+        let part_body = b"new part checksum element";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+        let etag = part.e_tag().unwrap();
+        let sha512 = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
+
+        let url = multipart_complete_url(&bucket, key, &upload_id);
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag><ChecksumSHA512>{sha512}</ChecksumSHA512></Part></CompleteMultipartUpload>"
+        );
+        let (status, body_text) = send_signed_post(&url, body.as_bytes(), &[]);
+        assert_eq!(status, 400, "body: {body_text}");
+        assert_error_code(&body_text, "InvalidPart");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_new_checksum_without_create_algorithm_is_accepted() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-upload-part-new-checksum-without-create";
+        let part_body = b"new upload part checksum header";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let sha512 = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
+
+        let resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .checksum_algorithm(ChecksumAlgorithm::Sha512)
+            .checksum_sha512(&sha512)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.checksum_sha512(), Some(sha512.as_str()));
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_object_checksum_xxhash_vectors_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"xxhash wire compatibility vector";
+        let cases = [
+            (
+                "xxhash64",
+                ChecksumAlgorithm::Xxhash64,
+                LocalChecksumAlgorithm::XxHash64,
+            ),
+            (
+                "xxhash3",
+                ChecksumAlgorithm::Xxhash3,
+                LocalChecksumAlgorithm::XxHash3,
+            ),
+            (
+                "xxhash128",
+                ChecksumAlgorithm::Xxhash128,
+                LocalChecksumAlgorithm::XxHash128,
+            ),
+        ];
+        let mut keys = Vec::new();
+
+        for (name, aws_algo, local_algo) in cases {
+            let key = format!("object-checksum-{name}");
+            let expected = checksum_base64(local_algo, body);
+            let put = match aws_algo {
+                ChecksumAlgorithm::Xxhash64 => {
+                    client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .body(ByteStream::from(body.to_vec()))
+                        .checksum_algorithm(aws_algo.clone())
+                        .checksum_xxhash64(&expected)
+                        .send()
+                        .await
+                }
+                ChecksumAlgorithm::Xxhash3 => {
+                    client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .body(ByteStream::from(body.to_vec()))
+                        .checksum_algorithm(aws_algo.clone())
+                        .checksum_xxhash3(&expected)
+                        .send()
+                        .await
+                }
+                ChecksumAlgorithm::Xxhash128 => {
+                    client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .body(ByteStream::from(body.to_vec()))
+                        .checksum_algorithm(aws_algo.clone())
+                        .checksum_xxhash128(&expected)
+                        .send()
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .unwrap();
+            assert_eq!(get_cksum_from_put(&put, &aws_algo), Some(expected.clone()));
+
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .checksum_mode(ChecksumMode::Enabled)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(get_cksum_from_head(&head, &aws_algo), Some(expected));
+            keys.push(key);
+        }
+
+        let refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        cleanup(&bucket, &refs).await;
+    });
 }
 
 #[test]

@@ -20,7 +20,7 @@ impl ChecksumClaim {
     pub fn from_base64(algorithm: ChecksumAlgorithm, b64: &str) -> Result<Self, ServerError> {
         use base64::Engine;
 
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; checksum::ChecksumBytes::MAX_LEN];
         let decoded_len = base64::engine::general_purpose::STANDARD
             .decode_slice(b64, &mut bytes)
             .map_err(|_| ServerError::InvalidRequest {

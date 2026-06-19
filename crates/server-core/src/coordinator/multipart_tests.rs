@@ -5447,6 +5447,58 @@ fn complete_multipart_sha256_composite_checksum() {
 }
 
 #[test]
+fn complete_multipart_sha512_composite_checksum() {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let big = vec![0xCDu8; 5 * 1024 * 1024];
+    let small = b"final-part";
+    let (upload_id, parts) = create_checksum_upload(
+        &coord,
+        "bucket",
+        "key",
+        ChecksumAlgorithm::Sha512,
+        None,
+        &[&big, small],
+    );
+
+    let result = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Sha512));
+    assert_eq!(result.checksum_type, Some(ChecksumType::Composite));
+    let val = result.checksum_value.unwrap();
+
+    let raw1 = compute_checksum(ChecksumAlgorithm::Sha512, &big);
+    let raw2 = compute_checksum(ChecksumAlgorithm::Sha512, small);
+    let mut concat = Vec::new();
+    concat.extend_from_slice(raw1.bytes());
+    concat.extend_from_slice(raw2.bytes());
+    let expected_hash = compute_checksum(ChecksumAlgorithm::Sha512, &concat);
+    let expected = format!("{}-2", b64.encode(expected_hash.bytes()));
+    assert_eq!(val, expected);
+}
+
+#[test]
 fn complete_multipart_crc32_full_object_checksum() {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -5895,8 +5947,8 @@ fn complete_multipart_bad_part_checksum_rejected() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::InvalidRequest { .. }),
-        "expected InvalidRequest, got {err:?}"
+        matches!(err, ServerError::InvalidPart { part_number: 1 }),
+        "expected InvalidPart, got {err:?}"
     );
 }
 
@@ -5936,6 +5988,169 @@ fn complete_multipart_no_checksum_returns_none() {
     assert_eq!(result.checksum_algorithm, None);
     assert_eq!(result.checksum_type, None);
     assert_eq!(result.checksum_value, None);
+}
+
+#[test]
+fn complete_multipart_ignores_legacy_object_checksum_header_without_upload_algorithm() {
+    use base64::Engine;
+
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) =
+        create_upload_with_parts(&coord, "bucket", "key", &[(1, b"only part")]);
+    let wrong_checksum = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    let claimed_checksum = EncodedChecksumClaim::new(ChecksumAlgorithm::Sha256, wrong_checksum);
+
+    let result = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: Some(&claimed_checksum),
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.checksum_algorithm, None);
+    assert_eq!(result.checksum_type, None);
+    assert_eq!(result.checksum_value, None);
+}
+
+#[test]
+fn complete_multipart_rejects_new_object_checksum_header_without_upload_algorithm() {
+    use base64::Engine;
+
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) =
+        create_upload_with_parts(&coord, "bucket", "key", &[(1, b"only part")]);
+    let checksum = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+    let claimed_checksum = EncodedChecksumClaim::new(ChecksumAlgorithm::Sha512, checksum);
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: Some(&claimed_checksum),
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ServerError::InvalidRequest { .. }),
+        "expected InvalidRequest for unconfigured SHA512 complete checksum header, got {err:?}"
+    );
+}
+
+#[test]
+fn complete_multipart_new_part_checksum_without_stored_checksum_is_invalid_part() {
+    use base64::Engine;
+
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let data = b"only part";
+    let (upload_id, mut parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, data)]);
+    let checksum = base64::engine::general_purpose::STANDARD
+        .encode(compute_checksum(ChecksumAlgorithm::Sha512, data).bytes());
+    parts[0].checksum =
+        Some(ChecksumClaim::from_base64(ChecksumAlgorithm::Sha512, &checksum).unwrap());
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ServerError::InvalidPart { part_number: 1 }),
+        "expected InvalidPart for SHA512 part checksum element without stored checksum, got {err:?}"
+    );
+}
+
+#[test]
+fn upload_part_accepts_new_checksum_without_upload_algorithm() {
+    use base64::Engine;
+
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request("bucket", "key", test_requester()),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    let data = b"part-with-unconfigured-sha512";
+    let checksum = base64::engine::general_purpose::STANDARD
+        .encode(compute_checksum(ChecksumAlgorithm::Sha512, data).bytes());
+    let claim = ChecksumClaim::from_base64(ChecksumAlgorithm::Sha512, &checksum).unwrap();
+
+    let uploaded = test_helpers::upload_part(
+        &coord,
+        &UploadPartRequest {
+            upload: multipart_object_request("bucket", "key", &create.upload_id, test_requester()),
+            part_number: 1,
+            data,
+            claimed_checksum: Some(&claim),
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+
+    let stored = uploaded.checksum.expect("expected echoed part checksum");
+    assert_eq!(stored.algorithm(), ChecksumAlgorithm::Sha512);
+    assert_eq!(
+        stored.bytes(),
+        compute_checksum(ChecksumAlgorithm::Sha512, data).bytes()
+    );
 }
 
 #[test]

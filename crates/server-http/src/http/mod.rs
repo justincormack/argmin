@@ -3596,8 +3596,7 @@ impl HttpFrontend {
             success_redirect,
             response_location,
             post_policy,
-            checksum_sha256_b64: field("x-amz-checksum-sha256")
-                .map(std::string::ToString::to_string),
+            checksum: post_checksum_claim_from_fields(form_fields)?,
             sse_customer: sse_customer_request,
             authorized_write: prepared_put.authorized_write,
         })
@@ -3609,7 +3608,7 @@ impl HttpFrontend {
         ctx: &StreamingPostContext,
         crc64: u64,
         total_size: u64,
-        actual_sha256_b64: &str,
+        actual_checksum: Option<&RawChecksum>,
     ) -> Result<S3Response, ServerError> {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
@@ -3632,11 +3631,17 @@ impl HttpFrontend {
                 .map_err(Self::map_post_policy_error)?;
         }
 
-        // Validate optional x-amz-checksum-sha256 form field.
-        if let Some(claimed) = ctx.checksum_sha256_b64.as_deref() {
-            if claimed != actual_sha256_b64 {
+        if let Some(claimed) = ctx.checksum.as_ref() {
+            let Some(actual) = actual_checksum else {
                 return Err(ServerError::InvalidRequest {
-                    reason: "checksum mismatch".to_string(),
+                    reason: "checksum algorithm was not computed".to_string(),
+                });
+            };
+            if actual.algorithm() != claimed.algorithm()
+                || actual.bytes() != claimed.expected_bytes()
+            {
+                return Err(ServerError::ChecksumDigestMismatch {
+                    algorithm: claimed.algorithm().as_str().to_string(),
                 });
             }
         }
@@ -3851,16 +3856,9 @@ impl HttpFrontend {
         let has_trailing_checksum = checksum_state.has_trailing_checksum;
 
         if has_trailing_checksum {
-            let checksum_value_headers: &[&str] = &[
-                "x-amz-checksum-sha256",
-                "x-amz-checksum-crc64nvme",
-                "x-amz-checksum-crc32",
-                "x-amz-checksum-crc32c",
-                "x-amz-checksum-sha1",
-            ];
-            let has_inline_checksum = checksum_value_headers
-                .iter()
-                .any(|h| req.header(h).is_some());
+            let has_inline_checksum = ChecksumAlgorithm::ALL
+                .into_iter()
+                .any(|algorithm| req.header(algorithm.header_name()).is_some());
             if has_inline_checksum {
                 return Err(ServerError::InvalidRequest {
                     reason: "Expecting a single x-amz-checksum- header".to_string(),
@@ -4469,7 +4467,7 @@ struct StreamingPostContext {
     success_redirect: Option<String>,
     response_location: Option<String>,
     post_policy: Option<auth::PreparedPostPolicy>,
-    checksum_sha256_b64: Option<String>,
+    checksum: Option<ChecksumClaim>,
     sse_customer: Option<SseCustomerRequest>,
     authorized_write: AuthorizedPutObjectWrite,
 }
@@ -4916,6 +4914,11 @@ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
     ("CRC32", "x-amz-checksum-crc32"),
     ("CRC32C", "x-amz-checksum-crc32c"),
     ("SHA1", "x-amz-checksum-sha1"),
+    ("MD5", "x-amz-checksum-md5"),
+    ("XXHASH64", "x-amz-checksum-xxhash64"),
+    ("XXHASH3", "x-amz-checksum-xxhash3"),
+    ("XXHASH128", "x-amz-checksum-xxhash128"),
+    ("SHA512", "x-amz-checksum-sha512"),
 ];
 
 const SSE_C_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
@@ -5032,6 +5035,38 @@ fn parse_form_field_once<'a>(
         });
     }
     Ok(first)
+}
+
+fn post_checksum_claim_from_fields(
+    form_fields: &[(String, String)],
+) -> Result<Option<ChecksumClaim>, ServerError> {
+    let declared_algorithm = parse_form_field_once(form_fields, "x-amz-checksum-algorithm")?;
+    let mut claim: Option<ChecksumClaim> = None;
+
+    for &(algorithm_name, header) in CHECKSUM_HEADERS {
+        let Some(value) = parse_form_field_once(form_fields, header)? else {
+            continue;
+        };
+        if claim.is_some() {
+            return Err(ServerError::InvalidRequest {
+                reason: "only one checksum field may be specified".to_string(),
+            });
+        }
+        if let Some(declared) = declared_algorithm {
+            if !declared.eq_ignore_ascii_case(algorithm_name) {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "checksum algorithm mismatch: field says {declared} but got {algorithm_name}"
+                    ),
+                });
+            }
+        }
+        let algorithm = ChecksumAlgorithm::parse(algorithm_name)
+            .expect("CHECKSUM_HEADERS uses known algorithms");
+        claim = Some(ChecksumClaim::from_base64(algorithm, value)?);
+    }
+
+    Ok(claim)
 }
 
 fn parse_sse_customer_form_fields(
@@ -5374,13 +5409,7 @@ fn require_request_checksum(
 /// Map a checksum header name (e.g. `x-amz-checksum-crc32`) to its
 /// `ChecksumAlgorithm`. Returns `None` for unrecognized headers.
 fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
-    let lower = header.to_ascii_lowercase();
-    for &(algo_name, h) in CHECKSUM_HEADERS {
-        if h == lower {
-            return ChecksumAlgorithm::parse(algo_name);
-        }
-    }
-    None
+    ChecksumAlgorithm::from_header_name(header)
 }
 
 /// Validate checksum headers on `PutObject`.
@@ -5419,14 +5448,9 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                 }
             }
 
-            // Expected byte length for each algorithm.
-            let expected_len = match algo {
-                "SHA256" => 32,
-                "SHA1" => 20,
-                "CRC32" | "CRC32C" => 4,
-                "CRC64NVME" => 8,
-                _ => continue,
-            };
+            let algorithm =
+                ChecksumAlgorithm::parse(algo).expect("CHECKSUM_HEADERS uses known algorithms");
+            let expected_len = algorithm.expected_byte_length();
 
             // Validate checksum value format (base64 decodes to correct length).
             let decoded_bytes = base64::engine::general_purpose::STANDARD
@@ -5442,32 +5466,8 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
             }
 
             if verify_body {
-                let actual_b64 = match algo {
-                    "SHA256" => {
-                        let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
-                        base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
-                    }
-                    "SHA1" => {
-                        let digest = ring::digest::digest(
-                            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-                            &req.body,
-                        );
-                        base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
-                    }
-                    "CRC32" => {
-                        let crc = checksum::crc32::checksum(&req.body);
-                        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
-                    }
-                    "CRC32C" => {
-                        let crc = checksum::crc32c::checksum(&req.body);
-                        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
-                    }
-                    "CRC64NVME" => {
-                        let crc = checksum::crc64::checksum(&req.body);
-                        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
-                    }
-                    _ => continue,
-                };
+                let actual = checksum::compute_checksum(algorithm, &req.body);
+                let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual.bytes());
                 if claimed != actual_b64 {
                     return Err(ServerError::ChecksumDigestMismatch {
                         algorithm: algo.to_string(),
@@ -10811,26 +10811,63 @@ mod tests {
     }
 
     fn compute_checksum_for_test(algo: ChecksumAlgorithm, data: &[u8]) -> RawChecksum {
-        match algo {
-            ChecksumAlgorithm::Crc32 => {
-                RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
-            }
-            ChecksumAlgorithm::Crc32c => {
-                RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
-            }
-            ChecksumAlgorithm::Crc64nvme => {
-                RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
-            }
-            ChecksumAlgorithm::Sha256 => RawChecksum::new(
-                algo,
-                ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
-            ),
-            ChecksumAlgorithm::Sha1 => RawChecksum::new(
-                algo,
-                ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
-            ),
+        checksum::compute_checksum(algo, data)
+    }
+
+    #[test]
+    fn validate_checksum_headers_accepts_new_algorithms() {
+        use base64::Engine;
+
+        let body = b"new checksum algorithms";
+        for algorithm in [
+            ChecksumAlgorithm::Md5,
+            ChecksumAlgorithm::XxHash64,
+            ChecksumAlgorithm::XxHash3,
+            ChecksumAlgorithm::XxHash128,
+            ChecksumAlgorithm::Sha512,
+        ] {
+            let checksum = checksum::compute_checksum(algorithm, body);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(checksum.bytes());
+            let req = new_req(
+                http::Method::PUT,
+                "",
+                "",
+                vec![(algorithm.header_name().to_string(), encoded)],
+                body.to_vec(),
+            );
+            validate_checksum_headers(&req, true).unwrap();
         }
-        .expect("checksum helper produces bytes matching the requested algorithm")
+    }
+
+    #[test]
+    fn post_checksum_claim_from_fields_accepts_sha512() {
+        use base64::Engine;
+
+        let checksum = checksum::compute_checksum(ChecksumAlgorithm::Sha512, b"post-body");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(checksum.bytes());
+        let fields = vec![
+            ("key".to_string(), "mykey".to_string()),
+            ("x-amz-checksum-algorithm".to_string(), "SHA512".to_string()),
+            ("x-amz-checksum-sha512".to_string(), encoded),
+        ];
+        let claim = post_checksum_claim_from_fields(&fields)
+            .unwrap()
+            .expect("checksum field should be parsed");
+        assert_eq!(claim.algorithm(), ChecksumAlgorithm::Sha512);
+        assert_eq!(claim.expected_bytes(), checksum.bytes());
+    }
+
+    #[test]
+    fn post_checksum_claim_from_fields_rejects_algorithm_mismatch() {
+        let fields = vec![
+            ("key".to_string(), "mykey".to_string()),
+            ("x-amz-checksum-algorithm".to_string(), "SHA512".to_string()),
+            (
+                "x-amz-checksum-md5".to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            ),
+        ];
+        assert!(post_checksum_claim_from_fields(&fields).is_err());
     }
 
     fn stream_upload_part(

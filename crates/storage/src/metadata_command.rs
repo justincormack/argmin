@@ -2759,7 +2759,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
 
     fn skip_optional_multipart_checksum_config(&mut self) -> Result<(), String> {
         self.skip_optional(|decoder| {
-            decoder.read_valid_u8("multipart checksum algorithm", 0..=4)?;
+            decoder.read_valid_u8("multipart checksum algorithm", 0..=9)?;
             decoder.read_valid_u8("multipart checksum type", 0..=1)
         })
     }

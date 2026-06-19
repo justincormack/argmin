@@ -13,8 +13,10 @@
 pub mod crc32;
 pub mod crc32c;
 pub mod crc64;
+mod hash;
 mod types;
 
+pub use hash::{compute_checksum, ChecksumHasher};
 pub use types::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
     RawChecksum,

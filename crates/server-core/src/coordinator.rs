@@ -671,93 +671,10 @@ mod bucket_fast_path_cache_tests {
 
 /// Compute an inline checksum value for the given algorithm and data.
 fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> RawChecksum {
-    match algo {
-        ChecksumAlgorithm::Crc32 => {
-            RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
-        }
-        ChecksumAlgorithm::Crc32c => {
-            RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
-        }
-        ChecksumAlgorithm::Crc64nvme => {
-            RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
-        }
-        ChecksumAlgorithm::Sha256 => RawChecksum::new(
-            algo,
-            ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
-        ),
-        ChecksumAlgorithm::Sha1 => RawChecksum::new(
-            algo,
-            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
-        ),
-    }
-    .expect("checksum helper produces bytes matching the requested algorithm")
+    checksum::compute_checksum(algo, data)
 }
 
-enum StreamingChecksumAccumulator {
-    Crc32(checksum::crc32::Hasher),
-    Crc32c(checksum::crc32c::Hasher),
-    Crc64(checksum::crc64::Hasher),
-    Sha1(ring::digest::Context),
-    Sha256(ring::digest::Context),
-}
-
-impl StreamingChecksumAccumulator {
-    fn new(algo: ChecksumAlgorithm) -> Self {
-        match algo {
-            ChecksumAlgorithm::Crc32 => Self::Crc32(checksum::crc32::Hasher::new()),
-            ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
-            ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
-            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
-                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            )),
-            ChecksumAlgorithm::Sha256 => {
-                Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
-            }
-        }
-    }
-
-    fn algorithm(&self) -> ChecksumAlgorithm {
-        match self {
-            Self::Crc32(_) => ChecksumAlgorithm::Crc32,
-            Self::Crc32c(_) => ChecksumAlgorithm::Crc32c,
-            Self::Crc64(_) => ChecksumAlgorithm::Crc64nvme,
-            Self::Sha1(_) => ChecksumAlgorithm::Sha1,
-            Self::Sha256(_) => ChecksumAlgorithm::Sha256,
-        }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        match self {
-            Self::Crc32(hasher) => hasher.update(data),
-            Self::Crc32c(hasher) => hasher.update(data),
-            Self::Crc64(hasher) => hasher.update(data),
-            Self::Sha1(hasher) => hasher.update(data),
-            Self::Sha256(hasher) => hasher.update(data),
-        }
-    }
-
-    fn finalize(self) -> RawChecksum {
-        match self {
-            Self::Crc32(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Crc32, hasher.finalize().to_be_bytes())
-            }
-            Self::Crc32c(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Crc32c, hasher.finalize().to_be_bytes())
-            }
-            Self::Crc64(hasher) => RawChecksum::new(
-                ChecksumAlgorithm::Crc64nvme,
-                hasher.finalize().to_be_bytes(),
-            ),
-            Self::Sha1(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Sha1, hasher.finish().as_ref())
-            }
-            Self::Sha256(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Sha256, hasher.finish().as_ref())
-            }
-        }
-        .expect("streaming checksum accumulator produces bytes matching the algorithm")
-    }
-}
+type StreamingChecksumAccumulator = checksum::ChecksumHasher;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;

@@ -7,9 +7,27 @@ pub enum ChecksumAlgorithm {
     Sha1 = 2,
     Sha256 = 3,
     Crc64nvme = 4,
+    Md5 = 5,
+    XxHash64 = 6,
+    XxHash3 = 7,
+    XxHash128 = 8,
+    Sha512 = 9,
 }
 
 impl ChecksumAlgorithm {
+    pub const ALL: [Self; 10] = [
+        Self::Crc32,
+        Self::Crc32c,
+        Self::Sha1,
+        Self::Sha256,
+        Self::Crc64nvme,
+        Self::Md5,
+        Self::XxHash64,
+        Self::XxHash3,
+        Self::XxHash128,
+        Self::Sha512,
+    ];
+
     #[must_use]
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -18,12 +36,17 @@ impl ChecksumAlgorithm {
             2 => Some(Self::Sha1),
             3 => Some(Self::Sha256),
             4 => Some(Self::Crc64nvme),
+            5 => Some(Self::Md5),
+            6 => Some(Self::XxHash64),
+            7 => Some(Self::XxHash3),
+            8 => Some(Self::XxHash128),
+            9 => Some(Self::Sha512),
             _ => None,
         }
     }
 
     /// Parse from an S3 API header value. Only accepts the canonical
-    /// uppercase form (`SHA256`, `CRC32`, `CRC32C`, `SHA1`, `CRC64NVME`).
+    /// uppercase form (`SHA256`, `CRC32`, `CRC32C`, etc.).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -32,6 +55,11 @@ impl ChecksumAlgorithm {
             "SHA1" => Some(Self::Sha1),
             "SHA256" => Some(Self::Sha256),
             "CRC64NVME" => Some(Self::Crc64nvme),
+            "MD5" => Some(Self::Md5),
+            "XXHASH64" => Some(Self::XxHash64),
+            "XXHASH3" => Some(Self::XxHash3),
+            "XXHASH128" => Some(Self::XxHash128),
+            "SHA512" => Some(Self::Sha512),
             _ => None,
         }
     }
@@ -45,6 +73,11 @@ impl ChecksumAlgorithm {
             Self::Sha1 => "SHA1",
             Self::Sha256 => "SHA256",
             Self::Crc64nvme => "CRC64NVME",
+            Self::Md5 => "MD5",
+            Self::XxHash64 => "XXHASH64",
+            Self::XxHash3 => "XXHASH3",
+            Self::XxHash128 => "XXHASH128",
+            Self::Sha512 => "SHA512",
         }
     }
 
@@ -57,7 +90,21 @@ impl ChecksumAlgorithm {
             Self::Sha1 => "x-amz-checksum-sha1",
             Self::Sha256 => "x-amz-checksum-sha256",
             Self::Crc64nvme => "x-amz-checksum-crc64nvme",
+            Self::Md5 => "x-amz-checksum-md5",
+            Self::XxHash64 => "x-amz-checksum-xxhash64",
+            Self::XxHash3 => "x-amz-checksum-xxhash3",
+            Self::XxHash128 => "x-amz-checksum-xxhash128",
+            Self::Sha512 => "x-amz-checksum-sha512",
         }
+    }
+
+    /// Parse an `x-amz-checksum-*` header name.
+    #[must_use]
+    pub fn from_header_name(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|algorithm| algorithm.header_name() == lower)
     }
 
     /// XML element name for this checksum (e.g. `ChecksumCRC32`).
@@ -69,6 +116,11 @@ impl ChecksumAlgorithm {
             Self::Sha1 => "ChecksumSHA1",
             Self::Sha256 => "ChecksumSHA256",
             Self::Crc64nvme => "ChecksumCRC64NVME",
+            Self::Md5 => "ChecksumMD5",
+            Self::XxHash64 => "ChecksumXXHash64",
+            Self::XxHash3 => "ChecksumXXHash3",
+            Self::XxHash128 => "ChecksumXXHash128",
+            Self::Sha512 => "ChecksumSHA512",
         }
     }
 
@@ -77,10 +129,30 @@ impl ChecksumAlgorithm {
     pub fn expected_byte_length(self) -> usize {
         match self {
             Self::Crc32 | Self::Crc32c => 4,
-            Self::Crc64nvme => 8,
+            Self::Crc64nvme | Self::XxHash64 | Self::XxHash3 => 8,
+            Self::Md5 | Self::XxHash128 => 16,
             Self::Sha1 => 20,
             Self::Sha256 => 32,
+            Self::Sha512 => 64,
         }
+    }
+
+    /// AWS requires these algorithms to be declared on CreateMultipartUpload
+    /// before they may be used for multipart part or object checksums.
+    #[must_use]
+    pub fn requires_multipart_create_algorithm(self) -> bool {
+        matches!(
+            self,
+            Self::Md5 | Self::XxHash64 | Self::XxHash3 | Self::XxHash128 | Self::Sha512
+        )
+    }
+
+    /// Algorithms whose CompleteMultipartUpload checksum header is accepted
+    /// but ignored when the multipart upload was not created with an
+    /// algorithm.
+    #[must_use]
+    pub fn accepts_unconfigured_complete_multipart_header(self) -> bool {
+        matches!(self, Self::Crc32 | Self::Crc32c | Self::Sha1 | Self::Sha256)
     }
 }
 
@@ -123,9 +195,16 @@ impl ChecksumType {
     #[must_use]
     pub fn default_for(algo: ChecksumAlgorithm) -> Self {
         match algo {
-            ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => Self::Composite,
-            ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => Self::Composite,
             ChecksumAlgorithm::Crc64nvme => Self::FullObject,
+            ChecksumAlgorithm::Crc32
+            | ChecksumAlgorithm::Crc32c
+            | ChecksumAlgorithm::Sha1
+            | ChecksumAlgorithm::Sha256
+            | ChecksumAlgorithm::Md5
+            | ChecksumAlgorithm::XxHash64
+            | ChecksumAlgorithm::XxHash3
+            | ChecksumAlgorithm::XxHash128
+            | ChecksumAlgorithm::Sha512 => Self::Composite,
         }
     }
 }
@@ -148,7 +227,7 @@ impl std::error::Error for InvalidChecksumConfig {}
 /// Validated checksum configuration for a multipart upload.
 ///
 /// Encodes the S3 combination rules:
-/// - SHA1/SHA256 only support COMPOSITE
+/// - SHA1/SHA256/MD5/XXHash/SHA512 only support COMPOSITE
 /// - CRC64NVME only supports FULL_OBJECT
 /// - CRC32/CRC32C support both (default COMPOSITE)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,14 +248,21 @@ impl MultipartChecksumConfig {
         let checksum_type = checksum_type.unwrap_or_else(|| ChecksumType::default_for(algorithm));
 
         match (algorithm, checksum_type) {
-            (ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256, ChecksumType::FullObject) => {
-                Err(InvalidChecksumConfig {
-                    reason: format!(
-                        "FULL_OBJECT checksum type is not supported for {}",
-                        algorithm.as_str()
-                    ),
-                })
-            }
+            (
+                ChecksumAlgorithm::Sha1
+                | ChecksumAlgorithm::Sha256
+                | ChecksumAlgorithm::Md5
+                | ChecksumAlgorithm::XxHash64
+                | ChecksumAlgorithm::XxHash3
+                | ChecksumAlgorithm::XxHash128
+                | ChecksumAlgorithm::Sha512,
+                ChecksumType::FullObject,
+            ) => Err(InvalidChecksumConfig {
+                reason: format!(
+                    "FULL_OBJECT checksum type is not supported for {}",
+                    algorithm.as_str()
+                ),
+            }),
             (ChecksumAlgorithm::Crc64nvme, ChecksumType::Composite) => Err(InvalidChecksumConfig {
                 reason: "COMPOSITE checksum type is not supported for CRC64NVME".to_string(),
             }),
@@ -206,7 +292,7 @@ pub struct RawChecksum {
 }
 
 impl RawChecksum {
-    const MAX_LEN: usize = 32;
+    const MAX_LEN: usize = 64;
 
     /// Construct a `RawChecksum`, validating that the byte length matches the algorithm.
     pub fn new(
@@ -248,13 +334,13 @@ pub struct ChecksumBytes {
 }
 
 impl ChecksumBytes {
-    pub const MAX_LEN: usize = 32;
+    pub const MAX_LEN: usize = 64;
 
     /// Construct inline checksum bytes, validating only the bounded size.
     pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, &'static str> {
         let bytes = bytes.as_ref();
         if bytes.is_empty() || bytes.len() > Self::MAX_LEN {
-            return Err("checksum byte length must be between 1 and 32");
+            return Err("checksum byte length must be between 1 and 64");
         }
 
         let mut stored = [0u8; Self::MAX_LEN];
@@ -295,32 +381,31 @@ mod tests {
 
     #[test]
     fn checksum_algorithm_from_u8_round_trip() {
-        for v in 0..=4u8 {
-            let algo = ChecksumAlgorithm::from_u8(v).unwrap();
-            assert_eq!(algo as u8, v);
+        for algorithm in ChecksumAlgorithm::ALL {
+            assert_eq!(ChecksumAlgorithm::from_u8(algorithm as u8), Some(algorithm));
         }
-        assert_eq!(ChecksumAlgorithm::from_u8(5), None);
+        assert_eq!(ChecksumAlgorithm::from_u8(10), None);
         assert_eq!(ChecksumAlgorithm::from_u8(255), None);
     }
 
     #[test]
     fn checksum_algorithm_from_str() {
-        assert_eq!(
-            ChecksumAlgorithm::parse("SHA256"),
-            Some(ChecksumAlgorithm::Sha256)
-        );
-        assert_eq!(
-            ChecksumAlgorithm::parse("CRC64NVME"),
-            Some(ChecksumAlgorithm::Crc64nvme)
-        );
+        for algorithm in ChecksumAlgorithm::ALL {
+            assert_eq!(
+                ChecksumAlgorithm::parse(algorithm.as_str()),
+                Some(algorithm)
+            );
+        }
         assert_eq!(ChecksumAlgorithm::parse("bogus"), None);
     }
 
     #[test]
     fn checksum_algorithm_as_str_round_trip() {
-        for v in 0..=4u8 {
-            let algo = ChecksumAlgorithm::from_u8(v).unwrap();
-            assert_eq!(ChecksumAlgorithm::parse(algo.as_str()), Some(algo));
+        for algorithm in ChecksumAlgorithm::ALL {
+            assert_eq!(
+                ChecksumAlgorithm::parse(algorithm.as_str()),
+                Some(algorithm)
+            );
         }
     }
 
@@ -366,45 +451,65 @@ mod tests {
             ChecksumType::default_for(ChecksumAlgorithm::Crc64nvme),
             ChecksumType::FullObject
         );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Md5),
+            ChecksumType::Composite
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::XxHash64),
+            ChecksumType::Composite
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::XxHash3),
+            ChecksumType::Composite
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::XxHash128),
+            ChecksumType::Composite
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Sha512),
+            ChecksumType::Composite
+        );
     }
 
     #[test]
     fn checksum_algorithm_header_name() {
-        assert_eq!(
-            ChecksumAlgorithm::Crc32.header_name(),
-            "x-amz-checksum-crc32"
-        );
-        assert_eq!(
-            ChecksumAlgorithm::Crc32c.header_name(),
-            "x-amz-checksum-crc32c"
-        );
-        assert_eq!(ChecksumAlgorithm::Sha1.header_name(), "x-amz-checksum-sha1");
-        assert_eq!(
-            ChecksumAlgorithm::Sha256.header_name(),
-            "x-amz-checksum-sha256"
-        );
-        assert_eq!(
-            ChecksumAlgorithm::Crc64nvme.header_name(),
-            "x-amz-checksum-crc64nvme"
-        );
+        let expected = [
+            (ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
+            (ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
+            (ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
+            (ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
+            (ChecksumAlgorithm::Crc64nvme, "x-amz-checksum-crc64nvme"),
+            (ChecksumAlgorithm::Md5, "x-amz-checksum-md5"),
+            (ChecksumAlgorithm::XxHash64, "x-amz-checksum-xxhash64"),
+            (ChecksumAlgorithm::XxHash3, "x-amz-checksum-xxhash3"),
+            (ChecksumAlgorithm::XxHash128, "x-amz-checksum-xxhash128"),
+            (ChecksumAlgorithm::Sha512, "x-amz-checksum-sha512"),
+        ];
+        for (algorithm, header) in expected {
+            assert_eq!(algorithm.header_name(), header);
+            assert_eq!(ChecksumAlgorithm::from_header_name(header), Some(algorithm));
+        }
     }
 
     #[test]
     fn checksum_algorithm_xml_element_name() {
-        assert_eq!(ChecksumAlgorithm::Crc32.xml_element_name(), "ChecksumCRC32");
-        assert_eq!(
-            ChecksumAlgorithm::Crc32c.xml_element_name(),
-            "ChecksumCRC32C"
-        );
-        assert_eq!(ChecksumAlgorithm::Sha1.xml_element_name(), "ChecksumSHA1");
-        assert_eq!(
-            ChecksumAlgorithm::Sha256.xml_element_name(),
-            "ChecksumSHA256"
-        );
-        assert_eq!(
-            ChecksumAlgorithm::Crc64nvme.xml_element_name(),
-            "ChecksumCRC64NVME"
-        );
+        let expected = [
+            (ChecksumAlgorithm::Crc32, "ChecksumCRC32"),
+            (ChecksumAlgorithm::Crc32c, "ChecksumCRC32C"),
+            (ChecksumAlgorithm::Sha1, "ChecksumSHA1"),
+            (ChecksumAlgorithm::Sha256, "ChecksumSHA256"),
+            (ChecksumAlgorithm::Crc64nvme, "ChecksumCRC64NVME"),
+            (ChecksumAlgorithm::Md5, "ChecksumMD5"),
+            (ChecksumAlgorithm::XxHash64, "ChecksumXXHash64"),
+            (ChecksumAlgorithm::XxHash3, "ChecksumXXHash3"),
+            (ChecksumAlgorithm::XxHash128, "ChecksumXXHash128"),
+            (ChecksumAlgorithm::Sha512, "ChecksumSHA512"),
+        ];
+        for (algorithm, element) in expected {
+            assert_eq!(algorithm.xml_element_name(), element);
+        }
     }
 
     #[test]
@@ -414,6 +519,11 @@ mod tests {
         assert_eq!(ChecksumAlgorithm::Sha1.expected_byte_length(), 20);
         assert_eq!(ChecksumAlgorithm::Sha256.expected_byte_length(), 32);
         assert_eq!(ChecksumAlgorithm::Crc64nvme.expected_byte_length(), 8);
+        assert_eq!(ChecksumAlgorithm::Md5.expected_byte_length(), 16);
+        assert_eq!(ChecksumAlgorithm::XxHash64.expected_byte_length(), 8);
+        assert_eq!(ChecksumAlgorithm::XxHash3.expected_byte_length(), 8);
+        assert_eq!(ChecksumAlgorithm::XxHash128.expected_byte_length(), 16);
+        assert_eq!(ChecksumAlgorithm::Sha512.expected_byte_length(), 64);
     }
 
     #[test]
@@ -460,6 +570,18 @@ mod tests {
         let config = MultipartChecksumConfig::new(ChecksumAlgorithm::Crc64nvme, None).unwrap();
         assert_eq!(config.algorithm(), ChecksumAlgorithm::Crc64nvme);
         assert_eq!(config.checksum_type(), ChecksumType::FullObject);
+
+        for algorithm in [
+            ChecksumAlgorithm::Md5,
+            ChecksumAlgorithm::XxHash64,
+            ChecksumAlgorithm::XxHash3,
+            ChecksumAlgorithm::XxHash128,
+            ChecksumAlgorithm::Sha512,
+        ] {
+            let config = MultipartChecksumConfig::new(algorithm, None).unwrap();
+            assert_eq!(config.algorithm(), algorithm);
+            assert_eq!(config.checksum_type(), ChecksumType::Composite);
+        }
     }
 
     #[test]
@@ -476,6 +598,17 @@ mod tests {
         let result =
             MultipartChecksumConfig::new(ChecksumAlgorithm::Sha1, Some(ChecksumType::FullObject));
         assert!(result.is_err());
+
+        for algorithm in [
+            ChecksumAlgorithm::Md5,
+            ChecksumAlgorithm::XxHash64,
+            ChecksumAlgorithm::XxHash3,
+            ChecksumAlgorithm::XxHash128,
+            ChecksumAlgorithm::Sha512,
+        ] {
+            let result = MultipartChecksumConfig::new(algorithm, Some(ChecksumType::FullObject));
+            assert!(result.is_err());
+        }
 
         // CRC64NVME + COMPOSITE is invalid
         let result = MultipartChecksumConfig::new(
@@ -510,6 +643,14 @@ mod tests {
         let checksum = RawChecksum::new(ChecksumAlgorithm::Sha256, vec![0; 32]).unwrap();
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
         assert_eq!(checksum.bytes().len(), 32);
+
+        let checksum = RawChecksum::new(ChecksumAlgorithm::Md5, vec![0; 16]).unwrap();
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Md5);
+        assert_eq!(checksum.bytes().len(), 16);
+
+        let checksum = RawChecksum::new(ChecksumAlgorithm::Sha512, vec![0; 64]).unwrap();
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha512);
+        assert_eq!(checksum.bytes().len(), 64);
     }
 
     #[test]
@@ -532,6 +673,6 @@ mod tests {
     #[test]
     fn checksum_bytes_invalid_length() {
         assert!(ChecksumBytes::new([]).is_err());
-        assert!(ChecksumBytes::new([0u8; 33]).is_err());
+        assert!(ChecksumBytes::new([0u8; 65]).is_err());
     }
 }

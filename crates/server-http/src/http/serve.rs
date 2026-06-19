@@ -70,76 +70,27 @@ const MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES: usize = 2_621_440;
 /// Created when `x-amz-trailer` declares a checksum header. Fed with decoded
 /// payload during streaming, then finalized to a base64 string for comparison
 /// with the trailer value.
-enum TrailingChecksumHasher {
-    Crc32(checksum::crc32::Hasher),
-    Crc32c(checksum::crc32c::Hasher),
-    Crc64(checksum::crc64::Hasher),
-    Sha256(ring::digest::Context),
-    Sha1(ring::digest::Context),
-}
+struct TrailingChecksumHasher(checksum::ChecksumHasher);
 
 impl TrailingChecksumHasher {
     fn from_algorithm(algorithm: ChecksumAlgorithm) -> Self {
-        match algorithm {
-            ChecksumAlgorithm::Crc32 => Self::Crc32(checksum::crc32::Hasher::new()),
-            ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
-            ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
-            ChecksumAlgorithm::Sha256 => {
-                Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
-            }
-            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
-                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            )),
-        }
+        Self(checksum::ChecksumHasher::new(algorithm))
     }
 
     /// Create a hasher from a trailer header name (e.g. `x-amz-checksum-crc32`).
     ///
     /// Matches case-insensitively since HTTP header names are case-insensitive.
     fn from_trailer_header(header: &str) -> Option<Self> {
-        match header.to_ascii_lowercase().as_str() {
-            "x-amz-checksum-crc32" => Some(Self::Crc32(checksum::crc32::Hasher::new())),
-            "x-amz-checksum-crc32c" => Some(Self::Crc32c(checksum::crc32c::Hasher::new())),
-            "x-amz-checksum-crc64nvme" => Some(Self::Crc64(checksum::crc64::Hasher::new())),
-            "x-amz-checksum-sha256" => Some(Self::Sha256(ring::digest::Context::new(
-                &ring::digest::SHA256,
-            ))),
-            "x-amz-checksum-sha1" => Some(Self::Sha1(ring::digest::Context::new(
-                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            ))),
-            _ => None,
-        }
+        ChecksumAlgorithm::from_header_name(header).map(Self::from_algorithm)
     }
 
     fn update(&mut self, data: &[u8]) {
-        match self {
-            Self::Crc32(h) => h.update(data),
-            Self::Crc32c(h) => {
-                h.update(data);
-            }
-            Self::Crc64(h) => {
-                h.update(data);
-            }
-            Self::Sha256(ctx) | Self::Sha1(ctx) => ctx.update(data),
-        }
+        self.0.update(data);
     }
 
     /// Finalize and return a validated `RawChecksum`.
     fn finalize_raw(self) -> RawChecksum {
-        match self {
-            Self::Crc32(h) => {
-                RawChecksum::new(ChecksumAlgorithm::Crc32, h.finalize().to_be_bytes())
-            }
-            Self::Crc32c(h) => {
-                RawChecksum::new(ChecksumAlgorithm::Crc32c, h.finalize().to_be_bytes())
-            }
-            Self::Crc64(h) => {
-                RawChecksum::new(ChecksumAlgorithm::Crc64nvme, h.finalize().to_be_bytes())
-            }
-            Self::Sha256(ctx) => RawChecksum::new(ChecksumAlgorithm::Sha256, ctx.finish().as_ref()),
-            Self::Sha1(ctx) => RawChecksum::new(ChecksumAlgorithm::Sha1, ctx.finish().as_ref()),
-        }
-        .expect("hasher produces correct length")
+        self.0.finalize()
     }
 
     /// Finalize and return the base64-encoded checksum string.
@@ -150,13 +101,7 @@ impl TrailingChecksumHasher {
     }
 
     fn aws_algorithm_name(&self) -> &'static str {
-        match self {
-            Self::Crc32(_) => "CRC32",
-            Self::Crc32c(_) => "CRC32C",
-            Self::Crc64(_) => "CRC64NVME",
-            Self::Sha256(_) => "SHA256",
-            Self::Sha1(_) => "SHA1",
-        }
+        self.0.algorithm().as_str()
     }
 }
 
@@ -1541,6 +1486,9 @@ fn streaming_post_field_value_limit(name: &str) -> usize {
     if lower.starts_with("x-amz-meta-") {
         return USER_METADATA_SIZE_LIMIT;
     }
+    if ChecksumAlgorithm::from_header_name(&lower).is_some() {
+        return MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES;
+    }
 
     match lower.as_str() {
         "key" => MAX_STREAMING_POST_KEY_FIELD_BYTES,
@@ -1552,7 +1500,6 @@ fn streaming_post_field_value_limit(name: &str) -> usize {
         "x-amz-algorithm" => MAX_STREAMING_POST_ALGORITHM_FIELD_BYTES,
         "acl" => MAX_STREAMING_POST_ACL_FIELD_BYTES,
         "success_action_status" => MAX_STREAMING_POST_STATUS_FIELD_BYTES,
-        "x-amz-checksum-sha256" => MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES,
         "x-amz-server-side-encryption"
         | "x-amz-server-side-encryption-aws-kms-key-id"
         | "x-amz-server-side-encryption-customer-algorithm"
@@ -2137,8 +2084,6 @@ async fn handle_streaming_post_object(
     trace: observability::TraceContext,
     wire_ids: WireResponseIds,
 ) -> S3Response {
-    use base64::Engine;
-
     let idle_timeout = state.config.body_idle_timeout;
     let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
     let internal_error_response = || {
@@ -2188,7 +2133,7 @@ async fn handle_streaming_post_object(
     let mut file_ended = false;
 
     let mut crc64 = checksum::crc64::Hasher::new();
-    let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut post_checksum_hasher: Option<checksum::ChecksumHasher> = None;
     let mut total_size: u64 = 0;
     let mut segment_index: u32 = 0;
     let mut upload_buf = PooledSegmentBuffer::new(&state);
@@ -2259,7 +2204,12 @@ async fn handle_streaming_post_object(
                                 })
                                 .await;
                                 match ctx_res {
-                                    Ok(Ok(c)) => ctx = Some(c),
+                                    Ok(Ok(c)) => {
+                                        post_checksum_hasher = c.checksum.as_ref().map(|claim| {
+                                            checksum::ChecksumHasher::new(claim.algorithm())
+                                        });
+                                        ctx = Some(c);
+                                    }
                                     Ok(Err(err)) => {
                                         return finish_streaming_post_rejection(
                                             error_response(&err),
@@ -2278,7 +2228,9 @@ async fn handle_streaming_post_object(
                                     });
                                 };
                                 crc64.update(&data);
-                                sha256.update(&data);
+                                if let Some(hasher) = post_checksum_hasher.as_mut() {
+                                    hasher.update(&data);
+                                }
                                 total_size += data.len() as u64;
                                 if total_size > MAX_OBJECT_SIZE {
                                     abort_streaming_post_object(&state, c).await;
@@ -2431,8 +2383,7 @@ async fn handle_streaming_post_object(
         }
     }
 
-    let actual_sha256_b64 =
-        base64::engine::general_purpose::STANDARD.encode(sha256.finish().as_ref());
+    let actual_checksum = post_checksum_hasher.map(checksum::ChecksumHasher::finalize);
     let crc64 = crc64.finalize();
     let st = Arc::clone(&state);
     let ctx_ref = Arc::clone(&ctx);
@@ -2443,7 +2394,7 @@ async fn handle_streaming_post_object(
             &ctx_ref,
             crc64,
             total_size,
-            &actual_sha256_b64,
+            actual_checksum.as_ref(),
         );
         if result.is_ok() {
             abort_guard_for_finalize.disarm();
@@ -4251,13 +4202,8 @@ fn inline_checksum_hasher_from_request(
 ) -> Option<(TrailingChecksumHasher, String)> {
     // The header names in CHECKSUM_HEADERS (in mod.rs) match the trailer
     // header names used by TrailingChecksumHasher::from_trailer_header.
-    for name in &[
-        "x-amz-checksum-crc32",
-        "x-amz-checksum-crc32c",
-        "x-amz-checksum-crc64nvme",
-        "x-amz-checksum-sha256",
-        "x-amz-checksum-sha1",
-    ] {
+    for algorithm in ChecksumAlgorithm::ALL {
+        let name = algorithm.header_name();
         if let Some(val) = req.header(name) {
             if let Some(h) = TrailingChecksumHasher::from_trailer_header(name) {
                 return Some((h, val.to_string()));
@@ -5668,6 +5614,11 @@ mod tests {
         assert!(TrailingChecksumHasher::from_trailer_header("X-Amz-Checksum-Sha256").is_some());
         assert!(TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha1").is_some());
         assert!(TrailingChecksumHasher::from_trailer_header("X-AMZ-CHECKSUM-CRC64NVME").is_some());
+        assert!(TrailingChecksumHasher::from_trailer_header("x-amz-checksum-md5").is_some());
+        assert!(TrailingChecksumHasher::from_trailer_header("X-Amz-Checksum-XXHash64").is_some());
+        assert!(TrailingChecksumHasher::from_trailer_header("x-amz-checksum-xxhash3").is_some());
+        assert!(TrailingChecksumHasher::from_trailer_header("X-Amz-Checksum-XXHash128").is_some());
+        assert!(TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha512").is_some());
     }
 
     #[test]
@@ -5838,6 +5789,32 @@ mod tests {
     }
 
     #[test]
+    fn sha512_streaming_matches_shared_checksum() {
+        let data = b"123456789";
+        let expected = checksum::compute_checksum(ChecksumAlgorithm::Sha512, data);
+
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha512").unwrap();
+        hasher.update(data);
+        let cksum = hasher.finalize_raw();
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha512);
+        assert_eq!(cksum.bytes(), expected.bytes());
+    }
+
+    #[test]
+    fn xxhash3_streaming_matches_shared_checksum() {
+        let data = b"123456789";
+        let expected = checksum::compute_checksum(ChecksumAlgorithm::XxHash3, data);
+
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-xxhash3").unwrap();
+        hasher.update(data);
+        let cksum = hasher.finalize_raw();
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::XxHash3);
+        assert_eq!(cksum.bytes(), expected.bytes());
+    }
+
+    #[test]
     fn sha256_streaming_incremental_matches_canonical() {
         let data = b"hello world!";
         let expected = ring::digest::digest(&ring::digest::SHA256, data);
@@ -5889,6 +5866,21 @@ mod tests {
     }
 
     #[test]
+    fn inline_checksum_hasher_picks_sha512() {
+        let req = make_s3req(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-checksum-sha512", "dGVzdA==")],
+        );
+        let result = inline_checksum_hasher_from_request(&req);
+        assert!(result.is_some());
+        let (h, claimed) = result.unwrap();
+        assert_eq!(claimed, "dGVzdA==");
+        let cksum = h.finalize_raw();
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha512);
+    }
+
+    #[test]
     fn inline_checksum_hasher_not_triggered_by_non_checksum_headers() {
         // x-amz-checksum-algorithm is not a checksum value header.
         let req = make_s3req(
@@ -5897,6 +5889,18 @@ mod tests {
             &[("x-amz-checksum-algorithm", "CRC32")],
         );
         assert!(inline_checksum_hasher_from_request(&req).is_none());
+    }
+
+    #[test]
+    fn streaming_post_field_value_limit_covers_new_checksums() {
+        assert_eq!(
+            streaming_post_field_value_limit("x-amz-checksum-sha512"),
+            MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES
+        );
+        assert_eq!(
+            streaming_post_field_value_limit("X-Amz-Checksum-XXHash128"),
+            MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

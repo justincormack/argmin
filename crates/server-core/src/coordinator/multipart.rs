@@ -489,14 +489,14 @@ impl Coordinator {
                     match &part.checksum {
                         Some(stored_bytes) => {
                             if claim.expected_bytes() != stored_bytes.as_slice() {
-                                return Err(ServerError::InvalidRequest {
-                                    reason: "part checksum mismatch".to_string(),
+                                return Err(ServerError::InvalidPart {
+                                    part_number: cp.part_number,
                                 });
                             }
                         }
                         None => {
-                            return Err(ServerError::InvalidRequest {
-                                reason: "part checksum mismatch".to_string(),
+                            return Err(ServerError::InvalidPart {
+                                part_number: cp.part_number,
                             });
                         }
                     }
@@ -658,7 +658,13 @@ impl Coordinator {
                             }
                             Some(b64.encode(combined.to_be_bytes()))
                         }
-                        ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => {
+                        ChecksumAlgorithm::Sha1
+                        | ChecksumAlgorithm::Sha256
+                        | ChecksumAlgorithm::Md5
+                        | ChecksumAlgorithm::XxHash64
+                        | ChecksumAlgorithm::XxHash3
+                        | ChecksumAlgorithm::XxHash128
+                        | ChecksumAlgorithm::Sha512 => {
                             return Err(ServerError::InternalError {
                                 reason: format!(
                                     "FULL_OBJECT checksum type is not supported for {}",
@@ -683,6 +689,9 @@ impl Coordinator {
                             ),
                         });
                     }
+                    None if claimed
+                        .algorithm()
+                        .accepts_unconfigured_complete_multipart_header() => {}
                     None => {
                         return Err(ServerError::InvalidRequest {
                             reason: "checksum header sent but upload has no checksum algorithm"
@@ -693,15 +702,8 @@ impl Coordinator {
                 }
                 if let Some(ref computed) = checksum_value {
                     if computed != claimed.encoded_value() {
-                        let header_name = match claimed.algorithm() {
-                            ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
-                            ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
-                            ChecksumAlgorithm::Crc64nvme => "x-amz-checksum-crc64nvme",
-                            ChecksumAlgorithm::Sha1 => "x-amz-checksum-sha1",
-                            ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
-                        };
                         return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
-                            header_name: header_name.to_string(),
+                            header_name: claimed.algorithm().header_name().to_string(),
                         });
                     }
                 }

@@ -76,14 +76,7 @@ fn has_invalid_header_bytes(s: &str) -> bool {
 }
 
 fn checksum_algorithm_from_header_name(name: &str) -> Option<ChecksumAlgorithm> {
-    match name {
-        "x-amz-checksum-sha256" => Some(ChecksumAlgorithm::Sha256),
-        "x-amz-checksum-sha1" => Some(ChecksumAlgorithm::Sha1),
-        "x-amz-checksum-crc32" => Some(ChecksumAlgorithm::Crc32),
-        "x-amz-checksum-crc32c" => Some(ChecksumAlgorithm::Crc32c),
-        "x-amz-checksum-crc64nvme" => Some(ChecksumAlgorithm::Crc64nvme),
-        _ => None,
-    }
+    ChecksumAlgorithm::from_header_name(name)
 }
 
 pub fn is_system_metadata_header_name(name: &str) -> bool {

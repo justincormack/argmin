@@ -4152,14 +4152,7 @@ fn strip_composite_suffix(value: &str) -> &str {
 /// Map a metadata header key like `x-amz-checksum-sha256` to an XML element
 /// name like `ChecksumSHA256`.
 fn checksum_header_to_xml_tag(header: &str) -> Option<&'static str> {
-    match header {
-        "x-amz-checksum-sha256" => Some("ChecksumSHA256"),
-        "x-amz-checksum-sha1" => Some("ChecksumSHA1"),
-        "x-amz-checksum-crc32" => Some("ChecksumCRC32"),
-        "x-amz-checksum-crc32c" => Some("ChecksumCRC32C"),
-        "x-amz-checksum-crc64nvme" => Some("ChecksumCRC64NVME"),
-        _ => None,
-    }
+    ChecksumAlgorithm::from_header_name(header).map(ChecksumAlgorithm::xml_element_name)
 }
 
 // ── Multipart upload XML ─────────────────────────────────────────
@@ -4429,6 +4422,11 @@ const CHECKSUM_ELEMENTS: &[(&str, ChecksumAlgorithm)] = &[
     ("ChecksumSHA1", ChecksumAlgorithm::Sha1),
     ("ChecksumSHA256", ChecksumAlgorithm::Sha256),
     ("ChecksumCRC64NVME", ChecksumAlgorithm::Crc64nvme),
+    ("ChecksumMD5", ChecksumAlgorithm::Md5),
+    ("ChecksumXXHash64", ChecksumAlgorithm::XxHash64),
+    ("ChecksumXXHash3", ChecksumAlgorithm::XxHash3),
+    ("ChecksumXXHash128", ChecksumAlgorithm::XxHash128),
+    ("ChecksumSHA512", ChecksumAlgorithm::Sha512),
 ];
 
 /// Parse a `CompleteMultipartUpload` request XML body into a list of parts.
@@ -6879,6 +6877,32 @@ mod tests {
             Some(ChecksumClaim::from_base64(ChecksumAlgorithm::Crc32, crc32_b64).unwrap())
         );
         assert_eq!(parts[1].checksum, None);
+    }
+
+    #[test]
+    fn parse_complete_multipart_with_new_checksum_elements() {
+        use base64::Engine;
+
+        let sha512 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let xxhash128 = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        let body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+             <ChecksumSHA512>{sha512}</ChecksumSHA512></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>\"e2\"</ETag>\
+             <ChecksumXXHash128>{xxhash128}</ChecksumXXHash128></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let parts = parse_complete_multipart_upload_xml(body.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].checksum,
+            Some(ChecksumClaim::from_base64(ChecksumAlgorithm::Sha512, &sha512).unwrap())
+        );
+        assert_eq!(
+            parts[1].checksum,
+            Some(ChecksumClaim::from_base64(ChecksumAlgorithm::XxHash128, &xxhash128).unwrap())
+        );
     }
 
     #[test]

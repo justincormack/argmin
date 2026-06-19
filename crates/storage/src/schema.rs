@@ -796,7 +796,7 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     // BEFORE INSERT/UPDATE triggers instead.
     //
     // Rules:
-    //   - SHA1 (2) / SHA256 (3) + FULL_OBJECT (1) → invalid
+    //   - SHA1/SHA256/MD5/XXHash/SHA512 + FULL_OBJECT (1) → invalid
     //   - CRC64NVME (4) + COMPOSITE (0) → invalid
     //   - checksum_type without checksum_algorithm → invalid
     conn.execute_batch(
@@ -806,8 +806,8 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
          BEGIN
            SELECT RAISE(ABORT, 'checksum_type without checksum_algorithm')
              WHERE NEW.checksum_type IS NOT NULL AND NEW.checksum_algorithm IS NULL;
-           SELECT RAISE(ABORT, 'SHA + FULL_OBJECT is invalid')
-             WHERE NEW.checksum_algorithm IN (2, 3) AND NEW.checksum_type = 1;
+           SELECT RAISE(ABORT, 'composite-only algorithm + FULL_OBJECT is invalid')
+             WHERE NEW.checksum_algorithm IN (2, 3, 5, 6, 7, 8, 9) AND NEW.checksum_type = 1;
            SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
              WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
          END;
@@ -817,8 +817,8 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
          BEGIN
            SELECT RAISE(ABORT, 'checksum_type without checksum_algorithm')
              WHERE NEW.checksum_type IS NOT NULL AND NEW.checksum_algorithm IS NULL;
-           SELECT RAISE(ABORT, 'SHA + FULL_OBJECT is invalid')
-             WHERE NEW.checksum_algorithm IN (2, 3) AND NEW.checksum_type = 1;
+           SELECT RAISE(ABORT, 'composite-only algorithm + FULL_OBJECT is invalid')
+             WHERE NEW.checksum_algorithm IN (2, 3, 5, 6, 7, 8, 9) AND NEW.checksum_type = 1;
            SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
              WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
          END;",

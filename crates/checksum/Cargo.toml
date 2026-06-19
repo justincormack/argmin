@@ -6,5 +6,15 @@ edition = "2021"
 [features]
 bench-select = []
 
+[dependencies]
+md5_legacy = { package = "md-5", version = "0.10" }
+ring = "0.17"
+twox-hash = { version = "2.1.2", default-features = false, features = [
+    "std",
+    "xxhash64",
+    "xxhash3_64",
+    "xxhash3_128",
+] }
+
 [dev-dependencies]
 proptest = "1"
