@@ -122,13 +122,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn incremental_hash_matches_oneshot() {
-        let data = b"123456789";
+    fn incremental_hash_matches_oneshot_for_varied_chunk_boundaries() {
+        let data = b"abcdefghijklmnopqrstuvwxyz0123456789checksum-boundary-test";
         for algorithm in ChecksumAlgorithm::ALL {
-            let mut hasher = ChecksumHasher::new(algorithm);
-            hasher.update(&data[..3]);
-            hasher.update(&data[3..]);
-            assert_eq!(hasher.finalize(), compute_checksum(algorithm, data));
+            let expected = compute_checksum(algorithm, data);
+            for chunk_size in [1, 2, 3, 5, 8, 13, 31, data.len() + 1] {
+                let mut hasher = ChecksumHasher::new(algorithm);
+                for chunk in data.chunks(chunk_size) {
+                    hasher.update(chunk);
+                }
+                assert_eq!(
+                    hasher.finalize(),
+                    expected,
+                    "{algorithm:?} differed with chunk size {chunk_size}"
+                );
+            }
         }
     }
 
@@ -162,6 +170,43 @@ mod tests {
             [
                 0x99, 0xaa, 0x06, 0xd3, 0x01, 0x47, 0x98, 0xd8, 0x60, 0x01, 0xc3, 0x24, 0x46, 0x8d,
                 0x49, 0x7f,
+            ]
+        );
+    }
+
+    #[test]
+    fn non_empty_input_vectors_are_big_endian() {
+        let data = b"123456789";
+        assert_eq!(
+            compute_checksum(ChecksumAlgorithm::Md5, data).bytes(),
+            [
+                0x25, 0xf9, 0xe7, 0x94, 0x32, 0x3b, 0x45, 0x38, 0x85, 0xf5, 0x18, 0x1f, 0x1b, 0x62,
+                0x4d, 0x0b,
+            ]
+        );
+        assert_eq!(
+            compute_checksum(ChecksumAlgorithm::Sha512, data).bytes(),
+            [
+                0xd9, 0xe6, 0x76, 0x2d, 0xd1, 0xc8, 0xea, 0xf6, 0xd6, 0x1b, 0x3c, 0x61, 0x92, 0xfc,
+                0x40, 0x8d, 0x4d, 0x6d, 0x5f, 0x11, 0x76, 0xd0, 0xc2, 0x91, 0x69, 0xbc, 0x24, 0xe7,
+                0x1c, 0x3f, 0x27, 0x4a, 0xd2, 0x7f, 0xcd, 0x58, 0x11, 0xb3, 0x13, 0xd6, 0x81, 0xf7,
+                0xe5, 0x5e, 0xc0, 0x2d, 0x73, 0xd4, 0x99, 0xc9, 0x54, 0x55, 0xb6, 0xb5, 0xbb, 0x50,
+                0x3a, 0xcf, 0x57, 0x4f, 0xba, 0x8f, 0xfe, 0x85,
+            ]
+        );
+        assert_eq!(
+            compute_checksum(ChecksumAlgorithm::XxHash64, data).bytes(),
+            [0x8c, 0xb8, 0x41, 0xdb, 0x40, 0xe6, 0xae, 0x83]
+        );
+        assert_eq!(
+            compute_checksum(ChecksumAlgorithm::XxHash3, data).bytes(),
+            [0x72, 0xdc, 0xb1, 0x8b, 0x67, 0xa1, 0x7d, 0xff]
+        );
+        assert_eq!(
+            compute_checksum(ChecksumAlgorithm::XxHash128, data).bytes(),
+            [
+                0x33, 0x11, 0x94, 0x77, 0xed, 0xe5, 0xdc, 0xd5, 0xe9, 0x71, 0x64, 0x27, 0x68, 0x1d,
+                0x58, 0x60,
             ]
         );
     }

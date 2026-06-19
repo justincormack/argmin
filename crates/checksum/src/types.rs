@@ -117,9 +117,9 @@ impl ChecksumAlgorithm {
             Self::Sha256 => "ChecksumSHA256",
             Self::Crc64nvme => "ChecksumCRC64NVME",
             Self::Md5 => "ChecksumMD5",
-            Self::XxHash64 => "ChecksumXXHash64",
-            Self::XxHash3 => "ChecksumXXHash3",
-            Self::XxHash128 => "ChecksumXXHash128",
+            Self::XxHash64 => "ChecksumXXHASH64",
+            Self::XxHash3 => "ChecksumXXHASH3",
+            Self::XxHash128 => "ChecksumXXHASH128",
             Self::Sha512 => "ChecksumSHA512",
         }
     }
@@ -502,9 +502,9 @@ mod tests {
             (ChecksumAlgorithm::Sha256, "ChecksumSHA256"),
             (ChecksumAlgorithm::Crc64nvme, "ChecksumCRC64NVME"),
             (ChecksumAlgorithm::Md5, "ChecksumMD5"),
-            (ChecksumAlgorithm::XxHash64, "ChecksumXXHash64"),
-            (ChecksumAlgorithm::XxHash3, "ChecksumXXHash3"),
-            (ChecksumAlgorithm::XxHash128, "ChecksumXXHash128"),
+            (ChecksumAlgorithm::XxHash64, "ChecksumXXHASH64"),
+            (ChecksumAlgorithm::XxHash3, "ChecksumXXHASH3"),
+            (ChecksumAlgorithm::XxHash128, "ChecksumXXHASH128"),
             (ChecksumAlgorithm::Sha512, "ChecksumSHA512"),
         ];
         for (algorithm, element) in expected {

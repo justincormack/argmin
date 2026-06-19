@@ -5499,6 +5499,55 @@ fn complete_multipart_sha512_composite_checksum() {
 }
 
 #[test]
+fn complete_multipart_sha512_object_checksum_header_mismatch_rejected() {
+    use base64::Engine;
+
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let data = b"single sha512 part";
+    let (upload_id, parts) = create_checksum_upload(
+        &coord,
+        "bucket",
+        "key",
+        ChecksumAlgorithm::Sha512,
+        Some(ChecksumType::Composite),
+        &[data],
+    );
+    let wrong_checksum = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+    let claimed_checksum = EncodedChecksumClaim::new(ChecksumAlgorithm::Sha512, wrong_checksum);
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: Some(&claimed_checksum),
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ServerError::ChecksumDigestMismatch { ref algorithm }
+            if algorithm == "sha512"
+        ),
+        "expected ChecksumDigestMismatch for wrong SHA512 object checksum header, got {err:?}"
+    );
+}
+
+#[test]
 fn complete_multipart_crc32_full_object_checksum() {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -6151,6 +6200,32 @@ fn upload_part_accepts_new_checksum_without_upload_algorithm() {
         stored.bytes(),
         compute_checksum(ChecksumAlgorithm::Sha512, data).bytes()
     );
+
+    let parts = [CompletePart {
+        part_number: 1,
+        etag: uploaded.etag,
+        checksum: Some(claim),
+    }];
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::InvalidPart { part_number: 1 }),
+        "expected InvalidPart because unconfigured UploadPart checksum is echoed but not stored, got {err:?}"
+    );
 }
 
 #[test]
@@ -6274,10 +6349,10 @@ fn complete_multipart_sse_c_checksum_requires_headers() {
     assert!(
         matches!(
             err,
-            ServerError::CompleteMultipartChecksumHeaderInvalid { ref header_name }
-            if header_name == "x-amz-checksum-sha256"
+            ServerError::ChecksumDigestMismatch { ref algorithm }
+            if algorithm == "sha256"
         ),
-        "expected CompleteMultipartChecksumHeaderInvalid when SSE-C checksum finalize omits headers, got {err:?}"
+        "expected ChecksumDigestMismatch when SSE-C checksum finalize omits headers, got {err:?}"
     );
 }
 

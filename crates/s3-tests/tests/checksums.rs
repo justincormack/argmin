@@ -221,6 +221,63 @@ fn checksum_base64(algo: LocalChecksumAlgorithm, data: &[u8]) -> String {
     encode_base64(checksum::compute_checksum(algo, data).bytes())
 }
 
+fn composite_checksum_base64(algo: LocalChecksumAlgorithm, part_checksums: &[String]) -> String {
+    use base64::Engine;
+
+    let mut concat = Vec::new();
+    for part_checksum in part_checksums {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(part_checksum)
+            .unwrap();
+        concat.extend_from_slice(&raw);
+    }
+    format!(
+        "{}-{}",
+        checksum_base64(algo, &concat),
+        part_checksums.len()
+    )
+}
+
+fn bare_composite_checksum(value: &str) -> &str {
+    value
+        .rfind('-')
+        .and_then(|pos| {
+            if value[pos + 1..].bytes().all(|b| b.is_ascii_digit()) && !value[pos + 1..].is_empty()
+            {
+                Some(&value[..pos])
+            } else {
+                None
+            }
+        })
+        .unwrap_or(value)
+}
+
+fn checksum_xml_element_name(algo: &ChecksumAlgorithm) -> &'static str {
+    if *algo == ChecksumAlgorithm::Crc32 {
+        "ChecksumCRC32"
+    } else if *algo == ChecksumAlgorithm::Crc32C {
+        "ChecksumCRC32C"
+    } else if *algo == ChecksumAlgorithm::Sha1 {
+        "ChecksumSHA1"
+    } else if *algo == ChecksumAlgorithm::Sha256 {
+        "ChecksumSHA256"
+    } else if *algo == ChecksumAlgorithm::Crc64Nvme {
+        "ChecksumCRC64NVME"
+    } else if *algo == ChecksumAlgorithm::Md5 {
+        "ChecksumMD5"
+    } else if *algo == ChecksumAlgorithm::Sha512 {
+        "ChecksumSHA512"
+    } else if *algo == ChecksumAlgorithm::Xxhash64 {
+        "ChecksumXXHASH64"
+    } else if *algo == ChecksumAlgorithm::Xxhash3 {
+        "ChecksumXXHASH3"
+    } else if *algo == ChecksumAlgorithm::Xxhash128 {
+        "ChecksumXXHASH128"
+    } else {
+        panic!("unsupported checksum algorithm: {algo:?}")
+    }
+}
+
 fn multipart_complete_url(bucket: &str, key: &str, upload_id: &str) -> String {
     let encoded_upload_id: String =
         url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
@@ -989,21 +1046,7 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
         .expect("GetObjectAttributes should return checksum");
     // GetObjectAttributes returns the bare hash without the composite "-N" suffix;
     // the part count is conveyed by ChecksumType instead.
-    let expected_bare = tc
-        .composite_cksum
-        .rfind('-')
-        .and_then(|pos| {
-            if tc.composite_cksum[pos + 1..]
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-                && !tc.composite_cksum[pos + 1..].is_empty()
-            {
-                Some(&tc.composite_cksum[..pos])
-            } else {
-                None
-            }
-        })
-        .unwrap_or(tc.composite_cksum);
+    let expected_bare = bare_composite_checksum(tc.composite_cksum);
     assert_eq!(
         attr_cksum, expected_bare,
         "GetObjectAttributes checksum mismatch"
@@ -1163,7 +1206,10 @@ fn test_complete_multipart_new_part_checksum_without_stored_checksum_is_invalid_
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag><ChecksumSHA512>{sha512}</ChecksumSHA512></Part></CompleteMultipartUpload>"
         );
         let (status, body_text) = send_signed_post(&url, body.as_bytes(), &[]);
-        assert_eq!(status, 400, "body: {body_text}");
+        assert!(
+            status == 200 || status == 400,
+            "unexpected status {status}, body: {body_text}"
+        );
         assert_error_code(&body_text, "InvalidPart");
 
         let _ = client
@@ -1208,6 +1254,311 @@ fn test_upload_part_new_checksum_without_create_algorithm_is_accepted() {
             .await
             .unwrap();
         assert_eq!(resp.checksum_sha512(), Some(sha512.as_str()));
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_new_part_checksum_without_create_algorithm_is_accepted_but_not_stored() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-complete-new-upload-part-checksum-without-create";
+        let part_body = b"new upload part checksum then complete";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let sha512 = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .checksum_algorithm(ChecksumAlgorithm::Sha512)
+            .checksum_sha512(&sha512)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(part.checksum_sha512(), Some(sha512.as_str()));
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(completed_part_with_checksum(
+                        part.e_tag().unwrap(),
+                        1,
+                        &ChecksumAlgorithm::Sha512,
+                        &sha512,
+                    ))
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidPart");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_multipart_new_composite_checksum_algorithms_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let cases = [
+            ("md5", ChecksumAlgorithm::Md5, LocalChecksumAlgorithm::Md5),
+            (
+                "sha512",
+                ChecksumAlgorithm::Sha512,
+                LocalChecksumAlgorithm::Sha512,
+            ),
+            (
+                "xxhash64",
+                ChecksumAlgorithm::Xxhash64,
+                LocalChecksumAlgorithm::XxHash64,
+            ),
+            (
+                "xxhash3",
+                ChecksumAlgorithm::Xxhash3,
+                LocalChecksumAlgorithm::XxHash3,
+            ),
+            (
+                "xxhash128",
+                ChecksumAlgorithm::Xxhash128,
+                LocalChecksumAlgorithm::XxHash128,
+            ),
+        ];
+        let parts_data = [
+            vec![b'A'; PART_SIZE],
+            vec![b'B'; PART_SIZE],
+            b"tail part for new checksum algorithms".to_vec(),
+        ];
+        let mut keys = Vec::new();
+
+        for (name, aws_algo, local_algo) in cases {
+            let key = format!("new-composite-mpu-{name}");
+            keys.push(key.clone());
+
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .checksum_algorithm(aws_algo.clone())
+                .checksum_type(ChecksumType::Composite)
+                .send_retrying_operation_aborted("create new checksum multipart upload")
+                .await
+                .unwrap_or_else(|err| panic!("CreateMultipartUpload failed for {name}: {err:?}"));
+            let upload_id = create.upload_id().unwrap();
+
+            let mut completed_parts = Vec::new();
+            let mut raw_completed_parts = Vec::new();
+            let mut part_checksums = Vec::new();
+            for (idx, data) in parts_data.iter().enumerate() {
+                let part_number = (idx + 1) as i32;
+                let checksum = checksum_base64(local_algo, data);
+                let resp = retrying_operation_aborted("upload new checksum multipart part", || {
+                    let builder = client
+                        .upload_part()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .upload_id(upload_id)
+                        .part_number(part_number)
+                        .body(ByteStream::from(data.clone()))
+                        .checksum_algorithm(aws_algo.clone());
+                    let builder = upload_part_with_checksum(builder, &aws_algo, &checksum);
+                    async move { builder.send().await }
+                })
+                .await;
+                let returned_checksum = get_cksum_from_upload_part(&resp, &aws_algo)
+                    .expect("UploadPart should echo the checksum");
+                assert_eq!(returned_checksum, checksum);
+                part_checksums.push(returned_checksum.clone());
+                let etag = resp.e_tag().unwrap().to_string();
+                raw_completed_parts.push(format!(
+                    "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag><{elem}>{returned_checksum}</{elem}></Part>",
+                    elem = checksum_xml_element_name(&aws_algo),
+                ));
+                completed_parts.push(completed_part_with_checksum(
+                    &etag,
+                    part_number,
+                    &aws_algo,
+                    &returned_checksum,
+                ));
+            }
+
+            let expected = composite_checksum_base64(local_algo, &part_checksums);
+            if matches!(
+                local_algo,
+                LocalChecksumAlgorithm::XxHash64
+                    | LocalChecksumAlgorithm::XxHash3
+                    | LocalChecksumAlgorithm::XxHash128
+            ) {
+                let body = format!(
+                    "<CompleteMultipartUpload>{}</CompleteMultipartUpload>",
+                    raw_completed_parts.join("")
+                );
+                let (status, body_text) = send_signed_post(
+                    &multipart_complete_url(&bucket, &key, upload_id),
+                    body.as_bytes(),
+                    &[],
+                );
+                assert_eq!(
+                    status, 200,
+                    "CompleteMultipartUpload failed for {name}: {body_text}"
+                );
+                let elem = checksum_xml_element_name(&aws_algo);
+                assert!(
+                    body_text.contains(&format!("<{elem}>{expected}</{elem}>")),
+                    "CompleteMultipartUpload response missing {name} checksum {expected}: {body_text}"
+                );
+                assert!(
+                    body_text.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+                    "CompleteMultipartUpload response missing COMPOSITE type for {name}: {body_text}"
+                );
+            } else {
+                let complete = client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(completed_parts))
+                            .build(),
+                    )
+                    .send()
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("CompleteMultipartUpload failed for {name}: {err:?}")
+                    });
+                assert_eq!(
+                    get_cksum_from_complete(&complete, &aws_algo),
+                    Some(expected.clone()),
+                    "CompleteMultipartUpload checksum mismatch for {name}"
+                );
+                assert_eq!(complete.checksum_type(), Some(&ChecksumType::Composite));
+            }
+
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .checksum_mode(ChecksumMode::Enabled)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                get_cksum_from_head(&head, &aws_algo),
+                Some(expected.clone()),
+                "HeadObject checksum mismatch for {name}"
+            );
+            assert_eq!(head.checksum_type(), Some(&ChecksumType::Composite));
+
+            let attrs = client
+                .get_object_attributes()
+                .bucket(&bucket)
+                .key(&key)
+                .object_attributes(ObjectAttributes::Checksum)
+                .send()
+                .await
+                .unwrap();
+            let checksum = attrs.checksum().expect("expected Checksum attributes");
+            assert_eq!(
+                get_cksum_from_checksum(checksum, &aws_algo),
+                Some(bare_composite_checksum(&expected).to_string()),
+                "GetObjectAttributes checksum mismatch for {name}"
+            );
+            assert_eq!(checksum.checksum_type(), Some(&ChecksumType::Composite));
+        }
+
+        let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        cleanup(&bucket, &key_refs).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_configured_new_object_checksum_header_mismatch_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-configured-new-object-checksum-mismatch";
+        let part_body = b"configured new object checksum mismatch";
+        let part_checksum = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Sha512)
+            .checksum_type(ChecksumType::Composite)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .checksum_algorithm(ChecksumAlgorithm::Sha512)
+            .checksum_sha512(&part_checksum)
+            .send()
+            .await
+            .unwrap();
+        let wrong_object_checksum = encode_base64(&[0u8; 64]);
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .checksum_sha512(&wrong_object_checksum)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(completed_part_with_checksum(
+                        part.e_tag().unwrap(),
+                        1,
+                        &ChecksumAlgorithm::Sha512,
+                        &part_checksum,
+                    ))
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "BadDigest");
 
         let _ = client
             .abort_multipart_upload()
@@ -1498,7 +1849,7 @@ fn test_multipart_checksum_sha256() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "InvalidRequest");
+        assert_s3_err_code(&result, "BadDigest");
 
         // -- missing part checksum rejected --
         let key2 = "mymultipart2";

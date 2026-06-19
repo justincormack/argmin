@@ -702,8 +702,8 @@ impl Coordinator {
                 }
                 if let Some(ref computed) = checksum_value {
                     if computed != claimed.encoded_value() {
-                        return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
-                            header_name: claimed.algorithm().header_name().to_string(),
+                        return Err(ServerError::ChecksumDigestMismatch {
+                            algorithm: claimed.algorithm().as_str().to_ascii_lowercase(),
                         });
                     }
                 }
@@ -1195,6 +1195,12 @@ impl Coordinator {
                         },
                     );
 
+                    let stored_checksum = if upload_checksum_algo.is_some() {
+                        checksum.as_ref().map(ChecksumBytes::from)
+                    } else {
+                        None
+                    };
+
                     let part_record = MultipartPartRecord {
                         upload_id: upload_id.clone(),
                         part_number,
@@ -1209,7 +1215,7 @@ impl Coordinator {
                         ec_k: ec.k,
                         ec_m: ec.m,
                         last_modified: now,
-                        checksum: checksum.as_ref().map(ChecksumBytes::from),
+                        checksum: stored_checksum,
                     };
 
                     Ok::<_, ServerError>(PreparedStreamPartCommit {

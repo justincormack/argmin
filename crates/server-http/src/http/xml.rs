@@ -4423,9 +4423,9 @@ const CHECKSUM_ELEMENTS: &[(&str, ChecksumAlgorithm)] = &[
     ("ChecksumSHA256", ChecksumAlgorithm::Sha256),
     ("ChecksumCRC64NVME", ChecksumAlgorithm::Crc64nvme),
     ("ChecksumMD5", ChecksumAlgorithm::Md5),
-    ("ChecksumXXHash64", ChecksumAlgorithm::XxHash64),
-    ("ChecksumXXHash3", ChecksumAlgorithm::XxHash3),
-    ("ChecksumXXHash128", ChecksumAlgorithm::XxHash128),
+    ("ChecksumXXHASH64", ChecksumAlgorithm::XxHash64),
+    ("ChecksumXXHASH3", ChecksumAlgorithm::XxHash3),
+    ("ChecksumXXHASH128", ChecksumAlgorithm::XxHash128),
     ("ChecksumSHA512", ChecksumAlgorithm::Sha512),
 ];
 
@@ -6890,7 +6890,7 @@ mod tests {
              <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
              <ChecksumSHA512>{sha512}</ChecksumSHA512></Part>\
              <Part><PartNumber>2</PartNumber><ETag>\"e2\"</ETag>\
-             <ChecksumXXHash128>{xxhash128}</ChecksumXXHash128></Part>\
+             <ChecksumXXHASH128>{xxhash128}</ChecksumXXHASH128></Part>\
              </CompleteMultipartUpload>"
         );
         let parts = parse_complete_multipart_upload_xml(body.as_bytes()).unwrap();
@@ -6903,6 +6903,17 @@ mod tests {
             parts[1].checksum,
             Some(ChecksumClaim::from_base64(ChecksumAlgorithm::XxHash128, &xxhash128).unwrap())
         );
+    }
+
+    #[test]
+    fn parse_complete_multipart_rejects_title_case_xxhash_elements() {
+        let body = b"\
+            <CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+            <ChecksumXXHash64>AAAAAAAAAAA=</ChecksumXXHash64></Part>\
+            </CompleteMultipartUpload>";
+
+        assert!(parse_complete_multipart_upload_xml(body).is_err());
     }
 
     #[test]
