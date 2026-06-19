@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumAlgorithm, ChecksumMode, ObjectAttributes,
@@ -175,12 +176,21 @@ async fn cleanup(bucket: &str, key: &str) {
     let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
 
     for _ in 0..10 {
-        let uploads = client
+        let uploads = match client
             .list_multipart_uploads()
             .bucket(bucket)
-            .send()
+            .send_retrying_operation_aborted("list multipart uploads during SSE-C cleanup")
             .await
-            .unwrap();
+        {
+            Ok(uploads) => uploads,
+            Err(err)
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchBucket") =>
+            {
+                return;
+            }
+            Err(err) => panic!("list multipart uploads during SSE-C cleanup: {err:?}"),
+        };
         for upload in uploads.uploads() {
             let _ = client
                 .abort_multipart_upload()
@@ -199,6 +209,11 @@ async fn cleanup(bucket: &str, key: &str) {
         {
             Ok(_) => return,
             Err(err) => {
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchBucket")
+                {
+                    return;
+                }
                 let raw = format!("{err:?}");
                 if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

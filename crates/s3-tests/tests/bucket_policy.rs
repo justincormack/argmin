@@ -87,12 +87,21 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
     }
 
     for _ in 0..10 {
-        let uploads = client
+        let uploads = match client
             .list_multipart_uploads()
             .bucket(bucket)
             .send_retrying_operation_aborted("list multipart uploads during bucket policy cleanup")
             .await
-            .unwrap();
+        {
+            Ok(uploads) => uploads,
+            Err(err)
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchBucket") =>
+            {
+                return;
+            }
+            Err(err) => panic!("list multipart uploads during bucket policy cleanup: {err:?}"),
+        };
         for upload in uploads.uploads() {
             let _ = client
                 .abort_multipart_upload()
@@ -113,6 +122,11 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
         {
             Ok(_) => return,
             Err(err) => {
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchBucket")
+                {
+                    return;
+                }
                 let raw = format!("{err:?}");
                 if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
