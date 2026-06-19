@@ -380,6 +380,7 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "segment_index",
             "size",
             "segment_crc64",
+            "payload_crc64",
             "segment_okh",
             "segment_vid",
             "data_pg_id",

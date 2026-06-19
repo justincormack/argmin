@@ -17,7 +17,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestCaseResult};
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -25,6 +25,7 @@ use std::time::Duration;
 static METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static PAYLOAD_CLEANUP_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static BUCKET_SCOPED_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+static STREAMED_MULTIPART_PART_SESSION_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn lock_metadata_command_apply_hook_test() -> std::sync::MutexGuard<'static, ()> {
     METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL
@@ -1276,7 +1277,14 @@ fn upload_streamed_test_multipart_part(
     crate::MultipartPartSegmentRecord,
 ) {
     let session_seed = segment_okh[0];
-    let session_id = crate::SessionId::try_from(format!("{session_seed:02x}").repeat(16)).unwrap();
+    let session_nonce = STREAMED_MULTIPART_PART_SESSION_NONCE.fetch_add(1, Ordering::SeqCst);
+    let session_id = crate::SessionId::try_from(format!(
+        "{session_nonce:016x}{:014x}{session_seed:02x}",
+        u64::from(part_number),
+    ))
+    .unwrap();
+    let mut effective_segment_okh = segment_okh;
+    effective_segment_okh[..8].copy_from_slice(&session_nonce.to_be_bytes());
     let upload = cluster
         .load_in_progress_multipart_upload(bucket, key, upload_id)
         .unwrap();
@@ -1297,7 +1305,8 @@ fn upload_streamed_test_multipart_part(
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
-                segment_okh,
+                payload_crc64: checksum::crc64::checksum(payload),
+                segment_okh: effective_segment_okh,
             },
         )
         .unwrap();
@@ -1330,12 +1339,18 @@ fn upload_streamed_test_multipart_part(
                 let generation = snapshot
                     .existing_part_generation
                     .map_or(0, |generation| generation + 1);
+                let payload_crc64 = snapshot.staging_segments.iter().fold(
+                    checksum::crc64::checksum(&[]),
+                    |crc64, segment| {
+                        checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                    },
+                );
                 let part = crate::MultipartPartRecord {
                     upload_id: upload_id.clone(),
                     part_number,
                     generation,
                     size: payload.len() as u64,
-                    payload_crc64: 0,
+                    payload_crc64,
                     etag: vec![session_seed; 8],
                     etag_kind: crate::EtagKind::Crc64,
                     part_okh: [0u8; 16],

@@ -650,6 +650,7 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
                 segment_index: 0,
                 size: replacement_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(replacement_payload),
+                payload_crc64: checksum::crc64::checksum(replacement_payload),
                 segment_okh: replacement_okh,
             },
         )
@@ -1229,6 +1230,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh,
             },
         )
@@ -1256,12 +1258,18 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
             let generation = snapshot
                 .existing_part_generation
                 .map_or(0, |generation| generation + 1);
+            let payload_crc64 = snapshot.staging_segments.iter().fold(
+                checksum::crc64::checksum(&[]),
+                |crc64, segment| {
+                    checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                },
+            );
             let part = crate::MultipartPartRecord {
                 upload_id: upload_id.clone(),
                 part_number: 1,
                 generation,
                 size: payload.len() as u64,
-                payload_crc64: 0,
+                payload_crc64,
                 etag: vec![0x55; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],

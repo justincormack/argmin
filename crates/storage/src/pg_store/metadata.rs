@@ -1,5 +1,13 @@
 use super::*;
 
+fn combined_stream_segment_payload_crc64(segments: &[StreamUploadSegmentRecord]) -> u64 {
+    segments
+        .iter()
+        .fold(checksum::crc64::checksum(&[]), |crc64, segment| {
+            checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+        })
+}
+
 impl PgStore {
     pub(super) fn with_immediate_txn<T>(
         &self,
@@ -2257,24 +2265,37 @@ impl PgStore {
         }
 
         let staged_segments = self.list_stream_segments(&command.session_id)?;
-        let expected_staged_segments: Vec<StreamUploadSegmentRecord> = command
-            .segments
-            .iter()
-            .map(|segment| StreamUploadSegmentRecord {
-                session_id: command.session_id.clone(),
-                segment_index: segment.segment_index,
-                size: segment.size,
-                segment_crc64: segment.segment_crc64,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                data_pg_id: segment.data_pg_id,
-                ec_k: segment.ec_k,
-                ec_m: segment.ec_m,
-            })
-            .collect();
-        if staged_segments != expected_staged_segments {
+        if staged_segments.len() != command.segments.len()
+            || staged_segments
+                .iter()
+                .zip(command.segments.iter())
+                .any(|(staged, segment)| {
+                    staged.segment_index != segment.segment_index
+                        || staged.size != segment.size
+                        || staged.segment_crc64 != segment.segment_crc64
+                        || staged.segment_okh != segment.segment_okh
+                        || staged.segment_vid != segment.segment_vid
+                        || staged.data_pg_id != segment.data_pg_id
+                        || staged.ec_k != segment.ec_k
+                        || staged.ec_m != segment.ec_m
+                })
+        {
             return Err(MetadataError::Db {
                 context: "commit stream part command staged segments mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let staged_segments_total: u64 = staged_segments.iter().map(|segment| segment.size).sum();
+        if staged_segments_total != command.part.size {
+            return Err(MetadataError::Db {
+                context: "commit stream part command staged payload size mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let staged_crc64 = combined_stream_segment_payload_crc64(&staged_segments);
+        if staged_crc64 != command.part.payload_crc64 {
+            return Err(MetadataError::Db {
+                context: "commit stream part command staged payload CRC64 mismatch",
                 source: rusqlite::Error::InvalidQuery,
             });
         }
@@ -10622,7 +10643,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT session_id, segment_index, size, segment_okh, segment_vid, data_pg_id, \
-                 segment_crc64, ec_k, ec_m FROM stream_upload_segments \
+                 segment_crc64, payload_crc64, ec_k, ec_m FROM stream_upload_segments \
                  WHERE session_id = ?1 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -10639,6 +10660,7 @@ impl PgMetadataStore for PgStore {
                     segment_index: row.get(1)?,
                     size: row.get::<_, i64>(2)? as u64,
                     segment_crc64: row.get::<_, i64>(6)? as u64,
+                    payload_crc64: row.get::<_, i64>(7)? as u64,
                     segment_okh: okh,
                     segment_vid: Self::parse_generation_id(
                         row.get::<_, i64>(4)?,
@@ -10646,8 +10668,8 @@ impl PgMetadataStore for PgStore {
                         "segment_vid",
                     )?,
                     data_pg_id: row.get(5)?,
-                    ec_k: row.get(7)?,
-                    ec_m: row.get(8)?,
+                    ec_k: row.get(8)?,
+                    ec_m: row.get(9)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -11546,13 +11568,14 @@ impl PgStore {
         self.conn
                 .execute(
                     "INSERT INTO stream_upload_segments \
-                 (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (session_id, segment_index, size, segment_crc64, payload_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     segment.session_id,
                     segment.segment_index,
                     segment.size as i64,
                     segment.segment_crc64 as i64,
+                    segment.payload_crc64 as i64,
                     segment.segment_okh.as_slice(),
                     segment.segment_vid.get() as i64,
                     segment.data_pg_id,

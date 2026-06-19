@@ -2155,6 +2155,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
                 segment_index: 0,
                 size: 11,
                 segment_crc64: 123,
+                payload_crc64: 123,
                 segment_okh: [7; 16],
             },
         )

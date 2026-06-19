@@ -141,6 +141,7 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh,
             },
         )

@@ -3655,8 +3655,10 @@ pub struct PrepareStreamUploadSegmentAppendReq {
     pub session_id: SessionId,
     pub segment_index: u32,
     pub size: u64,
-    /// CRC64-NVME over the logical segment bytes.
+    /// CRC64-NVME over the bytes written to storage.
     pub segment_crc64: u64,
+    /// CRC64-NVME over the user-visible plaintext payload bytes.
+    pub payload_crc64: u64,
     /// 16-byte object key hash for shard keys.
     pub segment_okh: [u8; 16],
 }
@@ -3667,8 +3669,10 @@ pub struct StreamUploadSegmentRecord {
     pub session_id: SessionId,
     pub segment_index: u32,
     pub size: u64,
-    /// CRC64-NVME over the logical segment bytes.
+    /// CRC64-NVME over the bytes written to storage.
     pub segment_crc64: u64,
+    /// CRC64-NVME over the user-visible plaintext payload bytes.
+    pub payload_crc64: u64,
     /// 16-byte object key hash for shard keys.
     pub segment_okh: [u8; 16],
     /// Payload generation for shard keys.

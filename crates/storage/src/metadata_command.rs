@@ -2325,6 +2325,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u32()?;
         self.read_u64()?;
         self.read_u64()?;
+        self.read_u64()?;
         self.read_bytes()?;
         self.read_nonzero_u64("stream upload segment VID")?;
         self.read_u32()?;
@@ -2339,6 +2340,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
             segment_crc64: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_bytes("stream upload segment OKH")?,
             segment_vid: self.read_generation_id("stream upload segment VID")?,
             data_pg_id: self.read_u32()?,
@@ -3552,6 +3554,7 @@ fn encode_stream_upload_segment(out: &mut Vec<u8>, segment: &StreamUploadSegment
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
     put_u64(out, segment.segment_crc64);
+    put_u64(out, segment.payload_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
@@ -4842,6 +4845,7 @@ mod tests {
             segment_index: 3,
             size: 17,
             segment_crc64: 12,
+            payload_crc64: 12,
             segment_okh: [12; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
@@ -5284,7 +5288,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0x1e712152d885dc1f,
                 0x0bf1842505b04e6d,
-                0x9e66539a1d4f1ec7,
+                0x4906ba7e71a28b40,
                 0x903cf2da427ff645,
                 0x22e816661cec7274,
                 0xe7353d51b6609ac8,
@@ -5297,12 +5301,12 @@ mod tests {
                 0x48fb53d34217c071,
                 0x60d07b32ba40633a,
                 0x5905759308d55e48,
-                0x46fa27c26df043f8,
+                0x722e76a80ad6b753,
                 0x2d6608601fded1d8,
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,
-                0x7dbd565565a4a8d6,
-                0xddc42690979914a4,
+                0xce0268549819ae28,
+                0x5f1aa1cea13e9196,
                 0xe73984452d023876,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,

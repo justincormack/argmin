@@ -353,6 +353,7 @@ impl Coordinator {
         let object_crc64 = checksum::crc64::checksum(req.data);
         let write_encryption = &authorized.write_encryption;
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+            let chunk_crc64 = checksum::crc64::checksum(chunk);
             let chunk_storage = write_encryption.encrypt_segment(idx as u32, chunk)?;
             self.append_stream_segment_for_storage_node(
                 storage_node,
@@ -360,7 +361,10 @@ impl Coordinator {
                 authorized.key_typed(),
                 session_id,
                 idx as u32,
-                &chunk_storage,
+                super::StreamSegmentAppendPayload {
+                    storage_bytes: &chunk_storage,
+                    payload_crc64: chunk_crc64,
+                },
             )?;
         }
         self.finalize_stream_put_with_authorized_write_tags_with_storage_node(
@@ -468,13 +472,17 @@ impl Coordinator {
             req.session_id,
             req.sse_customer,
         )?;
+        let payload_crc64 = checksum::crc64::checksum(req.data);
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
         self.append_stream_segment_for(
             req.bucket,
             req.key,
             req.session_id,
             req.segment_index,
-            &storage_data,
+            super::StreamSegmentAppendPayload {
+                storage_bytes: &storage_data,
+                payload_crc64,
+            },
         )
     }
 
@@ -490,6 +498,7 @@ impl Coordinator {
             req.session_id,
             req.sse_customer,
         )?;
+        let payload_crc64 = checksum::crc64::checksum(req.data);
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
         self.append_stream_segment_for_storage_node(
             storage_node,
@@ -497,7 +506,10 @@ impl Coordinator {
             req.key,
             req.session_id,
             req.segment_index,
-            &storage_data,
+            super::StreamSegmentAppendPayload {
+                storage_bytes: &storage_data,
+                payload_crc64,
+            },
         )
     }
 

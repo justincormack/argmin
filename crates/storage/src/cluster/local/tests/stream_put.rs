@@ -53,6 +53,7 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
                 segment_index: 0,
                 size: loser_payload.len() as u64,
                 segment_crc64: loser_crc64,
+                payload_crc64: loser_crc64,
                 segment_okh: [0x93; 16],
             },
         )
@@ -605,6 +606,7 @@ fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
                 segment_index: 0,
                 size: stream_payload.len() as u64,
                 segment_crc64: stream_crc64,
+                payload_crc64: stream_crc64,
                 segment_okh: [0x5a; 16],
             },
         )
@@ -829,6 +831,7 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
                     segment_index: 0,
                     size: payload.len() as u64,
                     segment_crc64: crc64,
+                    payload_crc64: crc64,
                     segment_okh,
                 },
             )

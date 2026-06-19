@@ -2372,6 +2372,7 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [88; 16],
             },
         )

@@ -94,6 +94,7 @@ impl UnixStorageNodeClient {
             || segment.segment_index != request.segment_index
             || segment.size != request.size
             || segment.segment_crc64 != request.segment_crc64
+            || segment.payload_crc64 != request.payload_crc64
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 context,

@@ -317,7 +317,7 @@ const STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 8 + 4 + 16;
+    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 8 + 8 + 4 + 16;
 const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;
@@ -326,7 +326,7 @@ const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 8 +
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
-    4 + SESSION_ID_LEN + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
+    4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
@@ -11819,6 +11819,7 @@ impl<'a> StorageRpcDecoder<'a> {
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
             segment_crc64: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_16_bytes("stream segment append OKH")?,
         })
     }
@@ -12141,6 +12142,7 @@ impl<'a> StorageRpcDecoder<'a> {
             segment_index: self.read_u32()?,
             size: self.read_u64()?,
             segment_crc64: self.read_u64()?,
+            payload_crc64: self.read_u64()?,
             segment_okh: self.read_fixed_16_bytes("stream upload segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
@@ -13882,6 +13884,7 @@ fn put_prepare_stream_segment_append_req(
     put_u32(out, request.segment_index);
     put_u64(out, request.size);
     put_u64(out, request.segment_crc64);
+    put_u64(out, request.payload_crc64);
     put_bytes(out, &request.segment_okh);
 }
 
@@ -13987,6 +13990,7 @@ fn put_stream_upload_segment_record(out: &mut Vec<u8>, segment: &StreamUploadSeg
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
     put_u64(out, segment.segment_crc64);
+    put_u64(out, segment.payload_crc64);
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);

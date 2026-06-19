@@ -304,6 +304,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
     segment_crc64 INTEGER NOT NULL,
+    payload_crc64 INTEGER NOT NULL,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,

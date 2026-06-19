@@ -3300,13 +3300,14 @@ fn metadata_state_digest_covers_stream_upload_state() {
                 .conn
                 .execute(
                     "INSERT INTO stream_upload_segments \
-                     (session_id, segment_index, size, segment_crc64, segment_okh, \
+                     (session_id, segment_index, size, segment_crc64, payload_crc64, segment_okh, \
                       segment_vid, data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         "seg-session",
                         0_i64,
                         64_i64,
+                        99_i64,
                         99_i64,
                         okh.as_slice(),
                         1_i64,

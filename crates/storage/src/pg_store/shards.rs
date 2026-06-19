@@ -494,13 +494,14 @@ impl PgStore {
             self.conn
                 .execute(
                     "INSERT INTO stream_upload_segments \
-                     (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     (session_id, segment_index, size, segment_crc64, payload_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         segment.session_id,
                         segment.segment_index,
                         segment.size as i64,
                         segment.segment_crc64 as i64,
+                        segment.payload_crc64 as i64,
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
                         segment.data_pg_id,

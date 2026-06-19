@@ -342,7 +342,12 @@ fn upload_copied_test_multipart_part(
     payloads: [&[u8]; 2],
 ) -> crate::MultipartPartRecord {
     let session_seed = payload_seed.max(1);
-    let session_id = crate::SessionId::try_from(format!("{session_seed:02x}").repeat(16)).unwrap();
+    let session_nonce = STREAMED_MULTIPART_PART_SESSION_NONCE.fetch_add(1, Ordering::SeqCst);
+    let session_id = crate::SessionId::try_from(format!(
+        "{session_nonce:016x}{:014x}{session_seed:02x}",
+        u64::from(part_number),
+    ))
+    .unwrap();
     let upload = cluster
         .load_in_progress_multipart_upload(bucket, key, upload_id)
         .unwrap();
@@ -356,9 +361,11 @@ fn upload_copied_test_multipart_part(
 
     let mut staged_segments = Vec::new();
     for (segment_index, payload) in payloads.into_iter().enumerate() {
-        let segment_okh = [payload_seed
+        let mut segment_okh = [payload_seed
             .wrapping_add(u8::try_from(segment_index).unwrap())
             .max(1); 16];
+        let segment_nonce = session_nonce + u64::try_from(segment_index).unwrap();
+        segment_okh[..8].copy_from_slice(&segment_nonce.to_be_bytes());
         let (_target, segment) = cluster
             .prepare_stream_segment_append(
                 bucket,
@@ -368,6 +375,7 @@ fn upload_copied_test_multipart_part(
                     segment_index: u32::try_from(segment_index).unwrap(),
                     size: payload.len() as u64,
                     segment_crc64: checksum::crc64::checksum(payload),
+                    payload_crc64: checksum::crc64::checksum(payload),
                     segment_okh,
                 },
             )
@@ -412,12 +420,18 @@ fn upload_copied_test_multipart_part(
                         m: segment.ec_m,
                     })
                     .unwrap_or(EcShape { k: 0, m: 0 });
+                let payload_crc64 = snapshot.staging_segments.iter().fold(
+                    checksum::crc64::checksum(&[]),
+                    |crc64, segment| {
+                        checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                    },
+                );
                 let part = crate::MultipartPartRecord {
                     upload_id: upload_id.clone(),
                     part_number,
                     generation,
                     size,
-                    payload_crc64: 0,
+                    payload_crc64,
                     etag: vec![payload_seed; 8],
                     etag_kind: crate::EtagKind::Crc64,
                     part_okh: [0u8; 16],

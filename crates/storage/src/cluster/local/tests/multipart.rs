@@ -1726,6 +1726,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                 segment_index: 0,
                 size: first_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(first_payload),
+                payload_crc64: checksum::crc64::checksum(first_payload),
                 segment_okh: [0x38; 16],
             },
         )
@@ -1757,6 +1758,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                 segment_index: 1,
                 size: second_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(second_payload),
+                payload_crc64: checksum::crc64::checksum(second_payload),
                 segment_okh: [0x39; 16],
             },
         )
@@ -1963,6 +1965,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x3b; 16],
             },
         )
@@ -2013,12 +2016,18 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_for_hook).unwrap();
             let staging_segments =
                 crate::PgMetadataStore::list_stream_segments(&*pg, &session_for_hook).unwrap();
+            let payload_crc64 =
+                staging_segments
+                    .iter()
+                    .fold(checksum::crc64::checksum(&[]), |crc64, segment| {
+                        checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                    });
             let part = crate::MultipartPartRecord {
                 upload_id: upload_for_hook.clone(),
                 part_number: 1,
                 generation: 0,
                 size: staging_segments.iter().map(|segment| segment.size).sum(),
-                payload_crc64: 0,
+                payload_crc64,
                 etag: vec![0x3b; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
@@ -2993,6 +3002,7 @@ fn multipart_abort_zero_apply_leaves_upload_in_progress_before_retry() {
                 segment_index: 0,
                 size: staged_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(staged_payload),
+                payload_crc64: checksum::crc64::checksum(staged_payload),
                 segment_okh: staged_okh,
             },
         )

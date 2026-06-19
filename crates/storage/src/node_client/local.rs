@@ -54,6 +54,14 @@ impl LocalStorageNodeClient {
     }
 }
 
+fn combined_stream_segment_crc64(segments: &[StreamUploadSegmentRecord]) -> u64 {
+    segments
+        .iter()
+        .fold(checksum::crc64::checksum(&[]), |crc64, segment| {
+            checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+        })
+}
+
 impl PlacedShardNodeClient for LocalStorageNodeClient {
     fn node_id(&self) -> NodeId {
         self.node_id
@@ -2903,6 +2911,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             segment_index: request.segment_index,
             size: request.size,
             segment_crc64: request.segment_crc64,
+            payload_crc64: request.payload_crc64,
             segment_okh,
             segment_vid,
             data_pg_id,
@@ -3059,6 +3068,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 ),
             });
         }
+        let staged_crc64 = combined_stream_segment_crc64(&current.staging_segments);
+        if staged_crc64 != request.commit.etag_crc64 {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "stream PUT etag CRC64 mismatch: caller passed {} but staged payload segments combine to {staged_crc64}",
+                    request.commit.etag_crc64
+                ),
+            });
+        }
 
         let version_id = request.commit.version_id;
         if request.commit.versioning == BucketVersioningState::Enabled && version_id.is_null() {
@@ -3185,6 +3203,49 @@ impl StorageNodeClient for LocalStorageNodeClient {
         if &current != request.expected_snapshot {
             return Err(ObjectPgActionError::StaleStreamFinalizeSnapshot);
         }
+        let staged_segments = &current.auth_snapshot.staging_segments;
+        let segments_total: u64 = staged_segments.iter().map(|segment| segment.size).sum();
+        if segments_total != request.part.size {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "stream UploadPart size mismatch: caller passed {} but staged segments sum to {segments_total}",
+                    request.part.size
+                ),
+            });
+        }
+        let staged_crc64 = combined_stream_segment_crc64(staged_segments);
+        if staged_crc64 != request.part.payload_crc64 {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "stream UploadPart etag CRC64 mismatch: caller passed {} but staged payload segments combine to {staged_crc64}",
+                    request.part.payload_crc64
+                ),
+            });
+        }
+        let committed_segments: Vec<MultipartPartSegmentRecord> = staged_segments
+            .iter()
+            .map(|segment| MultipartPartSegmentRecord {
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                upload_id: request.upload_id.clone(),
+                version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+                part_number: request.part_number,
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_crc64: segment.segment_crc64,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                data_pg_id: segment.data_pg_id,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
+            })
+            .collect();
+        if committed_segments != request.segments {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "stream UploadPart segments do not match staged stream segments"
+                    .to_string(),
+            });
+        }
         let command_id = self.next_metadata_command_id_from_locked_pg(
             request.pg_id,
             request.cluster_epoch,
@@ -3198,7 +3259,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 session_id: request.session_id.clone(),
                 upload: current.auth_snapshot.upload,
                 part: request.part.clone(),
-                segments: request.segments.to_vec(),
+                segments: committed_segments,
                 existing_part: current.existing_part,
                 displaced_segments: current.displaced_segments,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),

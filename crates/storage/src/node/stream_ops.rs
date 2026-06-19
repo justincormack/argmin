@@ -219,6 +219,7 @@ impl SharedStorageNode {
             segment_index: request.segment_index,
             size: request.size,
             segment_crc64: request.segment_crc64,
+            payload_crc64: request.payload_crc64,
             segment_okh,
             segment_vid,
             data_pg_id,

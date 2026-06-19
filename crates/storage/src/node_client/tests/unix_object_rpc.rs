@@ -1485,6 +1485,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         segment_index: 0,
         size: 16,
         segment_crc64: 44,
+        payload_crc64: 44,
         segment_okh: [3; 16],
     };
     let segment = StreamUploadSegmentRecord {
@@ -1492,6 +1493,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         segment_index: 0,
         size: request.size,
         segment_crc64: request.segment_crc64,
+        payload_crc64: request.segment_crc64,
         segment_okh: request.segment_okh,
         segment_vid: GenerationId::new(1).unwrap(),
         data_pg_id: 0,
@@ -1512,6 +1514,24 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
     let err = client
         .validate_stream_segment_append_prepare_response(
             &bad_segment,
+            &StreamUploadTarget::PutObject,
+            &StreamUploadTarget::PutObject,
+            &request,
+            "validate stream append read response",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "validate stream append read response",
+            ..
+        })
+    ));
+    let mut bad_payload_crc_segment = segment.clone();
+    bad_payload_crc_segment.payload_crc64 += 1;
+    let err = client
+        .validate_stream_segment_append_prepare_response(
+            &bad_payload_crc_segment,
             &StreamUploadTarget::PutObject,
             &StreamUploadTarget::PutObject,
             &request,
@@ -1617,6 +1637,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
         segment_index: 0,
         size: 12,
         segment_crc64: 99,
+        payload_crc64: 99,
         segment_okh: [4; 16],
         segment_vid: GenerationId::new(10).unwrap(),
         data_pg_id: 0,
@@ -1843,6 +1864,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
                 segment_index: 0,
                 size: 12,
                 segment_crc64: 100,
+                payload_crc64: 100,
                 segment_okh: [5; 16],
                 segment_vid: GenerationId::new(32).unwrap(),
                 data_pg_id: 0,

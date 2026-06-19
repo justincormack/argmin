@@ -140,6 +140,7 @@ impl Coordinator {
                 },
                 other => other,
             })?;
+        let payload_crc64 = checksum::crc64::checksum(req.data);
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
         self.append_stream_segment_for_storage_node(
             storage_node,
@@ -147,7 +148,10 @@ impl Coordinator {
             &req.key,
             req.session_id,
             req.segment_index,
-            &storage_data,
+            super::StreamSegmentAppendPayload {
+                storage_bytes: &storage_data,
+                payload_crc64,
+            },
         )
         .map_err(|error| match error {
             ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
@@ -1137,6 +1141,19 @@ impl Coordinator {
                         return Err(ServerError::InvalidRequest {
                             reason: format!(
                                 "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
+                            ),
+                        });
+                    }
+                    let staged_crc64 = staging_segments.iter().fold(
+                        checksum::crc64::checksum(&[]),
+                        |crc64, segment| {
+                            checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                        },
+                    );
+                    if staged_crc64 != crc64 {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "stream UploadPart etag CRC64 mismatch: caller passed {crc64} but staged payload segments combine to {staged_crc64}"
                             ),
                         });
                     }

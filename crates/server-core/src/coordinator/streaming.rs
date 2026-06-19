@@ -249,13 +249,17 @@ impl Coordinator {
             session_id,
             None,
         )?;
+        let payload_crc64 = checksum::crc64::checksum(data);
         let storage_data = write_encryption.encrypt_segment(segment_index, data)?;
         self.append_stream_segment_for(
             &trusted_bucket_name(bucket),
             &trusted_object_key(key),
             session_id,
             segment_index,
-            &storage_data,
+            super::StreamSegmentAppendPayload {
+                storage_bytes: &storage_data,
+                payload_crc64,
+            },
         )
     }
 
@@ -441,7 +445,7 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
         segment_index: u32,
-        data: &[u8],
+        payload: super::StreamSegmentAppendPayload<'_>,
     ) -> Result<(), ServerError> {
         self.append_stream_segment_for_storage_node(
             &self.storage_node(),
@@ -449,7 +453,7 @@ impl Coordinator {
             key,
             session_id,
             segment_index,
-            data,
+            payload,
         )
     }
 
@@ -460,7 +464,7 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
         segment_index: u32,
-        data: &[u8],
+        payload: super::StreamSegmentAppendPayload<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -470,11 +474,11 @@ impl Coordinator {
             key,
             session_id,
             segment_index,
-            data.len()
+            payload.storage_bytes.len()
         );
         let segment_okh = stream_segment_key_hash(session_id, segment_index);
 
-        let logical_size = if data.is_empty() {
+        let logical_size = if payload.storage_bytes.is_empty() {
             0
         } else {
             match storage_node
@@ -482,9 +486,9 @@ impl Coordinator {
                 .map_err(Self::map_object_pg_action_error)?
                 .encryption
             {
-                ObjectEncryption::None => data.len() as u64,
+                ObjectEncryption::None => payload.storage_bytes.len() as u64,
                 ObjectEncryption::SseCustomer(_) | ObjectEncryption::SseS3(_) => {
-                    let ciphertext_len = data.len();
+                    let ciphertext_len = payload.storage_bytes.len();
                     let logical_len = ciphertext_len.checked_sub(SSE_C_SEGMENT_TAG_LEN).ok_or(
                         ServerError::InvalidRequest {
                             reason: "encrypted stream segment shorter than authentication tag"
@@ -504,7 +508,8 @@ impl Coordinator {
                     session_id: session_id.clone(),
                     segment_index,
                     size: logical_size,
-                    segment_crc64: checksum::crc64::checksum(data),
+                    segment_crc64: checksum::crc64::checksum(payload.storage_bytes),
+                    payload_crc64: payload.payload_crc64,
                     segment_okh,
                 },
             )
@@ -522,8 +527,8 @@ impl Coordinator {
         #[cfg(test)]
         self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
-        let written_shards =
-            storage_node.write_stream_segment_payload_shards(&segment_record, data)?;
+        let written_shards = storage_node
+            .write_stream_segment_payload_shards(&segment_record, payload.storage_bytes)?;
 
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
             .iter()
@@ -556,7 +561,10 @@ impl Coordinator {
             &trusted_object_key(key),
             session_id,
             segment_index,
-            data,
+            super::StreamSegmentAppendPayload {
+                storage_bytes: data,
+                payload_crc64: checksum::crc64::checksum(data),
+            },
         )
     }
 

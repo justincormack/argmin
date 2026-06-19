@@ -330,6 +330,7 @@ impl Coordinator {
                 if let Some(checksum) = replacement_checksum.as_mut() {
                     checksum.update(&chunk);
                 }
+                let chunk_crc64 = checksum::crc64::checksum(&chunk);
                 let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
                 self.append_stream_segment_for_storage_node(
                     &storage_node,
@@ -337,7 +338,10 @@ impl Coordinator {
                     req.destination.key_typed(),
                     &session_id,
                     segment_index,
-                    &storage_chunk,
+                    super::StreamSegmentAppendPayload {
+                        storage_bytes: &storage_chunk,
+                        payload_crc64: chunk_crc64,
+                    },
                 )?;
                 segment_index =
                     segment_index
@@ -532,6 +536,7 @@ impl Coordinator {
                 if let Some(checksum) = computed_checksum.as_mut() {
                     checksum.update(&chunk);
                 }
+                let chunk_crc64 = checksum::crc64::checksum(&chunk);
                 let storage_chunk = write_encryption.encrypt_segment(segment_index, &chunk)?;
                 self.append_stream_segment_for_storage_node(
                     &storage_node,
@@ -539,7 +544,10 @@ impl Coordinator {
                     &key,
                     session_id,
                     segment_index,
-                    &storage_chunk,
+                    super::StreamSegmentAppendPayload {
+                        storage_bytes: &storage_chunk,
+                        payload_crc64: chunk_crc64,
+                    },
                 )?;
                 segment_index =
                     segment_index

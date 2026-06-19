@@ -619,6 +619,7 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [89; 16],
             },
         )
@@ -780,6 +781,7 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0xd4; 16],
             },
         )
@@ -890,6 +892,7 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [98; 16],
             },
         )
@@ -1000,6 +1003,7 @@ fn stream_abort_pending_drain_cleans_terminal_stream_session() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x45; 16],
             },
         )
@@ -1125,6 +1129,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 segment_index: 0,
                 size: first_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(first_payload),
+                payload_crc64: checksum::crc64::checksum(first_payload),
                 segment_okh: [0x4b; 16],
             },
         )
@@ -1157,6 +1162,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 segment_index: 1,
                 size: second_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(second_payload),
+                payload_crc64: checksum::crc64::checksum(second_payload),
                 segment_okh: [0x4c; 16],
             },
         )
@@ -1379,6 +1385,7 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
+                payload_crc64,
                 segment_okh: [0x49; 16],
             },
         )
@@ -1658,6 +1665,376 @@ fn stream_put_finalize_action_failure_same_pg_releases_bucket_write_proof() {
 }
 
 #[test]
+fn stream_put_finalize_rejects_unencrypted_etag_crc64_mismatch() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let session_id = crate::SessionId::try_from("8f".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+
+    let payloads: [&[u8]; 1] = [b"unencrypted stream segment"];
+    let mut expected_crc64 = checksum::crc64::checksum(&[]);
+    let mut total_size = 0;
+    for (segment_index, payload) in payloads.iter().enumerate() {
+        let segment_crc64 = checksum::crc64::checksum(payload);
+        expected_crc64 =
+            checksum::crc64::combine(expected_crc64, segment_crc64, payload.len() as u64);
+        total_size += payload.len() as u64;
+        let (_target, segment) = cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: segment_index as u32,
+                    size: payload.len() as u64,
+                    segment_crc64,
+                    payload_crc64: segment_crc64,
+                    segment_okh: [0x80 + segment_index as u8; 16],
+                },
+            )
+            .unwrap();
+        let written_shards = cluster
+            .write_stream_segment_payload_shards(&segment, payload)
+            .unwrap();
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                segment.segment_index,
+                &segment,
+                &shard_batch,
+            )
+            .unwrap();
+    }
+
+    let err = cluster
+        .finalize_put_object_stream(
+            &bucket,
+            &key,
+            &session_id,
+            total_size,
+            acquire_test_bucket_write_proof(
+                &cluster,
+                &bucket,
+                "stream-put-finalize-crc-test",
+                Some(key.as_str()),
+            ),
+            |_| {
+                Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                    value: (),
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    size: total_size,
+                    etag_crc64: expected_crc64 ^ 1,
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                })
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason.contains("stream PUT etag CRC64 mismatch")
+        ),
+        "expected stream PUT etag CRC64 mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState {
+        wrapping_key_id: 9,
+        wrap_nonce: [10; crate::SSE_S3_WRAP_NONCE_LEN],
+        wrapped_dek: [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+        segment_nonce_prefix: [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        checksum_nonce: [13; crate::SSE_S3_CHECKSUM_NONCE_LEN],
+        encrypted_checksum_metadata: vec![14, 15, 16],
+    });
+    let session_id = crate::SessionId::try_from("90".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
+        .unwrap();
+
+    let payload = b"encrypted stream plaintext";
+    let storage_bytes = b"encrypted stream ciphertext";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let segment_crc64 = checksum::crc64::checksum(storage_bytes);
+    assert_ne!(payload_crc64, segment_crc64);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64,
+                payload_crc64,
+                segment_okh: [0x91; 16],
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, storage_bytes)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let err = cluster
+        .finalize_put_object_stream(
+            &bucket,
+            &key,
+            &session_id,
+            payload.len() as u64,
+            acquire_test_bucket_write_proof(
+                &cluster,
+                &bucket,
+                "stream-put-finalize-encrypted-crc-test",
+                Some(key.as_str()),
+            ),
+            |_| {
+                Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                    value: (),
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    size: payload.len() as u64,
+                    etag_crc64: payload_crc64 ^ 1,
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: encryption.clone(),
+                })
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason.contains("stream PUT etag CRC64 mismatch")
+        ),
+        "expected encrypted stream PUT payload CRC64 mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("partcrcmismatch");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let session_id = crate::SessionId::try_from("92".repeat(16)).unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &session_id,
+        )
+        .unwrap();
+
+    let payload = b"stream part payload crc mismatch";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: payload_crc64,
+                payload_crc64,
+                segment_okh: [0x92; 16],
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let part = crate::MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number: 1,
+        generation: 0,
+        size: payload.len() as u64,
+        payload_crc64: payload_crc64 ^ 1,
+        etag: vec![0x92; 8],
+        etag_kind: crate::EtagKind::Crc64,
+        part_okh: [0u8; 16],
+        part_vid: crate::GenerationId::MIN,
+        ec_k: segment.ec_k,
+        ec_m: segment.ec_m,
+        last_modified: 123_456,
+        checksum: None,
+    };
+    let segments = vec![crate::MultipartPartSegmentRecord {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        upload_id: upload_id.clone(),
+        version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+        part_number: 1,
+        segment_index: segment.segment_index,
+        size: segment.size,
+        segment_crc64: segment.segment_crc64,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.segment_vid,
+        data_pg_id: segment.data_pg_id,
+        ec_k: segment.ec_k,
+        ec_m: segment.ec_m,
+    }];
+
+    let err = cluster
+        .finalize_upload_part_stream(&bucket, &key, &upload_id, &session_id, 1, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPartCommit {
+                value: (),
+                part: part.clone(),
+                segments: segments.clone(),
+            })
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason.contains("stream UploadPart etag CRC64 mismatch")
+        ),
+        "expected stream UploadPart etag CRC64 mismatch, got {err:?}"
+    );
+}
+
+#[test]
 fn stream_put_finalize_matching_pending_install_race_returns_success() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1698,6 +2075,7 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
+                payload_crc64,
                 segment_okh: [0x4c; 16],
             },
         )
@@ -1898,6 +2276,7 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
+                payload_crc64,
                 segment_okh: [0x76; 16],
             },
         )
@@ -2065,6 +2444,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x47; 16],
             },
         )
@@ -2118,7 +2498,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
-        payload_crc64: 0,
+        payload_crc64: segment.payload_crc64,
         etag: vec![0x47; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2266,6 +2646,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x4b; 16],
             },
         )
@@ -2293,7 +2674,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
-        payload_crc64: 0,
+        payload_crc64: segment.payload_crc64,
         etag: vec![0x4b; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2465,6 +2846,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x4e; 16],
             },
         )
@@ -2492,7 +2874,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
-        payload_crc64: 0,
+        payload_crc64: segment.payload_crc64,
         etag: vec![0x4e; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2668,6 +3050,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x4d; 16],
             },
         )
@@ -2695,7 +3078,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         part_number: 1,
         generation: 0,
         size: payload.len() as u64,
-        payload_crc64: 0,
+        payload_crc64: segment.payload_crc64,
         etag: vec![0x4d; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_okh: [0u8; 16],
@@ -2885,6 +3268,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                 segment_index: 0,
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
                 segment_okh: [0x59; 16],
             },
         )
@@ -2967,6 +3351,12 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
     let err = first_cluster
         .finalize_upload_part_stream(&bucket, &key, &upload_id, &session_id, 1, |snapshot| {
             calls_for_action.fetch_add(1, Ordering::SeqCst);
+            let payload_crc64 = snapshot.staging_segments.iter().fold(
+                checksum::crc64::checksum(&[]),
+                |crc64, segment| {
+                    checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                },
+            );
             let part = crate::MultipartPartRecord {
                 upload_id: upload_id.clone(),
                 part_number: 1,
@@ -2974,7 +3364,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                     .existing_part_generation
                     .map_or(0, |generation| generation + 1),
                 size: payload.len() as u64,
-                payload_crc64: 0,
+                payload_crc64,
                 etag: vec![0x59; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
@@ -3118,6 +3508,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 segment_index: 0,
                 size: first_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(first_payload),
+                payload_crc64: checksum::crc64::checksum(first_payload),
                 segment_okh: [0x5a; 16],
             },
         )
@@ -3149,6 +3540,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 segment_index: 1,
                 size: second_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(second_payload),
+                payload_crc64: checksum::crc64::checksum(second_payload),
                 segment_okh: [0x5d; 16],
             },
         )
@@ -3286,6 +3678,12 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     let err = cluster
         .finalize_upload_part_stream(&bucket, &key, &req.upload_id, &session_id, 2, |snapshot| {
             calls_for_action.fetch_add(1, Ordering::SeqCst);
+            let payload_crc64 = snapshot.staging_segments.iter().fold(
+                checksum::crc64::checksum(&[]),
+                |crc64, segment| {
+                    checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                },
+            );
             let part = crate::MultipartPartRecord {
                 upload_id: req.upload_id.clone(),
                 part_number: 2,
@@ -3297,7 +3695,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                     .iter()
                     .map(|segment| segment.size)
                     .sum(),
-                payload_crc64: 0,
+                payload_crc64,
                 etag: vec![0x5a; 8],
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
@@ -3582,6 +3980,7 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
         segment_index: 0,
         size: 16,
         segment_crc64: 1,
+        payload_crc64: 1,
         segment_okh: [42; 16],
     };
 
@@ -3623,6 +4022,7 @@ fn stream_segment_prepare_allocates_vid_after_validation() {
         segment_index: 0,
         size: 16,
         segment_crc64: 1,
+        payload_crc64: 1,
         segment_okh: [42; 16],
     };
 

@@ -88,6 +88,11 @@ pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
     }
 }
 
+pub(crate) struct StreamSegmentAppendPayload<'a> {
+    pub(crate) storage_bytes: &'a [u8],
+    pub(crate) payload_crc64: u64,
+}
+
 pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataError) -> bool {
     matches!(
         error,
