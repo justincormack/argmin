@@ -1,0 +1,166 @@
+Shared cleanup admission can starve background cleanup
+Link: https://chatgpt.com/codex/cloud/security/findings/d2d92c75a018819188e4df57d4ff57ae?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit [`cd33dda2`](https://github.com/justincormack/argmin/commit/cd33dda2) (`Split background cleanup admission lanes`).
+
+The fix removes the single shared `DurableCleanup` fairness domain. Background cleanup admission is now split into separate fixed nonzero lanes: `ReclaimCleanup` for object payload reclaim and bucket-delete finalization, `LifecycleCleanup` for lifecycle sweeps, and `StreamSessionCleanup` for abandoned stream-session cleanup. These workers still use the shared admission framework and non-blocking permits, but unrelated cleanup categories no longer contend for the same single counter.
+
+The UAT metrics summary now reports the three cleanup classes independently, so reclaim, lifecycle, and stream-session admission/denial/finish behavior can be observed separately.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo test -p server-core background_work`
+- `bash -n scripts/uat-s3-tests`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: fe54c42
+Fixed Commit: cd33dda2
+Author: justin@specialbusservice.com
+Created: 19/06/2026, 17:32:32
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit changes runtime behavior, not just telemetry, by adding a shared fixed-size admission gate for DurableCleanup. Because unrelated cleanup workers now contend for a single non-fair permit, one cleanup workload can starve or significantly delay another.
+The new background admission framework sets the DurableCleanup concurrency limit to 1 and wires both object/bucket reclaim and lifecycle sweeping through that same class. Admission is a non-blocking try_acquire with no fairness or queueing. If lifecycle cleanup holds the permit during a long full-bucket sweep, reclaim work is repeatedly deferred; conversely, a continuous reclaim backlog can cause lifecycle sweeps to miss admission and then sleep until the next lifecycle interval. An authenticated client able to generate large lifecycle scans or sustained reclaim work can therefore delay deletion/finalization cleanup and increase disk-retention/storage-exhaustion impact compared with the previous independent workers.
+
+# Validation
+## Rubric
+- [x] Confirm the commit introduced a shared background admission registry and a DurableCleanup concurrency limit of 1.
+- [x] Confirm admission is non-blocking and has no fairness/queueing semantics.
+- [x] Confirm reclaim/object-payload/bucket-delete cleanup now uses `BackgroundWorkClass::DurableCleanup` and defers work on denial.
+- [x] Confirm lifecycle sweeping uses the same `DurableCleanup` class and skips a sweep until the lifecycle interval after denial.
+- [x] Dynamically demonstrate contention/delay with the actual `BackgroundWorkAdmission` implementation and capture a debugger trace.
+## Report
+Validated the finding as a logic/availability regression rather than a memory-safety crash. The commit introduces `BACKGROUND_DURABLE_CLEANUP_LIMIT: usize = 1` in `crates/server-core/src/coordinator/runtime.rs:50-52`, a process-local shared admission object in `runtime.rs:198-213`, and a non-blocking `try_acquire` that returns `None` with no queue/fairness when the class counter is at limit in `runtime.rs:119-143`. Both cleanup paths use the same `BackgroundWorkClass::DurableCleanup`: reclaim work at `runtime.rs:369-374` stores `pending_work` and sleeps `OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN` on denial, while lifecycle sweeping at `runtime.rs:548-567` skips `run_lifecycle_sweep_at` on denial and then waits `LIFECYCLE_SWEEP_INTERVAL_MILLIS` before retrying; that interval is 1000 ms in `crates/server-core/src/coordinator.rs:208`. I added a targeted unit-test PoC using the real private `BackgroundWorkAdmission` implementation. The PoC holds the single DurableCleanup permit in a lifecycle-like path while a reclaim-like thread retries the same class. Command output: `shared durable_cleanup gate: reclaim-like worker saw 3 denied admissions over 300.463881ms before lifecycle-like permit was released` and the test passed. LLDB confirmed execution through the real vulnerable method: breakpoint at `server_core::coordinator::runtime::BackgroundWorkAdmission::try_acquire` with `class=DurableCleanup` at `runtime.rs:120`, called by the PoC test. Direct crash was not expected or observed because this is an availability/scheduling issue. Valgrind was attempted but is not installed in the container (`bash: command not found: valgrind`). This supports that the commit changed behavior beyond telemetry by serializing unrelated durable cleanup workloads through a single non-fair permit.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L119 to 143)
+  Note: Admission is non-blocking and has no fairness or queueing; denied workers simply receive None.
+```
+    fn try_acquire(self: &Arc<Self>, class: BackgroundWorkClass) -> Option<BackgroundWorkPermit> {
+        let counter = self.counter_for(class);
+        let limit = self.limit_for(class);
+        let mut active = counter.load(Ordering::Acquire);
+        while active < limit {
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.emit(class, "admitted", None);
+                    return Some(BackgroundWorkPermit {
+                        admission: Arc::clone(self),
+                        class,
+                        started_at: Instant::now(),
+                        active: true,
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+        self.emit(class, "denied_limit", None);
+        None
+```
+
+crates/server-core/src/coordinator/runtime.rs (L369 to 374)
+  Note: Object payload and bucket-delete reclaim now require the shared DurableCleanup permit and defer work when denied.
+```
+                    let Some(_cleanup_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    else {
+                        pending_work = Some(work);
+                        std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
+                        continue;
+```
+
+crates/server-core/src/coordinator/runtime.rs (L50 to 52)
+  Note: The newly introduced fixed caps allow only one DurableCleanup task process-wide per storage-cluster registry key.
+```
+const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
+const BACKGROUND_DURABLE_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
+```
+
+crates/server-core/src/coordinator/runtime.rs (L548 to 567)
+  Note: Lifecycle sweeping uses the same DurableCleanup permit and, if denied, waits for the full lifecycle interval before retrying.
+```
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    {
+                        let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
+                    if *stop_guard {
+                        break;
+                    }
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(
+                            stop_guard,
+                            Duration::from_millis(LIFECYCLE_SWEEP_INTERVAL_MILLIS),
+                            |stop_requested| !*stop_requested,
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity remains medium. The issue is in the main runtime path and is reachable through normal authenticated S3 operations: PutBucketLifecycle is authorized through the HTTP frontend, object deletes enqueue reclaim work, and lifecycle sweeps scan bucket contents. The code evidence shows a single shared DurableCleanup permit, non-blocking non-fair admission, and retry/sleep behavior that can starve cleanup classes. However, the impact is limited to availability/storage-retention pressure, requires valid credentials and relevant bucket permissions, depends on deployment exposure because the default listener is 127.0.0.1:9000, and does not provide confidentiality, integrity, auth-bypass, or RCE impact. These factors support medium rather than high/critical, and the finding is more security-relevant than ignore/low because storage availability is an explicit asset in the project threat model.
+## Likelihood
+high - Exploitation is plausible for an authenticated S3 client with write/delete or lifecycle permissions and enough object volume. It is not unauthenticated, default exposure is localhost-only, and the attacker must generate sustained cleanup contention. | Remote network vector
+## Impact
+medium - The demonstrated effect is delayed deletion/finalization cleanup and increased retained disk usage. This can contribute to service-level storage exhaustion, but it does not disclose data, bypass authorization, corrupt live objects, or execute code.
+## Assumptions
+- The argmin-s3 HTTP frontend is reachable by the attacker; repository defaults bind to localhost, but ARGMIN_LISTEN_ADDR can expose it on a non-loopback interface.
+- The attacker has valid SigV4 credentials with permission to write/delete objects and/or configure bucket lifecycle rules.
+- The attacker can create enough objects, lifecycle candidates, delete backlog, or bucket finalization work for lifecycle sweeps or reclaim work to occupy the cleanup worker for meaningful time.
+- reachable argmin-s3 HTTP endpoint
+- valid S3 SigV4 credentials or equivalent bucket policy permissions
+- permission to create lifecycle scans or sustained reclaim work
+- sufficient storage/object volume to make cleanup contention material
+## Path
+Authenticated S3 client
+  -> lifecycle + write/delete workload
+  -> shared DurableCleanup gate(limit=1, try_acquire no queue)
+  -> reclaim deferred OR lifecycle skipped
+  -> delayed cleanup / retained disk / storage exhaustion pressure
+## Path evidence
+- `crates/argmin-s3/src/config.rs:102-130` - Configuration documents required S3 credentials, default listen address 127.0.0.1:9000, optional TLS, and runtime limits; exposure is deployment-dependent.
+- `crates/argmin-s3/src/main.rs:889-945` - The production binary binds the configured TCP listener, optionally enables TLS, logs max connection/in-flight settings, and starts the HTTP server.
+- `crates/server-http/src/http/mod.rs:3068-3164` - HTTP requests are authenticated with authenticate_request; missing authentication becomes anonymous, while invalid auth fails, supporting the required authenticated-client precondition for write/admin operations.
+- `crates/server-core/src/coordinator/runtime.rs:43-51` - The cleanup retry cooldown is 100 ms and BACKGROUND_DURABLE_CLEANUP_LIMIT is fixed at 1.
+- `crates/server-core/src/coordinator/runtime.rs:119-143` - BackgroundWorkAdmission.try_acquire is non-blocking and returns None when the class counter reaches the limit; there is no queue or fairness mechanism.
+- `crates/server-core/src/coordinator/runtime.rs:198-213` - The admission object is shared per process-local storage-cluster registry key, so independent cleanup workers contend for the same DurableCleanup counter.
+- `crates/server-core/src/coordinator/runtime.rs:369-374` - Object payload and bucket-delete reclaim require the DurableCleanup permit; if denied, work is stored as pending and the worker sleeps before retrying.
+- `crates/server-core/src/coordinator/runtime.rs:548-567` - Lifecycle sweeping uses the same DurableCleanup class; if admission is denied, run_lifecycle_sweep_at is skipped and the worker waits for the lifecycle interval.
+- `crates/server-core/src/coordinator.rs:208` - The lifecycle sweep interval is 1000 ms, defining the skipped-sweep retry cadence after denied admission.
+- `crates/server-core/src/coordinator/runtime.rs:1344-1387` - A lifecycle sweep lists all objects in a bucket and evaluates each against lifecycle rules, showing why a sweep can hold the single cleanup permit for longer on large buckets.
+- `crates/server-core/src/coordinator/authz/bucket.rs:696-718` - PutBucketLifecycle is authorized as a bucket write action for PutLifecycleConfiguration, limiting lifecycle-trigger setup to authenticated/authorized principals.
+## Narrative
+The finding is a real in-scope availability regression. The main argmin-s3 service exposes S3 APIs over an HTTP listener and authenticates requests with SigV4 credentials. This commit sets the DurableCleanup background-work class limit to 1 and makes admission a non-blocking try_acquire with no fairness. Both object/bucket reclaim and lifecycle sweeping use that same class. On denial, reclaim work is retained and sleeps for 100 ms; lifecycle simply skips run_lifecycle_sweep_at and then waits for the lifecycle interval. Lifecycle sweeps can scan all objects/versions/uploads in a bucket, so an authenticated client able to create large lifecycle scans or sustained delete/reclaim work can delay cleanup and increase retained disk usage. The impact is availability/storage pressure only: no auth bypass, data disclosure, code execution, or integrity compromise is evidenced. The original medium severity is appropriate in this threat model, with deployment exposure and required credentials limiting likelihood.
+## Controls
+- SigV4 authentication for normal S3 requests
+- Bucket/object authorization for lifecycle, delete, and write operations
+- Default listener is localhost-only at 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Optional direct HTTPS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- HTTP max_connections and max_inflight_requests admission controls
+- Header/body idle timeouts and bounded control-plane body sizes
+- Lifecycle sweep claims and heartbeats reduce duplicate lifecycle execution but do not address shared DurableCleanup permit starvation
+## Blindspots
+- No Kubernetes, Terraform, compose, or other deployment manifests were found to prove public exposure or load balancer type.
+- Static review cannot quantify real-world sweep duration; exploitability depends on object counts, disk speed, bucket lifecycle rules, and concurrent reclaim backlog.
+- Repository artifacts do not show production quotas or external rate limiting that might reduce authenticated storage-exhaustion risk.
+- No cloud APIs were called; identity and exposure assessment is limited to repository configuration and code.
