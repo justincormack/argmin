@@ -1,0 +1,143 @@
+Shard repair worker exits after first idle timeout
+Link: https://chatgpt.com/codex/cloud/security/findings/c15427b9f88c8191a80f69b4bd4687a3?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Resolution
+Fixed in commit [`b5a83478`](https://github.com/justincormack/argmin/commit/b5a83478) (`Keep shard repair worker alive after idle waits`).
+
+The shard repair worker now distinguishes shutdown from an ordinary empty-queue polling timeout. If `wait_for_placed_segment_shard_repair_work` returns `None` while the stop flag is not set, the worker remains alive and continues its loop instead of exiting. It only breaks out of the loop when the coordinator is actually stopping.
+
+The regression test now synchronizes on the worker reaching the idle-timeout branch before enqueueing repair work, so it directly covers the original failure mode without relying on a fixed sleep. The test hook is scoped to the coordinator's storage-cluster registry key, preventing another in-process shard repair worker from satisfying the hook under parallel test execution.
+
+Verification for the fix:
+- `cargo nextest run -p server-core shard_repair_worker_repairs_read_discovered_corrupt_shard`
+- `cargo nextest run -p server-core`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 91b73a8
+Fixed Commit: b5a83478
+Author: justin@specialbusservice.com
+Created: 18/06/2026, 16:47:42
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced bug: the shard repair worker uses a polling wait that may return None on timeout, but the worker interprets that as a terminal condition rather than continuing to wait or performing another durable scan.
+The commit adds a background shard repair sweeper. Its main loop attempts to take queued repair work and otherwise calls wait_for_placed_segment_shard_repair_work. The local wait helper uses a bounded condvar wait and returns None when the queue is still empty after the timeout. The sweeper treats None as a shutdown signal and breaks out of the loop. As a result, a normally idle server can lose its shard repair worker shortly after startup. Any repair rows created later may remain durable but unprocessed until the process restarts or another worker is spawned. This weakens the intended durability repair behavior and can leave recoverable shard corruption unrepaired, but it does not appear to create a remotely exploitable confidentiality, authentication, or authorization issue under the provided threat model.
+
+# Validation
+## Rubric
+- [x] Confirm the worker loop treats `None` from repair-work waiting as terminal shutdown/break rather than retrying.
+- [x] Confirm the public wait path delegates to a single local polling wait rather than looping until stop/work.
+- [x] Confirm the local polling wait returns `None` after a bounded timeout with an empty queue and `stop=false`.
+- [x] Dynamically reproduce that a worker using this loop exits during idle time and fails to process repair work enqueued afterward.
+- [x] Capture concrete evidence through a crashing/failing PoC test and debugger trace; note valgrind was unavailable.
+## Report
+Validated the finding with a targeted Rust unit-test PoC. The vulnerable control flow is present: `crates/server-core/src/coordinator/runtime.rs:526-533` breaks the shard repair worker loop when the combined `try_take(...).or_else(wait...)` returns `None`; `crates/storage/src/cluster.rs:6835-6842` delegates directly to one local wait; and `crates/storage/src/cluster/local.rs:1172-1194` performs only a single bounded `Condvar::wait_timeout` and then returns `None` via `pop_front()?` if the queue is still empty while `stop=false`. I added `poc_shard_repair_worker_exits_after_idle_poll_timeout` to `crates/storage/src/cluster/local/tests.rs`, which mimics the worker loop, starts with an empty queue and `stop=false`, sleeps past the 100ms poll timeout, then enqueues repair work. The test failed as expected: `processed=0` and `remaining=Some(PlacedSegmentShardRepairWorkItem ...)`, proving the worker exited during normal idleness and left later repair work queued. I also attempted instrumentation/debug validation: `valgrind` was unavailable in the container, and a non-interactive LLDB run stopped at the failing assertion with a backtrace into the PoC test.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L526 to 533)
+  Note: The shard repair worker breaks out of its main loop when wait_for_placed_segment_shard_repair_work returns None.
+```
+                    let Some(work_item) = storage_cluster
+                        .try_take_placed_segment_shard_repair_work()
+                        .or_else(|| {
+                            storage_cluster.wait_for_placed_segment_shard_repair_work(&stop)
+                        })
+                    else {
+                        break;
+                    };
+```
+
+crates/storage/src/cluster.rs (L6835 to 6842)
+  Note: The StorageCluster wait method simply delegates to a single polling wait rather than looping until stop or work availability.
+```
+    pub fn wait_for_placed_segment_shard_repair_work(
+        &self,
+        stop: &AtomicBool,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        self.local_map
+            .runtime_state()
+            .wait_for_placed_segment_shard_repair_work_poll(stop)
+    }
+```
+
+crates/storage/src/cluster/local.rs (L1172 to 1194)
+  Note: The local wait helper waits only once for a bounded timeout and then returns None if the queue is still empty, which the worker misinterprets as shutdown.
+```
+    pub(crate) fn wait_for_placed_segment_shard_repair_work_poll(
+        &self,
+        stop: &AtomicBool,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        let (state_lock, cv) = &self.placed_segment_shard_repair_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.work_queue.is_empty() && !stop.load(Ordering::SeqCst) {
+            let (next_state, _) = cv
+                .wait_timeout(
+                    state,
+                    Duration::from_millis(
+                        LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS,
+                    ),
+                )
+                .unwrap_or_else(|e| e.into_inner());
+            state = next_state;
+        }
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        let work = state.work_queue.pop_front()?;
+        state.queued.remove(&work);
+        Some(work)
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Confirmed as a real in-product reliability bug but not a security vulnerability. Evidence shows crates/server-core/src/coordinator/runtime.rs:526-533 treats None from the repair wait as terminal, while crates/storage/src/cluster/local.rs:1172-1194 returns None after a single 100 ms empty-queue timeout with stop=false. The affected worker is part of normal runtime, but the impact is delayed/unprocessed self-healing repair work. No repository evidence connects attacker-controlled HTTP input to arbitrary repair-queue control or shard corruption, and the threat model explicitly trusts the filesystem. Therefore probability x security impact is below low for vulnerability triage; keep the engineering bug but ignore for security criticality.
+## Likelihood
+ignore - The worker-exit condition is likely during normal idle operation, but exploitation as a security issue is not realistically attacker-controlled. A meaningful attack would require causing or relying on storage corruption/repair work, which is not exposed through the normal S3 network boundary and local filesystem tampering is out of scope.
+## Impact
+ignore - The proven effect is stalled background shard repair after normal idleness, which can weaken durability and availability if recoverable shard corruption/loss occurs later. It does not directly expose object data, bypass authentication/authorization, execute code, leak credentials, or let a network attacker corrupt storage under the stated assumptions.
+## Assumptions
+- Static review is limited to repository artifacts in /workspace/argmin; no cloud APIs or runtime deployment state were queried.
+- The project threat model treats the host OS and data directory filesystem permissions as trusted and local filesystem tampering as out of scope.
+- A network client can use the S3 API only through configured HTTP exposure and normal SigV4/public-bucket authorization paths; the shard repair worker queue is internal.
+- argmin-s3 coordinator starts with shard repair background workers enabled
+- repair queue remains empty for at least one 100 ms polling interval
+- later repair work exists, typically after recoverable shard loss/corruption or a read recovery path
+- process is not restarted and no replacement worker is spawned
+## Path
+Coordinator startup -> idle repair queue >100ms -> wait returns None -> repair worker exits -> later repair rows queued but not processed
+## Path evidence
+- `crates/server-core/src/coordinator/infra.rs:27-44` - BackgroundWorkerMode::all enables shard_repair, showing the worker is part of the normal runtime configuration.
+- `crates/server-core/src/coordinator/infra.rs:384-389` - Coordinator construction acquires/spawns ShardRepairSweeper when shard_repair background workers are enabled.
+- `crates/server-core/src/coordinator/runtime.rs:496-533` - Shard repair worker is spawned and breaks out of its main loop when try_take().or_else(wait()) returns None.
+- `crates/storage/src/cluster.rs:6835-6842` - Public StorageCluster wait method delegates directly to the single local polling wait.
+- `crates/storage/src/cluster/local.rs:37` - The local repair worker wait poll interval is 100 ms.
+- `crates/storage/src/cluster/local.rs:1172-1194` - Local wait performs one bounded Condvar wait and then uses pop_front()?; if the queue is still empty and stop=false, it returns None.
+- `crates/storage/src/cluster.rs:6848-6865` - Durable repair records are scanned and enqueued by the repair worker; if the worker exited, later records may not be processed.
+- `crates/storage/src/cluster.rs:7434-7460` - Repair work is recorded durably and enqueued internally, not from a direct arbitrary external request.
+- `crates/argmin-s3/src/config.rs:101-130` - Runtime configuration uses environment variables for S3 credentials, listen address, TLS paths, data directory, and limits.
+- `crates/argmin-s3/src/config.rs:186-193` - Default listen address is 127.0.0.1:9000 and TLS certificate/key paths are optional.
+- `crates/argmin-s3/src/main.rs:888-965` - argmin-s3 binds a TCP listener on the configured listen address and starts HTTP or HTTPS serving.
+- `crates/server-http/src/http/mod.rs:3069-3140` - HTTP requests pass through SigV4 authentication handling, with missing auth becoming anonymous rather than bypassing authorization.
+- `crates/server-http/src/http/serve.rs:210-255` - ServeConfig defines header/body idle timeouts and request wait timeout controls for the HTTP surface.
+## Narrative
+Static review confirms the reported control-flow bug in main product runtime. The coordinator starts a shard repair sweeper, the sweeper breaks its loop when the wait helper returns None, and the local helper returns None after a single 100 ms empty-queue timeout even when stop=false. Durable repair records are then only queued later and may not be processed. This is a real durability/self-healing defect, and validation included an executable unit-test PoC showing queued work left unprocessed. It is not, however, a demonstrated security vulnerability under the stated threat model: the path is internal, not attacker-input controlled, and meaningful impact depends on storage corruption/failure or filesystem tampering, with filesystem tampering out of scope. No auth bypass, privilege escalation, secret exposure, RCE, or network-triggerable data compromise was identified.
+## Controls
+- SigV4 authentication for S3 API requests
+- Anonymous access only through higher-level public-bucket authorization paths
+- Default ARGMIN_LISTEN_ADDR is loopback 127.0.0.1:9000
+- Optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- HTTP header/body idle timeouts and request admission limits
+- Local debug endpoint requires loopback listener
+- Threat model assumes trusted host OS and filesystem permissions
+## Blindspots
+- No live deployment manifests or load balancer configuration were present, so actual public exposure cannot be proven from repository artifacts.
+- Static review did not execute the server end-to-end; validation evidence came from an earlier targeted unit-test PoC.
+- A future threat model that includes malicious storage nodes, local filesystem attackers, or hostile operators could change reachability and impact.
+- Only repository artifacts were inspected; operational monitoring or process supervisors might restart failed workers in some deployments, but no such control was evidenced here.
