@@ -8591,6 +8591,90 @@ fn shard_scavenger_worker_records_audit_observations() {
 }
 
 #[test]
+fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"foreground read should not rewrite corrupt shard inline";
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let segment = coord
+        .storage_node()
+        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("put object should create one segment");
+    let corrupt_shard_index = 0;
+    let corrupt_path = shard_file_path(&coord, "bucket", "key", corrupt_shard_index);
+    let original_bytes = std::fs::read(&corrupt_path).unwrap();
+    corrupt_shard_on_disk(&coord, "bucket", "key", corrupt_shard_index);
+    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+    assert_ne!(corrupt_bytes, original_bytes);
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+
+    assert_eq!(
+        std::fs::read(&corrupt_path).unwrap(),
+        corrupt_bytes,
+        "foreground read recovery must not rewrite the damaged shard inline"
+    );
+    let repairs = coord
+        .storage_node()
+        .list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap();
+    assert_eq!(repairs.len(), 1);
+    let repair = &repairs[0].work_item;
+    assert_eq!(repair.request.data_pg_id, segment.data_pg_id);
+    assert_eq!(repair.request.segment_okh, segment.segment_okh);
+    assert_eq!(repair.request.segment_vid, segment.segment_vid);
+    assert_eq!(repair.request.segment_crc64, segment.segment_crc64);
+    assert_eq!(repair.shard_index.get(), corrupt_shard_index);
+    assert_eq!(
+        coord
+            .storage_node()
+            .try_take_placed_segment_shard_repair_work(),
+        Some(*repair),
+        "successful read recovery should leave a background repair wake hint"
+    );
+}
+
+#[test]
 fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
     if !backend_supports_parity_recovery() {
         return;

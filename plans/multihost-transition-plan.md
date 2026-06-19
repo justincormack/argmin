@@ -7575,6 +7575,12 @@ Shard repair design:
   repairing inline. The explicit repair primitive reconstructs without
   recursively scheduling itself, then verifies the full EC set after writing
   requested repairs so any other bad shards are queued too.
+- Added coordinator-level coverage for the foreground/background repair split.
+  A read-discovered checksum-corrupt shard is now tested with all background
+  sweepers disabled, proving the foreground read reconstructs and returns the
+  object bytes while leaving the corrupt shard file untouched, recording the
+  durable repair row, and leaving only a background repair wake hint for the
+  worker.
 - Made read-discovered repair scheduling durable. Successful read recovery now
   records an idempotent `PlacedSegmentShardRepairWorkItem` row in the affected
   data PG before enqueueing the in-memory wake hint and fails rather than
