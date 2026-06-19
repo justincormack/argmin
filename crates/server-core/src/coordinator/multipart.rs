@@ -148,10 +148,14 @@ impl Coordinator {
             &req.key,
             req.session_id,
             req.segment_index,
-            super::StreamSegmentAppendPayload {
-                storage_bytes: &storage_data,
+            super::StreamSegmentAppendPayload::maybe_encrypted(
+                &storage_data,
                 payload_crc64,
-            },
+                matches!(
+                    write_encryption.as_ref(),
+                    super::ActiveWriteEncryptionRef::None
+                ),
+            ),
         )
         .map_err(|error| match error {
             ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })

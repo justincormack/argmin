@@ -256,10 +256,14 @@ impl Coordinator {
             &trusted_object_key(key),
             session_id,
             segment_index,
-            super::StreamSegmentAppendPayload {
-                storage_bytes: &storage_data,
+            super::StreamSegmentAppendPayload::maybe_encrypted(
+                &storage_data,
                 payload_crc64,
-            },
+                matches!(
+                    write_encryption.as_ref(),
+                    super::ActiveWriteEncryptionRef::None
+                ),
+            ),
         )
     }
 
@@ -508,7 +512,7 @@ impl Coordinator {
                     session_id: session_id.clone(),
                     segment_index,
                     size: logical_size,
-                    segment_crc64: checksum::crc64::checksum(payload.storage_bytes),
+                    segment_crc64: payload.segment_crc64,
                     payload_crc64: payload.payload_crc64,
                     segment_okh,
                 },
@@ -561,10 +565,11 @@ impl Coordinator {
             &trusted_object_key(key),
             session_id,
             segment_index,
-            super::StreamSegmentAppendPayload {
-                storage_bytes: data,
-                payload_crc64: checksum::crc64::checksum(data),
-            },
+            super::StreamSegmentAppendPayload::maybe_encrypted(
+                data,
+                checksum::crc64::checksum(data),
+                true,
+            ),
         )
     }
 

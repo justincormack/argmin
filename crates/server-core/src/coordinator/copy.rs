@@ -338,10 +338,14 @@ impl Coordinator {
                     req.destination.key_typed(),
                     &session_id,
                     segment_index,
-                    super::StreamSegmentAppendPayload {
-                        storage_bytes: &storage_chunk,
-                        payload_crc64: chunk_crc64,
-                    },
+                    super::StreamSegmentAppendPayload::maybe_encrypted(
+                        &storage_chunk,
+                        chunk_crc64,
+                        matches!(
+                            dst_write_encryption.as_ref(),
+                            super::ActiveWriteEncryptionRef::None
+                        ),
+                    ),
                 )?;
                 segment_index =
                     segment_index
@@ -544,10 +548,14 @@ impl Coordinator {
                     &key,
                     session_id,
                     segment_index,
-                    super::StreamSegmentAppendPayload {
-                        storage_bytes: &storage_chunk,
-                        payload_crc64: chunk_crc64,
-                    },
+                    super::StreamSegmentAppendPayload::maybe_encrypted(
+                        &storage_chunk,
+                        chunk_crc64,
+                        matches!(
+                            write_encryption.as_ref(),
+                            super::ActiveWriteEncryptionRef::None
+                        ),
+                    ),
                 )?;
                 segment_index =
                     segment_index

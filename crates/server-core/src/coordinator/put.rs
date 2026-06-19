@@ -361,10 +361,14 @@ impl Coordinator {
                 authorized.key_typed(),
                 session_id,
                 idx as u32,
-                super::StreamSegmentAppendPayload {
-                    storage_bytes: &chunk_storage,
-                    payload_crc64: chunk_crc64,
-                },
+                super::StreamSegmentAppendPayload::maybe_encrypted(
+                    &chunk_storage,
+                    chunk_crc64,
+                    matches!(
+                        write_encryption.as_ref(),
+                        super::ActiveWriteEncryptionRef::None
+                    ),
+                ),
             )?;
         }
         self.finalize_stream_put_with_authorized_write_tags_with_storage_node(
@@ -479,10 +483,14 @@ impl Coordinator {
             req.key,
             req.session_id,
             req.segment_index,
-            super::StreamSegmentAppendPayload {
-                storage_bytes: &storage_data,
+            super::StreamSegmentAppendPayload::maybe_encrypted(
+                &storage_data,
                 payload_crc64,
-            },
+                matches!(
+                    write_encryption.as_ref(),
+                    super::ActiveWriteEncryptionRef::None
+                ),
+            ),
         )
     }
 
@@ -506,10 +514,14 @@ impl Coordinator {
             req.key,
             req.session_id,
             req.segment_index,
-            super::StreamSegmentAppendPayload {
-                storage_bytes: &storage_data,
+            super::StreamSegmentAppendPayload::maybe_encrypted(
+                &storage_data,
                 payload_crc64,
-            },
+                matches!(
+                    write_encryption.as_ref(),
+                    super::ActiveWriteEncryptionRef::None
+                ),
+            ),
         )
     }
 
