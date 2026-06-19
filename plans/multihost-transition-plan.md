@@ -7615,8 +7615,8 @@ Shard repair design:
   and `shard_repair_event_total` counters plus `shard_repair_event_by_pg_total`
   dimensions, and `scripts/uat-s3-tests` prints per-event shard-repair counts
   plus top families in the long-lived UAT metrics summary.
-- Added the first static background-work admission slice. Long-running
-  process-local background work now shares one admission object per
+- Added the first background-work admission slice. Long-running process-local
+  background work now shares one admission object per
   `StorageCluster::process_local_registry_key()` with RAII permits and fixed
   per-class concurrency caps. The initial classes are `KnownDamageRepair` for
   durable read/scrub-discovered shard repair, `DurableCleanup` for reclaim,
@@ -7624,6 +7624,23 @@ Shard repair design:
   and `OpportunisticScan` for shard scavenger integrity scans that can always
   defer because durable findings are recorded separately. Later
   backfill/migration/scanner output still needs to enter the same framework.
+- Added the first adaptive admission policy hook. `KnownDamageRepair` and
+  `DurableCleanup` currently keep their fixed nonzero lanes so known repair and
+  visible/durable cleanup are not starved. `OpportunisticScan` now denies with
+  `denied_foreground_pressure` when recent request admission or storage-RPC
+  admission pressure is observed, or while foreground request/read/write/list
+  work is active. Process-wide metadata-command recovery counters are not
+  treated as foreground pressure until they carry caller/class attribution.
+  It denies with
+  `denied_backlog_pressure` while durable cleanup or shard repair queues are
+  nonempty. The foreground signal is held briefly based on counter deltas so
+  lifetime cumulative metrics do not permanently suppress scans after a single
+  old wait; deltas observed after a production-like scavenger sweep gap are
+  treated as stale rather than recent pressure. The shard scavenger samples
+  those pressure counters faster than the foreground-pressure hold cadence, with
+  one bounded sample interval of scheduler slack, independently from the normal
+  expensive scan interval. That keeps a recent wait just before a production
+  scan visible without running the scan every second.
 - Background-work policy rules: foreground S3 requests keep their own reserved
   capacity and must not wait behind background work. `KnownDamageRepair` should
   have a small nonzero reserved background lane because it fixes known durable
@@ -7635,18 +7652,17 @@ Shard repair design:
   cannot acquire a permit, and durable work rows remain the source of truth
   whenever admission is denied.
 - Background-work instrumentation now exposes per-class admission totals,
-  `denied_limit`, active counts, completed work counts, and elapsed work time
-  through the local debug metrics endpoint and UAT summary. Existing
-  shard-repair metrics still describe repair semantics (`started`,
-  `resolved_clean`, `repaired`, `failed`, `unrecoverable`, completion events);
-  the admission metrics describe scheduler behavior and must not be interpreted
-  as successful shard rewrites.
-- Remaining background-work admission order: only after fixed caps and UAT data
-  are stable should the policy read foreground pressure signals such as request
-  admission waits/timeouts, storage-RPC active and wait counters,
-  metadata-command recovery contention, and backlog depth. Later
-  backfill/migration/scanner output should enter through the same classes
-  rather than adding separate uncoordinated loops.
+  `denied_limit`, `denied_foreground_pressure`, `denied_backlog_pressure`,
+  active counts, completed work counts, and elapsed work time through the local
+  debug metrics endpoint and UAT summary. Existing shard-repair metrics still
+  describe repair semantics (`started`, `resolved_clean`, `repaired`,
+  `failed`, `unrecoverable`, completion events); the admission metrics describe
+  scheduler behavior and must not be interpreted as successful shard rewrites.
+- Remaining background-work admission order: tune the foreground-pressure
+  thresholds after UAT data shows whether opportunistic scans are still making
+  enough progress during quiet windows. Later backfill/migration/scanner output
+  should enter through the same classes rather than adding separate
+  uncoordinated loops.
 - Remaining shard-repair queue work: decide whether completed repair
   verification should persist richer per-shard outcome telemetry. Background
   scan cursor/progress does not need to be durable; a scanner can restart from a

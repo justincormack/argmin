@@ -50,6 +50,9 @@ const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
 const BACKGROUND_DURABLE_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
+const BACKGROUND_FOREGROUND_PRESSURE_HOLD: Duration = Duration::from_millis(1_000);
+const BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP: Duration = Duration::from_millis(1_250);
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
 
@@ -90,9 +93,23 @@ impl Default for BackgroundWorkAdmissionLimits {
 #[derive(Debug)]
 struct BackgroundWorkAdmission {
     limits: BackgroundWorkAdmissionLimits,
+    pressure: Mutex<BackgroundWorkPressureState>,
     known_damage_repair_active: AtomicUsize,
     durable_cleanup_active: AtomicUsize,
     opportunistic_scan_active: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundWorkPressureState {
+    last_snapshot: Option<observability::MetricsSnapshot>,
+    last_snapshot_at: Option<Instant>,
+    foreground_pressure_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundWorkPressure {
+    foreground: bool,
+    durable_backlog: bool,
 }
 
 struct BackgroundWorkPermit {
@@ -110,6 +127,7 @@ impl BackgroundWorkAdmission {
     fn with_limits(limits: BackgroundWorkAdmissionLimits) -> Self {
         Self {
             limits,
+            pressure: Mutex::new(BackgroundWorkPressureState::default()),
             known_damage_repair_active: AtomicUsize::new(0),
             durable_cleanup_active: AtomicUsize::new(0),
             opportunistic_scan_active: AtomicUsize::new(0),
@@ -117,6 +135,11 @@ impl BackgroundWorkAdmission {
     }
 
     fn try_acquire(self: &Arc<Self>, class: BackgroundWorkClass) -> Option<BackgroundWorkPermit> {
+        if let Some(event) = self.policy_denial_event(class) {
+            self.emit(class, event, None);
+            return None;
+        }
+
         let counter = self.counter_for(class);
         let limit = self.limit_for(class);
         let mut active = counter.load(Ordering::Acquire);
@@ -141,6 +164,26 @@ impl BackgroundWorkAdmission {
         }
         self.emit(class, "denied_limit", None);
         None
+    }
+
+    fn policy_denial_event(&self, class: BackgroundWorkClass) -> Option<&'static str> {
+        if class != BackgroundWorkClass::OpportunisticScan {
+            return None;
+        }
+
+        let pressure = self.observe_pressure();
+        if pressure.foreground {
+            Some("denied_foreground_pressure")
+        } else if pressure.durable_backlog {
+            Some("denied_backlog_pressure")
+        } else {
+            None
+        }
+    }
+
+    fn observe_pressure(&self) -> BackgroundWorkPressure {
+        let snapshot = observability::metrics_snapshot();
+        lock_mutex_unpoisoned(&self.pressure).observe(Instant::now(), snapshot)
     }
 
     fn counter_for(&self, class: BackgroundWorkClass) -> &AtomicUsize {
@@ -176,6 +219,59 @@ impl BackgroundWorkAdmission {
             },
         );
     }
+}
+
+impl BackgroundWorkPressureState {
+    fn observe(
+        &mut self,
+        now: Instant,
+        snapshot: observability::MetricsSnapshot,
+    ) -> BackgroundWorkPressure {
+        if self.last_snapshot.zip(self.last_snapshot_at).is_some_and(
+            |(last_snapshot, last_snapshot_at)| {
+                now.checked_duration_since(last_snapshot_at)
+                    .is_some_and(|elapsed| elapsed <= BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP)
+                    && background_work_foreground_pressure_delta(last_snapshot, snapshot)
+            },
+        ) {
+            self.foreground_pressure_until = Some(now + BACKGROUND_FOREGROUND_PRESSURE_HOLD);
+        }
+        self.last_snapshot = Some(snapshot);
+        self.last_snapshot_at = Some(now);
+
+        BackgroundWorkPressure {
+            foreground: self
+                .foreground_pressure_until
+                .is_some_and(|pressure_until| now < pressure_until)
+                || background_work_foreground_pressure_active(snapshot),
+            durable_backlog: background_work_durable_backlog_active(snapshot),
+        }
+    }
+}
+
+fn background_work_foreground_pressure_delta(
+    last: observability::MetricsSnapshot,
+    current: observability::MetricsSnapshot,
+) -> bool {
+    current.request_admission_wait_total > last.request_admission_wait_total
+        || current.request_admission_timeout_total > last.request_admission_timeout_total
+        || current.storage_rpc_admission_wait_total > last.storage_rpc_admission_wait_total
+        || current.storage_rpc_admission_timeout_total > last.storage_rpc_admission_timeout_total
+}
+
+fn background_work_foreground_pressure_active(snapshot: observability::MetricsSnapshot) -> bool {
+    snapshot.inflight_requests > 0
+        || snapshot.storage_rpc_active_read > 0
+        || snapshot.storage_rpc_active_start_write > 0
+        || snapshot.storage_rpc_active_list > 0
+}
+
+fn background_work_durable_backlog_active(snapshot: observability::MetricsSnapshot) -> bool {
+    snapshot.reclaim_work_queue_depth > 0
+        || snapshot.object_payload_reclaim_queue_depth > 0
+        || snapshot.object_payload_reclaim_outstanding_depth > 0
+        || snapshot.bucket_delete_finalize_queue_depth > 0
+        || snapshot.shard_repair_queue_depth > 0
 }
 
 impl Drop for BackgroundWorkPermit {
@@ -614,17 +710,27 @@ impl ShardScavengerSweeper {
         let handle = std::thread::Builder::new()
             .name("argmin-shard-scavenger".to_string())
             .spawn(move || {
+                let sweep_interval =
+                    Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS);
+                let pressure_sample_interval = BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL;
+                let mut next_sweep = Instant::now();
                 while !stop.load(Ordering::SeqCst) {
-                    if let Some(_permit) =
-                        admission.try_acquire(BackgroundWorkClass::OpportunisticScan)
-                    {
-                        if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
-                            let _ = observability::event(
-                                TRACE_TARGET,
-                                "shard_scavenger_audit_error",
-                                Some(format_args!("error={error}")),
-                            );
+                    admission.observe_pressure();
+                    let now = Instant::now();
+                    if now >= next_sweep {
+                        if let Some(_permit) =
+                            admission.try_acquire(BackgroundWorkClass::OpportunisticScan)
+                        {
+                            if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger()
+                            {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "shard_scavenger_audit_error",
+                                    Some(format_args!("error={error}")),
+                                );
+                            }
                         }
+                        next_sweep = Instant::now() + sweep_interval;
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
@@ -633,13 +739,14 @@ impl ShardScavengerSweeper {
                     if *stop_guard {
                         break;
                     }
+                    let now = Instant::now();
+                    let wait_for = next_sweep
+                        .checked_duration_since(now)
+                        .unwrap_or_default()
+                        .min(pressure_sample_interval);
                     let _ = wake
                         .1
-                        .wait_timeout_while(
-                            stop_guard,
-                            Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
-                            |stop_requested| !*stop_requested,
-                        )
+                        .wait_timeout_while(stop_guard, wait_for, |stop_requested| !*stop_requested)
                         .unwrap_or_else(|e| e.into_inner());
                 }
             })
@@ -2064,6 +2171,122 @@ mod tests {
         drop(replacement);
         drop(cleanup_permit);
         assert_eq!(admission.active_total(), 0);
+    }
+
+    #[test]
+    fn background_work_pressure_uses_recent_counter_deltas() {
+        let mut state = BackgroundWorkPressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot::default();
+
+        assert_eq!(
+            state.observe(now, snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            }
+        );
+
+        snapshot.request_admission_wait_total += 1;
+        let production_sweep_gap = Duration::from_millis(60_000);
+        assert_eq!(
+            state.observe(now + production_sweep_gap, snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            },
+            "counter deltas observed after a scavenger sweep gap are stale"
+        );
+
+        snapshot.storage_rpc_admission_wait_total += 1;
+        let sampler_tick_before_next_scan = now + (production_sweep_gap * 2)
+            - BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL
+            - Duration::from_millis(20);
+        assert_eq!(
+            state.observe(sampler_tick_before_next_scan, snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            }
+        );
+
+        snapshot.storage_rpc_admission_timeout_total += 1;
+        let recent = now + (production_sweep_gap * 2);
+        assert_eq!(
+            state.observe(recent, snapshot),
+            BackgroundWorkPressure {
+                foreground: true,
+                durable_backlog: false,
+            },
+            "a faster sampler catches pressure just before a production scan"
+        );
+
+        assert_eq!(
+            state.observe(
+                recent + BACKGROUND_FOREGROUND_PRESSURE_HOLD + Duration::from_millis(20),
+                snapshot,
+            ),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            },
+            "old cumulative counters must not keep scans denied forever"
+        );
+    }
+
+    #[test]
+    fn background_work_pressure_ignores_metadata_recovery_counters() {
+        let mut state = BackgroundWorkPressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot::default();
+
+        assert_eq!(
+            state.observe(now, snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            }
+        );
+
+        snapshot.metadata_command_recovery_wait_total += 1;
+        snapshot.metadata_command_recovery_timeout_total += 1;
+        snapshot.metadata_command_budget_exhausted_total += 1;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(10), snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            },
+            "process-wide metadata recovery contention is not necessarily foreground S3 pressure"
+        );
+    }
+
+    #[test]
+    fn background_work_pressure_detects_active_foreground_and_durable_backlog() {
+        let mut state = BackgroundWorkPressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot {
+            inflight_requests: 1,
+            reclaim_work_queue_depth: 7,
+            ..observability::MetricsSnapshot::default()
+        };
+
+        assert_eq!(
+            state.observe(now, snapshot),
+            BackgroundWorkPressure {
+                foreground: true,
+                durable_backlog: true,
+            }
+        );
+
+        snapshot.inflight_requests = 0;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(10), snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: true,
+            }
+        );
     }
 
     #[test]
