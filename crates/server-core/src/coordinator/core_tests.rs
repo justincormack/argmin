@@ -8595,8 +8595,37 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
     if !backend_supports_parity_recovery() {
         return;
     }
+    let _hook_serial = SHARD_REPAIR_WORKER_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_only_shard_repair_sweeper(tmp.path());
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let target_registry_key = storage_cluster.process_local_registry_key();
+    let (idle_tx, idle_rx) = mpsc::channel();
+    let _hook_guard = install_shard_repair_worker_test_hooks(ShardRepairWorkerTestHooks {
+        target_registry_key: Some(target_registry_key),
+        after_idle_timeout: Some(Arc::new(move || {
+            let _ = idle_tx.send(());
+        })),
+    });
+    let coord = Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
+        storage_cluster,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            ShardRepairSweeper::acquire_shared,
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap();
+    idle_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("shard repair worker did not reach the idle timeout path");
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)

@@ -13,6 +13,8 @@ use storage::{
 
 use super::payload::SharedPayloadBuffer;
 use super::read_core::{PayloadLease, ReadRuntime, SegmentPayloadRecord};
+#[cfg(test)]
+use super::test_hooks::maybe_run_shard_repair_worker_idle_timeout_hook;
 use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
 #[cfg(test)]
@@ -525,7 +527,14 @@ impl ShardRepairSweeper {
                             storage_cluster.wait_for_placed_segment_shard_repair_work(&stop)
                         })
                     else {
-                        break;
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        #[cfg(test)]
+                        maybe_run_shard_repair_worker_idle_timeout_hook(
+                            storage_cluster.process_local_registry_key(),
+                        );
+                        continue;
                     };
                     if stop.load(Ordering::SeqCst) {
                         break;

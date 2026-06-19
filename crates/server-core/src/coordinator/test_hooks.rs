@@ -66,6 +66,16 @@ pub(super) struct StreamAppendTestHooks {
 
 pub(super) static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[derive(Default, Clone)]
+pub(super) struct ShardRepairWorkerTestHooks {
+    pub(super) target_registry_key: Option<usize>,
+    pub(super) after_idle_timeout: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub(super) static SHARD_REPAIR_WORKER_TEST_HOOKS: OnceLock<Mutex<ShardRepairWorkerTestHooks>> =
+    OnceLock::new();
+pub(super) static SHARD_REPAIR_WORKER_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
 pub(super) struct ReclamationTestHookGuard;
 
 impl Drop for ReclamationTestHookGuard {
@@ -85,6 +95,8 @@ pub(super) struct BucketPolicyLoadTestHookGuard;
 pub(super) struct BucketFastPathIdentityLoadErrorTestHookGuard;
 
 pub(super) struct BucketWriteHandleTestHookGuard;
+
+pub(super) struct ShardRepairWorkerTestHookGuard;
 
 impl Drop for StreamAppendTestHookGuard {
     fn drop(&mut self) {
@@ -113,6 +125,14 @@ impl Drop for BucketFastPathIdentityLoadErrorTestHookGuard {
         let bucket =
             BUCKET_FAST_PATH_IDENTITY_LOAD_ERROR_TEST_BUCKET.get_or_init(|| Mutex::new(None));
         *bucket.lock().unwrap() = None;
+    }
+}
+
+impl Drop for ShardRepairWorkerTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = SHARD_REPAIR_WORKER_TEST_HOOKS
+            .get_or_init(|| Mutex::new(ShardRepairWorkerTestHooks::default()));
+        *hooks.lock().unwrap() = ShardRepairWorkerTestHooks::default();
     }
 }
 
@@ -160,6 +180,32 @@ pub(super) fn install_bucket_write_handle_test_hooks(
         .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     BucketWriteHandleTestHookGuard
+}
+
+pub(super) fn install_shard_repair_worker_test_hooks(
+    hooks: ShardRepairWorkerTestHooks,
+) -> ShardRepairWorkerTestHookGuard {
+    let slot = SHARD_REPAIR_WORKER_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ShardRepairWorkerTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    ShardRepairWorkerTestHookGuard
+}
+
+pub(super) fn maybe_run_shard_repair_worker_idle_timeout_hook(registry_key: usize) {
+    let hooks = SHARD_REPAIR_WORKER_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ShardRepairWorkerTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target_registry_key
+        .is_some_and(|target| target != registry_key)
+    {
+        return;
+    }
+    if let Some(hook) = hooks.after_idle_timeout {
+        hook();
+    }
 }
 
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
