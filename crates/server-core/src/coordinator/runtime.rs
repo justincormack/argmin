@@ -48,7 +48,9 @@ const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
-const BACKGROUND_DURABLE_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
 const BACKGROUND_FOREGROUND_PRESSURE_HOLD: Duration = Duration::from_millis(1_000);
 const BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -59,7 +61,9 @@ type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundWorkClass {
     KnownDamageRepair,
-    DurableCleanup,
+    ReclaimCleanup,
+    LifecycleCleanup,
+    StreamSessionCleanup,
     OpportunisticScan,
 }
 
@@ -67,7 +71,9 @@ impl BackgroundWorkClass {
     fn name(self) -> &'static str {
         match self {
             Self::KnownDamageRepair => "known_damage_repair",
-            Self::DurableCleanup => "durable_cleanup",
+            Self::ReclaimCleanup => "reclaim_cleanup",
+            Self::LifecycleCleanup => "lifecycle_cleanup",
+            Self::StreamSessionCleanup => "stream_session_cleanup",
             Self::OpportunisticScan => "opportunistic_scan",
         }
     }
@@ -76,7 +82,9 @@ impl BackgroundWorkClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundWorkAdmissionLimits {
     known_damage_repair: usize,
-    durable_cleanup: usize,
+    reclaim_cleanup: usize,
+    lifecycle_cleanup: usize,
+    stream_session_cleanup: usize,
     opportunistic_scan: usize,
 }
 
@@ -84,7 +92,9 @@ impl Default for BackgroundWorkAdmissionLimits {
     fn default() -> Self {
         Self {
             known_damage_repair: BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT,
-            durable_cleanup: BACKGROUND_DURABLE_CLEANUP_LIMIT,
+            reclaim_cleanup: BACKGROUND_RECLAIM_CLEANUP_LIMIT,
+            lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
+            stream_session_cleanup: BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT,
             opportunistic_scan: BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT,
         }
     }
@@ -95,7 +105,9 @@ struct BackgroundWorkAdmission {
     limits: BackgroundWorkAdmissionLimits,
     pressure: Mutex<BackgroundWorkPressureState>,
     known_damage_repair_active: AtomicUsize,
-    durable_cleanup_active: AtomicUsize,
+    reclaim_cleanup_active: AtomicUsize,
+    lifecycle_cleanup_active: AtomicUsize,
+    stream_session_cleanup_active: AtomicUsize,
     opportunistic_scan_active: AtomicUsize,
 }
 
@@ -129,7 +141,9 @@ impl BackgroundWorkAdmission {
             limits,
             pressure: Mutex::new(BackgroundWorkPressureState::default()),
             known_damage_repair_active: AtomicUsize::new(0),
-            durable_cleanup_active: AtomicUsize::new(0),
+            reclaim_cleanup_active: AtomicUsize::new(0),
+            lifecycle_cleanup_active: AtomicUsize::new(0),
+            stream_session_cleanup_active: AtomicUsize::new(0),
             opportunistic_scan_active: AtomicUsize::new(0),
         }
     }
@@ -189,7 +203,9 @@ impl BackgroundWorkAdmission {
     fn counter_for(&self, class: BackgroundWorkClass) -> &AtomicUsize {
         match class {
             BackgroundWorkClass::KnownDamageRepair => &self.known_damage_repair_active,
-            BackgroundWorkClass::DurableCleanup => &self.durable_cleanup_active,
+            BackgroundWorkClass::ReclaimCleanup => &self.reclaim_cleanup_active,
+            BackgroundWorkClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
+            BackgroundWorkClass::StreamSessionCleanup => &self.stream_session_cleanup_active,
             BackgroundWorkClass::OpportunisticScan => &self.opportunistic_scan_active,
         }
     }
@@ -197,14 +213,18 @@ impl BackgroundWorkAdmission {
     fn limit_for(&self, class: BackgroundWorkClass) -> usize {
         match class {
             BackgroundWorkClass::KnownDamageRepair => self.limits.known_damage_repair,
-            BackgroundWorkClass::DurableCleanup => self.limits.durable_cleanup,
+            BackgroundWorkClass::ReclaimCleanup => self.limits.reclaim_cleanup,
+            BackgroundWorkClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
+            BackgroundWorkClass::StreamSessionCleanup => self.limits.stream_session_cleanup,
             BackgroundWorkClass::OpportunisticScan => self.limits.opportunistic_scan,
         }
     }
 
     fn active_total(&self) -> usize {
         self.known_damage_repair_active.load(Ordering::Acquire)
-            + self.durable_cleanup_active.load(Ordering::Acquire)
+            + self.reclaim_cleanup_active.load(Ordering::Acquire)
+            + self.lifecycle_cleanup_active.load(Ordering::Acquire)
+            + self.stream_session_cleanup_active.load(Ordering::Acquire)
             + self.opportunistic_scan_active.load(Ordering::Acquire)
     }
 
@@ -463,7 +483,7 @@ impl ReclaimSweeper {
                         break;
                     };
                     let Some(_cleanup_permit) =
-                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                        admission.try_acquire(BackgroundWorkClass::ReclaimCleanup)
                     else {
                         pending_work = Some(work);
                         std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
@@ -642,7 +662,7 @@ impl LifecycleSweeper {
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     if let Some(_permit) =
-                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                        admission.try_acquire(BackgroundWorkClass::LifecycleCleanup)
                     {
                         let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
                     }
@@ -1122,7 +1142,7 @@ impl StreamSessionSweeper {
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     if let Some(_permit) =
-                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                        admission.try_acquire(BackgroundWorkClass::StreamSessionCleanup)
                     {
                         let count = storage_cluster.scavenge_abandoned_stream_sessions(
                             super::STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS,
@@ -2137,7 +2157,9 @@ mod tests {
         let admission = Arc::new(BackgroundWorkAdmission::with_limits(
             BackgroundWorkAdmissionLimits {
                 known_damage_repair: 1,
-                durable_cleanup: 1,
+                reclaim_cleanup: 1,
+                lifecycle_cleanup: 1,
+                stream_session_cleanup: 1,
                 opportunistic_scan: 0,
             },
         ));
@@ -2152,10 +2174,34 @@ mod tests {
             "second repair permit should be denied at limit"
         );
 
-        let cleanup_permit = admission
-            .try_acquire(BackgroundWorkClass::DurableCleanup)
-            .expect("cleanup should have its own class limit");
-        assert_eq!(admission.active_total(), 2);
+        let reclaim_permit = admission
+            .try_acquire(BackgroundWorkClass::ReclaimCleanup)
+            .expect("reclaim cleanup should have its own class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::ReclaimCleanup)
+                .is_none(),
+            "second reclaim cleanup permit should be denied at limit"
+        );
+        let lifecycle_permit = admission
+            .try_acquire(BackgroundWorkClass::LifecycleCleanup)
+            .expect("lifecycle cleanup should have its own class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::LifecycleCleanup)
+                .is_none(),
+            "second lifecycle cleanup permit should be denied at limit"
+        );
+        let stream_session_permit = admission
+            .try_acquire(BackgroundWorkClass::StreamSessionCleanup)
+            .expect("stream session cleanup should have its own class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::StreamSessionCleanup)
+                .is_none(),
+            "second stream session cleanup permit should be denied at limit"
+        );
+        assert_eq!(admission.active_total(), 4);
         assert!(
             admission
                 .try_acquire(BackgroundWorkClass::OpportunisticScan)
@@ -2164,12 +2210,14 @@ mod tests {
         );
 
         drop(repair_permit);
-        assert_eq!(admission.active_total(), 1);
+        assert_eq!(admission.active_total(), 3);
         let replacement = admission
             .try_acquire(BackgroundWorkClass::KnownDamageRepair)
             .expect("dropping a permit should release class capacity");
         drop(replacement);
-        drop(cleanup_permit);
+        drop(reclaim_permit);
+        drop(lifecycle_permit);
+        drop(stream_session_permit);
         assert_eq!(admission.active_total(), 0);
     }
 

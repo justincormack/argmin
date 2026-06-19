@@ -7619,19 +7619,21 @@ Shard repair design:
   background work now shares one admission object per
   `StorageCluster::process_local_registry_key()` with RAII permits and fixed
   per-class concurrency caps. The initial classes are `KnownDamageRepair` for
-  durable read/scrub-discovered shard repair, `DurableCleanup` for reclaim,
-  bucket-delete finalization, lifecycle cleanup, and stream-session cleanup,
+  durable read/scrub-discovered shard repair, `ReclaimCleanup` for object
+  payload reclaim and bucket-delete finalization, `LifecycleCleanup` for bucket
+  lifecycle sweeps, `StreamSessionCleanup` for abandoned streaming sessions,
   and `OpportunisticScan` for shard scavenger integrity scans that can always
   defer because durable findings are recorded separately. Later
   backfill/migration/scanner output still needs to enter the same framework.
 - Added the first adaptive admission policy hook. `KnownDamageRepair` and
-  `DurableCleanup` currently keep their fixed nonzero lanes so known repair and
-  visible/durable cleanup are not starved. `OpportunisticScan` now denies with
-  `denied_foreground_pressure` when recent request admission or storage-RPC
-  admission pressure is observed, or while foreground request/read/write/list
-  work is active. Process-wide metadata-command recovery counters are not
-  treated as foreground pressure until they carry caller/class attribution.
-  It denies with
+  the concrete cleanup classes currently keep fixed nonzero lanes so known
+  repair, reclaim/bucket finalization, lifecycle cleanup, and stream-session
+  cleanup cannot starve each other behind a single shared cleanup permit.
+  `OpportunisticScan` now denies with `denied_foreground_pressure` when recent
+  request admission or storage-RPC admission pressure is observed, or while
+  foreground request/read/write/list work is active. Process-wide
+  metadata-command recovery counters are not treated as foreground pressure
+  until they carry caller/class attribution. It denies with
   `denied_backlog_pressure` while durable cleanup or shard repair queues are
   nonempty. The foreground signal is held briefly based on counter deltas so
   lifetime cumulative metrics do not permanently suppress scans after a single
@@ -7644,13 +7646,14 @@ Shard repair design:
 - Background-work policy rules: foreground S3 requests keep their own reserved
   capacity and must not wait behind background work. `KnownDamageRepair` should
   have a small nonzero reserved background lane because it fixes known durable
-  damage. `DurableCleanup` should be paced but eventually make progress because
-  it closes already-admitted or already-visible state. `OpportunisticScan`
-  should be the easiest class to deny under foreground pressure or when any
-  durable cleanup/repair backlog is nonzero; denied scan work should sleep and
-  retry later without recording failure. No background worker should spin if it
-  cannot acquire a permit, and durable work rows remain the source of truth
-  whenever admission is denied.
+  damage. Reclaim/bucket finalization, lifecycle cleanup, and stream-session
+  cleanup should each be paced but eventually make progress because they close
+  already-admitted or already-visible state. `OpportunisticScan` should be the
+  easiest class to deny under foreground pressure or when any durable
+  cleanup/repair backlog is nonzero; denied scan work should sleep and retry
+  later without recording failure. No background worker should spin if it cannot
+  acquire a permit, and durable work rows remain the source of truth whenever
+  admission is denied.
 - Background-work instrumentation now exposes per-class admission totals,
   `denied_limit`, `denied_foreground_pressure`, `denied_backlog_pressure`,
   active counts, completed work counts, and elapsed work time through the local
