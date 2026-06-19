@@ -1,0 +1,169 @@
+Range reads now verify whole multipart parts causing DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/b96d0cd204b88191a461993acbe22ea7?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 116a5c6
+Author: justin@specialbusservice.com
+Created: 19/06/2026, 14:04:21
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit `92a8263b03d7d037f50d0af75433e56eb8532fe8` (`Limit multipart range verification to returned segments`).
+
+The fix removes the verify-only segment inclusion mode from multipart range planning, so range reads now queue only the segments that overlap the requested byte range. Multipart range reads use the normal stored segment CRC checks, matching standard range reads and avoiding whole-part read/decrypt/checksum amplification.
+
+Full multipart object reads and `GetObjectPart` full-part reads still enable the part payload CRC exit check, so the original checksum hardening remains in place where the response covers the complete stored part payload.
+
+# Summary
+Introduced an availability bug while adding multipart part checksum verification on reads. The integrity hardening verifies whole multipart parts even for tiny range requests, creating a network-triggerable resource amplification vector.
+For multipart objects, `from_multipart_range` calls `multipart_ranges_for_range`, which now passes `include_verify_only_segments = true` into `segment_slices_for_range`. In that mode the slice builder no longer stops after the requested range and pushes every non-empty segment in any overlapping multipart part. Segments outside the requested byte range are represented with `(start_offset, end_offset) = (0, 0)`, so they emit no response bytes, but `SegmentListReader::next_chunk` still reads each segment and updates the part CRC verifier before discarding it. Because `MultipartReader` now always installs `expected_crc64` for each part, this verification path is active for multipart range responses. As a result, an attacker who can read an object, including anonymous users for public-read buckets, can issue very small Range GETs against large multipart parts and force the server to read/decrypt/checksum up to the whole part or object before the response completes. With the repository's 5 GiB object limit, repeated low-bandwidth requests can consume storage I/O, CPU, and blocking worker capacity disproportionately.
+
+# Validation
+## Rubric
+- [x] Confirm multipart range construction passes `include_verify_only_segments=true`. - [x] Confirm that mode queues non-overlapping segments as zero-length output slices instead of stopping at the requested end. - [x] Dynamically demonstrate tiny-range amplification with a targeted unit-test PoC and non-multipart control. - [x] Confirm the runtime reads/checksums every queued slice before applying output offsets and that multipart readers enable expected CRC verification. - [ ] Full end-to-end HTTP GET against a large live object was not run due storage/server setup cost; validation was performed at the library planning/reader-code level with a debugger trace.
+## Report
+Validated the finding as a logic/availability issue. I added a targeted debug unit-test PoC that constructs one multipart part split into four 1024-byte segments and requests only byte range 1..1. The test output shows the amplification: `multipart tiny range: bytes_returned=1 slices=4 verify_only_zero_len=3 bytes_queued_for_crc=4096`, while the non-multipart control shows `bytes_returned=1 slices=1 bytes_queued_for_crc=1024`. LLDB confirmed the PoC variables at the breakpoint: `bytes_returned = 1`, `bytes_queued_for_crc = 4096`, `zero_length_verify_only = 3`, and the test exited successfully. Code evidence matches the suspected chain: `crates/server-core/src/coordinator/read_core.rs:199-226` queues all non-empty segments when `include_verify_only_segments` is true and assigns non-overlapping segments `(start_offset,end_offset)=(0,0)`; `read_core.rs:261-270` passes `true` for multipart range reads; `crates/server-core/src/coordinator/runtime.rs:1750-1760` reads each queued segment and updates the CRC before applying slice offsets; `runtime.rs:1808-1819` sets `expected_crc64: Some(...)` and `expected_verified_size` for each multipart part, activating whole-part verification. I also checked the introducing commit diff, which adds the include-verify-only mode and multipart part CRC verification. A direct crash was not expected or observed because this is a resource-amplification bug, not a memory-safety crash. Valgrind was unavailable (`command not found`), and ASan could not be used because stable Rust rejected `-Z sanitizer=address`.
+
+# Evidence
+crates/server-core/src/coordinator/read_core.rs (L199 to 226)
+  Note: When include_verify_only_segments is true, the code does not break after the requested end offset and pushes all non-empty segments; non-overlapping segments receive zero-length output offsets but remain in the read list.
+```
+        for (segment_index, payload) in segments.into_iter().enumerate() {
+            let segment_end = offset + payload.size as usize;
+            if !include_verify_only_segments && offset > end {
+                break;
+            }
+            if payload.size != 0 && (include_verify_only_segments || segment_end > start) {
+                let overlaps = segment_end > start && offset <= end;
+                let (start_offset, end_offset) = if overlaps {
+                    (
+                        start.saturating_sub(offset),
+                        (end + 1).saturating_sub(offset).min(payload.size as usize),
+                    )
+                } else {
+                    (0, 0)
+                };
+                slices.push(SegmentSliceRecord {
+                    payload,
+                    segment_index,
+                    segment_object_offset_start: object_offset_base + offset,
+                    segment_object_offset_end_exclusive: object_offset_base + segment_end,
+                    start_offset,
+                    end_offset,
+                    part_number: part_layout.map(|layout| layout.part_number),
+                    part_order: part_layout.map(|layout| layout.part_order),
+                    part_object_offset_start: part_layout.map(|layout| layout.object_offset_start),
+                    part_object_offset_end_exclusive: part_layout
+                        .map(|layout| layout.object_offset_end_exclusive),
+                });
+```
+
+crates/server-core/src/coordinator/read_core.rs (L261 to 270)
+  Note: Multipart range construction now passes include_verify_only_segments=true, enabling whole-part segment inclusion for range reads.
+```
+                ranges.push(SnapshottedMultipartPartRange {
+                    layout: layout.clone(),
+                    segments: Self::segment_slices_for_range(
+                        part.segments,
+                        start_offset,
+                        end_offset - 1,
+                        part_start,
+                        Some(&layout),
+                        true,
+                    ),
+```
+
+crates/server-core/src/coordinator/runtime.rs (L1750 to 1760)
+  Note: Every queued segment is read and added to the CRC verifier before its slice offsets are applied, so verify-only zero-length slices still consume full read/decrypt/checksum work.
+```
+            let data = self.runtime.read_segment_payload(
+                &slice.payload,
+                slice.part_number,
+                self.sse_customer_request.as_ref(),
+            )?;
+            if self.expected_crc64.is_some() {
+                self.verified_size += data.len();
+                self.verified_crc64.update(data.as_ref());
+            }
+            self.next_segment_index += 1;
+            self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
+```
+
+crates/server-core/src/coordinator/runtime.rs (L1808 to 1819)
+  Note: Multipart part readers now always set expected_crc64 and expected_verified_size, activating full-part verification for each part touched by a range response.
+```
+            self.current_part = Some(SegmentListReader {
+                runtime: self.runtime.clone(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                segments: part.segments,
+                next_segment_index: 0,
+                loaded_segment: None,
+                sse_customer_request: self.sse_customer_request.clone(),
+                expected_crc64: Some(part.layout.payload_crc64),
+                expected_verified_size: part.layout.part_size,
+                verified_size: 0,
+                verified_crc64: checksum::crc64::Hasher::new(),
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity remains medium. The finding is not a false positive: repository code shows GetObject Range reaches multipart range planning, planning queues zero-output verify-only segments, and the runtime reads/decrypts/checksums each queued segment before discarding output. The affected path is the main runtime S3 server and is reachable by a normal object reader, including anonymous users for public-read objects. The impact is meaningful transient service-level DoS/resource amplification, but it is limited to availability, requires read access to suitable multipart data, has no auth bypass or data compromise, is bounded by the 5 GiB object/part cap and request/connection semaphores, and repository defaults bind to localhost rather than proving public internet exposure.
+## Likelihood
+high - The exploit path is simple HTTP/S3 behavior and was validated by an executable unit-test PoC showing bytes_returned=1 with bytes_queued_for_crc=4096 in a small model. However, practical exploitation requires network reachability, a readable multipart object, and usually valid read authorization unless the bucket/object is public-read. Default bind is loopback, and in-flight limits reduce but do not eliminate amplification. | Remote network vector
+## Impact
+medium - A one-byte or similarly tiny range response against a multipart object can cause reading, optional decryption, and CRC64 verification of all segments in the touched multipart part. Repeated requests can consume storage I/O, CPU, and in-flight request capacity for the argmin-s3 service. The bug does not bypass authorization and does not expose or corrupt data, so impact is availability-only.
+## Assumptions
+- The vulnerable component is the argmin-s3 runtime server, not test-only code.
+- A realistic attacker has network access to the HTTP listener and normal read permission for at least one large multipart object, either through SigV4 credentials/presigned URL/bucket policy/object ACL or anonymously on a public-read object.
+- No deployment manifests in the repository prove internet exposure; the code default is loopback 127.0.0.1:9000, but ARGMIN_LISTEN_ADDR can bind an externally reachable address.
+- The availability impact scales with multipart part size, segment count, encryption settings, storage speed, and configured in-flight request limits.
+- argmin-s3 frontend/combined/legacy-local server is running and reachable over HTTP/HTTPS
+- target object uses MultipartManifest layout
+- attacker can perform GetObject/Range read for the target object
+- attacker sends a small HTTP Range header such as bytes=0-0 that intersects a large multipart part
+## Path
+Remote reader/public client
+  -> HTTP GET Object + Range
+  -> server-http GetObject range dispatch
+  -> Coordinator::get_object_range
+  -> ReadHandle::from_multipart_range
+  -> segment_slices_for_range(include_verify_only_segments=true)
+  -> SegmentListReader reads/decrypts/CRC-checks queued segments
+  -> storage I/O + CPU + request-slot exhaustion
+## Path evidence
+- `crates/server-http/src/http/mod.rs:1641-1722` - GetObject handling accepts the HTTP Range header, parses it, and calls coordinator.get_object_range with attacker-controlled byte_range.
+- `crates/server-core/src/coordinator/read.rs:790-828` - Coordinator::get_object_range authorizes the read and loads the full payload layout snapshot for the requested object.
+- `crates/server-core/src/coordinator/read.rs:892-928` - MultipartManifest objects route range reads to ReadHandle::from_multipart_range with the resolved user range.
+- `crates/server-core/src/coordinator/read_core.rs:199-226` - When include_verify_only_segments is true, segment_slices_for_range queues every non-empty segment and represents non-overlapping segments as zero-length output slices.
+- `crates/server-core/src/coordinator/read_core.rs:261-270` - multipart_ranges_for_range passes include_verify_only_segments=true for multipart range reads.
+- `crates/server-core/src/coordinator/runtime.rs:1539-1573` - read_segment_payload reads stored segment bytes from the storage node and decrypts when encryption is configured.
+- `crates/server-core/src/coordinator/runtime.rs:1633-1760` - SegmentListReader reads each queued segment and updates CRC state before using slice offsets, so zero-length output slices still do full read/checksum work.
+- `crates/server-core/src/coordinator/runtime.rs:1808-1819` - MultipartReader sets expected_crc64 and expected_verified_size for each part, activating full-part verification behavior.
+- `crates/server-core/src/coordinator/authz.rs:531-554` - Object reads require owner/ACL/public-read authorization; public-read objects can be read without authenticated identity when public ACLs are not ignored.
+- `crates/server-core/src/coordinator.rs:180-184` - The code allows object/upload part sizes up to 5 GiB and uses 8 MiB internal segments, giving substantial amplification potential.
+- `crates/argmin-s3/src/config.rs:101-105` - Runtime credentials are environment-configured and the default listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:888-896` - The service binds the configured TCP listener address for the S3 HTTP frontend.
+- `crates/server-http/src/http/serve.rs:530-537` - Built-in availability controls include connection and in-flight request semaphores, but these do not remove per-request read amplification.
+- `crates/server-http/src/http/serve.rs:764-803` - Requests that cannot acquire an in-flight slot are shed with SlowDown, bounding concurrency but allowing admitted requests to perform excessive work.
+## Narrative
+This is a real in-scope availability vulnerability in the main S3 server. HTTP GetObject accepts attacker-controlled Range headers and dispatches to get_object_range. For MultipartManifest objects, the range path calls from_multipart_range, which invokes multipart_ranges_for_range. That function passes include_verify_only_segments=true into segment_slices_for_range; in that mode every non-empty segment in an intersected multipart part is queued, and non-overlapping segments get start_offset/end_offset of 0/0. SegmentListReader then reads the full segment payload from storage and updates the part CRC before applying those offsets, so zero-output slices still consume disk I/O, optional decryption, and CRC CPU. MultipartReader always installs expected_crc64 for each touched part, activating this path. Authorization is still enforced, so private objects require normal read access, but public-read objects can be reached anonymously. The impact is availability-only and bounded somewhat by max object size and connection/in-flight semaphores, supporting medium rather than high/critical severity.
+## Controls
+- SigV4 and presigned URL authentication for private objects
+- Object owner, ACL, bucket policy, public-read, and public access block authorization checks
+- Default listener is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection semaphore with default ARGMIN_MAX_CONNECTIONS=512
+- In-flight request semaphore with default ARGMIN_MAX_INFLIGHT_REQUESTS=32
+- Admission timeout returns S3 SlowDown when request slots are exhausted
+- Maximum object/upload part size is capped at 5 GiB
+## Blindspots
+- Static-only repository review did not run a full end-to-end HTTP test against a large live multipart object.
+- No Kubernetes/Terraform/Compose ingress or load balancer manifests were found in the quick repository scan, so real deployment exposure is unknown.
+- Actual amplification depends on multipart part sizes, encryption mode, disk/storage-node performance, and production configuration values.
+- The provided validation PoC exercised library-level planning/reader behavior rather than a production network deployment.
