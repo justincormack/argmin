@@ -136,6 +136,10 @@ static OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_WORK_ELAPSED_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
     OnceLock::new();
 static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
@@ -163,6 +167,9 @@ static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_DIMENSIONS: OnceLock<
 > = OnceLock::new();
 static SHARD_REPAIR_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardRepairEventDimensionCounter>>> =
     OnceLock::new();
+static BACKGROUND_WORK_ADMISSION_DIMENSIONS: OnceLock<
+    Mutex<Vec<BackgroundWorkAdmissionDimensionCounter>>,
+> = OnceLock::new();
 static STREAM_UPLOAD_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SESSION_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SESSION_ABORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -249,6 +256,14 @@ pub struct ShardRepairEventDimensionSample {
     pub count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundWorkAdmissionDimensionSample {
+    pub class: &'static str,
+    pub event: &'static str,
+    pub count: u64,
+    pub elapsed_us_total: u64,
+}
+
 struct MetadataCommandDimensionCounter {
     pg_id: u32,
     classifier: &'static str,
@@ -291,6 +306,13 @@ struct ShardRepairEventDimensionCounter {
     pg_id: Option<u32>,
     event: &'static str,
     count: u64,
+}
+
+struct BackgroundWorkAdmissionDimensionCounter {
+    class: &'static str,
+    event: &'static str,
+    count: u64,
+    elapsed_us_total: u64,
 }
 
 impl FlightRecorder {
@@ -429,6 +451,11 @@ fn object_payload_reclaim_durable_scan_dimensions(
 
 fn shard_repair_event_dimensions() -> &'static Mutex<Vec<ShardRepairEventDimensionCounter>> {
     SHARD_REPAIR_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn background_work_admission_dimensions(
+) -> &'static Mutex<Vec<BackgroundWorkAdmissionDimensionCounter>> {
+    BACKGROUND_WORK_ADMISSION_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn fetch_max_atomic(counter: &AtomicU64, value: u64) {
@@ -605,6 +632,34 @@ fn increment_shard_repair_dimension(pg_id: Option<u32>, event: &'static str) {
     }
 }
 
+fn increment_background_work_admission_dimension(
+    class: &'static str,
+    event: &'static str,
+    elapsed_us: Option<u64>,
+) {
+    let mut counters = background_work_admission_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters
+        .iter_mut()
+        .find(|counter| counter.class == class && counter.event == event)
+    {
+        counter.count = counter.count.saturating_add(1);
+        if let Some(elapsed_us) = elapsed_us {
+            counter.elapsed_us_total = counter.elapsed_us_total.saturating_add(elapsed_us);
+        }
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(BackgroundWorkAdmissionDimensionCounter {
+            class,
+            event,
+            count: 1,
+            elapsed_us_total: elapsed_us.unwrap_or(0),
+        });
+    }
+}
+
 #[must_use]
 pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDimensionSample> {
     metadata_command_dimension_snapshot(metadata_command_conflict_dimensions())
@@ -703,6 +758,22 @@ pub fn object_payload_reclaim_durable_scan_dimension_snapshot(
             pg_id: counter.pg_id,
             event: counter.event,
             count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn background_work_admission_dimension_snapshot() -> Vec<BackgroundWorkAdmissionDimensionSample>
+{
+    background_work_admission_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| BackgroundWorkAdmissionDimensionSample {
+            class: counter.class,
+            event: counter.event,
+            count: counter.count,
+            elapsed_us_total: counter.elapsed_us_total,
         })
         .collect()
 }
@@ -1194,6 +1265,14 @@ pub struct ShardRepairEventSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackgroundWorkAdmissionSummary {
+    pub class: &'static str,
+    pub event: &'static str,
+    pub active_total: usize,
+    pub elapsed_us: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageRpcErrorSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
@@ -1284,6 +1363,10 @@ pub struct MetricsSnapshot {
     pub object_payload_reclaim_durable_scan_total: u64,
     pub shard_repair_queue_depth: u64,
     pub shard_repair_event_total: u64,
+    pub background_work_admission_event_total: u64,
+    pub background_work_active_total: u64,
+    pub background_work_finished_total: u64,
+    pub background_work_elapsed_us_total: u64,
     pub stream_upload_active_sessions: u64,
     pub stream_upload_session_created_total: u64,
     pub stream_upload_session_aborted_total: u64,
@@ -1537,6 +1620,11 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         shard_repair_queue_depth: SHARD_REPAIR_QUEUE_DEPTH.load(Ordering::Relaxed),
         shard_repair_event_total: SHARD_REPAIR_EVENT_TOTAL.load(Ordering::Relaxed),
+        background_work_admission_event_total: BACKGROUND_WORK_ADMISSION_EVENT_TOTAL
+            .load(Ordering::Relaxed),
+        background_work_active_total: BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed),
+        background_work_finished_total: BACKGROUND_WORK_FINISHED_TOTAL.load(Ordering::Relaxed),
+        background_work_elapsed_us_total: BACKGROUND_WORK_ELAPSED_US_TOTAL.load(Ordering::Relaxed),
         stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
             .load(Ordering::Relaxed),
@@ -2465,6 +2553,56 @@ pub fn emit_shard_repair_event(target: &'static str, summary: ShardRepairEventSu
     )
 }
 
+pub fn emit_background_work_admission_event(
+    target: &'static str,
+    summary: BackgroundWorkAdmissionSummary,
+) -> bool {
+    BACKGROUND_WORK_ADMISSION_EVENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let global_active_total = match summary.event {
+        "admitted" => BACKGROUND_WORK_ACTIVE_TOTAL
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1),
+        "finished" => {
+            BACKGROUND_WORK_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            if let Some(elapsed_us) = summary.elapsed_us {
+                BACKGROUND_WORK_ELAPSED_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+            }
+            BACKGROUND_WORK_ACTIVE_TOTAL
+                .fetch_sub(1, Ordering::Relaxed)
+                .saturating_sub(1)
+        }
+        _ => BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed),
+    };
+    increment_background_work_admission_dimension(summary.class, summary.event, summary.elapsed_us);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = match summary.elapsed_us {
+        Some(elapsed_us) => format!(
+            "class={} event={} global_active_total={} local_active_total={} elapsed_us={}",
+            summary.class, summary.event, global_active_total, summary.active_total, elapsed_us
+        ),
+        None => format!(
+            "class={} event={} global_active_total={} local_active_total={}",
+            summary.class, summary.event, global_active_total, summary.active_total
+        ),
+    };
+    record_flight_event(&context, target, "background_work_admission_event", detail);
+    event_in_context(
+        &context,
+        target,
+        "background_work_admission_event",
+        Some(format_args!(
+            "class={} event={} global_active_total={} local_active_total={} elapsed_us={}",
+            summary.class,
+            summary.event,
+            global_active_total,
+            summary.active_total,
+            summary.elapsed_us.unwrap_or(0)
+        )),
+    )
+}
+
 pub fn emit_storage_rpc_error(target: &'static str, summary: StorageRpcErrorSummary<'_>) -> bool {
     STORAGE_RPC_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(context) = current_context() else {
@@ -3152,6 +3290,24 @@ mod tests {
                 queue_depth: Some(4),
             },
         );
+        emit_background_work_admission_event(
+            "storage",
+            BackgroundWorkAdmissionSummary {
+                class: "known_damage_repair",
+                event: "admitted",
+                active_total: 1,
+                elapsed_us: None,
+            },
+        );
+        emit_background_work_admission_event(
+            "storage",
+            BackgroundWorkAdmissionSummary {
+                class: "known_damage_repair",
+                event: "finished",
+                active_total: 0,
+                elapsed_us: Some(321),
+            },
+        );
         emit_storage_rpc_error(
             "storage",
             StorageRpcErrorSummary {
@@ -3418,6 +3574,25 @@ mod tests {
             .any(|sample| sample.pg_id == Some(11)
                 && sample.event == "queued"
                 && sample.count >= 1));
+        assert_eq!(
+            after.background_work_admission_event_total,
+            before.background_work_admission_event_total + 2
+        );
+        assert_eq!(after.background_work_active_total, 0);
+        assert_eq!(
+            after.background_work_finished_total,
+            before.background_work_finished_total + 1
+        );
+        assert_eq!(
+            after.background_work_elapsed_us_total,
+            before.background_work_elapsed_us_total + 321
+        );
+        assert!(background_work_admission_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.class == "known_damage_repair"
+                && sample.event == "finished"
+                && sample.count >= 1
+                && sample.elapsed_us_total >= 321));
         assert_eq!(
             after.storage_rpc_error_total,
             before.storage_rpc_error_total + 1

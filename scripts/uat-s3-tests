@@ -411,9 +411,14 @@ latest_metric_family_label_sum() {
     local metric_name="$2"
     local label_name="$3"
     local label_value="$4"
-    awk -v metric="$metric_name" -v label="$label_name" -v label_value="$label_value" '
-        BEGIN { needle = label "=\"" label_value "\"" }
-        index($1, metric "{") == 1 && index($1, needle) > 0 { values[$1] = $2 }
+    local label_name_2="${5:-}"
+    local label_value_2="${6:-}"
+    awk -v metric="$metric_name" -v label="$label_name" -v label_value="$label_value" -v label_2="$label_name_2" -v label_value_2="$label_value_2" '
+        BEGIN {
+            needle = label "=\"" label_value "\""
+            needle_2 = label_2 "=\"" label_value_2 "\""
+        }
+        index($1, metric "{") == 1 && index($1, needle) > 0 && (label_2 == "" || index($1, needle_2) > 0) { values[$1] = $2 }
         END {
             total = 0
             for (sample in values) {
@@ -498,6 +503,19 @@ print_slowdown_summary() {
         local shard_repair_complete_failed
         local shard_repair_failed
         local shard_repair_unrecoverable
+        local background_work_event
+        local background_work_active
+        local background_work_finished
+        local background_work_elapsed_us
+        local background_work_known_damage_admitted
+        local background_work_known_damage_denied_limit
+        local background_work_known_damage_finished
+        local background_work_durable_cleanup_admitted
+        local background_work_durable_cleanup_denied_limit
+        local background_work_durable_cleanup_finished
+        local background_work_opportunistic_scan_admitted
+        local background_work_opportunistic_scan_denied_limit
+        local background_work_opportunistic_scan_finished
         slow_down="$(latest_metric_sample_value "$metrics_log" slow_down_response_total)"
         admission_timeout="$(latest_metric_sample_value "$metrics_log" request_admission_timeout_total)"
         admission_wait="$(latest_metric_sample_value "$metrics_log" request_admission_wait_total)"
@@ -548,6 +566,19 @@ print_slowdown_summary() {
         shard_repair_complete_failed="$(latest_metric_family_label_sum "$metrics_log" shard_repair_event_by_pg_total event complete_failed)"
         shard_repair_failed="$(latest_metric_family_label_sum "$metrics_log" shard_repair_event_by_pg_total event failed)"
         shard_repair_unrecoverable="$(latest_metric_family_label_sum "$metrics_log" shard_repair_event_by_pg_total event unrecoverable)"
+        background_work_event="$(latest_metric_sample_value "$metrics_log" background_work_admission_event_total)"
+        background_work_active="$(latest_metric_sample_value "$metrics_log" background_work_active_total)"
+        background_work_finished="$(latest_metric_sample_value "$metrics_log" background_work_finished_total)"
+        background_work_elapsed_us="$(latest_metric_sample_value "$metrics_log" background_work_elapsed_us_total)"
+        background_work_known_damage_admitted="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event admitted class known_damage_repair)"
+        background_work_known_damage_denied_limit="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_limit class known_damage_repair)"
+        background_work_known_damage_finished="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event finished class known_damage_repair)"
+        background_work_durable_cleanup_admitted="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event admitted class durable_cleanup)"
+        background_work_durable_cleanup_denied_limit="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_limit class durable_cleanup)"
+        background_work_durable_cleanup_finished="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event finished class durable_cleanup)"
+        background_work_opportunistic_scan_admitted="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event admitted class opportunistic_scan)"
+        background_work_opportunistic_scan_denied_limit="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_limit class opportunistic_scan)"
+        background_work_opportunistic_scan_finished="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event finished class opportunistic_scan)"
         if ((storage_rpc_admission_total > 0)); then
             storage_rpc_admission_wait_percent="$(awk -v waited="$storage_rpc_admission_wait" -v total="$storage_rpc_admission_total" 'BEGIN { printf "%.2f", (waited * 100.0) / total }')"
         else
@@ -560,6 +591,8 @@ print_slowdown_summary() {
         echo "reclaim queue_depth=$reclaim_queue_depth object_payload_queue_depth=$object_payload_reclaim_queue_depth object_payload_outstanding_depth=$object_payload_reclaim_outstanding_depth bucket_delete_queue_depth=$bucket_delete_finalize_queue_depth queue_action_total=$reclaim_queue_action object_payload_event_total=$object_payload_reclaim_event durable_scan_total=$object_payload_reclaim_durable_scan" >&2
         echo "shard_repair queue_depth=$shard_repair_queue_depth event_total=$shard_repair_event" >&2
         echo "shard_repair_events durable_scan_empty=$shard_repair_durable_scan_empty durable_scan_queued=$shard_repair_durable_scan_queued durable_scan_no_new_enqueue=$shard_repair_durable_scan_no_new_enqueue queued=$shard_repair_queued queue_full=$shard_repair_queue_full deduped=$shard_repair_deduped started=$shard_repair_started resolved_clean=$shard_repair_resolved_clean repaired=$shard_repair_repaired complete_succeeded=$shard_repair_complete_succeeded complete_stale=$shard_repair_complete_stale complete_failed=$shard_repair_complete_failed failed=$shard_repair_failed unrecoverable=$shard_repair_unrecoverable" >&2
+        echo "background_work event_total=$background_work_event active=$background_work_active finished=$background_work_finished elapsed_us_total=$background_work_elapsed_us" >&2
+        echo "background_work_classes known_damage_repair_admitted=$background_work_known_damage_admitted known_damage_repair_denied_limit=$background_work_known_damage_denied_limit known_damage_repair_finished=$background_work_known_damage_finished durable_cleanup_admitted=$background_work_durable_cleanup_admitted durable_cleanup_denied_limit=$background_work_durable_cleanup_denied_limit durable_cleanup_finished=$background_work_durable_cleanup_finished opportunistic_scan_admitted=$background_work_opportunistic_scan_admitted opportunistic_scan_denied_limit=$background_work_opportunistic_scan_denied_limit opportunistic_scan_finished=$background_work_opportunistic_scan_finished" >&2
         echo "metadata_recovery_top admission" >&2
         latest_metric_family_top "$metrics_log" metadata_command_recovery_admission_by_pg_command_total 10 >&2 || true
         echo "metadata_recovery_top outcome" >&2
@@ -582,6 +615,10 @@ print_slowdown_summary() {
         latest_metric_family_top "$metrics_log" object_payload_reclaim_durable_scan_by_pg_total 10 >&2 || true
         echo "shard_repair_top event" >&2
         latest_metric_family_top "$metrics_log" shard_repair_event_by_pg_total 10 >&2 || true
+        echo "background_work_top admission" >&2
+        latest_metric_family_top "$metrics_log" background_work_admission_by_class_total 10 >&2 || true
+        echo "background_work_top elapsed_us" >&2
+        latest_metric_family_top "$metrics_log" background_work_admission_by_class_elapsed_us_total 10 >&2 || true
     else
         echo "metrics unavailable" >&2
     fi

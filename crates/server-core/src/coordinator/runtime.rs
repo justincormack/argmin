@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -35,6 +35,9 @@ static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<ShardRe
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
 > = OnceLock::new();
+static BACKGROUND_WORK_ADMISSION_REGISTRY: OnceLock<
+    Mutex<HashMap<usize, Weak<BackgroundWorkAdmission>>>,
+> = OnceLock::new();
 static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
@@ -44,8 +47,171 @@ const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
+const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
+const BACKGROUND_DURABLE_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundWorkClass {
+    KnownDamageRepair,
+    DurableCleanup,
+    OpportunisticScan,
+}
+
+impl BackgroundWorkClass {
+    fn name(self) -> &'static str {
+        match self {
+            Self::KnownDamageRepair => "known_damage_repair",
+            Self::DurableCleanup => "durable_cleanup",
+            Self::OpportunisticScan => "opportunistic_scan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundWorkAdmissionLimits {
+    known_damage_repair: usize,
+    durable_cleanup: usize,
+    opportunistic_scan: usize,
+}
+
+impl Default for BackgroundWorkAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            known_damage_repair: BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT,
+            durable_cleanup: BACKGROUND_DURABLE_CLEANUP_LIMIT,
+            opportunistic_scan: BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BackgroundWorkAdmission {
+    limits: BackgroundWorkAdmissionLimits,
+    known_damage_repair_active: AtomicUsize,
+    durable_cleanup_active: AtomicUsize,
+    opportunistic_scan_active: AtomicUsize,
+}
+
+struct BackgroundWorkPermit {
+    admission: Arc<BackgroundWorkAdmission>,
+    class: BackgroundWorkClass,
+    started_at: Instant,
+    active: bool,
+}
+
+impl BackgroundWorkAdmission {
+    fn new() -> Self {
+        Self::with_limits(BackgroundWorkAdmissionLimits::default())
+    }
+
+    fn with_limits(limits: BackgroundWorkAdmissionLimits) -> Self {
+        Self {
+            limits,
+            known_damage_repair_active: AtomicUsize::new(0),
+            durable_cleanup_active: AtomicUsize::new(0),
+            opportunistic_scan_active: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, class: BackgroundWorkClass) -> Option<BackgroundWorkPermit> {
+        let counter = self.counter_for(class);
+        let limit = self.limit_for(class);
+        let mut active = counter.load(Ordering::Acquire);
+        while active < limit {
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.emit(class, "admitted", None);
+                    return Some(BackgroundWorkPermit {
+                        admission: Arc::clone(self),
+                        class,
+                        started_at: Instant::now(),
+                        active: true,
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+        self.emit(class, "denied_limit", None);
+        None
+    }
+
+    fn counter_for(&self, class: BackgroundWorkClass) -> &AtomicUsize {
+        match class {
+            BackgroundWorkClass::KnownDamageRepair => &self.known_damage_repair_active,
+            BackgroundWorkClass::DurableCleanup => &self.durable_cleanup_active,
+            BackgroundWorkClass::OpportunisticScan => &self.opportunistic_scan_active,
+        }
+    }
+
+    fn limit_for(&self, class: BackgroundWorkClass) -> usize {
+        match class {
+            BackgroundWorkClass::KnownDamageRepair => self.limits.known_damage_repair,
+            BackgroundWorkClass::DurableCleanup => self.limits.durable_cleanup,
+            BackgroundWorkClass::OpportunisticScan => self.limits.opportunistic_scan,
+        }
+    }
+
+    fn active_total(&self) -> usize {
+        self.known_damage_repair_active.load(Ordering::Acquire)
+            + self.durable_cleanup_active.load(Ordering::Acquire)
+            + self.opportunistic_scan_active.load(Ordering::Acquire)
+    }
+
+    fn emit(&self, class: BackgroundWorkClass, event: &'static str, elapsed_us: Option<u64>) {
+        let _ = observability::emit_background_work_admission_event(
+            TRACE_TARGET,
+            observability::BackgroundWorkAdmissionSummary {
+                class: class.name(),
+                event,
+                active_total: self.active_total(),
+                elapsed_us,
+            },
+        );
+    }
+}
+
+impl Drop for BackgroundWorkPermit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let previous = self
+            .admission
+            .counter_for(self.class)
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        let elapsed_us = u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.admission
+            .emit(self.class, "finished", Some(elapsed_us));
+        self.active = false;
+    }
+}
+
+fn background_work_admission_for(
+    storage_cluster: &Arc<StorageCluster>,
+) -> Arc<BackgroundWorkAdmission> {
+    let registry = BACKGROUND_WORK_ADMISSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<BackgroundWorkAdmission>>> =
+        lock_mutex_unpoisoned(registry);
+    registry.retain(|_, admission| admission.upgrade().is_some());
+
+    let key = storage_cluster.process_local_registry_key();
+    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+
+    let admission = Arc::new(BackgroundWorkAdmission::new());
+    registry.insert(key, Arc::downgrade(&admission));
+    admission
+}
 
 fn earliest_object_payload_reclaim_retry_sleep(
     storage_node: &StorageCluster,
@@ -161,6 +327,7 @@ impl ReclaimSweeper {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_node = Arc::clone(&storage_cluster);
+        let admission = background_work_admission_for(&storage_cluster);
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
             .spawn(move || {
@@ -198,6 +365,13 @@ impl ReclaimSweeper {
                         .or_else(|| worker_node.wait_for_reclaim_work(&worker_stop))
                     else {
                         break;
+                    };
+                    let Some(_cleanup_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    else {
+                        pending_work = Some(work);
+                        std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
+                        continue;
                     };
                     match work {
                         ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
@@ -350,12 +524,16 @@ impl LifecycleSweeper {
             return Ok(existing);
         }
 
-        let sweeper = Self::spawn(runtime)?;
+        let admission = background_work_admission_for(storage_cluster);
+        let sweeper = Self::spawn(runtime, admission)?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
     }
 
-    fn spawn(runtime: ReadRuntime) -> Result<Arc<Self>, ServerError> {
+    fn spawn(
+        runtime: ReadRuntime,
+        admission: Arc<BackgroundWorkAdmission>,
+    ) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let sweeper = Arc::new(Self {
@@ -367,7 +545,11 @@ impl LifecycleSweeper {
             .name("argmin-lifecycle".to_string())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    {
+                        let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                    }
                     if stop.load(Ordering::SeqCst) {
                         break;
                     }
@@ -423,6 +605,7 @@ impl ShardScavengerSweeper {
     fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let admission = background_work_admission_for(&storage_cluster);
         let sweeper = Arc::new(Self {
             stop: Arc::clone(&stop),
             wake: Arc::clone(&wake),
@@ -432,12 +615,16 @@ impl ShardScavengerSweeper {
             .name("argmin-shard-scavenger".to_string())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
-                        let _ = observability::event(
-                            TRACE_TARGET,
-                            "shard_scavenger_audit_error",
-                            Some(format_args!("error={error}")),
-                        );
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::OpportunisticScan)
+                    {
+                        if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "shard_scavenger_audit_error",
+                                Some(format_args!("error={error}")),
+                            );
+                        }
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
@@ -493,6 +680,7 @@ impl ShardRepairSweeper {
 
     fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
+        let admission = background_work_admission_for(&storage_cluster);
         let sweeper = Arc::new(Self {
             storage_node: Arc::clone(&storage_cluster),
             stop: Arc::clone(&stop),
@@ -632,6 +820,43 @@ impl ShardRepairSweeper {
                             );
                             continue;
                         }
+                    };
+
+                    let Some(_repair_permit) =
+                        admission.try_acquire(BackgroundWorkClass::KnownDamageRepair)
+                    else {
+                        let _ = observability::emit_shard_repair_event(
+                            TRACE_TARGET,
+                            observability::ShardRepairEventSummary {
+                                pg_id: Some(claim.work_item.request.data_pg_id),
+                                event: "admission_denied",
+                                queue_depth: None,
+                            },
+                        );
+                        let next_attempt_after = Coordinator::now_millis()
+                            .saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
+                        if let Err(record_error) = storage_cluster
+                            .record_placed_segment_shard_repair_claim_error(
+                                &claim,
+                                "background known-damage repair admission denied",
+                                next_attempt_after,
+                            )
+                        {
+                            let _ = observability::emit_shard_repair_event(
+                                TRACE_TARGET,
+                                observability::ShardRepairEventSummary {
+                                    pg_id: Some(claim.work_item.request.data_pg_id),
+                                    event: "record_error_failed",
+                                    queue_depth: None,
+                                },
+                            );
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "shard_repair_record_error_failed",
+                                Some(format_args!("record_error={record_error}")),
+                            );
+                        }
+                        continue;
                     };
 
                     let _ = observability::emit_shard_repair_event(
@@ -1794,6 +2019,47 @@ mod tests {
 
     use super::super::payload::PayloadBufferPool;
     use super::*;
+
+    #[test]
+    fn background_work_admission_limits_and_releases_per_class() {
+        let admission = Arc::new(BackgroundWorkAdmission::with_limits(
+            BackgroundWorkAdmissionLimits {
+                known_damage_repair: 1,
+                durable_cleanup: 1,
+                opportunistic_scan: 0,
+            },
+        ));
+
+        let repair_permit = admission
+            .try_acquire(BackgroundWorkClass::KnownDamageRepair)
+            .expect("first repair permit should fit limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::KnownDamageRepair)
+                .is_none(),
+            "second repair permit should be denied at limit"
+        );
+
+        let cleanup_permit = admission
+            .try_acquire(BackgroundWorkClass::DurableCleanup)
+            .expect("cleanup should have its own class limit");
+        assert_eq!(admission.active_total(), 2);
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::OpportunisticScan)
+                .is_none(),
+            "zero-limit scan class should deny"
+        );
+
+        drop(repair_permit);
+        assert_eq!(admission.active_total(), 1);
+        let replacement = admission
+            .try_acquire(BackgroundWorkClass::KnownDamageRepair)
+            .expect("dropping a permit should release class capacity");
+        drop(replacement);
+        drop(cleanup_permit);
+        assert_eq!(admission.active_total(), 0);
+    }
 
     #[test]
     fn stale_read_runtime_rejects_zero_size_segment_payload() {

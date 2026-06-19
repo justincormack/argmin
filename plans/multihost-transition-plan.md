@@ -7615,18 +7615,15 @@ Shard repair design:
   and `shard_repair_event_total` counters plus `shard_repair_event_by_pg_total`
   dimensions, and `scripts/uat-s3-tests` prints per-event shard-repair counts
   plus top families in the long-lived UAT metrics summary.
-- Planned background-work admission model: add a small shared admission
-  framework for all long-running process-local background work before adding an
-  adaptive controller. The first implementation should be intentionally static:
-  one admission object per `StorageCluster::process_local_registry_key()`, RAII
-  permits, fixed per-class concurrency caps, and metrics for admitted, denied,
-  active, and finished work. The first classes should be:
-  `KnownDamageRepair` for durable read/scrub-discovered shard repair,
-  `DurableCleanup` for reclaim, bucket-delete finalization, lifecycle
-  cleanup, and stream-session cleanup that is already represented by durable
-  state or is completing visible side effects, and `OpportunisticScan` for
-  background integrity scans and scavenger/scrub passes that can always defer
-  because durable findings are recorded separately.
+- Added the first static background-work admission slice. Long-running
+  process-local background work now shares one admission object per
+  `StorageCluster::process_local_registry_key()` with RAII permits and fixed
+  per-class concurrency caps. The initial classes are `KnownDamageRepair` for
+  durable read/scrub-discovered shard repair, `DurableCleanup` for reclaim,
+  bucket-delete finalization, and lifecycle cleanup, and `OpportunisticScan`
+  for shard scavenger integrity scans that can always defer because durable
+  findings are recorded separately. Stream-session cleanup and later
+  backfill/migration/scanner output still need to enter the same framework.
 - Background-work policy rules: foreground S3 requests keep their own reserved
   capacity and must not wait behind background work. `KnownDamageRepair` should
   have a small nonzero reserved background lane because it fixes known durable
@@ -7637,25 +7634,20 @@ Shard repair design:
   retry later without recording failure. No background worker should spin if it
   cannot acquire a permit, and durable work rows remain the source of truth
   whenever admission is denied.
-- Background-work instrumentation requirements: the local debug metrics
-  endpoint and UAT summary should expose per-class admission totals, denial
-  reason (`limit`, later `foreground_pressure`), active counts, completed work
-  counts, and elapsed work time. Existing shard-repair metrics still describe
-  repair semantics (`started`, `resolved_clean`, `repaired`, `failed`,
-  `unrecoverable`, completion events); the admission metrics describe scheduler
-  behavior and must not be interpreted as successful shard rewrites.
-- Background-work rollout order: first add the shared permit type and metrics,
-  then wire `ShardScavengerSweeper` as `OpportunisticScan` and
-  `ShardRepairSweeper` repair execution as `KnownDamageRepair`, because those
-  paths already have durable repair rows and UAT observability. Next wire object
-  payload reclaim, bucket delete finalization, lifecycle cleanup, and
-  stream-session sweeping as `DurableCleanup`, preserving their current durable
-  ownership/backoff semantics. Only after fixed caps and UAT data are stable
-  should the policy read foreground pressure signals such as request admission
-  waits/timeouts, storage-RPC active and wait counters, metadata-command
-  recovery contention, and backlog depth. Later backfill/migration/scanner
-  output should enter through the same classes rather than adding separate
-  uncoordinated loops.
+- Background-work instrumentation now exposes per-class admission totals,
+  `denied_limit`, active counts, completed work counts, and elapsed work time
+  through the local debug metrics endpoint and UAT summary. Existing
+  shard-repair metrics still describe repair semantics (`started`,
+  `resolved_clean`, `repaired`, `failed`, `unrecoverable`, completion events);
+  the admission metrics describe scheduler behavior and must not be interpreted
+  as successful shard rewrites.
+- Remaining background-work admission order: wire stream-session sweeping as
+  `DurableCleanup`, preserving current durable ownership/backoff semantics.
+  Only after fixed caps and UAT data are stable should the policy read
+  foreground pressure signals such as request admission waits/timeouts,
+  storage-RPC active and wait counters, metadata-command recovery contention,
+  and backlog depth. Later backfill/migration/scanner output should enter
+  through the same classes rather than adding separate uncoordinated loops.
 - Remaining shard-repair queue work: decide whether completed repair
   verification should persist richer per-shard outcome telemetry. Background
   scan cursor/progress does not need to be durable; a scanner can restart from a

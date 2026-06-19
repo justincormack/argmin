@@ -1133,6 +1133,10 @@ fn local_debug_metrics_body() -> String {
             "object_payload_reclaim_durable_scan_total {}\n",
             "shard_repair_queue_depth {}\n",
             "shard_repair_event_total {}\n",
+            "background_work_admission_event_total {}\n",
+            "background_work_active_total {}\n",
+            "background_work_finished_total {}\n",
+            "background_work_elapsed_us_total {}\n",
             "stream_upload_active_sessions {}\n",
             "stream_upload_session_created_total {}\n",
             "stream_upload_session_aborted_total {}\n",
@@ -1199,6 +1203,10 @@ fn local_debug_metrics_body() -> String {
         snapshot.object_payload_reclaim_durable_scan_total,
         snapshot.shard_repair_queue_depth,
         snapshot.shard_repair_event_total,
+        snapshot.background_work_admission_event_total,
+        snapshot.background_work_active_total,
+        snapshot.background_work_finished_total,
+        snapshot.background_work_elapsed_us_total,
         snapshot.stream_upload_active_sessions,
         snapshot.stream_upload_session_created_total,
         snapshot.stream_upload_session_aborted_total,
@@ -1315,6 +1323,20 @@ fn local_debug_metrics_body() -> String {
             body,
             "shard_repair_event_by_pg_total{{pg_id=\"{}\",event=\"{}\"}} {}",
             pg_id, event, sample.count
+        );
+    }
+    for sample in observability::background_work_admission_dimension_snapshot() {
+        let class = debug_metric_label_value(sample.class);
+        let event = debug_metric_label_value(sample.event);
+        let _ = writeln!(
+            body,
+            "background_work_admission_by_class_total{{class=\"{}\",event=\"{}\"}} {}",
+            class, event, sample.count
+        );
+        let _ = writeln!(
+            body,
+            "background_work_admission_by_class_elapsed_us_total{{class=\"{}\",event=\"{}\"}} {}",
+            class, event, sample.elapsed_us_total
         );
     }
     body
