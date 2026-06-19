@@ -7620,10 +7620,10 @@ Shard repair design:
   `StorageCluster::process_local_registry_key()` with RAII permits and fixed
   per-class concurrency caps. The initial classes are `KnownDamageRepair` for
   durable read/scrub-discovered shard repair, `DurableCleanup` for reclaim,
-  bucket-delete finalization, and lifecycle cleanup, and `OpportunisticScan`
-  for shard scavenger integrity scans that can always defer because durable
-  findings are recorded separately. Stream-session cleanup and later
-  backfill/migration/scanner output still need to enter the same framework.
+  bucket-delete finalization, lifecycle cleanup, and stream-session cleanup,
+  and `OpportunisticScan` for shard scavenger integrity scans that can always
+  defer because durable findings are recorded separately. Later
+  backfill/migration/scanner output still needs to enter the same framework.
 - Background-work policy rules: foreground S3 requests keep their own reserved
   capacity and must not wait behind background work. `KnownDamageRepair` should
   have a small nonzero reserved background lane because it fixes known durable
@@ -7641,13 +7641,12 @@ Shard repair design:
   `resolved_clean`, `repaired`, `failed`, `unrecoverable`, completion events);
   the admission metrics describe scheduler behavior and must not be interpreted
   as successful shard rewrites.
-- Remaining background-work admission order: wire stream-session sweeping as
-  `DurableCleanup`, preserving current durable ownership/backoff semantics.
-  Only after fixed caps and UAT data are stable should the policy read
-  foreground pressure signals such as request admission waits/timeouts,
-  storage-RPC active and wait counters, metadata-command recovery contention,
-  and backlog depth. Later backfill/migration/scanner output should enter
-  through the same classes rather than adding separate uncoordinated loops.
+- Remaining background-work admission order: only after fixed caps and UAT data
+  are stable should the policy read foreground pressure signals such as request
+  admission waits/timeouts, storage-RPC active and wait counters,
+  metadata-command recovery contention, and backlog depth. Later
+  backfill/migration/scanner output should enter through the same classes
+  rather than adding separate uncoordinated loops.
 - Remaining shard-repair queue work: decide whether completed repair
   verification should persist richer per-shard outcome telemetry. Background
   scan cursor/progress does not need to be durable; a scanner can restart from a

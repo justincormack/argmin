@@ -1004,6 +1004,7 @@ impl StreamSessionSweeper {
     fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let admission = background_work_admission_for(&storage_cluster);
         let sweeper = Arc::new(Self {
             stop: Arc::clone(&stop),
             wake: Arc::clone(&wake),
@@ -1013,15 +1014,19 @@ impl StreamSessionSweeper {
             .name("argmin-stream-session-sweeper".to_string())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    let count = storage_cluster.scavenge_abandoned_stream_sessions(
-                        super::STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS,
-                    );
-                    if count > 0 {
-                        let _ = observability::event(
-                            TRACE_TARGET,
-                            "stream_session_sweep_abandoned",
-                            Some(format_args!("aborted_sessions={count}")),
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    {
+                        let count = storage_cluster.scavenge_abandoned_stream_sessions(
+                            super::STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS,
                         );
+                        if count > 0 {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "stream_session_sweep_abandoned",
+                                Some(format_args!("aborted_sessions={count}")),
+                            );
+                        }
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
