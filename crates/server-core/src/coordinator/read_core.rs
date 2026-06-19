@@ -99,6 +99,7 @@ enum SegmentListVerification {
 pub(super) struct SnapshottedMultipartPartRange {
     pub(super) layout: MultipartPartReadLayout,
     pub(super) segments: Vec<SegmentSliceRecord>,
+    pub(super) verify_payload_crc: bool,
 }
 
 pub(super) struct MultipartReader {
@@ -413,15 +414,25 @@ impl MultipartReader {
                     )),
                 );
             }
-            self.current_part = Some(SegmentListReader::new_full_payload_crc_checked(
-                self.runtime.clone(),
-                self.bucket.clone(),
-                self.key.clone(),
-                part.segments,
-                self.sse_customer_request.clone(),
-                part.layout.part_size,
-                part.layout.payload_crc64,
-            ));
+            self.current_part = Some(if part.verify_payload_crc {
+                SegmentListReader::new_full_payload_crc_checked(
+                    self.runtime.clone(),
+                    self.bucket.clone(),
+                    self.key.clone(),
+                    part.segments,
+                    self.sse_customer_request.clone(),
+                    part.layout.part_size,
+                    part.layout.payload_crc64,
+                )
+            } else {
+                SegmentListReader::new_stored_segment_crc_checked(
+                    self.runtime.clone(),
+                    self.bucket.clone(),
+                    self.key.clone(),
+                    part.segments,
+                    self.sse_customer_request.clone(),
+                )
+            });
         }
     }
 }
@@ -470,26 +481,18 @@ impl ReadHandle {
         end: usize,
         object_offset_base: usize,
         part_layout: Option<&MultipartPartReadLayout>,
-        include_verify_only_segments: bool,
     ) -> Vec<SegmentSliceRecord> {
         let mut slices = Vec::new();
         let mut offset = 0usize;
 
         for (segment_index, payload) in segments.into_iter().enumerate() {
             let segment_end = offset + payload.size as usize;
-            if !include_verify_only_segments && offset > end {
+            if offset > end {
                 break;
             }
-            if payload.size != 0 && (include_verify_only_segments || segment_end > start) {
-                let overlaps = segment_end > start && offset <= end;
-                let (start_offset, end_offset) = if overlaps {
-                    (
-                        start.saturating_sub(offset),
-                        (end + 1).saturating_sub(offset).min(payload.size as usize),
-                    )
-                } else {
-                    (0, 0)
-                };
+            if payload.size != 0 && segment_end > start {
+                let start_offset = start.saturating_sub(offset);
+                let end_offset = (end + 1).saturating_sub(offset).min(payload.size as usize);
                 slices.push(SegmentSliceRecord {
                     payload,
                     segment_index,
@@ -514,6 +517,7 @@ impl ReadHandle {
         parts: Vec<SnapshottedMultipartPart>,
         start: usize,
         end: usize,
+        verify_payload_crc: bool,
     ) -> Vec<SnapshottedMultipartPartRange> {
         let mut ranges = Vec::new();
 
@@ -545,8 +549,8 @@ impl ReadHandle {
                         end_offset - 1,
                         part_start,
                         Some(&layout),
-                        true,
                     ),
+                    verify_payload_crc,
                 });
             }
         }
@@ -569,14 +573,8 @@ impl ReadHandle {
         } = ctx;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        let segments = Self::segment_slices_for_range(
-            segments,
-            0,
-            expected_size.saturating_sub(1),
-            0,
-            None,
-            false,
-        );
+        let segments =
+            Self::segment_slices_for_range(segments, 0, expected_size.saturating_sub(1), 0, None);
         let locations = Self::shard_locations_for_segment_slices(&runtime, &segments)?;
         let lease = runtime.acquire_object_payload_lease_for_shard_locations(
             bucket,
@@ -630,7 +628,7 @@ impl ReadHandle {
         let expected_size = end - start + 1;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        let segments = Self::segment_slices_for_range(segments, start, end, 0, None, false);
+        let segments = Self::segment_slices_for_range(segments, start, end, 0, None);
         let locations = Self::shard_locations_for_segment_slices(&runtime, &segments)?;
         let lease = runtime.acquire_object_payload_lease_for_shard_locations(
             bucket,
@@ -666,7 +664,8 @@ impl ReadHandle {
         expected_size: usize,
         sse_customer_request: Option<SseCustomerRequest>,
     ) -> Result<Self, ServerError> {
-        let ranges = Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1));
+        let ranges =
+            Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1), true);
         let locations = Self::shard_locations_for_multipart_ranges(&runtime, &ranges)?;
         let lease = runtime.acquire_object_payload_lease_for_shard_locations(
             bucket,
@@ -706,7 +705,7 @@ impl ReadHandle {
     ) -> Result<Self, ServerError> {
         let (start, end) = range;
         let expected_size = end - start + 1;
-        let ranges = Self::multipart_ranges_for_range(parts, start, end);
+        let ranges = Self::multipart_ranges_for_range(parts, start, end, false);
         let locations = Self::shard_locations_for_multipart_ranges(&runtime, &ranges)?;
         let lease = runtime.acquire_object_payload_lease_for_shard_locations(
             bucket,

@@ -5300,7 +5300,7 @@ fn get_object_part_rejects_bad_part_payload_crc64() {
 }
 
 #[test]
-fn get_multipart_range_verifies_whole_containing_part_crc64() {
+fn get_multipart_range_uses_segment_crc_without_whole_part_payload_crc64() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -5313,7 +5313,7 @@ fn get_multipart_range_verifies_whole_containing_part_crc64() {
 
     corrupt_committed_part_payload_crc64(&coord, "bucket", "key", result.version_id, 1);
 
-    let err = coord
+    let body = coord
         .get_object_range(&GetObjectRangeRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
@@ -5329,11 +5329,8 @@ fn get_multipart_range_verifies_whole_containing_part_crc64() {
         .unwrap()
         .body
         .read_all()
-        .unwrap_err();
-    assert!(
-        matches!(err, ServerError::IntegrityError { .. }),
-        "expected IntegrityError after verifying containing part crc64, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(body, vec![0xAA; 10]);
 }
 
 // ── CompleteMultipartUpload checksum tests ──────────────────────────
