@@ -7581,6 +7581,14 @@ Shard repair design:
   object bytes while leaving the corrupt shard file untouched, recording the
   durable repair row, and leaving only a background repair wake hint for the
   worker.
+- Added focused shard-repair worker behavior coverage for retry and fail-closed
+  paths. A one-shot storage-node shard-read overload now proves the worker
+  records the durable claim error, waits for the retry/backoff path, then
+  reclaims and drains the row once the transient failure clears. A separate
+  coordinator test makes more shards unavailable than the EC set can recover,
+  proving the worker records the unrecoverable repair error, leaves the durable
+  row for operator/backoff visibility, and does not recreate any shard from an
+  insufficient EC set.
 - Made read-discovered repair scheduling durable. Successful read recovery now
   records an idempotent `PlacedSegmentShardRepairWorkItem` row in the affected
   data PG before enqueueing the in-memory wake hint and fails rather than

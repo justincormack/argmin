@@ -40,6 +40,25 @@ fn setup_direct_coordinator_with_storage_cluster(
     .unwrap()
 }
 
+fn setup_coordinator_with_only_shard_repair_worker(
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
+    Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
+        storage_cluster,
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            ShardRepairSweeper::acquire_shared,
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap()
+}
+
 #[test]
 fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     let tmp = test_util::tempdir();
@@ -8672,6 +8691,247 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
         Some(*repair),
         "successful read recovery should leave a background repair wake hint"
     );
+}
+
+#[test]
+fn shard_repair_worker_retries_after_transient_shard_read_error() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
+        Arc::clone(&storage_cluster),
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap();
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"background shard repair retries transient read failure";
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let segment = coord
+        .storage_node()
+        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("put object should create one segment");
+    let corrupt_shard_index = 0;
+    let corrupt_path = shard_file_path(&coord, "bucket", "key", corrupt_shard_index);
+    corrupt_shard_on_disk(&coord, "bucket", "key", corrupt_shard_index);
+    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let failure_injected = Arc::new(AtomicBool::new(false));
+    let hook_fail_once = Arc::clone(&fail_once);
+    let hook_failure_injected = Arc::clone(&failure_injected);
+    let _read_hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(
+        Arc::new(move |location, _shard_key| {
+            if hook_fail_once.swap(false, Ordering::SeqCst) {
+                hook_failure_injected.store(true, Ordering::SeqCst);
+                return Err(storage::StoreError::StorageRpcResourceExhausted {
+                    node_id: location.node_id().as_u32(),
+                    operation: "repair read payload shard",
+                    message: "test injected transient shard repair read failure".to_string(),
+                });
+            }
+            Ok(())
+        }),
+    );
+    let _worker = setup_coordinator_with_only_shard_repair_worker(Arc::clone(&storage_cluster));
+
+    let start = std::time::Instant::now();
+    loop {
+        let repairs = coord
+            .storage_node()
+            .list_placed_segment_shard_repairs(segment.data_pg_id)
+            .unwrap();
+        if repairs.iter().any(|repair| {
+            repair.last_error.as_deref().is_some_and(|error| {
+                error.contains("test injected transient shard repair read failure")
+            })
+        }) {
+            break;
+        }
+        assert!(
+            start.elapsed() < TEST_EVENT_TIMEOUT,
+            "shard repair worker did not record transient failure; repairs={repairs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(failure_injected.load(Ordering::SeqCst));
+
+    let start = std::time::Instant::now();
+    loop {
+        let repairs = coord
+            .storage_node()
+            .list_placed_segment_shard_repairs(segment.data_pg_id)
+            .unwrap();
+        if repairs.is_empty() {
+            let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
+            assert_ne!(
+                repaired_bytes, corrupt_bytes,
+                "retry should rewrite the corrupt shard after transient failure"
+            );
+            return;
+        }
+        assert!(
+            start.elapsed() < TEST_EVENT_TIMEOUT + Duration::from_secs(2),
+            "shard repair worker did not retry and drain row; repairs={repairs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
+        Arc::clone(&storage_cluster),
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap();
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"background shard repair fails closed when too many shards are unavailable";
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let segment = coord
+        .storage_node()
+        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("put object should create one segment");
+    let corrupt_path = shard_file_path(&coord, "bucket", "key", 0);
+    corrupt_shard_on_disk(&coord, "bucket", "key", 0);
+    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+
+    let missing_paths = [
+        shard_file_path(&coord, "bucket", "key", 1),
+        shard_file_path(&coord, "bucket", "key", 2),
+    ];
+    for path in &missing_paths {
+        std::fs::remove_file(path).unwrap();
+    }
+
+    let _worker = setup_coordinator_with_only_shard_repair_worker(Arc::clone(&storage_cluster));
+    let start = std::time::Instant::now();
+    loop {
+        let repairs = coord
+            .storage_node()
+            .list_placed_segment_shard_repairs(segment.data_pg_id)
+            .unwrap();
+        if repairs
+            .iter()
+            .any(|repair| repair.last_error.as_deref().is_some())
+        {
+            assert_eq!(repairs.len(), 1);
+            assert_eq!(repairs[0].work_item.shard_index.get(), 0);
+            assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
+            for path in &missing_paths {
+                assert!(
+                    !path.exists(),
+                    "unrecoverable repair should not recreate any shard from an insufficient EC set"
+                );
+            }
+            return;
+        }
+        assert!(
+            start.elapsed() < TEST_EVENT_TIMEOUT,
+            "shard repair worker did not record unrecoverable repair failure; repairs={repairs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
