@@ -1145,13 +1145,24 @@ impl LocalClusterRuntimeState {
         let (state_lock, cv) = &self.placed_segment_shard_repair_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         if state.queued.contains(&work_item) {
+            Self::emit_shard_repair_queue_event(
+                &state,
+                Some(work_item.request.data_pg_id),
+                "deduped",
+            );
             return false;
         }
         if state.work_queue.len() >= LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT {
+            Self::emit_shard_repair_queue_event(
+                &state,
+                Some(work_item.request.data_pg_id),
+                "queue_full",
+            );
             return false;
         }
         state.queued.insert(work_item);
         state.work_queue.push_back(work_item);
+        Self::emit_shard_repair_queue_event(&state, Some(work_item.request.data_pg_id), "queued");
         cv.notify_one();
         true
     }
@@ -1166,6 +1177,7 @@ impl LocalClusterRuntimeState {
             .unwrap_or_else(|e| e.into_inner());
         let work = state.work_queue.pop_front()?;
         state.queued.remove(&work);
+        Self::emit_shard_repair_queue_event(&state, Some(work.request.data_pg_id), "dequeued");
         Some(work)
     }
 
@@ -1191,6 +1203,7 @@ impl LocalClusterRuntimeState {
         }
         let work = state.work_queue.pop_front()?;
         state.queued.remove(&work);
+        Self::emit_shard_repair_queue_event(&state, Some(work.request.data_pg_id), "dequeued");
         Some(work)
     }
 
@@ -1258,6 +1271,21 @@ impl LocalClusterRuntimeState {
                 object_payload_depth: state.queued_objects.len(),
                 object_payload_outstanding_depth: state.outstanding_objects.len(),
                 bucket_delete_depth: state.queued_bucket_deletes.len(),
+            },
+        );
+    }
+
+    fn emit_shard_repair_queue_event(
+        state: &LocalPlacedSegmentShardRepairQueueState,
+        pg_id: Option<u32>,
+        event: &'static str,
+    ) {
+        let _ = observability::emit_shard_repair_event(
+            "storage",
+            observability::ShardRepairEventSummary {
+                pg_id,
+                event,
+                queue_depth: Some(state.work_queue.len()),
             },
         );
     }

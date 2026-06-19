@@ -134,6 +134,8 @@ static BUCKET_DELETE_FINALIZE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RECLAIM_WORK_QUEUE_ACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_REPAIR_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static SHARD_REPAIR_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
     OnceLock::new();
 static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
@@ -159,6 +161,8 @@ static OBJECT_PAYLOAD_RECLAIM_EVENT_DIMENSIONS: OnceLock<
 static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_DIMENSIONS: OnceLock<
     Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>>,
 > = OnceLock::new();
+static SHARD_REPAIR_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardRepairEventDimensionCounter>>> =
+    OnceLock::new();
 static STREAM_UPLOAD_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SESSION_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SESSION_ABORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -238,6 +242,13 @@ pub struct ObjectPayloadReclaimEventDimensionSample {
     pub count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardRepairEventDimensionSample {
+    pub pg_id: Option<u32>,
+    pub event: &'static str,
+    pub count: u64,
+}
+
 struct MetadataCommandDimensionCounter {
     pg_id: u32,
     classifier: &'static str,
@@ -272,6 +283,12 @@ struct ReclaimQueueDimensionCounter {
 
 struct ObjectPayloadReclaimEventDimensionCounter {
     pg_id: u32,
+    event: &'static str,
+    count: u64,
+}
+
+struct ShardRepairEventDimensionCounter {
+    pg_id: Option<u32>,
     event: &'static str,
     count: u64,
 }
@@ -408,6 +425,10 @@ fn object_payload_reclaim_event_dimensions(
 fn object_payload_reclaim_durable_scan_dimensions(
 ) -> &'static Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>> {
     OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn shard_repair_event_dimensions() -> &'static Mutex<Vec<ShardRepairEventDimensionCounter>> {
+    SHARD_REPAIR_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn fetch_max_atomic(counter: &AtomicU64, value: u64) {
@@ -564,6 +585,26 @@ fn increment_object_payload_reclaim_dimension(
     }
 }
 
+fn increment_shard_repair_dimension(pg_id: Option<u32>, event: &'static str) {
+    let mut counters = shard_repair_event_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters
+        .iter_mut()
+        .find(|counter| counter.pg_id == pg_id && counter.event == event)
+    {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(ShardRepairEventDimensionCounter {
+            pg_id,
+            event,
+            count: 1,
+        });
+    }
+}
+
 #[must_use]
 pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDimensionSample> {
     metadata_command_dimension_snapshot(metadata_command_conflict_dimensions())
@@ -659,6 +700,20 @@ pub fn object_payload_reclaim_durable_scan_dimension_snapshot(
         .unwrap_or_else(|err| err.into_inner())
         .iter()
         .map(|counter| ObjectPayloadReclaimEventDimensionSample {
+            pg_id: counter.pg_id,
+            event: counter.event,
+            count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn shard_repair_event_dimension_snapshot() -> Vec<ShardRepairEventDimensionSample> {
+    shard_repair_event_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| ShardRepairEventDimensionSample {
             pg_id: counter.pg_id,
             event: counter.event,
             count: counter.count,
@@ -1132,6 +1187,13 @@ pub struct ObjectPayloadReclaimEventSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardRepairEventSummary {
+    pub pg_id: Option<u32>,
+    pub event: &'static str,
+    pub queue_depth: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageRpcErrorSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
@@ -1220,6 +1282,8 @@ pub struct MetricsSnapshot {
     pub reclaim_work_queue_action_total: u64,
     pub object_payload_reclaim_event_total: u64,
     pub object_payload_reclaim_durable_scan_total: u64,
+    pub shard_repair_queue_depth: u64,
+    pub shard_repair_event_total: u64,
     pub stream_upload_active_sessions: u64,
     pub stream_upload_session_created_total: u64,
     pub stream_upload_session_aborted_total: u64,
@@ -1471,6 +1535,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         object_payload_reclaim_durable_scan_total: OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL
             .load(Ordering::Relaxed),
+        shard_repair_queue_depth: SHARD_REPAIR_QUEUE_DEPTH.load(Ordering::Relaxed),
+        shard_repair_event_total: SHARD_REPAIR_EVENT_TOTAL.load(Ordering::Relaxed),
         stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
             .load(Ordering::Relaxed),
@@ -2365,6 +2431,40 @@ pub fn emit_object_payload_reclaim_durable_scan(
     )
 }
 
+pub fn emit_shard_repair_event(target: &'static str, summary: ShardRepairEventSummary) -> bool {
+    SHARD_REPAIR_EVENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if let Some(queue_depth) = summary.queue_depth {
+        SHARD_REPAIR_QUEUE_DEPTH.store(queue_depth as u64, Ordering::Relaxed);
+    }
+    increment_shard_repair_dimension(summary.pg_id, summary.event);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let pg_id = summary
+        .pg_id
+        .map(|pg_id| pg_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let detail = match summary.queue_depth {
+        Some(queue_depth) => format!(
+            "pg_id={} event={} queue_depth={}",
+            pg_id, summary.event, queue_depth
+        ),
+        None => format!("pg_id={} event={}", pg_id, summary.event),
+    };
+    record_flight_event(&context, target, "shard_repair_event", detail);
+    event_in_context(
+        &context,
+        target,
+        "shard_repair_event",
+        Some(format_args!(
+            "pg_id={} event={} queue_depth={}",
+            pg_id,
+            summary.event,
+            summary.queue_depth.unwrap_or(0)
+        )),
+    )
+}
+
 pub fn emit_storage_rpc_error(target: &'static str, summary: StorageRpcErrorSummary<'_>) -> bool {
     STORAGE_RPC_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(context) = current_context() else {
@@ -3044,6 +3144,14 @@ mod tests {
                 event: "queued",
             },
         );
+        emit_shard_repair_event(
+            "storage",
+            ShardRepairEventSummary {
+                pg_id: Some(11),
+                event: "queued",
+                queue_depth: Some(4),
+            },
+        );
         emit_storage_rpc_error(
             "storage",
             StorageRpcErrorSummary {
@@ -3300,6 +3408,16 @@ mod tests {
         assert!(object_payload_reclaim_durable_scan_dimension_snapshot()
             .iter()
             .any(|sample| sample.pg_id == 11 && sample.event == "queued" && sample.count >= 1));
+        assert_eq!(after.shard_repair_queue_depth, 4);
+        assert_eq!(
+            after.shard_repair_event_total,
+            before.shard_repair_event_total + 1
+        );
+        assert!(shard_repair_event_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(11)
+                && sample.event == "queued"
+                && sample.count >= 1));
         assert_eq!(
             after.storage_rpc_error_total,
             before.storage_rpc_error_total + 1

@@ -1131,6 +1131,8 @@ fn local_debug_metrics_body() -> String {
             "reclaim_work_queue_action_total {}\n",
             "object_payload_reclaim_event_total {}\n",
             "object_payload_reclaim_durable_scan_total {}\n",
+            "shard_repair_queue_depth {}\n",
+            "shard_repair_event_total {}\n",
             "stream_upload_active_sessions {}\n",
             "stream_upload_session_created_total {}\n",
             "stream_upload_session_aborted_total {}\n",
@@ -1195,6 +1197,8 @@ fn local_debug_metrics_body() -> String {
         snapshot.reclaim_work_queue_action_total,
         snapshot.object_payload_reclaim_event_total,
         snapshot.object_payload_reclaim_durable_scan_total,
+        snapshot.shard_repair_queue_depth,
+        snapshot.shard_repair_event_total,
         snapshot.stream_upload_active_sessions,
         snapshot.stream_upload_session_created_total,
         snapshot.stream_upload_session_aborted_total,
@@ -1302,6 +1306,15 @@ fn local_debug_metrics_body() -> String {
             body,
             "object_payload_reclaim_durable_scan_by_pg_total{{pg_id=\"{}\",outcome=\"{}\"}} {}",
             sample.pg_id, outcome, sample.count
+        );
+    }
+    for sample in observability::shard_repair_event_dimension_snapshot() {
+        let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
+        let event = debug_metric_label_value(sample.event);
+        let _ = writeln!(
+            body,
+            "shard_repair_event_by_pg_total{{pg_id=\"{}\",event=\"{}\"}} {}",
+            pg_id, event, sample.count
         );
     }
     body
@@ -4617,6 +4630,8 @@ mod tests {
         assert!(response.contains("metadata_command_backoff_total "));
         assert!(response.contains("metadata_command_backoff_us_total "));
         assert!(response.contains("metadata_command_backoff_us_max "));
+        assert!(response.contains("shard_repair_queue_depth "));
+        assert!(response.contains("shard_repair_event_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));

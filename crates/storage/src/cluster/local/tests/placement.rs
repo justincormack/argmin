@@ -2168,6 +2168,21 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
     assert_eq!(durable_repairs.len(), 1);
     assert_eq!(durable_repairs[0].work_item, work);
     assert_eq!(durable_repairs[0].observation_count, 2);
+
+    let first_scan = cluster
+        .enqueue_durable_placed_segment_shard_repair_work()
+        .unwrap();
+    assert_eq!(first_scan.scanned, 1);
+    assert_eq!(first_scan.enqueued, 1);
+    let second_scan = cluster
+        .enqueue_durable_placed_segment_shard_repair_work()
+        .unwrap();
+    assert_eq!(second_scan.scanned, 1);
+    assert_eq!(second_scan.enqueued, 0);
+    assert_eq!(
+        cluster.try_take_placed_segment_shard_repair_work(),
+        Some(work)
+    );
 }
 
 #[test]

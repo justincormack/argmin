@@ -7604,6 +7604,17 @@ Shard repair design:
   multipart parts, and completed object parts now carry a non-optional CRC64
   used by read validation, EC reconstruction, scrub findings, and durable shard
   repair scheduling.
+- Added shard-repair observability for the first worker/queue slice. The
+  in-memory hint queue now reports queue depth plus queued, deduped, queue-full,
+  and dequeued events; the repair worker reports durable-scan, claim, started,
+  resolved-clean, repaired, failed, unrecoverable, and completion events.
+  `repaired` means at least one shard was rewritten; `resolved_clean` means the
+  repair/check operation found no shard write was needed. `complete_succeeded`,
+  `complete_stale`, and `complete_failed` describe durable repair-row completion.
+  The local debug metrics endpoint exposes aggregate `shard_repair_queue_depth`
+  and `shard_repair_event_total` counters plus `shard_repair_event_by_pg_total`
+  dimensions, and `scripts/uat-s3-tests` prints per-event shard-repair counts
+  plus top families in the long-lived UAT metrics summary.
 - Remaining shard-repair queue work: decide whether completed repair
   verification should persist richer per-shard outcome telemetry. Background
   scan cursor/progress does not need to be durable; a scanner can restart from a

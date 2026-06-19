@@ -8,7 +8,7 @@ use s3_types::BucketLifecycleConfiguration;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketInfo, BucketName, EcShape, GenerationId,
     ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
-    UploadId, UploadState, VersionId,
+    StoreError, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -509,14 +509,52 @@ impl ShardRepairSweeper {
                 while !stop.load(Ordering::SeqCst) {
                     let now = Instant::now();
                     if now >= next_durable_scan_at {
-                        if let Err(error) =
-                            storage_cluster.enqueue_durable_placed_segment_shard_repair_work()
-                        {
-                            let _ = observability::event(
-                                TRACE_TARGET,
-                                "shard_repair_durable_scan_error",
-                                Some(format_args!("error={error}")),
-                            );
+                        match storage_cluster.enqueue_durable_placed_segment_shard_repair_work() {
+                            Ok(summary) if summary.scanned == 0 => {
+                                let _ = observability::emit_shard_repair_event(
+                                    TRACE_TARGET,
+                                    observability::ShardRepairEventSummary {
+                                        pg_id: None,
+                                        event: "durable_scan_empty",
+                                        queue_depth: None,
+                                    },
+                                );
+                            }
+                            Ok(summary) if summary.enqueued > 0 => {
+                                let _ = observability::emit_shard_repair_event(
+                                    TRACE_TARGET,
+                                    observability::ShardRepairEventSummary {
+                                        pg_id: None,
+                                        event: "durable_scan_queued",
+                                        queue_depth: None,
+                                    },
+                                );
+                            }
+                            Ok(_) => {
+                                let _ = observability::emit_shard_repair_event(
+                                    TRACE_TARGET,
+                                    observability::ShardRepairEventSummary {
+                                        pg_id: None,
+                                        event: "durable_scan_no_new_enqueue",
+                                        queue_depth: None,
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                let _ = observability::emit_shard_repair_event(
+                                    TRACE_TARGET,
+                                    observability::ShardRepairEventSummary {
+                                        pg_id: None,
+                                        event: "durable_scan_failed",
+                                        queue_depth: None,
+                                    },
+                                );
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "shard_repair_durable_scan_error",
+                                    Some(format_args!("error={error}")),
+                                );
+                            }
                         }
                         next_durable_scan_at = now + SHARD_REPAIR_DURABLE_SCAN_INTERVAL;
                     }
@@ -556,9 +594,37 @@ impl ShardRepairSweeper {
                         now_ms.saturating_add(SHARD_REPAIR_CLAIM_LEASE_MILLIS),
                         now_ms,
                     ) {
-                        Ok(Some(claim)) => claim,
-                        Ok(None) => continue,
+                        Ok(Some(claim)) => {
+                            let _ = observability::emit_shard_repair_event(
+                                TRACE_TARGET,
+                                observability::ShardRepairEventSummary {
+                                    pg_id: Some(work_item.request.data_pg_id),
+                                    event: "claim_started",
+                                    queue_depth: None,
+                                },
+                            );
+                            claim
+                        }
+                        Ok(None) => {
+                            let _ = observability::emit_shard_repair_event(
+                                TRACE_TARGET,
+                                observability::ShardRepairEventSummary {
+                                    pg_id: Some(work_item.request.data_pg_id),
+                                    event: "claim_empty",
+                                    queue_depth: None,
+                                },
+                            );
+                            continue;
+                        }
                         Err(error) => {
+                            let _ = observability::emit_shard_repair_event(
+                                TRACE_TARGET,
+                                observability::ShardRepairEventSummary {
+                                    pg_id: Some(work_item.request.data_pg_id),
+                                    event: "claim_failed",
+                                    queue_depth: None,
+                                },
+                            );
                             let _ = observability::event(
                                 TRACE_TARGET,
                                 "shard_repair_claim_error",
@@ -568,21 +634,84 @@ impl ShardRepairSweeper {
                         }
                     };
 
+                    let _ = observability::emit_shard_repair_event(
+                        TRACE_TARGET,
+                        observability::ShardRepairEventSummary {
+                            pg_id: Some(claim.work_item.request.data_pg_id),
+                            event: "started",
+                            queue_depth: None,
+                        },
+                    );
                     match storage_cluster
                         .repair_placed_segment_payload_shards_if_needed(claim.work_item.request)
                     {
-                        Ok(_) => {
-                            if let Err(error) =
-                                storage_cluster.complete_placed_segment_shard_repair_claim(&claim)
+                        Ok(repaired_acks) => {
+                            let event = if repaired_acks.is_empty() {
+                                "resolved_clean"
+                            } else {
+                                "repaired"
+                            };
+                            let _ = observability::emit_shard_repair_event(
+                                TRACE_TARGET,
+                                observability::ShardRepairEventSummary {
+                                    pg_id: Some(claim.work_item.request.data_pg_id),
+                                    event,
+                                    queue_depth: None,
+                                },
+                            );
+                            match storage_cluster.complete_placed_segment_shard_repair_claim(&claim)
                             {
-                                let _ = observability::event(
-                                    TRACE_TARGET,
-                                    "shard_repair_complete_error",
-                                    Some(format_args!("error={error}")),
-                                );
+                                Ok(true) => {
+                                    let _ = observability::emit_shard_repair_event(
+                                        TRACE_TARGET,
+                                        observability::ShardRepairEventSummary {
+                                            pg_id: Some(claim.work_item.request.data_pg_id),
+                                            event: "complete_succeeded",
+                                            queue_depth: None,
+                                        },
+                                    );
+                                }
+                                Ok(false) => {
+                                    let _ = observability::emit_shard_repair_event(
+                                        TRACE_TARGET,
+                                        observability::ShardRepairEventSummary {
+                                            pg_id: Some(claim.work_item.request.data_pg_id),
+                                            event: "complete_stale",
+                                            queue_depth: None,
+                                        },
+                                    );
+                                }
+                                Err(error) => {
+                                    let _ = observability::emit_shard_repair_event(
+                                        TRACE_TARGET,
+                                        observability::ShardRepairEventSummary {
+                                            pg_id: Some(claim.work_item.request.data_pg_id),
+                                            event: "complete_failed",
+                                            queue_depth: None,
+                                        },
+                                    );
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "shard_repair_complete_error",
+                                        Some(format_args!("error={error}")),
+                                    );
+                                }
                             }
                         }
                         Err(error) => {
+                            let event = if matches!(error, StoreError::NotFound) {
+                                "unrecoverable"
+                            } else {
+                                "failed"
+                            };
+                            let _ = observability::emit_shard_repair_event(
+                                TRACE_TARGET,
+                                observability::ShardRepairEventSummary {
+                                    pg_id: Some(claim.work_item.request.data_pg_id),
+                                    event,
+                                    queue_depth: None,
+                                },
+                            );
                             let next_attempt_after = Coordinator::now_millis()
                                 .saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
                             if let Err(record_error) = storage_cluster
@@ -592,6 +721,14 @@ impl ShardRepairSweeper {
                                     next_attempt_after,
                                 )
                             {
+                                let _ = observability::emit_shard_repair_event(
+                                    TRACE_TARGET,
+                                    observability::ShardRepairEventSummary {
+                                        pg_id: Some(claim.work_item.request.data_pg_id),
+                                        event: "record_error_failed",
+                                        queue_depth: None,
+                                    },
+                                );
                                 let _ = observability::event(
                                     TRACE_TARGET,
                                     "shard_repair_record_error_failed",

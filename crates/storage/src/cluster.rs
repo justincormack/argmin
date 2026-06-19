@@ -98,6 +98,12 @@ pub(super) struct RequestWorkBudget {
     pg_id: Option<PgId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DurablePlacedSegmentShardRepairEnqueueSummary {
+    pub scanned: usize,
+    pub enqueued: usize,
+}
+
 impl RequestWorkBudget {
     fn new(budget: Duration, max_attempts: Option<usize>) -> Self {
         Self {
@@ -6847,22 +6853,25 @@ impl StorageCluster {
             .wake_placed_segment_shard_repair_workers();
     }
 
-    pub fn enqueue_durable_placed_segment_shard_repair_work(&self) -> Result<usize, StoreError> {
-        let mut enqueued = 0usize;
+    pub fn enqueue_durable_placed_segment_shard_repair_work(
+        &self,
+    ) -> Result<DurablePlacedSegmentShardRepairEnqueueSummary, StoreError> {
+        let mut summary = DurablePlacedSegmentShardRepairEnqueueSummary::default();
         for route in self.local_pg_routes() {
             if route.state() != PgState::Active {
                 continue;
             }
             for repair in self.list_placed_segment_shard_repairs(route.pg_id().get())? {
+                summary.scanned += 1;
                 if self.enqueue_placed_segment_shard_repair(
                     repair.work_item.request,
                     repair.work_item.shard_index,
                 ) {
-                    enqueued += 1;
+                    summary.enqueued += 1;
                 }
             }
         }
-        Ok(enqueued)
+        Ok(summary)
     }
 
     pub fn list_placed_segment_shard_repairs(
