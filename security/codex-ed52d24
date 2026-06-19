@@ -1,0 +1,219 @@
+Stream session cleanup can be starved by cleanup admission
+Link: https://chatgpt.com/codex/cloud/security/findings/5cbcff5da48081919566e812c1d8c951?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit [`cd33dda2`](https://github.com/justincormack/argmin/commit/cd33dda2) (`Split background cleanup admission lanes`).
+
+The fix removes stream-session scavenging from the shared single-slot `DurableCleanup` admission class. Background cleanup admission is now split into separate fixed nonzero lanes: `ReclaimCleanup` for object payload reclaim and bucket-delete finalization, `LifecycleCleanup` for lifecycle sweeps, and `StreamSessionCleanup` for abandoned stream-session cleanup. `StreamSessionCleanup` has its own counter and limit, so reclaim or lifecycle work can no longer consume the only permit needed for stale stream-session scavenging.
+
+The UAT metrics summary now reports `stream_session_cleanup` independently from `reclaim_cleanup` and `lifecycle_cleanup`, so admission, denial, and finish behavior for stream-session cleanup can be observed directly.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo test -p server-core background_work`
+- `bash -n scripts/uat-s3-tests`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run`
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ed52d24
+Fixed Commit: cd33dda2
+Author: justin@specialbusservice.com
+Created: 19/06/2026, 17:33:29
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the stream-session sweeper was newly gated on the shared DurableCleanup admission class. Because the class is single-slot and shared with other cleanup loops, and because denial causes the sweep to be skipped rather than queued, abandoned stream-session cleanup can be starved.
+Before this commit, the stream-session sweeper always called scavenge_abandoned_stream_sessions on each sweep interval. The new code only runs that cleanup if it can immediately acquire BackgroundWorkClass::DurableCleanup. That class has a fixed limit of 1 and is also used by object-payload reclaim and lifecycle cleanup. The admission API is non-blocking: on limit exhaustion it returns None and the stream sweeper simply waits until the next sweep interval without queuing or otherwise ensuring eventual cleanup. A workload that keeps durable cleanup occupied can therefore indefinitely postpone cleanup of abandoned PutObject stream sessions. Those sessions are security-relevant availability state: scavenging aborts stale stream uploads and releases associated object generation reservations and staged payload shards. If cleanup is starved, abandoned streaming state can accumulate and keep disk/reservation state alive longer than intended, potentially leading to service-wide availability degradation or disk exhaustion under a malicious authorized-write workload combined with cleanup pressure.
+
+# Validation
+## Rubric
+- [x] Confirm the commit introduced a new admission gate around stream-session scavenging; HEAD^ called scavenge unconditionally while HEAD gates it at runtime.rs:1017-1030.
+- [x] Confirm DurableCleanup is single-slot and shared; runtime.rs:50-52 sets the limit to 1, and object reclaim/lifecycle use the same class at runtime.rs:369-374 and 548-552.
+- [x] Confirm admission denial is non-blocking and unqueued; runtime.rs:119-143 emits `denied_limit` and returns `None`.
+- [x] Dynamically show an abandoned stream session remains while the DurableCleanup permit is occupied and is cleaned after the permit is released using the real StreamSessionSweeper.
+- [x] Confirm by debugger that the stream-session sweeper thread reaches the DurableCleanup `denied_limit` path, proving the cleanup call is skipped during contention.
+## Report
+Validated the finding. I added a targeted PoC unit test in crates/server-core/src/coordinator/runtime.rs that uses the real StorageCluster and StreamSessionSweeper. The test creates an abandoned PutObject stream session, holds the single shared DurableCleanup admission permit for 16s, starts the real stream-session sweeper, verifies the stale session remains while the permit is held, then releases the permit and verifies a later sweep cleans it. Command output: `test coordinator::runtime::tests::stream_session_sweeper_skips_scavenge_while_durable_cleanup_slot_is_held ... ok ... finished in 16.77s`. I also ran the existing direct scavenger test: `scavenging_stale_sessions_removes_abandoned_streaming_state ... ok`, confirming the cleanup routine itself removes stale stream state when called. Debugger evidence: LLDB breakpoint at crates/server-core/src/coordinator/runtime.rs:142 stopped in `BackgroundWorkAdmission::try_acquire(self=..., class=DurableCleanup)` on the `denied_limit` path, with frame #1 at `StreamSessionSweeper::spawn` runtime.rs:1018. This proves the stream sweeper reaches the non-blocking admission denial path and therefore skips the body containing `scavenge_abandoned_stream_sessions`. Code evidence: DurableCleanup limit is 1 at runtime.rs:50-52; try_acquire returns None without queuing at runtime.rs:119-143; object payload reclaim also uses DurableCleanup at runtime.rs:369-374; lifecycle sweeping uses it at runtime.rs:548-552; the stream sweeper now only calls scavenge under the same permit at runtime.rs:1017-1030. The previous commit called `storage_cluster.scavenge_abandoned_stream_sessions(...)` unconditionally in the stream sweeper. The cleanup is availability-relevant because crates/storage/src/cluster.rs:6772-6810 aborts stale PutObject stream sessions and releases object generation reservations. Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`). A direct crash was not expected because this is a starvation/availability logic bug, not a memory-safety crash.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L1017 to 1030)
+  Note: The commit newly gates stream-session scavenging on the shared DurableCleanup permit; if acquisition fails, no scavenging is attempted during that sweep.
+```
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    {
+                        let count = storage_cluster.scavenge_abandoned_stream_sessions(
+                            super::STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS,
+                        );
+                        if count > 0 {
+                            let _ = observability::event(
+                                TRACE_TARGET,
+                                "stream_session_sweep_abandoned",
+                                Some(format_args!("aborted_sessions={count}")),
+                            );
+                        }
+                    }
+```
+
+crates/server-core/src/coordinator/runtime.rs (L119 to 143)
+  Note: Admission is a non-blocking try_acquire; if the class is at its limit it returns None and does not queue work or provide fairness.
+```
+    fn try_acquire(self: &Arc<Self>, class: BackgroundWorkClass) -> Option<BackgroundWorkPermit> {
+        let counter = self.counter_for(class);
+        let limit = self.limit_for(class);
+        let mut active = counter.load(Ordering::Acquire);
+        while active < limit {
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.emit(class, "admitted", None);
+                    return Some(BackgroundWorkPermit {
+                        admission: Arc::clone(self),
+                        class,
+                        started_at: Instant::now(),
+                        active: true,
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+        self.emit(class, "denied_limit", None);
+        None
+```
+
+crates/server-core/src/coordinator/runtime.rs (L369 to 374)
+  Note: Object payload reclaim uses the same DurableCleanup class, so a reclaim backlog can consume the only cleanup permit.
+```
+                    let Some(_cleanup_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    else {
+                        pending_work = Some(work);
+                        std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
+                        continue;
+```
+
+crates/server-core/src/coordinator/runtime.rs (L50 to 52)
+  Note: The DurableCleanup admission class has a fixed concurrency limit of one, so all durable cleanup users contend for a single slot.
+```
+const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
+const BACKGROUND_DURABLE_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
+```
+
+crates/server-core/src/coordinator/runtime.rs (L548 to 552)
+  Note: Lifecycle sweeping also uses the same DurableCleanup class, adding another source of contention for the single cleanup permit.
+```
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::DurableCleanup)
+                    {
+                        let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                    }
+```
+
+crates/storage/src/cluster.rs (L6772 to 6798)
+  Note: This scavenger is responsible for aborting stale PutObject stream sessions and releasing their object generation reservations, so starving it leaves stale availability-impacting state behind.
+```
+    pub fn scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
+        let cutoff = crate::clock::current_time_millis().saturating_sub(max_age_ms);
+        let mut count = 0;
+
+        for session in self.list_stream_upload_sessions_best_effort() {
+            if session.created_at >= cutoff {
+                continue;
+            }
+            if session.target != StreamUploadTarget::PutObject {
+                continue;
+            }
+            match self.stream_upload_has_live_bucket_write_reservation(&session) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => continue,
+            }
+            match self.abort_stream_upload_session(
+                &session.bucket,
+                &session.key,
+                &session.session_id,
+            ) {
+                Ok(()) => {
+                    let _ = self.release_object_generation_reservation(
+                        &session.bucket,
+                        &session.key,
+                        &session.session_id,
+                    );
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The bug is real and in-scope because the stream-session sweeper in production background workers now depends on a shared single-slot DurableCleanup permit, and the denial path skips scavenge_abandoned_stream_sessions without queueing. The skipped function releases availability-relevant stream upload state. However, impact is limited to availability/resource retention and requires a write-capable or public-write attacker plus cleanup pressure and abandoned sessions; strong S3 authorization remains in place and no confidentiality, integrity, RCE, or auth bypass impact is evidenced. This supports medium rather than high/critical.
+## Likelihood
+high - The affected code is reachable in the main runtime, but practical exploitation requires write authorization or public-write configuration, stale/abandoned streaming sessions despite best-effort aborts, and sustained contention for the single DurableCleanup slot. The validation PoC proves starvation at the component level, not a complete remote HTTP exploit. | Remote network vector
+## Impact
+medium - The impact is availability only: skipped cleanup can leave stale PutObject stream sessions, generation reservations, and staged payload shards, potentially consuming disk and blocking normal cleanup. There is no demonstrated data disclosure, integrity bypass, privilege escalation, or code execution.
+## Assumptions
+- The argmin-s3 frontend is deployed in a role that enables background workers, as the main binary does for legacy-local and remote/combined frontend modes.
+- The attacker has S3 write permission to at least one bucket, or the target bucket is intentionally public-write.
+- The attacker can create or contribute to stale streaming PutObject sessions and concurrent durable cleanup pressure; static review cannot prove how often best-effort aborts fail in production.
+- No Kubernetes, load balancer, Terraform, or container deployment manifest was found in the repository, so public exposure depends on ARGMIN_LISTEN_ADDR and operator deployment.
+- reachable HTTP S3 frontend
+- authenticated PutObject/write capability or public-write bucket
+- streaming PutObject sessions large enough to promote to stream-session state
+- abandoned/stale sessions, such as interrupted uploads or cleanup failures
+- sustained DurableCleanup contention from object-payload reclaim or lifecycle work
+## Path
+Remote write client
+  -> HTTP PUT Object / POST-style streaming path
+  -> authorized streaming PutObject session
+  -> abandoned/stale session state
+  + concurrent reclaim/lifecycle cleanup pressure
+  -> DurableCleanup single-slot admission denied
+  -> stream-session scavenger skipped
+  -> retained reservations/shards
+  -> service availability/storage pressure
+## Path evidence
+- `crates/argmin-s3/src/main.rs:888-958` - The main argmin-s3 binary binds a TcpListener on the configured listen address and serves HTTP/TLS S3 traffic.
+- `crates/argmin-s3/src/config.rs:101-106` - Frontend credentials and listen address are environment-configured; default listen address is 127.0.0.1:9000, with optional TLS paths.
+- `crates/argmin-s3/src/main.rs:119-127` - Configured credentials are loaded into an in-memory credential store with OwnerAccountAdmin authorization for the primary configured access key.
+- `crates/argmin-s3/src/main.rs:732-752` - The main product enables all/remote background worker modes for local and remote frontend runs, so the affected stream-session sweeper is production runtime code.
+- `crates/server-http/src/http/serve.rs:830-865` - PUT Object requests are routed into the streaming write handler, making stream-session creation reachable from the HTTP S3 surface.
+- `crates/server-http/src/http/mod.rs:3083-3124` - HTTP requests are SigV4-authenticated when credentials are provided; missing auth becomes anonymous and later authorization decides access.
+- `crates/server-http/src/http/mod.rs:3894-3944` - Streaming PutObject preparation parses bucket/key, derives requester identity, and calls coordinator authorization before writing.
+- `crates/server-http/src/http/mod.rs:3970-3981` - The streaming PutObject path can begin a stream session through the coordinator once promoted.
+- `crates/storage/src/cluster.rs:5810-5845` - Creating a PutObject stream session acquires a durable write reservation.
+- `crates/storage/src/cluster.rs:5888-5908` - Stream session creation reserves an object generation, confirming stale sessions hold availability-relevant state.
+- `crates/server-core/src/coordinator/runtime.rs:50-52` - Background DurableCleanup has a fixed concurrency limit of one.
+- `crates/server-core/src/coordinator/runtime.rs:119-143` - Background admission uses a non-blocking try_acquire and returns None without queueing or fairness on limit exhaustion.
+- `crates/server-core/src/coordinator/runtime.rs:369-374` - Object-payload reclaim consumes the same DurableCleanup class, creating contention with stream-session cleanup.
+- `crates/server-core/src/coordinator/runtime.rs:548-552` - Lifecycle sweeping also consumes the same DurableCleanup class.
+- `crates/server-core/src/coordinator/runtime.rs:1017-1030` - The committed change gates stream-session scavenging on DurableCleanup; if admission is denied, no scavenging occurs in that sweep.
+- `crates/server-core/src/coordinator/runtime.rs:1040-1043` - After a skipped sweep, the worker waits until the next stream-session sweep interval instead of queueing immediate cleanup.
+- `crates/storage/src/cluster.rs:6772-6812` - The skipped scavenger aborts stale PutObject stream upload sessions and releases their object generation reservations.
+- `crates/server-core/src/coordinator/delete.rs:73-82` - Authorized object deletion enqueues object-payload reclaim work, giving a write-capable client a plausible way to create DurableCleanup pressure.
+- `crates/server-http/src/http/serve.rs:245-255` - ServeConfig includes timeouts as partial DoS controls but does not provide per-principal cleanup fairness or quotas.
+## Narrative
+The finding is a real in-scope availability bug. The commit changed the stream-session sweeper so it only calls scavenge_abandoned_stream_sessions after acquiring BackgroundWorkClass::DurableCleanup. That class has a hardcoded limit of one and is also used by object-payload reclaim and lifecycle sweeping. The admission API is non-blocking and returns None without queueing; when that occurs, the stream sweeper simply waits for the next 10 second interval. The scavenger it skips is responsible for aborting stale PutObject stream sessions and releasing their object generation reservations. Network reachability exists through the argmin-s3 HTTP S3 frontend and streaming PutObject path, but exploitation requires write authorization or a public-write bucket, creation of stale streaming state, and durable cleanup pressure. The validation evidence demonstrates the starvation behavior with the real sweeper/storage components, but not via a full remote HTTP exploit. Therefore medium availability severity is appropriate, with low-to-medium practical likelihood and no evidence of confidentiality, integrity, RCE, or authentication bypass impact.
+## Controls
+- SigV4 authentication and credential store
+- bucket/object authorization including ACLs, bucket policy, public access block, and expected owner checks
+- optional TLS when ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are configured
+- default listen address is loopback 127.0.0.1:9000 unless operator changes ARGMIN_LISTEN_ADDR
+- connection semaphore max_connections and request semaphore max_inflight_requests
+- header and body idle timeouts
+- streaming checksums/content hash validation
+- best-effort abort guard for normal streaming PUT failures
+- local debug endpoint is disabled by default and restricted to loopback when enabled
+## Blindspots
+- Static-only review did not run a full remote HTTP exploit; validation evidence was a targeted component/unit test using real StorageCluster and sweeper logic.
+- No deployment manifests or load balancer/IaC files were present, so internet exposure cannot be confirmed from the repository.
+- Repository review cannot quantify production frequency of abandoned sessions because normal streaming paths attempt best-effort abort cleanup.
+- No per-tenant quota or operational disk sizing data was available to calculate time-to-exhaustion.
+- The analysis did not inspect external reverse proxy/TLS/rate-limit controls because they are outside repository artifacts.
