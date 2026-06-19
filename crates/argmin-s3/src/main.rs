@@ -1502,24 +1502,26 @@ mod tests {
             maybe_spawn_frontend_control_plane_refresh_loop(handle.clone(), &config).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            if handle
-                .current()
-                .local_pg_route(storage::PgId::new(0))
-                .unwrap()
-                .state()
-                == PgState::Active
-            {
+            let status = refresh_loop.status();
+            if status.successes > 0 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "frontend refresh loop did not install active runtime map: {:?}",
-                refresh_loop.status()
+                status
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        assert!(refresh_loop.status().successes > 0);
+        assert_eq!(
+            handle
+                .current()
+                .local_pg_route(storage::PgId::new(0))
+                .unwrap()
+                .state(),
+            PgState::Active
+        );
         refresh_loop.stop();
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
