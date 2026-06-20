@@ -374,13 +374,13 @@ const STORAGE_RPC_MAX_MULTIPART_ABORT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
-    4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
+    4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 8 + 2 + 4 + 1;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
-    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1;
+    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 8 + 2 + 8 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
     4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
@@ -12972,6 +12972,7 @@ impl<'a> StorageRpcDecoder<'a> {
             )?,
             part_okh: self.read_fixed_16_bytes("multipart part OKH")?,
             part_vid: self.read_generation_id()?,
+            placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
             last_modified: self.read_u64()?,
@@ -13159,6 +13160,7 @@ impl<'a> StorageRpcDecoder<'a> {
             )?,
             part_okh: self.read_fixed_16_bytes("object part OKH")?,
             part_vid: self.read_generation_id()?,
+            placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
             data_pg_id: self.read_u32()?,
@@ -14835,6 +14837,7 @@ fn put_multipart_part_record(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
+    put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
     put_u8(out, part.ec_m);
     put_u64(out, part.last_modified);
@@ -15107,6 +15110,7 @@ fn put_object_part_record(out: &mut Vec<u8>, part: &ObjectPartRecord) {
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
+    put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
     put_u8(out, part.ec_m);
     put_u32(out, part.data_pg_id);
@@ -15659,7 +15663,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_record_count_guards_include_placement_epoch() {
+    fn payload_record_count_guards_include_placement_epoch() {
         for (min_record_len, old_record_len, message) in [
             (
                 STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN,
@@ -15667,9 +15671,19 @@ mod tests {
                 "object segment count exceeds payload",
             ),
             (
+                STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN,
+                4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1,
+                "object part count exceeds payload",
+            ),
+            (
                 STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN,
                 4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 2,
                 "stream upload segment count exceeds payload",
+            ),
+            (
+                STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN,
+                4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1,
+                "multipart part count exceeds payload",
             ),
             (
                 STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
@@ -18847,6 +18861,7 @@ mod tests {
             etag_kind: EtagKind::MultipartComposite,
             part_okh: [3; 16],
             part_vid: GenerationId::new(11).unwrap(),
+            placement_cluster_epoch: ClusterEpoch::new(10).unwrap(),
             ec_k: 4,
             ec_m: 2,
             data_pg_id: 5,

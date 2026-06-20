@@ -3060,8 +3060,8 @@ fn metadata_state_digest_covers_multipart_upload_and_part_state() {
                 .execute(
                     "INSERT INTO multipart_parts \
                      (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, part_okh, \
-                      part_vid, ec_k, ec_m, last_modified, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                      part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         upload_id.as_str(),
                         1_i64,
@@ -3071,6 +3071,7 @@ fn metadata_state_digest_covers_multipart_upload_and_part_state() {
                         b"etag".as_slice(),
                         EtagKind::Crc64 as u8,
                         okh.as_slice(),
+                        1_i64,
                         1_i64,
                         4_i64,
                         2_i64,

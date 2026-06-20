@@ -1214,6 +1214,11 @@ impl Coordinator {
                         part_okh: [0u8; 16],
                         part_vid: GenerationId::new(u64::from(generation) + 1)
                             .expect("multipart part generation must be nonzero"),
+                        placement_cluster_epoch: staging_segments
+                            .first()
+                            .map_or(storage_node.operation_epoch(), |segment| {
+                                segment.placement_cluster_epoch
+                            }),
                         ec_k: ec.k,
                         ec_m: ec.m,
                         last_modified: now,

@@ -2142,6 +2142,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_valid_u8("etag kind", 0..=1)?;
         self.read_bytes()?;
         self.read_nonzero_u64("object part VID")?;
+        self.read_cluster_epoch("object part placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
         self.read_u32()?;
@@ -2161,6 +2162,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .ok_or_else(|| "invalid etag kind".to_string())?,
             part_okh: self.read_fixed_bytes("object part OKH")?,
             part_vid: self.read_generation_id("object part VID")?,
+            placement_cluster_epoch: self.read_cluster_epoch("object part placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
             data_pg_id: self.read_u32()?,
@@ -2178,6 +2180,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_valid_u8("etag kind", 0..=1)?;
         self.read_bytes()?;
         self.read_nonzero_u64("multipart part VID")?;
+        self.read_cluster_epoch("multipart part placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
         self.read_u64()?;
@@ -2196,6 +2199,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .ok_or_else(|| "invalid etag kind".to_string())?,
             part_okh: self.read_fixed_bytes("multipart part OKH")?,
             part_vid: self.read_generation_id("multipart part VID")?,
+            placement_cluster_epoch: self.read_cluster_epoch("multipart part placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
             last_modified: self.read_u64()?,
@@ -3504,6 +3508,7 @@ fn encode_object_part(out: &mut Vec<u8>, part: &ObjectPartRecord) {
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
+    put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
     put_u8(out, part.ec_m);
     put_u32(out, part.data_pg_id);
@@ -3523,6 +3528,7 @@ fn encode_multipart_part(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     put_u8(out, part.etag_kind as u8);
     put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
+    put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
     put_u8(out, part.ec_m);
     put_u64(out, part.last_modified);
@@ -4801,6 +4807,7 @@ mod tests {
             etag_kind: crate::types::EtagKind::Crc64,
             part_okh: [0; 16],
             part_vid: generation_id,
+            placement_cluster_epoch: ClusterEpoch::new(10).unwrap(),
             ec_k: 2,
             ec_m: 1,
             data_pg_id: 2,
@@ -4850,6 +4857,7 @@ mod tests {
             etag_kind: crate::types::EtagKind::Crc64,
             part_okh: [0; 16],
             part_vid: generation_id,
+            placement_cluster_epoch: ClusterEpoch::new(11).unwrap(),
             ec_k: 2,
             ec_m: 1,
             last_modified: 444,
@@ -5306,7 +5314,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0x5531f7e6bf78ef78,
                 0x9b5a7f09485bffb3,
-                0x035d73a1a4da061f,
+                0x442711a79ce0147f,
                 0x903cf2da427ff645,
                 0x22e816661cec7274,
                 0xe7353d51b6609ac8,
@@ -5319,13 +5327,13 @@ mod tests {
                 0x48fb53d34217c071,
                 0x60d07b32ba40633a,
                 0x5905759308d55e48,
-                0x8940e203e3a025ce,
+                0x45131b8e7ccaf13a,
                 0x2d6608601fded1d8,
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,
                 0x506bcf86cc513234,
                 0xad26c80659b2eba1,
-                0x9d7ca8b27a004b60,
+                0x5d116b5e94f140e9,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,
                 0xba43f79ea2af20cb,

@@ -2523,8 +2523,8 @@ mod tests {
             .execute(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, \
-                  etag, etag_kind, part_okh, part_vid, ec_k, ec_m, data_pg_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  etag, etag_kind, part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     "bucket",
                     "object",
@@ -2537,6 +2537,7 @@ mod tests {
                     0i64,
                     [0x11u8; 16].as_slice(),
                     9i64,
+                    1i64,
                     4i64,
                     2i64,
                     7i64,
@@ -2573,8 +2574,8 @@ mod tests {
             .execute(
                 "INSERT INTO multipart_parts \
                  (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, last_modified) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     "u".repeat(128),
                     2i64,
@@ -2585,6 +2586,7 @@ mod tests {
                     0i64,
                     [0x22u8; 16].as_slice(),
                     10i64,
+                    1i64,
                     4i64,
                     2i64,
                     11i64,

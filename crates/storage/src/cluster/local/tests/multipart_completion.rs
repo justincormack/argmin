@@ -1274,6 +1274,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
                 part_vid: crate::GenerationId::new(u64::from(generation) + 1).unwrap(),
+                placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,
                 ec_m: segment.ec_m,
                 last_modified: 123_456,

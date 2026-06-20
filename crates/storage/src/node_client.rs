@@ -316,6 +316,7 @@ pub(crate) fn complete_multipart_expected_object_parts(
             etag_kind: part.etag_kind,
             part_okh: part.part_okh,
             part_vid: part.part_vid,
+            placement_cluster_epoch: part.placement_cluster_epoch,
             ec_k: part.ec_k,
             ec_m: part.ec_m,
             data_pg_id: topology

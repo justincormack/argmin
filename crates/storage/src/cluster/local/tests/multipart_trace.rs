@@ -436,6 +436,12 @@ fn upload_copied_test_multipart_part(
                     etag_kind: crate::EtagKind::Crc64,
                     part_okh: [0u8; 16],
                     part_vid: crate::GenerationId::new(u64::from(generation) + 1).unwrap(),
+                    placement_cluster_epoch: snapshot
+                        .staging_segments
+                        .first()
+                        .map_or(crate::ClusterEpoch::INITIAL, |segment| {
+                            segment.placement_cluster_epoch
+                        }),
                     ec_k: ec.k,
                     ec_m: ec.m,
                     last_modified: 123,

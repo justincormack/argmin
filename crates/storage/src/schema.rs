@@ -248,6 +248,7 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
     part_okh         BLOB NOT NULL,
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
     last_modified    INTEGER NOT NULL,
@@ -269,6 +270,7 @@ CREATE TABLE IF NOT EXISTS object_parts (
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
     part_okh         BLOB NOT NULL,
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
     data_pg_id      INTEGER NOT NULL,
@@ -970,6 +972,8 @@ fn migrate_segment_placement_epoch_columns(conn: &Connection) -> Result<(), rusq
         "ALTER TABLE stream_upload_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE object_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE multipart_part_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE multipart_parts ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE object_parts ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
     ];
     for sql in &migrations {
         match conn.execute(sql, []) {

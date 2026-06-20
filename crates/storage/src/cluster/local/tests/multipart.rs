@@ -2032,6 +2032,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 etag_kind: crate::EtagKind::Crc64,
                 part_okh: [0u8; 16],
                 part_vid: crate::GenerationId::MIN,
+                placement_cluster_epoch: staging_segments[0].placement_cluster_epoch,
                 ec_k: staging_segments[0].ec_k,
                 ec_m: staging_segments[0].ec_m,
                 last_modified: 123_456,

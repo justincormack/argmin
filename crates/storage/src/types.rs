@@ -3348,6 +3348,8 @@ pub struct MultipartPartRecord {
     pub part_okh: [u8; 16],
     /// Per-part payload generation for shard keys.
     pub part_vid: GenerationId,
+    /// Cluster-map epoch used when this direct part shard set was written.
+    pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
     /// Last modified timestamp (unix milliseconds).
@@ -3437,6 +3439,7 @@ pub struct ObjectPartRecord {
     pub etag_kind: EtagKind,
     pub part_okh: [u8; 16],
     pub part_vid: GenerationId,
+    pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
     /// PG where this part's shards are stored.
