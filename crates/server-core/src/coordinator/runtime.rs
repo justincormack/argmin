@@ -832,6 +832,7 @@ impl ShardRepairSweeper {
                                         pg_id: None,
                                         event: "durable_scan_empty",
                                         queue_depth: None,
+                                        shards_rewritten: None,
                                     },
                                 );
                             }
@@ -842,6 +843,7 @@ impl ShardRepairSweeper {
                                         pg_id: None,
                                         event: "durable_scan_queued",
                                         queue_depth: None,
+                                        shards_rewritten: None,
                                     },
                                 );
                             }
@@ -852,6 +854,7 @@ impl ShardRepairSweeper {
                                         pg_id: None,
                                         event: "durable_scan_no_new_enqueue",
                                         queue_depth: None,
+                                        shards_rewritten: None,
                                     },
                                 );
                             }
@@ -862,6 +865,7 @@ impl ShardRepairSweeper {
                                         pg_id: None,
                                         event: "durable_scan_failed",
                                         queue_depth: None,
+                                        shards_rewritten: None,
                                     },
                                 );
                                 let _ = observability::event(
@@ -916,6 +920,7 @@ impl ShardRepairSweeper {
                                     pg_id: Some(work_item.request.data_pg_id),
                                     event: "claim_started",
                                     queue_depth: None,
+                                    shards_rewritten: None,
                                 },
                             );
                             claim
@@ -927,6 +932,7 @@ impl ShardRepairSweeper {
                                     pg_id: Some(work_item.request.data_pg_id),
                                     event: "claim_empty",
                                     queue_depth: None,
+                                    shards_rewritten: None,
                                 },
                             );
                             continue;
@@ -938,6 +944,7 @@ impl ShardRepairSweeper {
                                     pg_id: Some(work_item.request.data_pg_id),
                                     event: "claim_failed",
                                     queue_depth: None,
+                                    shards_rewritten: None,
                                 },
                             );
                             let _ = observability::event(
@@ -958,6 +965,7 @@ impl ShardRepairSweeper {
                                 pg_id: Some(claim.work_item.request.data_pg_id),
                                 event: "admission_denied",
                                 queue_depth: None,
+                                shards_rewritten: None,
                             },
                         );
                         let next_attempt_after = Coordinator::now_millis()
@@ -975,6 +983,7 @@ impl ShardRepairSweeper {
                                     pg_id: Some(claim.work_item.request.data_pg_id),
                                     event: "record_error_failed",
                                     queue_depth: None,
+                                    shards_rewritten: None,
                                 },
                             );
                             let _ = observability::event(
@@ -992,6 +1001,7 @@ impl ShardRepairSweeper {
                             pg_id: Some(claim.work_item.request.data_pg_id),
                             event: "started",
                             queue_depth: None,
+                            shards_rewritten: None,
                         },
                     );
                     match storage_cluster
@@ -1009,6 +1019,7 @@ impl ShardRepairSweeper {
                                     pg_id: Some(claim.work_item.request.data_pg_id),
                                     event,
                                     queue_depth: None,
+                                    shards_rewritten: Some(repaired_acks.len()),
                                 },
                             );
                             match storage_cluster.complete_placed_segment_shard_repair_claim(&claim)
@@ -1020,6 +1031,7 @@ impl ShardRepairSweeper {
                                             pg_id: Some(claim.work_item.request.data_pg_id),
                                             event: "complete_succeeded",
                                             queue_depth: None,
+                                            shards_rewritten: None,
                                         },
                                     );
                                 }
@@ -1030,6 +1042,7 @@ impl ShardRepairSweeper {
                                             pg_id: Some(claim.work_item.request.data_pg_id),
                                             event: "complete_stale",
                                             queue_depth: None,
+                                            shards_rewritten: None,
                                         },
                                     );
                                 }
@@ -1040,6 +1053,7 @@ impl ShardRepairSweeper {
                                             pg_id: Some(claim.work_item.request.data_pg_id),
                                             event: "complete_failed",
                                             queue_depth: None,
+                                            shards_rewritten: None,
                                         },
                                     );
                                     let _ = observability::event(
@@ -1062,6 +1076,7 @@ impl ShardRepairSweeper {
                                     pg_id: Some(claim.work_item.request.data_pg_id),
                                     event,
                                     queue_depth: None,
+                                    shards_rewritten: None,
                                 },
                             );
                             let next_attempt_after = Coordinator::now_millis()
@@ -1079,6 +1094,7 @@ impl ShardRepairSweeper {
                                         pg_id: Some(claim.work_item.request.data_pg_id),
                                         event: "record_error_failed",
                                         queue_depth: None,
+                                        shards_rewritten: None,
                                     },
                                 );
                                 let _ = observability::event(

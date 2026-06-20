@@ -7680,9 +7680,12 @@ Shard repair design:
   enough progress during quiet windows. Later backfill/migration/scanner output
   should enter through the same classes rather than adding separate
   uncoordinated loops.
-- Remaining shard-repair queue work: decide whether completed repair
-  verification should persist richer per-shard outcome telemetry. Background
-  scan cursor/progress does not need to be durable; a scanner can restart from a
+- Added completed-repair outcome telemetry for shard repair. The worker now
+  reports the number of shards actually rewritten on `repaired` and
+  `resolved_clean` events, the local debug metrics endpoint exposes
+  `shard_repair_shards_rewritten_total`, and the long-lived UAT summary prints
+  that counter separately from generic repair event totals. Background scan
+  cursor/progress does not need to be durable; a scanner can restart from a
   random or rotating point because any actual damaged shard it finds is recorded
   in the durable repair queue.
 

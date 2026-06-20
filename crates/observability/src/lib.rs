@@ -136,6 +136,7 @@ static OBJECT_PAYLOAD_RECLAIM_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1262,6 +1263,7 @@ pub struct ShardRepairEventSummary {
     pub pg_id: Option<u32>,
     pub event: &'static str,
     pub queue_depth: Option<usize>,
+    pub shards_rewritten: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1363,6 +1365,7 @@ pub struct MetricsSnapshot {
     pub object_payload_reclaim_durable_scan_total: u64,
     pub shard_repair_queue_depth: u64,
     pub shard_repair_event_total: u64,
+    pub shard_repair_shards_rewritten_total: u64,
     pub background_work_admission_event_total: u64,
     pub background_work_active_total: u64,
     pub background_work_finished_total: u64,
@@ -1620,6 +1623,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         shard_repair_queue_depth: SHARD_REPAIR_QUEUE_DEPTH.load(Ordering::Relaxed),
         shard_repair_event_total: SHARD_REPAIR_EVENT_TOTAL.load(Ordering::Relaxed),
+        shard_repair_shards_rewritten_total: SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL
+            .load(Ordering::Relaxed),
         background_work_admission_event_total: BACKGROUND_WORK_ADMISSION_EVENT_TOTAL
             .load(Ordering::Relaxed),
         background_work_active_total: BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed),
@@ -2524,6 +2529,9 @@ pub fn emit_shard_repair_event(target: &'static str, summary: ShardRepairEventSu
     if let Some(queue_depth) = summary.queue_depth {
         SHARD_REPAIR_QUEUE_DEPTH.store(queue_depth as u64, Ordering::Relaxed);
     }
+    if let Some(shards_rewritten) = summary.shards_rewritten {
+        SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL.fetch_add(shards_rewritten as u64, Ordering::Relaxed);
+    }
     increment_shard_repair_dimension(summary.pg_id, summary.event);
     let Some(context) = current_context() else {
         return false;
@@ -2532,24 +2540,19 @@ pub fn emit_shard_repair_event(target: &'static str, summary: ShardRepairEventSu
         .pg_id
         .map(|pg_id| pg_id.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let detail = match summary.queue_depth {
-        Some(queue_depth) => format!(
-            "pg_id={} event={} queue_depth={}",
-            pg_id, summary.event, queue_depth
-        ),
-        None => format!("pg_id={} event={}", pg_id, summary.event),
-    };
-    record_flight_event(&context, target, "shard_repair_event", detail);
+    let mut detail = format!("pg_id={} event={}", pg_id, summary.event);
+    if let Some(queue_depth) = summary.queue_depth {
+        detail.push_str(&format!(" queue_depth={queue_depth}"));
+    }
+    if let Some(shards_rewritten) = summary.shards_rewritten {
+        detail.push_str(&format!(" shards_rewritten={shards_rewritten}"));
+    }
+    record_flight_event(&context, target, "shard_repair_event", detail.clone());
     event_in_context(
         &context,
         target,
         "shard_repair_event",
-        Some(format_args!(
-            "pg_id={} event={} queue_depth={}",
-            pg_id,
-            summary.event,
-            summary.queue_depth.unwrap_or(0)
-        )),
+        Some(format_args!("{detail}")),
     )
 }
 
@@ -3288,6 +3291,16 @@ mod tests {
                 pg_id: Some(11),
                 event: "queued",
                 queue_depth: Some(4),
+                shards_rewritten: None,
+            },
+        );
+        emit_shard_repair_event(
+            "storage",
+            ShardRepairEventSummary {
+                pg_id: Some(11),
+                event: "repaired",
+                queue_depth: None,
+                shards_rewritten: Some(2),
             },
         );
         emit_background_work_admission_event(
@@ -3567,12 +3580,21 @@ mod tests {
         assert_eq!(after.shard_repair_queue_depth, 4);
         assert_eq!(
             after.shard_repair_event_total,
-            before.shard_repair_event_total + 1
+            before.shard_repair_event_total + 2
+        );
+        assert_eq!(
+            after.shard_repair_shards_rewritten_total,
+            before.shard_repair_shards_rewritten_total + 2
         );
         assert!(shard_repair_event_dimension_snapshot()
             .iter()
             .any(|sample| sample.pg_id == Some(11)
                 && sample.event == "queued"
+                && sample.count >= 1));
+        assert!(shard_repair_event_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(11)
+                && sample.event == "repaired"
                 && sample.count >= 1));
         assert_eq!(
             after.background_work_admission_event_total,

@@ -1286,6 +1286,7 @@ impl LocalClusterRuntimeState {
                 pg_id,
                 event,
                 queue_depth: Some(state.work_queue.len()),
+                shards_rewritten: None,
             },
         );
     }

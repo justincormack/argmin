@@ -1078,6 +1078,7 @@ fn local_debug_metrics_body() -> String {
             "object_payload_reclaim_durable_scan_total {}\n",
             "shard_repair_queue_depth {}\n",
             "shard_repair_event_total {}\n",
+            "shard_repair_shards_rewritten_total {}\n",
             "background_work_admission_event_total {}\n",
             "background_work_active_total {}\n",
             "background_work_finished_total {}\n",
@@ -1148,6 +1149,7 @@ fn local_debug_metrics_body() -> String {
         snapshot.object_payload_reclaim_durable_scan_total,
         snapshot.shard_repair_queue_depth,
         snapshot.shard_repair_event_total,
+        snapshot.shard_repair_shards_rewritten_total,
         snapshot.background_work_admission_event_total,
         snapshot.background_work_active_total,
         snapshot.background_work_finished_total,
@@ -4600,6 +4602,7 @@ mod tests {
         assert!(response.contains("metadata_command_backoff_us_max "));
         assert!(response.contains("shard_repair_queue_depth "));
         assert!(response.contains("shard_repair_event_total "));
+        assert!(response.contains("shard_repair_shards_rewritten_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));
