@@ -1005,8 +1005,9 @@ impl ShardRepairSweeper {
                         },
                     );
                     match storage_cluster
-                        .repair_placed_segment_payload_shards_if_needed(claim.work_item.request)
-                    {
+                        .repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(
+                            claim.work_item.request,
+                        ) {
                         Ok(repaired_acks) => {
                             let event = if repaired_acks.is_empty() {
                                 "resolved_clean"

@@ -634,6 +634,12 @@ impl LocalShardNodeClient<'_> {
             .map_err(|source| self.store_error(source))
     }
 
+    fn repair_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, ShardIoError> {
+        self.client
+            .repair_placed_shard(self.data_pg_id, key, data)
+            .map_err(|source| self.store_error(source))
+    }
+
     fn read_shard(&self, key: &ShardKey, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
         let mut read_handle = self.acquire_read_handle(key)?;
         let data_result = self
@@ -3089,6 +3095,17 @@ impl LocalClusterMap {
     ) -> Result<WriteAck, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
             .write_shard(key, data)
+    }
+
+    pub fn repair_payload_shard(
+        &self,
+        operation_epoch: ClusterEpoch,
+        location: ShardLocation,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        self.shard_node_client(operation_epoch, location, key)?
+            .repair_shard(key, data)
     }
 
     pub(crate) fn read_payload_shard(

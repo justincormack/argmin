@@ -40,6 +40,15 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
         })
     }
 
+    fn repair_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        self.write_placed_shard(data_pg_id, key, data)
+    }
+
     fn read_placed_shard(
         &self,
         _data_pg_id: DataPgId,

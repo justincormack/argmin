@@ -7,7 +7,31 @@ impl UnixStorageNodeClient {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
-        let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ShardWrite)?;
+        self.write_placed_shard_with_kind(StorageRpcMessageKind::ShardWrite, data_pg_id, key, data)
+    }
+
+    pub(crate) fn repair_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        self.write_placed_shard_with_kind(
+            StorageRpcMessageKind::ShardRepairWrite,
+            data_pg_id,
+            key,
+            data,
+        )
+    }
+
+    fn write_placed_shard_with_kind(
+        &self,
+        kind: StorageRpcMessageKind,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        let rpc_permit = self.acquire_rpc_admission(kind)?;
         let expected_size = data.len() as u64;
         let expected_crc64 = checksum::crc64::checksum(data);
         let request = StorageRpcShardWriteRequest {
@@ -20,8 +44,7 @@ impl UnixStorageNodeClient {
         let payload = encode_shard_write_request(&request).map_err(|error| {
             self.rpc_payload_error("encode shard write request", error.to_string())
         })?;
-        let response =
-            self.rpc_request_with_permit(StorageRpcMessageKind::ShardWrite, payload, rpc_permit)?;
+        let response = self.rpc_request_with_permit(kind, payload, rpc_permit)?;
         decode_shard_write_ack(&response, expected_size, expected_crc64).map_err(|error| {
             self.rpc_payload_error("decode shard write response", error.to_string())
         })
@@ -522,6 +545,15 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
         UnixStorageNodeClient::write_placed_shard(self, data_pg_id, key, data)
+    }
+
+    fn repair_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::repair_placed_shard(self, data_pg_id, key, data)
     }
 
     fn read_placed_shard(

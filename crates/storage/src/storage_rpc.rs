@@ -608,6 +608,7 @@ pub(crate) enum StorageRpcMessageKind {
     PlacedSegmentShardRepairClaimAcquire = 131,
     PlacedSegmentShardRepairClaimComplete = 132,
     PlacedSegmentShardRepairClaimError = 133,
+    ShardRepairWrite = 134,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +664,7 @@ impl StorageRpcMessageKind {
             Self::Health => "health",
             Self::MetadataCommand => "metadata command",
             Self::ShardWrite => "shard write",
+            Self::ShardRepairWrite => "shard repair write",
             Self::ShardRead => "shard read",
             Self::ShardReadRange => "shard read range",
             Self::ShardDelete => "shard delete",
@@ -955,6 +957,7 @@ impl StorageRpcMessageKind {
             131 => Ok(Self::PlacedSegmentShardRepairClaimAcquire),
             132 => Ok(Self::PlacedSegmentShardRepairClaimComplete),
             133 => Ok(Self::PlacedSegmentShardRepairClaimError),
+            134 => Ok(Self::ShardRepairWrite),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -3066,7 +3069,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::MetadataCommand => {
             STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::ShardWrite => STORAGE_RPC_MAX_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardWrite | StorageRpcMessageKind::ShardRepairWrite => {
+            STORAGE_RPC_MAX_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN
         }

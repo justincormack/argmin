@@ -443,6 +443,7 @@ pub(crate) fn storage_rpc_admission_class(
         }
 
         StorageRpcMessageKind::ShardWrite
+        | StorageRpcMessageKind::ShardRepairWrite
         | StorageRpcMessageKind::ShardAckRecord
         | StorageRpcMessageKind::ShardAckValidate
         | StorageRpcMessageKind::ShardAckLoad

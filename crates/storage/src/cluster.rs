@@ -3262,6 +3262,16 @@ impl StorageCluster {
             .write_payload_shard(self.operation_epoch(), location, key, data)
     }
 
+    pub(crate) fn repair_payload_shard(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        self.local_map
+            .repair_payload_shard(self.operation_epoch(), location, key, data)
+    }
+
     pub(crate) fn read_payload_shard(
         &self,
         location: ShardLocation,
@@ -7024,13 +7034,30 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
         let repair_targets = self.placed_segment_payload_shard_repair_targets(req)?;
-        self.repair_placed_segment_payload_shards(req, &repair_targets)
+        self.repair_placed_segment_payload_shards_inner(req, &repair_targets, true)
+    }
+
+    pub fn repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(
+        &self,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let repair_targets = self.placed_segment_payload_shard_repair_targets(req)?;
+        self.repair_placed_segment_payload_shards_inner(req, &repair_targets, false)
     }
 
     pub fn repair_placed_segment_payload_shards(
         &self,
         req: SegmentStoredBytesRequest,
         shard_indices: &[ShardIndex],
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        self.repair_placed_segment_payload_shards_inner(req, shard_indices, true)
+    }
+
+    fn repair_placed_segment_payload_shards_inner(
+        &self,
+        req: SegmentStoredBytesRequest,
+        shard_indices: &[ShardIndex],
+        resolve_repair_rows: bool,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
         let total_shards =
             req.ec
@@ -7118,7 +7145,7 @@ impl StorageCluster {
                         }
                     })?;
                     let ack = self
-                        .write_payload_shard(*target_location, shard_key, shard_payload)
+                        .repair_payload_shard(*target_location, shard_key, shard_payload)
                         .map_err(shard_io_error_to_store)?;
                     repaired.push((shard_key.clone(), ack));
                 }
@@ -7138,8 +7165,10 @@ impl StorageCluster {
                 },
             })?;
         self.verify_repaired_placed_segment_payload_shards(req, shard_indices)?;
-        for shard_index in shard_indices {
-            self.resolve_placed_segment_shard_repair(req, *shard_index)?;
+        if resolve_repair_rows {
+            for shard_index in shard_indices {
+                self.resolve_placed_segment_shard_repair(req, *shard_index)?;
+            }
         }
         Ok(repaired)
     }
@@ -7991,11 +8020,23 @@ fn placed_segment_recoverable_shard_error(error: ShardIoError) -> Result<(), Sto
             ..
         } => Ok(()),
         ShardIoError::Store {
+            source: StoreError::StorageRpc {
+                operation, message, ..
+            },
+            ..
+        } if is_recoverable_remote_shard_read_error(operation, message.as_str()) => Ok(()),
+        ShardIoError::Store {
             source: StoreError::Io { context, source },
             ..
         } if is_recoverable_physical_shard_io_error(context, source.kind()) => Ok(()),
         other => Err(shard_io_error_to_store(other)),
     }
+}
+
+fn is_recoverable_remote_shard_read_error(operation: &'static str, message: &str) -> bool {
+    matches!(operation, "shard read" | "shard read range")
+        && (message == "Internal: shard not found"
+            || (message.starts_with("Internal: shard ") && message.contains(" ack mismatch: ")))
 }
 
 fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::ErrorKind) -> bool {
@@ -8069,6 +8110,51 @@ mod reissue_decision_tests {
             placed_segment_recoverable_shard_error(error),
             Err(StoreError::ShardStore { .. })
         ));
+    }
+
+    #[test]
+    fn placed_segment_read_recovers_remote_shard_read_damage_errors() {
+        for message in [
+            "Internal: shard not found".to_string(),
+            "Internal: shard 00000000000000000000000000000000000000000000000000 ack mismatch: expected size 4 CRC 0x0000000000000001, got size 4 CRC 0x0000000000000002".to_string(),
+        ] {
+            let error = ShardIoError::Store {
+                node_id: 5,
+                pg_id: 13,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                source: StoreError::StorageRpc {
+                    node_id: 5,
+                    operation: "shard read",
+                    message,
+                },
+            };
+
+            placed_segment_recoverable_shard_error(error).unwrap();
+        }
+    }
+
+    #[test]
+    fn placed_segment_read_does_not_recover_unrelated_remote_rpc_errors() {
+        for (operation, message) in [
+            ("shard read", "Internal: database is unavailable"),
+            ("shard delete", "Internal: shard not found"),
+        ] {
+            let error = ShardIoError::Store {
+                node_id: 5,
+                pg_id: 13,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                source: StoreError::StorageRpc {
+                    node_id: 5,
+                    operation,
+                    message: message.to_string(),
+                },
+            };
+
+            assert!(matches!(
+                placed_segment_recoverable_shard_error(error),
+                Err(StoreError::ShardStore { .. })
+            ));
+        }
     }
 
     fn replica_match(code: u8) -> ReissuedPendingCommandReplicaMatch {

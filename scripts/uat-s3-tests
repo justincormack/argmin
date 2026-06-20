@@ -22,7 +22,7 @@ Options:
   --repeat N            Repeat the selected s3-tests command N times (default: 1)
   --smoke NAME           Run a focused smoke instead of the full suite:
                          storage-node-restart, storage-node-kill-fails-closed,
-                         control-plane-runtime-map
+                         control-plane-runtime-map, shard-repair
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
@@ -133,10 +133,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map)
+    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair)
         ;;
     *)
-        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, or control-plane-runtime-map"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, or shard-repair"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -441,6 +441,86 @@ latest_metric_family_top() {
             }
         }
     ' "$metrics_log" | sort -nr | head -n "$limit"
+}
+
+sample_frontend_metrics() {
+    local output_path="$1"
+    curl -k -sS "$endpoint/__argmin/debug/metrics" >"$output_path"
+}
+
+wait_for_storage_shard_files() {
+    local expected_count="$1"
+    local deadline_seconds="$2"
+    local marker_file="$3"
+    local start
+    start="$(date +%s)"
+    while true; do
+        local count
+        count="$(find "$data_dir" -path '*/pg-*/shards/*' -type f -newer "$marker_file" 2>/dev/null | wc -l | tr -d ' ')"
+        if ((count >= expected_count)); then
+            return 0
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            find "$data_dir" -path '*/pg-*/shards/*' -type f -newer "$marker_file" -print >&2 || true
+            die "timed out waiting for at least $expected_count shard files; found $count"
+        fi
+        sleep 0.1
+    done
+}
+
+corrupt_storage_data_shard_file() {
+    local output_path_file="$1"
+    local marker_file="$2"
+    local shard_path
+    shard_path=""
+    local data_suffixes=()
+    for ((shard_index = 0; shard_index < ARGMIN_EC_K; shard_index++)); do
+        data_suffixes+=("$(printf '%02x' "$shard_index")")
+    done
+    while IFS= read -r -d '' candidate; do
+        local filename="${candidate##*/}"
+        for suffix in "${data_suffixes[@]}"; do
+            if [[ "${filename: -2}" == "$suffix" ]]; then
+                shard_path="$candidate"
+                break 2
+            fi
+        done
+    done < <(find "$data_dir" -path '*/pg-*/shards/*' -type f -newer "$marker_file" -print0 2>/dev/null)
+    [[ -n "$shard_path" ]] || die "no data shard file found to corrupt"
+    [[ -s "$shard_path" ]] || die "selected shard file is empty: $shard_path"
+    local tmp_path="$shard_path.corrupting.$$"
+    perl -0777 -pe 'substr($_, 0, 1) = chr(ord(substr($_, 0, 1)) ^ 0xff)' \
+        "$shard_path" >"$tmp_path"
+    mv "$tmp_path" "$shard_path"
+    printf '%s\n' "$shard_path" >"$output_path_file"
+    echo "== argmin-s3 UAT corrupted shard: $shard_path =="
+}
+
+wait_for_shard_repair_completion_metrics() {
+    local metrics_path="$1"
+    local deadline_seconds="$2"
+    local start
+    start="$(date +%s)"
+    while true; do
+        sample_frontend_metrics "$metrics_path"
+        local rewritten
+        local repaired
+        local completed
+        local queue_depth
+        rewritten="$(latest_metric_sample_value "$metrics_path" shard_repair_shards_rewritten_total)"
+        repaired="$(latest_metric_family_label_sum "$metrics_path" shard_repair_event_by_pg_total event repaired)"
+        completed="$(latest_metric_family_label_sum "$metrics_path" shard_repair_event_by_pg_total event complete_succeeded)"
+        queue_depth="$(latest_metric_sample_value "$metrics_path" shard_repair_queue_depth)"
+        if ((rewritten >= 1 && repaired >= 1 && completed >= 1 && queue_depth == 0)); then
+            echo "== argmin-s3 UAT shard repair metrics: rewritten=$rewritten repaired=$repaired complete_succeeded=$completed queue_depth=$queue_depth =="
+            return 0
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            cat "$metrics_path" >&2 || true
+            die "timed out waiting for shard repair completion metrics"
+        fi
+        sleep 0.2
+    done
 }
 
 print_slowdown_summary() {
@@ -941,6 +1021,56 @@ run_nextest_expect_failure() {
     echo "Summary: expected failure observed; UAT smoke passed"
 }
 
+run_shard_repair_smoke() {
+    local smoke_dir="$data_dir/shard-repair-smoke"
+    local bucket_file="$smoke_dir/bucket"
+    local body_file="$smoke_dir/body.bin"
+    local corrupted_path_file="$smoke_dir/corrupted-shard-path"
+    local corrupted_copy="$smoke_dir/corrupted-shard.bin"
+    local metrics_path="$smoke_dir/metrics.prom"
+    local shard_marker="$smoke_dir/pre-put-shard-marker"
+    local key="uat-shard-repair-object"
+    mkdir -p "$smoke_dir"
+    printf 'argmin shard repair UAT payload\n%.0s' {1..512} >"$body_file"
+    : >"$shard_marker"
+
+    local smoke_cmd=(cargo run -q -p s3-tests --bin uat_shard_repair_smoke --)
+
+    echo "== argmin-s3 UAT shard repair put =="
+    printf '+'
+    printf ' %q' "${smoke_cmd[@]}" put "$bucket_file" "$key" "$body_file"
+    printf '\n'
+    "${smoke_cmd[@]}" put "$bucket_file" "$key" "$body_file"
+
+    wait_for_storage_shard_files "$((ARGMIN_EC_K + ARGMIN_EC_M))" 10 "$shard_marker"
+    corrupt_storage_data_shard_file "$corrupted_path_file" "$shard_marker"
+    cp "$(cat "$corrupted_path_file")" "$corrupted_copy"
+
+    echo "== argmin-s3 UAT shard repair foreground recovery read =="
+    printf '+'
+    printf ' %q' "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+    printf '\n'
+    "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+
+    wait_for_shard_repair_completion_metrics "$metrics_path" 20
+    if cmp -s "$(cat "$corrupted_path_file")" "$corrupted_copy"; then
+        die "shard repair metrics completed but corrupted shard file did not change"
+    fi
+
+    echo "== argmin-s3 UAT shard repair post-repair read =="
+    printf '+'
+    printf ' %q' "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+    printf '\n'
+    "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+
+    echo "== argmin-s3 UAT shard repair cleanup =="
+    printf '+'
+    printf ' %q' "${smoke_cmd[@]}" cleanup "$bucket_file" "$key"
+    printf '\n'
+    "${smoke_cmd[@]}" cleanup "$bucket_file" "$key"
+    echo "PASS: shard repair UAT smoke repaired a read-discovered corrupt shard"
+}
+
 if [[ "$smoke" == "storage-node-restart" ]]; then
     run_nextest "pre-restart s3-tests smoke" test_object_default_content_type
     restart_storage_node 0
@@ -958,6 +1088,8 @@ elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
     restart_storage_node 0
     sleep 1
     run_nextest "control-plane runtime-map post-restart s3-tests smoke" test_object_read_not_exist
+elif [[ "$smoke" == "shard-repair" ]]; then
+    run_shard_repair_smoke
 else
     run_nextest "s3-tests" "${cargo_args[@]}"
 fi

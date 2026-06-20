@@ -2123,6 +2123,15 @@ impl StorageNodeConnectionHandler {
                     message: error.to_string(),
                 }),
             },
+            StorageRpcMessageKind::ShardRepairWrite => {
+                match decode_shard_write_request(&frame.payload) {
+                    Ok(request) => self.shard_repair_write_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ShardRead => match decode_shard_read_request(&frame.payload) {
                 Ok(request) => self.shard_read_response(request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -6016,6 +6025,27 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let response = match self.node.write_shard_file_if_absent(
+            request.location.data_pg_id().get(),
+            &request.shard_key,
+            &request.payload,
+        ) {
+            Ok(ack) => {
+                let payload = encode_shard_write_ack(ack);
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn shard_repair_write_response(
+        &self,
+        request: StorageRpcShardWriteRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_shard_location(request.location) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.write_shard_file(
             request.location.data_pg_id().get(),
             &request.shard_key,
             &request.payload,
@@ -10999,6 +11029,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.read_shard_file(0, &shard_key).unwrap(), payload);
+    }
+
+    #[test]
+    fn storage_node_server_repair_write_replaces_existing_shard() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let location = test_location(1, 0, 7);
+        let shard_key = test_shard_key(0);
+        let corrupt = b"corrupt shard".to_vec();
+        let repaired = b"repaired shard".to_vec();
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        node.write_shard_file(location.data_pg_id().get(), &shard_key, &corrupt)
+            .unwrap();
+        drop(node);
+
+        let request = StorageRpcShardWriteRequest {
+            location,
+            shard_key: shard_key.clone(),
+            expected_size: repaired.len() as u64,
+            expected_crc64: checksum::crc64::checksum(&repaired),
+            payload: repaired.clone(),
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardRepairWrite,
+            encode_shard_write_request(&request).unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let ack = decode_shard_write_ack(&payload, request.expected_size, request.expected_crc64)
+            .unwrap();
+        assert_eq!(ack.stored_size, request.expected_size);
+        assert_eq!(ack.crc64, request.expected_crc64);
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert_eq!(reopened.read_shard_file(0, &shard_key).unwrap(), repaired);
     }
 
     #[test]

@@ -77,6 +77,16 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
             .write_shard_file(data_pg_id.get(), key, data)
     }
 
+    fn repair_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        self.storage_node
+            .write_shard_file(data_pg_id.get(), key, data)
+    }
+
     fn read_placed_shard(
         &self,
         data_pg_id: DataPgId,

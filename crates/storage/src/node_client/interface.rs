@@ -901,6 +901,13 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
         data: &[u8],
     ) -> Result<WriteAck, StoreError>;
 
+    fn repair_placed_shard(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError>;
+
     fn read_placed_shard(
         &self,
         data_pg_id: DataPgId,

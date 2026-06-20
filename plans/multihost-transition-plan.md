@@ -7688,6 +7688,23 @@ Shard repair design:
   cursor/progress does not need to be durable; a scanner can restart from a
   random or rotating point because any actual damaged shard it finds is recorded
   in the durable repair queue.
+- Added a focused multihost UAT shard-repair smoke. The UAT runner can create an
+  object through the long-lived S3 endpoint, corrupt one physical data shard on
+  disk, verify that a foreground read reconstructs the object without inline
+  mutation, wait for shard-repair metrics to show a real rewritten shard and
+  durable completion, verify the corrupted file changed, and read the object
+  again after repair. This complements the focused cargo tests with
+  whole-process lifetime coverage using the same server group that UAT workloads
+  exercise.
+- Current repair writes replace the damaged file at the logical shard path via
+  repair-specific storage-node write plumbing; normal shard writes keep their
+  no-overwrite/idempotent retry behavior. A future storage-layout slice may
+  instead make physical shard files generation-addressed, publish the repaired
+  generation through metadata, and leave the old corrupt generation for reclaim.
+  That would need schema, read-path, scavenger, and cleanup invariants and is
+  deliberately left open rather than folded into this UAT coverage slice. See
+  [versioned physical shard files option](versioned-physical-shard-files-option.md)
+  for the standalone evaluation note.
 
 Exit criteria:
 
