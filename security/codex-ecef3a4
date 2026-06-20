@@ -287,8 +287,10 @@ Added regression coverage:
 
 Follow-up status:
 
-- the broader queue backpressure / bounded-memory work remains tracked as phase
-  2 in `plans/reclaim-queue-hardening-plan.md`
+- the broader queue backpressure / bounded-memory follow-up was later resolved
+  for object-payload reclaim on the active coordinator path and archived in
+  `plans/completed/reclaim-queue-hardening-plan.md`; remaining background
+  capacity policy is tracked separately
 - this report is resolved because the specific read-driven enqueue bug has been
   fixed
      }

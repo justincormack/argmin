@@ -54,8 +54,9 @@ This plan extends that style to the security-sensitive lifetime surfaces.
   - `install_stream_append_race_hooks`
 - HTTP cleanup regressions already assert that failed `PutObject` and
   `UploadPart` requests do not leak sessions
-- `plans/reclaim-queue-hardening-plan.md` covers design hardening for reclaim
-  queue behavior, but not a broader stateful testing strategy
+- `plans/completed/reclaim-queue-hardening-plan.md` covers the historical
+  design hardening for reclaim queue behavior, but not a broader stateful
+  testing strategy
 - there is no dedicated property/stateful model for multipart completion,
   reclaim retry, or stream-session lifetime invariants
 
@@ -397,9 +398,9 @@ Deliver:
   - retry after the final lease drop only when reclaim metadata remains
   - queue contents staying aligned with actual pending reclaim work
 
-This phase should complement, not replace,
-`plans/reclaim-queue-hardening-plan.md`.
-That plan is about design hardening; this one is about proving the behavior
+This phase complemented, rather than replaced,
+`plans/completed/reclaim-queue-hardening-plan.md`.
+That plan was about design hardening; this one was about proving the behavior
 repeatedly under short stateful traces.
 
 Current state:
