@@ -66,10 +66,13 @@ This is the main remaining lever that attacks the actual measured bottleneck:
 
 The expensive part now is that each request pays its own file durability
 boundary. Group commit would amortize that cost across multiple requests.
-Even very small batches are potentially valuable: if the batcher can usually
-combine two shard updates that would otherwise flush independently, it should
-roughly halve the shard file and directory sync boundaries for the batched
-portion of the workload.
+Even very small batches may be valuable, but the current one-shard-per-file
+layout limits what can actually be amortized. With loose shard files, batching
+can coalesce parent-directory `fsync`s when multiple renamed shards land in the
+same shard directory, but each shard file still needs its own data durability
+operation. A batch size of two is therefore not guaranteed to halve total shard
+sync time in this layout; it mostly attacks the directory-sync portion unless
+the storage format changes.
 
 This is especially attractive for:
 
@@ -123,6 +126,38 @@ For one batch:
 6. let the originating request publish metadata for those successful items
 
 This keeps the same visibility rule as today.
+
+This loose-file design should be understood as an incremental improvement, not
+the maximum possible group-commit design. It can reduce repeated directory
+syncs and create the request/batcher accounting boundary, but it cannot collapse
+many shard data syncs into one sync while each shard remains a separate file.
+Filesystem behavior also matters: the relative cost of file `fdatasync` versus
+directory `fsync` should be measured on the filesystems we care about before
+committing to this as the primary optimization.
+
+### Future append-log storage
+
+A larger storage-format change could make shard data durability genuinely
+batchable by moving from one file per shard to append-only data logs. In that
+model, many shard payloads would be appended to one PG-local or node-local log
+file, the log would be synced once for the batch, and metadata would reference
+`(log_file, offset, length, crc, shard_key)` rather than deriving the shard file
+path directly from the shard key.
+
+That shape could eventually apply to both data and metadata, but it is a much
+larger design:
+
+- shard records need file-range addressing, not just shard keys
+- reads need to resolve and validate shard ranges
+- crash recovery needs to handle partially written log tails
+- reclaim becomes log garbage collection and compaction
+- corruption isolation changes from per-file shards to ranges inside larger
+  files
+- migration or mixed loose-file/log operation will eventually need a plan
+
+This append-log direction is probably where the largest durability batching
+win lives, because it can reduce both file-data syncs and directory syncs. It
+should be treated separately from the loose-file batcher in this plan.
 
 ### Metadata publish
 
@@ -193,6 +228,13 @@ Add finer tracing inside `write_shard_files_durable` to split:
 - parent `fsync`
 
 That confirms exactly which durability step dominates on real runs.
+
+Run the same split on multiple filesystems before drawing design conclusions.
+The disk-backed versioning trace had file `fdatasync` and directory `fsync`
+costs in the same broad range, but that balance may differ on ext4, XFS,
+btrfs, tmpfs, and slower backed development directories. Loose-file batching is
+more attractive when directory `fsync` dominates; append-log storage becomes
+more compelling when per-file data sync dominates.
 
 ### Phase 2: Prototype local batcher
 
