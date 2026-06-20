@@ -3150,6 +3150,64 @@ impl LocalClusterMap {
             .read_shard(key, expected)
     }
 
+    pub(crate) fn read_payload_shard_for_historical_inspection(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        if location.shard_index() != key.shard_index() {
+            return Err(ShardIoError::ShardIndexMismatch {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                location_shard_index: location.shard_index().get(),
+                key_shard_index: key.shard_index().get(),
+            });
+        }
+        let node = self
+            .nodes
+            .get(&location.node_id())
+            .ok_or(ShardIoError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            })?;
+        let data = node
+            .storage_node()
+            .read_shard_file(location.data_pg_id().get(), key)
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })?;
+        if data.len() as u64 != expected.stored_size {
+            return Err(ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::Io {
+                    context: "read payload shard size mismatch",
+                    source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+                },
+            });
+        }
+        let actual = checksum::crc64::checksum(&data);
+        if actual != expected.crc64 {
+            return Err(ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::IntegrityError {
+                    expected: expected.crc64,
+                    actual,
+                },
+            });
+        }
+        Ok(data)
+    }
+
     #[cfg(test)]
     pub(crate) fn read_payload_shard_into(
         &self,

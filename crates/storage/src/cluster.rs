@@ -755,6 +755,12 @@ impl PlacedSegmentShardSetHealth {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlacedSegmentShardHealthReadMode {
+    CurrentRoute,
+    HistoricalInspection,
+}
+
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
     storage_clients: Vec<Arc<dyn StorageNodeClient>>,
@@ -3372,6 +3378,16 @@ impl StorageCluster {
     ) -> Result<Vec<u8>, ShardIoError> {
         self.local_map
             .read_payload_shard(self.operation_epoch(), location, key, expected)
+    }
+
+    fn read_payload_shard_for_historical_inspection(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        self.local_map
+            .read_payload_shard_for_historical_inspection(location, key, expected)
     }
 
     #[cfg(test)]
@@ -7082,13 +7098,36 @@ impl StorageCluster {
         let locations = self
             .place_payload_shards(data_pg, req.ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
-        self.placed_segment_payload_shard_health_at_locations(req, &locations)
+        self.placed_segment_payload_shard_health_at_locations(
+            req,
+            &locations,
+            PlacedSegmentShardHealthReadMode::CurrentRoute,
+        )
+    }
+
+    pub fn placed_segment_payload_shard_health_for_pg_route_snapshot(
+        &self,
+        route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
+        validate_placed_segment_repair_ec_shape(req.ec)?;
+        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
+        let locations = self
+            .place_payload_shards_for_pg_route_snapshot(route, data_pg, req.ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        self.placed_segment_payload_shard_health_at_locations(
+            req,
+            &locations,
+            PlacedSegmentShardHealthReadMode::HistoricalInspection,
+        )
     }
 
     fn placed_segment_payload_shard_health_at_locations(
         &self,
         req: SegmentStoredBytesRequest,
         locations: &[ShardLocation],
+        read_mode: PlacedSegmentShardHealthReadMode,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
         let k = usize::from(req.ec.k);
@@ -7111,7 +7150,16 @@ impl StorageCluster {
                 })?;
             let validation = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
                 Ok(ack) if ack.stored_size == shard_size as u64 => {
-                    match self.read_payload_shard(location, &shard_key, ack) {
+                    let read_result = match read_mode {
+                        PlacedSegmentShardHealthReadMode::CurrentRoute => {
+                            self.read_payload_shard(location, &shard_key, ack)
+                        }
+                        PlacedSegmentShardHealthReadMode::HistoricalInspection => self
+                            .read_payload_shard_for_historical_inspection(
+                                location, &shard_key, ack,
+                            ),
+                    };
+                    match read_result {
                         Ok(_) => {
                             valid_shards += 1;
                             PlacedSegmentShardValidation::Valid

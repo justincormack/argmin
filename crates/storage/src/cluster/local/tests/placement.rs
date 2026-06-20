@@ -2068,6 +2068,122 @@ fn placed_segment_payload_shard_repair_targets_identifies_and_clears_missing_and
 }
 
 #[test]
+fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join(format!("node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            vec![PgId::new(0)],
+        )
+        .unwrap();
+    let route = authority
+        .snapshot()
+        .reconstructed_pg_route_at_epoch(PgId::new(0), authority.snapshot().cluster_epoch())
+        .unwrap();
+    assert_eq!(route.primary_lease_deadline_ms(), None);
+
+    let configs: Vec<_> = node_ids
+        .iter()
+        .map(|&node_id| {
+            LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path()
+                    .join("storage")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect();
+    let map = Arc::new(
+        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+            NodeId::new(0),
+            configs.clone(),
+            &[0],
+            ec_shape,
+            route.cluster_epoch(),
+        )
+        .unwrap(),
+    );
+    let historical_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let segment = write_committed_direct_segment(&historical_cluster, b"phase-eleven-route-health");
+    let req = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        ec: segment.written.ec,
+    };
+    let current_epoch = ClusterEpoch::new(route.cluster_epoch().get() + 1).unwrap();
+    let current_map = Arc::new(
+        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+            NodeId::new(0),
+            configs,
+            &[0],
+            ec_shape,
+            current_epoch,
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&current_map)).unwrap();
+    assert_ne!(route.cluster_epoch(), cluster.cluster_epoch());
+
+    let health = cluster
+        .placed_segment_payload_shard_health_for_pg_route_snapshot(&route, req)
+        .unwrap();
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Healthy
+    );
+    assert_eq!(health.valid_shards, health.total_shards);
+
+    let missing_shard = ShardIndex::new(0);
+    let missing_path = cluster
+        .test_payload_shard_file_path(
+            segment.written.data_pg_id,
+            segment.written.ec,
+            &segment.segment_okh,
+            segment.generation_id,
+            missing_shard.get(),
+        )
+        .unwrap();
+    std::fs::remove_file(&missing_path).unwrap();
+    let health = cluster
+        .placed_segment_payload_shard_health_for_pg_route_snapshot(&route, req)
+        .unwrap();
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Degraded {
+            tolerance_remaining: usize::from(segment.written.ec.m) - 1,
+        }
+    );
+    assert_eq!(health.repair_targets(), vec![missing_shard]);
+}
+
+#[test]
 fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
     let tmp = test_util::tempdir();
     let node_ids = [

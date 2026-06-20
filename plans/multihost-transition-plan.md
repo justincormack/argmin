@@ -7778,6 +7778,14 @@ PG backfill and migration design notes:
   cluster epoch, including Active PGs without treating their primary lease as
   live service authority, and storage has a route-snapshot placement helper
   that checks the route PG matches the segment data PG before placing shards.
+- Added route-snapshot health inspection for placed segments. The storage
+  layer can now compute the existing healthy/degraded/unrecoverable shard
+  summary through a reconstructed PG route, which is the read-only verification
+  step needed before a later backfill worker queues mutating repair/migration
+  work from PG-history candidates. The local-cluster implementation can inspect
+  historical route locations directly from shard files without treating the old
+  route as current serving authority; remote storage-node historical inspection
+  remains part of the later Unix/storage-node boundary work.
 
 Exit criteria:
 
