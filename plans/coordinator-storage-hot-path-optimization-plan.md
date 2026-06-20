@@ -1,6 +1,7 @@
 ## Coordinator / Storage Hot-path Optimization Follow-up
 
-Status: in progress
+Status: deferred optimization candidate; requires a measurement pass before
+implementation
 
 This plan contains the optimization-only follow-up extracted from
 `plans/completed/coordinator-storage-capability-plan.md` after the
@@ -14,6 +15,14 @@ The boundary work is done. What remains here is deliberately narrower:
 These are performance and cache-shape follow-ons. They must not weaken the
 request-scoped snapshot guarantees or AWS behavior pinning established by the
 completed capability refactor.
+
+This work should not be treated as automatically worthwhile. Before either
+phase is implemented, run a focused performance measurement pass against
+representative BOE read/write workloads and lifecycle-visible request families.
+The measurement should show that policy or lifecycle evaluation is a material
+hot-path cost after the completed coordinator/storage boundary work. If the
+dominant cost is elsewhere, leave this plan deferred and prioritize the measured
+bottleneck instead.
 
 ## Scope
 
@@ -43,6 +52,12 @@ The completed boundary plan established:
 
 This plan starts from that state.
 
+Additional precondition before implementation:
+
+- collect current hot-path profiles/counters for the candidate request families
+  and confirm that policy residualization or lifecycle specialization is likely
+  to produce a meaningful end-to-end improvement
+
 ## Non-goals
 
 - do not change AWS-visible semantics for authorization or lifecycle headers
@@ -53,6 +68,12 @@ This plan starts from that state.
 - do not mix this work with unrelated authz or storage-boundary refactors
 
 ## Phase 11: Bucket Policy Residualization for Hot Paths
+
+Measurement gate: only start this phase if current profiles show bucket policy
+evaluation remains a material cost on the target hot paths after cache freshness
+and storage-boundary work. If authorization cost is already small relative to
+storage IO, checksum work, encryption, admission, or metadata contention, do not
+implement residualization yet.
 
 After the bounded fast-path execution-context cache exists and its freshness
 contract is correct, consider a follow-on optimization for the hottest
@@ -129,6 +150,8 @@ considered for:
 
 Acceptance criteria:
 
+- a pre-implementation measurement records current policy-evaluation cost and
+  justifies this phase
 - the bucket-static inputs eligible for substitution are explicitly listed
 - the residual policy representation is explicit and reviewable
 - the request-dynamic inputs still evaluated at request time are explicit
@@ -138,6 +161,12 @@ Acceptance criteria:
   fast-path cache rather than entangled with the initial cache rollout
 
 ## Phase 12: Lifecycle Fast-path Specialization
+
+Measurement gate: only start this phase if current profiles or counters show
+that lifecycle-derived header/query evaluation is a material cost for the
+affected request families, or that raw lifecycle state creates measurable hot
+cache pressure. If lifecycle work is not visible in the measured hot path, leave
+this phase deferred.
 
 After the initial bounded cache rollout, treat lifecycle the same way as
 policy: as something that should ideally not remain in raw form on the hot
@@ -179,6 +208,8 @@ This is explicitly a later optimization phase because:
 
 Acceptance criteria:
 
+- a pre-implementation measurement records current lifecycle-evaluation or cache
+  pressure cost and justifies this phase
 - the hot lifecycle-derived questions are explicitly listed and tested
 - the bucket-static inputs eligible for substitution are explicit
 - the residual lifecycle representation is explicit and reviewable
@@ -189,7 +220,7 @@ Acceptance criteria:
 
 ## Ordering
 
-Do Phase 11 first.
+If both phases are justified by measurement, do Phase 11 first.
 
 Reasoning:
 
@@ -203,7 +234,8 @@ Reasoning:
 This plan is complete when either:
 
 - both phases land with AWS-pinned coverage, or
-- one or both phases are explicitly rejected as not worthwhile after review,
+- one or both phases are explicitly rejected as not worthwhile after measurement
+  and review,
   with that decision recorded here
 
 Either outcome is acceptable. This is optimization work, not unfinished
