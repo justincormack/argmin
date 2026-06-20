@@ -7706,6 +7706,61 @@ Shard repair design:
   [versioned physical shard files option](versioned-physical-shard-files-option.md)
   for the standalone evaluation note.
 
+PG backfill and migration design notes:
+
+- Treat write placement migration and read backfill as separate concerns. New
+  writes must use the current authoritative PG mapping and must place the full
+  EC shard set; the system should fail closed rather than creating writes with
+  missing shards. Existing reads should continue to use the segment's recorded
+  data PG, EC shape, and stable shard identity plus cluster-map history to
+  reconstruct the deterministic old shard locations; they should not require a
+  persisted per-segment placement vector. Reads may proceed degraded when at
+  least `k` valid shards are readable.
+- Recommended storage capacity should be at least one node above the minimum EC
+  shape so writes can continue across one unavailable node. For example, a
+  `4+2` layout needs six nodes for the EC shape but should normally run with at
+  least seven nodes if one-node-down writes are expected to remain available.
+  If the current map cannot choose `k + m` eligible shard locations, writes
+  should return a typed retryable/capacity failure while reads keep using their
+  reconstructed historical placement where recoverable.
+- Cluster-map and PG-history generations are still first-class for discovery
+  and closure, but they are history hints rather than the main per-object
+  routing mechanism. Writes should record or imply enough map-generation context
+  to reconstruct placement through retained cluster-map history without
+  rewriting object metadata for every acting-set change. The control plane can
+  track which PG history ranges remain live because object metadata still
+  references data in those ranges. Backfill can prioritize older ranges when
+  safety is otherwise equal so old history can be closed off, but generation
+  age alone is not a safety signal.
+- A returning node has a new availability/incarnation context but may still
+  hold useful shard files from older PG-history placements. Backfill against
+  returned nodes should validate existing shard content and no-op where the
+  old shard is already correct. New writes created while the node was down may
+  still need migration/backfill if the desired current placement includes that
+  node again.
+- Actual safety is per placed segment, not global per generation or per node.
+  Risk must be computed from the shard locations reconstructed for that
+  segment from PG state and cluster-map history plus current validation
+  results: `valid >= k + m` is healthy, `k <= valid < k + m` is degraded and
+  should be repaired/backfilled, and `valid < k` is unrecoverable unless a node
+  returns or lower-level metadata/storage repair restores shards. Node
+  availability and PG-history changes can identify candidates, but they do not
+  prove which objects are at risk without inspecting the reconstructed shard
+  set.
+- Use two related queues. A candidate queue is populated from placement
+  history changes, node availability/incarnation changes, background scanner
+  output, and old-history tracking. A verified repair/backfill queue is
+  populated only after inspecting a segment's actual shard validity and
+  computing its risk. The scheduler should prioritize verified work by
+  remaining EC tolerance first, then by PG-history closure/age, then by routine
+  convergence to the current placement.
+- Backfill admission should reuse the background-work framework rather than
+  adding an independent loop. Routine convergence should be cheap to deny under
+  foreground pressure. Work that restores segments close to the EC `m` failure
+  limit should receive increasing priority relative to other background work,
+  while still preserving foreground S3 capacity and the rule that new writes
+  never intentionally omit shards.
+
 Exit criteria:
 
 1. stale primaries cannot accept writes after an epoch change
