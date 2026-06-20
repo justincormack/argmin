@@ -1,24 +1,27 @@
 # Internal Copy Pacing Plan
 
+Status: planned, refreshed after shared admission/backpressure work
+
 ## Problem
 
 `CopyObject` and `UploadPartCopy` now use bounded-memory streaming paths and do
 not hold long metadata locks, which is the right base behavior. However, once a
 copy has snapshotted source metadata and started its chunk loop, it runs as fast
-as local CPU and disk allow.
+as the shared request and storage-node admission paths allow.
 
 That differs from normal `PutObject` / `UploadPart` traffic, where the server is
 naturally paced by client body arrival and socket backpressure. Internal copies
-have no equivalent pacing point today.
+now have some implicit pacing through shared admission/backpressure, but they do
+not have a copy-specific capacity policy.
 
 The result is:
 
 - one request slot stays occupied for the full lifetime of the copy
 - one blocking worker stays occupied for the full lifetime of the copy
-- the copy can drive shard reads, EC work, encryption, and shard writes at full
-  local speed
-- unrelated reads and writes can be slowed indirectly even though they are not
-  blocked by a coarse lock
+- the copy can drive shard reads, EC work, encryption, and shard writes as fast
+  as generic shared resources admit that work
+- unrelated reads and writes can be slowed indirectly because copy traffic
+  competes for the same request, read, progress, and completion capacity
 
 ## Current State
 
@@ -31,8 +34,20 @@ The result is:
   the destination staging session immediately
 - the HTTP layer already has a global request semaphore and overloads with
   `SlowDown` when admission fails
+- storage-node RPC admission now provides shared pacing/backpressure for the
+  copy's source reads and destination write/finalization work:
+  - copy source payload reads use the shared `Read` class (`ShardRead`,
+    `ShardReadRange`, `ReadHandlesAcquire`)
+  - destination shard writes and stream append preparation use the shared
+    `Progress` class
+  - stream finalization and cleanup-related operations use the shared
+    `Completion` class
+- storage RPC resource exhaustion maps to public `SlowDown`; this is covered for
+  `CopyObject`, `UploadPartCopy`, and ranged `UploadPartCopy` source reads
 - there is no dedicated admission control or byte budget for internal copy work
 - there is no copy-specific fairness policy relative to non-copy reads/writes
+- there are no copy-specific metrics for in-flight copy count, copied bytes,
+  copy duration, or copy admission/wait time
 
 ## Why This Matters
 
@@ -41,14 +56,18 @@ This is not a correctness emergency:
 - copy paths are bounded-memory
 - copy paths do not hold source metadata locks for the full transfer
 - concurrent overwrite/delete behavior already has coverage
+- shared request and storage RPC admission can already force copy requests to
+  back off with `SlowDown` when the underlying shared resources are saturated
 
 But it is still an important performance and fairness gap:
 
 - a small number of large copies can consume a disproportionate amount of local
   IO/CPU
 - unrelated traffic can see higher tail latency or more `SlowDown` responses
-- the server currently has no explicit policy for how much capacity internal
-  copies are allowed to consume
+- the server currently has no explicit copy policy for how much of the shared
+  read/progress/completion capacity internal copies are allowed to consume
+- because copy work is only visible through generic request/RPC metrics, it is
+  hard to distinguish copy pressure from ordinary GET/PUT pressure
 
 This should be tracked now, but it does not need to preempt correctness work
 unless copy-heavy workloads become part of normal testing or production use.
@@ -149,8 +168,10 @@ Add copy-specific visibility first:
 - in-flight `UploadPartCopy` count
 - total copied bytes
 - copy duration
-- time spent waiting on any pacing control
-- copy aborts caused by pacing timeout
+- time spent waiting on shared request/storage admission while serving copy
+  operations, where attributable
+- time spent waiting on any future copy-specific pacing control
+- copy aborts caused by copy-specific pacing timeout
 
 Without this, it is too easy to debate fairness problems without being able to
 measure them.
@@ -161,7 +182,7 @@ Add a dedicated internal-copy semaphore as the first pacing control.
 
 This is the smallest useful step because it:
 
-- matches the existing explicit backpressure style in the HTTP layer
+- complements the existing request/storage RPC admission instead of replacing it
 - avoids unbounded growth in copy pressure
 - is easy to explain and operate
 
@@ -189,6 +210,11 @@ load-sensitive or adaptive policies.
   operation must abort cleanly and return a normal overload-style error
 - any pacing mechanism should apply to both `CopyObject` and `UploadPartCopy`
   through a shared policy, not two separate ad hoc implementations
+- keep shared request/RPC admission as the baseline backpressure mechanism; copy
+  pacing should reserve or limit copy's share of that capacity, not bypass it
+- copy-specific `SlowDown` must remain side-effect aware: after destination
+  staging has started, cleanup must complete or the operation must fail closed
+  rather than returning an ambiguous retryable result
 
 ## Validation
 
@@ -199,12 +225,16 @@ When work starts, cover at least:
 - mixed-workload tests with concurrent copies plus normal reads/writes
 - benchmark runs comparing tail latency of unrelated traffic with and without
   paced internal copies
+- tests that existing shared admission/resource exhaustion continues to map copy
+  source read overload to `SlowDown`
 
 ## Priority
 
 Medium.
 
-This is worth tracking because the current behavior has no fairness policy, but
-the existing implementation is already correct on memory and lock scope. Unless
-copy-heavy workloads are on the critical path right now, this should stay as
-planned future work rather than immediate implementation.
+This is worth tracking because the current behavior has shared backpressure but
+no copy-specific fairness policy. The existing implementation is already correct
+on memory and lock scope, and shared admission already gives copy an implicit
+backoff path under overload. Unless copy-heavy workloads are on the critical path
+right now, this should stay as planned future performance work rather than
+immediate implementation.
