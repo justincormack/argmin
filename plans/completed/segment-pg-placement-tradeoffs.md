@@ -1,8 +1,38 @@
 # Segment PG Placement Tradeoffs
 
+Status: completed
+
+## Resolution
+
+The implementation chose Option 4, bounded object-local PG sets, combined with
+Option 3 style banding.
+
+Current behavior lives in `crates/storage/src/pg_topology.rs`:
+
+- `DEFAULT_OBJECT_DATA_PG_SET_WIDTH` is `4`.
+- `DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE` is `16`.
+- each object generation ranks all configured data PGs using
+  `object_generation_pg_score(bucket, key, generation_id, pg_id)` and takes the
+  top `width` PGs as its deterministic object-local set
+- direct object segments use `band_index = segment_index / 16` and round-robin
+  that band index over the bounded set
+- multipart part records use `part_number - 1` as the band index over the same
+  object-local set
+- streamed multipart part segments add the part band index and segment band
+  index before mapping over the same object-local set
+
+This means request fan-out is bounded by the object-local PG-set width rather
+than scaling with total PG count. Object metadata placement remains separate and
+continues to use the metadata PG derived from `(bucket, key)`.
+
+The main deliberate simplifications versus the original recommendation are that
+width and band size are constants rather than runtime-configurable settings, and
+mapping inside the subset is round-robin by band index rather than hashed within
+the subset.
+
 ## Context
 
-The current segmented payload model stores explicit per-segment placement metadata,
+The segmented payload model stores explicit per-segment placement metadata,
 so we are free to choose how widely one object generation spreads across data PGs.
 
 This is separate from object metadata placement:
@@ -226,20 +256,18 @@ single-PG hot-spot behavior.
 
 ## Deferred Questions
 
-These do not need to be decided now:
+These were not needed for the completed implementation:
 
-1. whether segment-to-PG mapping inside the subset should be round-robin or hashed
-2. whether width should vary by object size
-3. whether band size should vary by object size or EC shape
-4. whether multipart parts should preserve stronger locality within the same subset
-5. whether future parallel read/write scheduling should align explicitly with the
+1. whether width should vary by object size
+2. whether band size should vary by object size or EC shape
+3. whether future parallel read/write scheduling should align explicitly with the
    chosen subset width
 
 ## Current Conclusion
 
-This is not an immediate implementation priority, but the design direction should be:
+The completed route follows the preferred direction:
 
-- do not scatter one object generation across all PGs by default
-- do not assume one PG per object is the long-term answer
-- treat banded placement as the simple locality improvement
-- prefer a bounded deterministic PG subset per object generation
+- object generations are not scattered across all PGs by default
+- object generations are not pinned to one PG
+- segment locality is improved with 16-segment bands
+- request fan-out is bounded by a deterministic object-local PG subset
