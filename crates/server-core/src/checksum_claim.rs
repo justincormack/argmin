@@ -91,4 +91,78 @@ impl EncodedChecksumClaim {
     pub fn encoded_value(&self) -> &str {
         &self.encoded_value
     }
+
+    /// Validate the CompleteMultipartUpload header value shape.
+    ///
+    /// AWS accepts both a plain full-object checksum value and the multipart
+    /// composite form (`base64-N`) in the object-level checksum header. In both
+    /// cases the checksum bytes before the optional suffix must be valid for
+    /// the selected algorithm.
+    pub fn validate_complete_multipart_header_value(&self) -> Result<(), ServerError> {
+        let value = self.encoded_value.as_str();
+        if let Some((checksum_value, part_count)) = value.split_once('-') {
+            if part_count.is_empty()
+                || part_count.starts_with('0')
+                || part_count.parse::<u32>().is_err()
+            {
+                return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
+                    header_name: self.algorithm.header_name().to_string(),
+                });
+            }
+            ChecksumClaim::from_base64(self.algorithm, checksum_value).map_err(|_| {
+                ServerError::CompleteMultipartChecksumHeaderInvalid {
+                    header_name: self.algorithm.header_name().to_string(),
+                }
+            })?;
+        } else {
+            ChecksumClaim::from_base64(self.algorithm, value).map_err(|_| {
+                ServerError::CompleteMultipartChecksumHeaderInvalid {
+                    header_name: self.algorithm.header_name().to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sha256_b64(bytes: [u8; 32]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn encoded_complete_multipart_checksum_accepts_plain_and_composite_values() {
+        let plain = EncodedChecksumClaim::new(ChecksumAlgorithm::Sha256, sha256_b64([0; 32]));
+        plain.validate_complete_multipart_header_value().unwrap();
+
+        let composite = EncodedChecksumClaim::new(
+            ChecksumAlgorithm::Sha256,
+            format!("{}-1", sha256_b64([1; 32])),
+        );
+        composite
+            .validate_complete_multipart_header_value()
+            .unwrap();
+    }
+
+    #[test]
+    fn encoded_complete_multipart_checksum_rejects_malformed_values() {
+        for value in ["bad", "not-valid-base64!!!", "", "abcd-", "abcd-0"] {
+            let claim = EncodedChecksumClaim::new(ChecksumAlgorithm::Sha256, value.to_string());
+            let err = claim
+                .validate_complete_multipart_header_value()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ServerError::CompleteMultipartChecksumHeaderInvalid { ref header_name }
+                        if header_name == "x-amz-checksum-sha256"
+                ),
+                "expected CompleteMultipartChecksumHeaderInvalid for {value:?}, got {err:?}"
+            );
+        }
+    }
 }

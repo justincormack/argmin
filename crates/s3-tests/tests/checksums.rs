@@ -1828,13 +1828,37 @@ fn test_multipart_checksum_sha256() {
             .await
             .unwrap();
 
-        // CompleteMultipartUpload with wrong checksum should fail
-        let result = client
+        // CompleteMultipartUpload with a malformed checksum should fail before digest comparison.
+        let malformed_result = client
             .complete_multipart_upload()
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
             .checksum_sha256("bad")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp.e_tag().unwrap())
+                            .checksum_sha256(resp.checksum_sha256().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&malformed_result), 400);
+        assert_s3_err_code(&malformed_result, "InvalidRequest");
+
+        // CompleteMultipartUpload with a validly encoded but wrong checksum should fail.
+        let wrong_sha256 = encode_base64(&[0u8; 32]);
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .checksum_sha256(wrong_sha256)
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .parts(

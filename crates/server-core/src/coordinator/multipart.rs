@@ -700,6 +700,7 @@ impl Coordinator {
                     }
                     _ => {}
                 }
+                claimed.validate_complete_multipart_header_value()?;
                 if let Some(ref computed) = checksum_value {
                     if computed != claimed.encoded_value() {
                         return Err(ServerError::ChecksumDigestMismatch {
