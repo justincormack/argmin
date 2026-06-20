@@ -2882,6 +2882,22 @@ impl StorageCluster {
         self.local_map.pg_routes()
     }
 
+    pub fn reconstructed_pg_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PgRouteSnapshot, StoreError> {
+        self.local_map
+            .reconstructed_pg_route_at_epoch(pg_id, cluster_epoch)
+            .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "PG {} route for cluster epoch {} is not retained",
+                    pg_id.get(),
+                    cluster_epoch.get()
+                ),
+            })
+    }
+
     /// Temporary process-local registry key for shared coordinator workers.
     ///
     /// Multiple `StorageCluster` handles backed by the same local node keep
@@ -6369,6 +6385,19 @@ impl StorageCluster {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_register_payload_shard_acks(
+        &self,
+        data_pg_id: u32,
+        written_shards: &[WrittenShardAck],
+    ) -> Result<(), ObjectPgActionError> {
+        let shard_batch: Vec<_> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        self.register_payload_shard_acks(data_pg_id, &shard_batch)
+    }
+
     fn validate_payload_shard_acks(
         &self,
         data_pg_id: u32,
@@ -7133,6 +7162,32 @@ impl StorageCluster {
         client.acquire_placed_segment_shard_backfill_claim(pg_id, &request)
     }
 
+    pub fn acquire_next_placed_segment_shard_backfill_claim(
+        &self,
+        claim_id: &str,
+        owner_token: &str,
+        claimed_at: u64,
+        lease_deadline: u64,
+        now: u64,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
+        for route in self.local_pg_routes() {
+            if route.state() != PgState::Active {
+                continue;
+            }
+            if let Some(claim) = self.acquire_placed_segment_shard_backfill_claim(
+                route.pg_id().get(),
+                claim_id,
+                owner_token,
+                claimed_at,
+                lease_deadline,
+                now,
+            )? {
+                return Ok(Some(claim));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn complete_placed_segment_shard_backfill_claim(
         &self,
         claim: &PlacedSegmentShardBackfillClaimRecord,
@@ -7454,6 +7509,22 @@ impl StorageCluster {
             .collect();
         self.verify_backfilled_placed_segment_payload_shards(desired_route, req, &target_indices)?;
         Ok(backfilled)
+    }
+
+    pub fn backfill_placed_segment_payload_shards_for_work_item(
+        &self,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let pg_id = PgId::new(work_item.request.data_pg_id);
+        let source_route =
+            self.reconstructed_pg_route_at_epoch(pg_id, work_item.source_cluster_epoch)?;
+        let desired_route =
+            self.reconstructed_pg_route_at_epoch(pg_id, work_item.desired_cluster_epoch)?;
+        self.backfill_placed_segment_payload_shards(
+            &source_route,
+            &desired_route,
+            work_item.request,
+        )
     }
 
     fn verify_backfilled_placed_segment_payload_shards(

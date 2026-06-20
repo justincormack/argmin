@@ -501,8 +501,12 @@ impl ClusterControlSnapshot {
         &self,
         pg_routes: Vec<PgRouteSnapshot>,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let historical_pg_routes = self.historical_pg_routes_for_runtime_map()?;
         let mut routed_node_ids = BTreeSet::new();
         for route in &pg_routes {
+            routed_node_ids.extend(route.acting_set().iter().copied());
+        }
+        for route in &historical_pg_routes {
             routed_node_ids.extend(route.acting_set().iter().copied());
         }
         let mut nodes = Vec::with_capacity(routed_node_ids.len());
@@ -534,7 +538,20 @@ impl ClusterControlSnapshot {
             valid_until_ms,
             nodes,
             pg_routes,
+            historical_pg_routes,
         })
+    }
+
+    fn historical_pg_routes_for_runtime_map(
+        &self,
+    ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+        let mut routes = Vec::new();
+        for history in &self.history {
+            for pg in history.pgs() {
+                routes.push(history.reconstructed_pg_route(pg.pg_id())?);
+            }
+        }
+        Ok(routes)
     }
 
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
@@ -584,6 +601,23 @@ pub struct PgRouteSnapshot {
 }
 
 impl PgRouteSnapshot {
+    pub fn reconstructed(
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        acting_set: Vec<NodeId>,
+        state: PgState,
+    ) -> Self {
+        Self {
+            cluster_epoch,
+            pg_id,
+            primary_node_id,
+            acting_set,
+            state,
+            primary_lease_deadline_ms: None,
+        }
+    }
+
     #[must_use]
     pub fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster_epoch
@@ -612,6 +646,13 @@ impl PgRouteSnapshot {
     #[must_use]
     pub fn primary_lease_deadline_ms(&self) -> Option<u64> {
         self.primary_lease_deadline_ms
+    }
+
+    #[must_use]
+    pub fn without_serving_authority(&self) -> Self {
+        let mut route = self.clone();
+        route.primary_lease_deadline_ms = None;
+        route
     }
 }
 
@@ -645,6 +686,7 @@ pub struct ClusterRuntimeMapSnapshot {
     valid_until_ms: Option<u64>,
     nodes: Vec<NodeRouteSnapshot>,
     pg_routes: Vec<PgRouteSnapshot>,
+    historical_pg_routes: Vec<PgRouteSnapshot>,
 }
 
 impl ClusterRuntimeMapSnapshot {
@@ -666,6 +708,31 @@ impl ClusterRuntimeMapSnapshot {
     #[must_use]
     pub fn pg_routes(&self) -> &[PgRouteSnapshot] {
         &self.pg_routes
+    }
+
+    #[must_use]
+    pub fn historical_pg_routes(&self) -> &[PgRouteSnapshot] {
+        &self.historical_pg_routes
+    }
+
+    pub fn reconstructed_pg_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        if cluster_epoch == self.cluster_epoch {
+            return self
+                .pg_routes
+                .iter()
+                .find(|route| route.pg_id == pg_id)
+                .map(PgRouteSnapshot::without_serving_authority)
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() });
+        }
+        self.historical_pg_routes
+            .iter()
+            .find(|route| route.cluster_epoch == cluster_epoch && route.pg_id == pg_id)
+            .cloned()
+            .ok_or(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch })
     }
 }
 
@@ -2531,8 +2598,18 @@ fn write_runtime_map_snapshot(
         write_u64(out, node.node_incarnation());
         write_string(out, node.endpoint())?;
     }
-    write_u32(out, len_as_u32(snapshot.pg_routes().len(), "PG routes")?);
-    for route in snapshot.pg_routes() {
+    write_pg_route_snapshots(out, "PG routes", snapshot.pg_routes())?;
+    write_pg_route_snapshots(out, "historical PG routes", snapshot.historical_pg_routes())?;
+    Ok(())
+}
+
+fn write_pg_route_snapshots(
+    out: &mut Vec<u8>,
+    label: &'static str,
+    routes: &[PgRouteSnapshot],
+) -> Result<(), ControlPlaneError> {
+    write_u32(out, len_as_u32(routes.len(), label)?);
+    for route in routes {
         write_u64(out, route.cluster_epoch().get());
         write_u32(out, route.pg_id().get());
         write_u32(out, route.primary_node_id().as_u32());
@@ -2561,9 +2638,23 @@ fn read_runtime_map_snapshot(
             endpoint: reader.read_string()?.to_owned(),
         });
     }
-    let route_count =
-        reader.read_collection_len("PG routes", CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN)?;
-    let mut pg_routes = Vec::with_capacity(route_count);
+    let pg_routes = read_pg_route_snapshots(reader, "PG routes")?;
+    let historical_pg_routes = read_pg_route_snapshots(reader, "historical PG routes")?;
+    Ok(ClusterRuntimeMapSnapshot {
+        cluster_epoch,
+        valid_until_ms,
+        nodes,
+        pg_routes,
+        historical_pg_routes,
+    })
+}
+
+fn read_pg_route_snapshots(
+    reader: &mut PayloadReader<'_>,
+    label: &'static str,
+) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+    let route_count = reader.read_collection_len(label, CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN)?;
+    let mut routes = Vec::with_capacity(route_count);
     for _ in 0..route_count {
         let route_epoch = read_cluster_epoch(reader, "PG route cluster epoch")?;
         let pg_id = PgId::new(reader.read_u32()?);
@@ -2578,7 +2669,7 @@ fn read_runtime_map_snapshot(
         for _ in 0..acting_set_len {
             acting_set.push(NodeId::new(reader.read_u32()?));
         }
-        pg_routes.push(PgRouteSnapshot {
+        routes.push(PgRouteSnapshot {
             cluster_epoch: route_epoch,
             pg_id,
             primary_node_id,
@@ -2587,12 +2678,7 @@ fn read_runtime_map_snapshot(
             primary_lease_deadline_ms,
         });
     }
-    Ok(ClusterRuntimeMapSnapshot {
-        cluster_epoch,
-        valid_until_ms,
-        nodes,
-        pg_routes,
-    })
+    Ok(routes)
 }
 
 fn write_pg_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
@@ -6132,6 +6218,93 @@ mod tests {
             runtime_map.nodes()[0].node_incarnation(),
             node_incarnation(&authority, 1)
         );
+    }
+
+    #[test]
+    fn runtime_map_exports_retained_historical_pg_routes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(26), vec![NodeId::new(1)])
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 2, 2_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(26), vec![NodeId::new(2)])
+            .unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(2_001).unwrap();
+        assert_eq!(
+            runtime_map
+                .nodes()
+                .iter()
+                .map(NodeRouteSnapshot::node_id)
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(1), NodeId::new(2)]
+        );
+        let historical = runtime_map
+            .reconstructed_pg_route_at_epoch(PgId::new(26), source_epoch)
+            .unwrap();
+        assert_eq!(historical.cluster_epoch(), source_epoch);
+        assert_eq!(historical.pg_id(), PgId::new(26));
+        assert_eq!(historical.primary_node_id(), NodeId::new(1));
+        assert_eq!(historical.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(historical.primary_lease_deadline_ms(), None);
+
+        let current = runtime_map
+            .reconstructed_pg_route_at_epoch(PgId::new(26), runtime_map.cluster_epoch())
+            .unwrap();
+        assert_eq!(current.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(current.primary_lease_deadline_ms(), None);
+    }
+
+    #[test]
+    fn runtime_map_refresh_preserves_historical_pg_routes_for_storage_cluster() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 2, 2_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(2)])
+            .unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let local_map =
+            crate::cluster::LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+                NodeId::new(1),
+                &runtime_map,
+                crate::EcShape { k: 1, m: 1 },
+            )
+            .unwrap();
+        let cluster = crate::StorageCluster::from_local_map(Arc::new(local_map)).unwrap();
+
+        let historical = cluster
+            .reconstructed_pg_route_at_epoch(PgId::new(30), source_epoch)
+            .unwrap();
+        assert_eq!(historical.acting_set(), &[NodeId::new(1)]);
+        let current = cluster
+            .reconstructed_pg_route_at_epoch(PgId::new(30), runtime_map.cluster_epoch())
+            .unwrap();
+        assert_eq!(current.acting_set(), &[NodeId::new(2)]);
     }
 
     #[test]

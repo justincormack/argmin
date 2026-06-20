@@ -7822,6 +7822,15 @@ PG backfill and migration design notes:
   backfill lifecycle operations route through the PG primary across the
   same-process and Unix-node boundary; worker admission and execution remain
   follow-up work.
+- Added the first durable backfill execution worker. Runtime maps now carry
+  retained non-serving historical PG routes, storage clusters preserve those
+  routes after runtime-map refresh, and the coordinator starts a shard backfill
+  sweeper that claims durable rows, reconstructs source/desired routes from
+  retained route history, executes the existing backfill primitive, and
+  completes or retries the durable claim. This is intentionally still a simple
+  single-lane worker using the existing known-damage background admission; the
+  remaining follow-up is the risk/priority model that distinguishes urgent
+  EC-safety backfill from routine convergence and integrates scanner output.
 
 Exit criteria:
 

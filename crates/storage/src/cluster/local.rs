@@ -1308,6 +1308,7 @@ pub struct LocalClusterMap {
     pg_topology: PgTopology,
     default_ec_shape: EcShape,
     pg_routes: BTreeMap<PgId, LocalPgRoute>,
+    historical_pg_routes: BTreeMap<(ClusterEpoch, PgId), PgRouteSnapshot>,
     placement_map: placement::ClusterMap,
     runtime_state: Arc<LocalClusterRuntimeState>,
     process_local_registry_key: usize,
@@ -1446,6 +1447,7 @@ impl LocalClusterMap {
             pg_topology,
             default_ec_shape,
             pg_routes,
+            historical_pg_routes: BTreeMap::new(),
             route_map_valid_until_ms: None,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
@@ -1534,6 +1536,7 @@ impl LocalClusterMap {
             pg_topology,
             default_ec_shape,
             pg_routes,
+            historical_pg_routes: BTreeMap::new(),
             route_map_valid_until_ms,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
@@ -1563,7 +1566,7 @@ impl LocalClusterMap {
             .map(LocalPgRoute::from)
             .collect();
 
-        Self::open_frontend_topology_only_with_pg_routes_and_validity(
+        let mut local_map = Self::open_frontend_topology_only_with_pg_routes_and_validity(
             metadata_primary_node_id,
             node_ids,
             &pg_ids,
@@ -1571,7 +1574,13 @@ impl LocalClusterMap {
             runtime_map.cluster_epoch(),
             pg_routes,
             runtime_map.valid_until_ms(),
-        )
+        )?;
+        local_map.historical_pg_routes = runtime_map
+            .historical_pg_routes()
+            .iter()
+            .map(|route| ((route.cluster_epoch(), route.pg_id()), route.clone()))
+            .collect();
+        Ok(local_map)
     }
 
     fn open_with_configs_inner(
@@ -1666,6 +1675,7 @@ impl LocalClusterMap {
             pg_topology,
             default_ec_shape,
             pg_routes,
+            historical_pg_routes: BTreeMap::new(),
             route_map_valid_until_ms: None,
             placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
@@ -2419,6 +2429,38 @@ impl LocalClusterMap {
 
     pub fn pg_routes(&self) -> impl Iterator<Item = &LocalPgRoute> + '_ {
         self.pg_routes.values()
+    }
+
+    pub fn reconstructed_pg_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Option<PgRouteSnapshot> {
+        if cluster_epoch == self.epoch {
+            return self.pg_route(pg_id).map(|route| {
+                PgRouteSnapshot::reconstructed(
+                    route.cluster_epoch(),
+                    route.pg_id(),
+                    route.primary_node_id(),
+                    route.acting_set().to_vec(),
+                    route.state(),
+                )
+            });
+        }
+        self.historical_pg_routes
+            .get(&(cluster_epoch, pg_id))
+            .cloned()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_historical_pg_routes(
+        &mut self,
+        routes: impl IntoIterator<Item = PgRouteSnapshot>,
+    ) {
+        self.historical_pg_routes = routes
+            .into_iter()
+            .map(|route| ((route.cluster_epoch(), route.pg_id()), route))
+            .collect();
     }
 
     pub fn process_local_registry_key(&self) -> usize {

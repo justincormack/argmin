@@ -8,7 +8,7 @@ use s3_types::BucketLifecycleConfiguration;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketInfo, BucketName, EcShape, GenerationId,
     ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
-    StoreError, UploadId, UploadState, VersionId,
+    StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -32,6 +32,9 @@ static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
 > = OnceLock::new();
 static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<ShardRepairSweeper>>>> =
     OnceLock::new();
+static SHARD_BACKFILL_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<usize, Weak<ShardBackfillSweeper>>>,
+> = OnceLock::new();
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
 > = OnceLock::new();
@@ -39,12 +42,16 @@ static BACKGROUND_WORK_ADMISSION_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<BackgroundWorkAdmission>>>,
 > = OnceLock::new();
 static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
+const SHARD_BACKFILL_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const SHARD_BACKFILL_CLAIM_LEASE_MILLIS: u64 = 30_000;
+const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
@@ -403,6 +410,12 @@ pub(super) struct ShardRepairSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+pub(super) struct ShardBackfillSweeper {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
+    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
+}
+
 pub(super) struct StreamSessionSweeper {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
@@ -608,6 +621,17 @@ impl Drop for ShardRepairSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.storage_node.wake_placed_segment_shard_repair_workers();
+        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ShardBackfillSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        *lock_mutex_unpoisoned(&self.wake.0) = true;
+        self.wake.1.notify_all();
         if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
             let _ = handle.join();
         }
@@ -1124,6 +1148,210 @@ impl ShardRepairSweeper {
             handle: Mutex::new(None),
         })
     }
+}
+
+impl ShardBackfillSweeper {
+    pub(super) fn acquire_shared(
+        storage_handle: &StorageClusterRuntimeMapHandle,
+    ) -> Result<Arc<Self>, ServerError> {
+        let registry = SHARD_BACKFILL_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardBackfillSweeper>>> =
+            lock_mutex_unpoisoned(registry);
+        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+
+        let storage_cluster = storage_handle.current();
+        let key = storage_cluster.process_local_registry_key();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(storage_handle.clone())?;
+        registry.insert(key, Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let sweeper = Arc::new(Self {
+            stop: Arc::clone(&stop),
+            wake: Arc::clone(&wake),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-shard-backfill".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let storage_cluster = storage_handle.current();
+                    let admission = background_work_admission_for(&storage_cluster);
+                    let owner_token = format!(
+                        "shard-backfill-worker-{}",
+                        storage_cluster.process_local_registry_key()
+                    );
+                    admission.observe_pressure();
+                    if let Some(_permit) =
+                        admission.try_acquire(BackgroundWorkClass::KnownDamageRepair)
+                    {
+                        run_one_placed_segment_shard_backfill(&storage_cluster, &owner_token);
+                    } else {
+                        emit_shard_backfill_event(None, "admission_denied", None);
+                    }
+
+                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(
+                            stop_guard,
+                            SHARD_BACKFILL_DURABLE_SCAN_INTERVAL,
+                            |stop_requested| !*stop_requested,
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start shard backfill worker: {e}"),
+            })?;
+        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
+        Ok(sweeper)
+    }
+
+    pub(super) fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new((Mutex::new(true), Condvar::new())),
+            handle: Mutex::new(None),
+        })
+    }
+}
+
+fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner_token: &str) {
+    let now_ms = Coordinator::now_millis();
+    let claim_id = format!(
+        "shard-backfill-{}-{}",
+        storage_cluster.process_local_registry_key(),
+        SHARD_BACKFILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let claim = match storage_cluster.acquire_next_placed_segment_shard_backfill_claim(
+        &claim_id,
+        owner_token,
+        now_ms,
+        now_ms.saturating_add(SHARD_BACKFILL_CLAIM_LEASE_MILLIS),
+        now_ms,
+    ) {
+        Ok(Some(claim)) => {
+            emit_shard_backfill_event(
+                Some(claim.work_item.request.data_pg_id),
+                "claim_started",
+                None,
+            );
+            claim
+        }
+        Ok(None) => {
+            emit_shard_backfill_event(None, "durable_scan_empty", None);
+            return;
+        }
+        Err(error) => {
+            emit_shard_backfill_event(None, "claim_failed", None);
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_backfill_claim_error",
+                Some(format_args!("error={error}")),
+            );
+            return;
+        }
+    };
+
+    emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), "started", None);
+    match storage_cluster.backfill_placed_segment_payload_shards_for_work_item(&claim.work_item) {
+        Ok(backfilled_acks) => {
+            let event = if backfilled_acks.is_empty() {
+                "resolved_clean"
+            } else {
+                "backfilled"
+            };
+            emit_shard_backfill_event(
+                Some(claim.work_item.request.data_pg_id),
+                event,
+                Some(backfilled_acks.len()),
+            );
+            match storage_cluster.complete_placed_segment_shard_backfill_claim(&claim) {
+                Ok(true) => {
+                    emit_shard_backfill_event(
+                        Some(claim.work_item.request.data_pg_id),
+                        "complete_succeeded",
+                        None,
+                    );
+                }
+                Ok(false) => {
+                    emit_shard_backfill_event(
+                        Some(claim.work_item.request.data_pg_id),
+                        "complete_stale",
+                        None,
+                    );
+                }
+                Err(error) => {
+                    emit_shard_backfill_event(
+                        Some(claim.work_item.request.data_pg_id),
+                        "complete_failed",
+                        None,
+                    );
+                    let _ = observability::event(
+                        TRACE_TARGET,
+                        "shard_backfill_complete_error",
+                        Some(format_args!("error={error}")),
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), "failed", None);
+            let next_attempt_after =
+                Coordinator::now_millis().saturating_add(SHARD_BACKFILL_ERROR_BACKOFF_MILLIS);
+            if let Err(record_error) = storage_cluster
+                .record_placed_segment_shard_backfill_claim_error(
+                    &claim,
+                    &error.to_string(),
+                    next_attempt_after,
+                )
+            {
+                emit_shard_backfill_event(
+                    Some(claim.work_item.request.data_pg_id),
+                    "record_error_failed",
+                    None,
+                );
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "shard_backfill_record_error_failed",
+                    Some(format_args!(
+                        "backfill_error={error} record_error={record_error}"
+                    )),
+                );
+            }
+        }
+    }
+}
+
+fn emit_shard_backfill_event(
+    pg_id: Option<u32>,
+    event: &'static str,
+    shards_written: Option<usize>,
+) {
+    let detail = match (pg_id, shards_written) {
+        (Some(pg_id), Some(shards_written)) => {
+            format!("pg_id={pg_id} event={event} shards_written={shards_written}")
+        }
+        (Some(pg_id), None) => format!("pg_id={pg_id} event={event}"),
+        (None, Some(shards_written)) => format!("event={event} shards_written={shards_written}"),
+        (None, None) => format!("event={event}"),
+    };
+    let _ = observability::event(
+        TRACE_TARGET,
+        "shard_backfill_event",
+        Some(format_args!("{detail}")),
+    );
 }
 
 impl StreamSessionSweeper {

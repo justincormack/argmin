@@ -13,8 +13,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use storage::{
-    install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind, PgId,
-    ShardScavengerObservationReason, StorageCluster, StorageClusterRuntimeMapHandle,
+    install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
+    LocalNodeStoreConfig, MetadataCommandApplyTestKind, PgId, PlacedSegmentShardBackfillWorkItem,
+    SegmentStoredBytesRequest, ShardScavengerObservationReason, StorageCluster,
+    StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -53,6 +55,30 @@ fn setup_coordinator_with_only_shard_repair_worker(
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
             ShardRepairSweeper::acquire_shared,
+            |_| Ok(ShardBackfillSweeper::disabled()),
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap()
+}
+
+fn setup_coordinator_with_only_shard_backfill_worker(
+    storage_handle: StorageClusterRuntimeMapHandle,
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
+    Coordinator::new_with_shared_caches_and_background_sweeper_factories(
+        storage_handle,
+        Arc::clone(&storage_cluster),
+        shared_caches_for_storage_cluster(&storage_cluster),
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            ShardBackfillSweeper::acquire_shared,
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
@@ -82,6 +108,108 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     handle.install(Arc::clone(&candidate)).unwrap();
 
     assert!(Arc::ptr_eq(&coord.storage_node(), &candidate));
+}
+
+#[test]
+fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let _coord =
+        setup_coordinator_with_only_shard_backfill_worker(handle.clone(), Arc::clone(&initial));
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let segment_okh = [0xBF; 16];
+    let segment_vid = GenerationId::MIN;
+    let payload = b"backfill worker must use refreshed runtime map";
+    let written_segment = initial
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            segment_vid,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    initial
+        .test_register_payload_shard_acks(
+            written_segment.data_pg_id,
+            &written_segment.written_shards,
+        )
+        .unwrap();
+
+    let source_epoch = initial.cluster_epoch();
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let source_route = initial
+        .local_pg_route(PgId::new(written_segment.data_pg_id))
+        .expect("test PG should have a local route");
+    let historical_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        source_epoch,
+        source_route.pg_id(),
+        source_route.primary_node_id(),
+        source_route.acting_set().to_vec(),
+        source_route.state(),
+    );
+    let ec_shape = initial.default_payload_ec_shape();
+    let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                storage::NodeId::new(node_id),
+                tmp.path().join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut refreshed_map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        storage::NodeId::new(0),
+        configs,
+        &[0],
+        ec_shape,
+        desired_epoch,
+    )
+    .unwrap();
+    refreshed_map.test_install_historical_pg_routes([historical_route]);
+    let refreshed = StorageCluster::from_local_map(Arc::new(refreshed_map)).unwrap();
+    handle.install(Arc::clone(&refreshed)).unwrap();
+
+    let work_item = PlacedSegmentShardBackfillWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id: written_segment.data_pg_id,
+            segment_okh,
+            segment_vid,
+            stored_size: payload.len(),
+            segment_crc64: checksum::crc64::checksum(payload),
+            ec: written_segment.ec,
+        },
+        source_cluster_epoch: source_epoch,
+        desired_cluster_epoch: desired_epoch,
+    };
+    assert!(
+        initial
+            .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+            .is_err(),
+        "the stale initial cluster must not be able to reconstruct the desired epoch"
+    );
+    refreshed
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    loop {
+        let rows = refreshed
+            .list_placed_segment_shard_backfills(written_segment.data_pg_id)
+            .unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        assert!(
+            start.elapsed() < TEST_EVENT_TIMEOUT,
+            "shard backfill worker did not complete durable row after runtime-map refresh: {rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -1963,6 +2091,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
             lifecycle: true,
             shard_scavenger: true,
             shard_repair: true,
+            shard_backfill: true,
             stream_session: true,
         }
     );
@@ -8710,6 +8839,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
@@ -8843,6 +8973,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
@@ -8963,6 +9094,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
             ShardRepairSweeper::acquire_shared,
+            |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
