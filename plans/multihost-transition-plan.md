@@ -7773,6 +7773,11 @@ PG backfill and migration design notes:
   placement still uses the existing active-route path, but this gives backfill
   planning a deterministic way to reconstruct old shard locations from retained
   PG/cluster-map history without adding per-segment placement vectors.
+- Added the first control-plane lookup for reconstructed PG routes. A snapshot
+  can now build a non-serving `PgRouteSnapshot` for the current or a retained
+  cluster epoch, including Active PGs without treating their primary lease as
+  live service authority, and storage has a route-snapshot placement helper
+  that checks the route PG matches the segment data PG before placing shards.
 
 Exit criteria:
 

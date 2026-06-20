@@ -270,6 +270,24 @@ impl ClusterControlSnapshot {
             .find(|record| record.cluster_epoch == epoch)
     }
 
+    pub fn reconstructed_pg_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        if cluster_epoch == self.cluster_epoch {
+            let record = self
+                .pg(pg_id)
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+            return reconstruct_pg_route_from_record(cluster_epoch, pg_id, record, |node_id| {
+                self.nodes.contains_key(&node_id)
+            });
+        }
+        self.cluster_map_at_epoch(cluster_epoch)
+            .ok_or(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch })?
+            .reconstructed_pg_route(pg_id)
+    }
+
     pub fn active_pg_route(
         &self,
         pg_id: PgId,
@@ -688,6 +706,61 @@ impl ClusterMapHistoryRecord {
     pub fn pgs(&self) -> &[PgControlRecord] {
         &self.pgs
     }
+
+    #[must_use]
+    pub fn pg(&self, pg_id: PgId) -> Option<&PgControlRecord> {
+        self.pgs.iter().find(|record| record.pg_id == pg_id)
+    }
+
+    pub fn reconstructed_pg_route(
+        &self,
+        pg_id: PgId,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        reconstruct_pg_route_from_record(self.cluster_epoch, pg_id, record, |node_id| {
+            self.nodes.iter().any(|node| node.node_id() == node_id)
+        })
+    }
+}
+
+fn reconstruct_pg_route_from_record(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    record: &PgControlRecord,
+    mut contains_node: impl FnMut(NodeId) -> bool,
+) -> Result<PgRouteSnapshot, ControlPlaneError> {
+    let primary = match record.state {
+        PgState::Active => record
+            .active_primary
+            .filter(|primary| record.acting_set.contains(primary))
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: pg_id.get(),
+                cluster_epoch,
+            })?,
+        _ => record
+            .acting_set
+            .first()
+            .copied()
+            .ok_or(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() })?,
+    };
+    for &node_id in &record.acting_set {
+        if !contains_node(node_id) {
+            return Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: pg_id.get(),
+                node_id: node_id.as_u32(),
+            });
+        }
+    }
+    Ok(PgRouteSnapshot {
+        cluster_epoch,
+        pg_id,
+        primary_node_id: primary,
+        acting_set: record.acting_set.clone(),
+        state: record.state,
+        primary_lease_deadline_ms: None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2763,6 +2836,9 @@ pub enum ControlPlaneError {
     #[error("unknown PG {pg_id}")]
     UnknownPg { pg_id: u32 },
 
+    #[error("cluster epoch {cluster_epoch} is not retained in cluster-map history")]
+    UnknownClusterMapEpoch { cluster_epoch: ClusterEpoch },
+
     #[error("PG {pg_id} acting set must not be empty")]
     EmptyActingSet { pg_id: u32 },
 
@@ -4700,6 +4776,50 @@ mod tests {
             CLUSTER_MAP_HISTORY_LIMIT
         );
         assert!(persisted.cluster_map_at_epoch(initial_epoch).is_none());
+    }
+
+    #[test]
+    fn snapshot_reconstructs_pg_route_at_epoch_without_serving_authority() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(3), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        let route_epoch = authority.snapshot().cluster_epoch();
+
+        authority
+            .set_node_membership(NodeId::new(4), NodeMembershipState::Active)
+            .unwrap();
+        let snapshot = authority.snapshot();
+        let historical = snapshot
+            .cluster_map_at_epoch(route_epoch)
+            .unwrap()
+            .pg(PgId::new(3))
+            .unwrap();
+        assert_eq!(historical.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
+
+        let route = snapshot
+            .reconstructed_pg_route_at_epoch(PgId::new(3), route_epoch)
+            .unwrap();
+        assert_eq!(route.cluster_epoch(), route_epoch);
+        assert_eq!(route.pg_id(), PgId::new(3));
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+        assert_eq!(route.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.primary_lease_deadline_ms(), None);
+        let missing_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
+        assert!(matches!(
+            snapshot.reconstructed_pg_route_at_epoch(PgId::new(3), missing_epoch),
+            Err(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch })
+                if cluster_epoch == missing_epoch
+        ));
     }
 
     #[test]
@@ -6913,6 +7033,14 @@ mod tests {
                 .active_pg_route(PgId::new(23), lease_deadline),
             Err(ControlPlaneError::PgHasNoServingPrimary { pg_id: 23, .. })
         ));
+        let reconstructed = authority
+            .snapshot()
+            .reconstructed_pg_route_at_epoch(PgId::new(23), authority.snapshot().cluster_epoch())
+            .unwrap();
+        assert_eq!(reconstructed.state(), PgState::Active);
+        assert_eq!(reconstructed.primary_node_id(), NodeId::new(1));
+        assert_eq!(reconstructed.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(reconstructed.primary_lease_deadline_ms(), None);
     }
 
     #[test]
@@ -8391,6 +8519,15 @@ mod tests {
             historical_pg.active_metadata_proof(),
             Some(active_metadata_proof)
         );
+        let historical_route = restarted
+            .snapshot()
+            .reconstructed_pg_route_at_epoch(PgId::new(26), active_epoch)
+            .unwrap();
+        assert_eq!(historical_route.cluster_epoch(), active_epoch);
+        assert_eq!(historical_route.state(), PgState::Active);
+        assert_eq!(historical_route.primary_node_id(), NodeId::new(1));
+        assert_eq!(historical_route.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(historical_route.primary_lease_deadline_ms(), None);
 
         let mut stale_active_heartbeat = heartbeat_from_record(&restarted, 1, restart_epoch, 2_003);
         stale_active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {

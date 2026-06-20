@@ -21,7 +21,7 @@ pub use local::{
 use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 
 use crate::control_plane::{
-    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
+    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource, PgRouteSnapshot,
 };
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
@@ -3300,6 +3300,31 @@ impl StorageCluster {
             ec_shape,
             stable_placement_key,
             acting_set,
+        )
+    }
+
+    pub fn place_payload_shards_for_pg_route_snapshot(
+        &self,
+        route: &PgRouteSnapshot,
+        data_pg_id: DataPgId,
+        ec_shape: EcShape,
+        stable_placement_key: &[u8],
+    ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
+        if route.pg_id() != data_pg_id.pg_id() {
+            return Err(ClusterBuildError::InvalidLocalPlacement {
+                reason: format!(
+                    "route PG {} does not match data PG {}",
+                    route.pg_id().get(),
+                    data_pg_id.pg_id().get()
+                ),
+            });
+        }
+        self.place_payload_shards_for_pg_route(
+            route.cluster_epoch(),
+            data_pg_id,
+            ec_shape,
+            stable_placement_key,
+            route.acting_set(),
         )
     }
 
