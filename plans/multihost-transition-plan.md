@@ -7831,6 +7831,16 @@ PG backfill and migration design notes:
   single-lane worker using the existing known-damage background admission; the
   remaining follow-up is the risk/priority model that distinguishes urgent
   EC-safety backfill from routine convergence and integrates scanner output.
+- Added first-class shard-backfill observability. The worker now emits
+  structured backfill events for durable scans with no claimable work, claims,
+  starts, no-op resolutions, real shard writes, failures, and completion
+  outcomes; the local debug metrics endpoint exposes aggregate queue depth,
+  event totals, per-PG/event dimensions, and
+  `shard_backfill_shards_written_total`, and UAT prints the same summary. The
+  queue-depth signal uses an exact durable count rather than the bounded row
+  listing API, and also counts as durable background backlog for opportunistic
+  scan admission. This is instrumentation only; EC-risk prioritization is still
+  the next scheduling slice.
 
 Exit criteria:
 

@@ -7140,6 +7140,21 @@ impl StorageCluster {
             .list_placed_segment_shard_backfills(pg_id)
     }
 
+    pub fn placed_segment_shard_backfill_backlog_depth(&self) -> Result<usize, StoreError> {
+        let mut depth = 0usize;
+        for route in self.local_pg_routes() {
+            if route.state() != PgState::Active {
+                continue;
+            }
+            let pg_id = route.pg_id();
+            depth = depth.saturating_add(
+                self.metadata_pg_primary_shard_ack_client(pg_id)?
+                    .count_placed_segment_shard_backfills(pg_id)?,
+            );
+        }
+        Ok(depth)
+    }
+
     pub fn acquire_placed_segment_shard_backfill_claim(
         &self,
         data_pg_id: u32,

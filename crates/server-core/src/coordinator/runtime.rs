@@ -299,6 +299,7 @@ fn background_work_durable_backlog_active(snapshot: observability::MetricsSnapsh
         || snapshot.object_payload_reclaim_outstanding_depth > 0
         || snapshot.bucket_delete_finalize_queue_depth > 0
         || snapshot.shard_repair_queue_depth > 0
+        || snapshot.shard_backfill_queue_depth > 0
 }
 
 impl Drop for BackgroundWorkPermit {
@@ -1194,7 +1195,12 @@ impl ShardBackfillSweeper {
                     {
                         run_one_placed_segment_shard_backfill(&storage_cluster, &owner_token);
                     } else {
-                        emit_shard_backfill_event(None, "admission_denied", None);
+                        emit_shard_backfill_event(
+                            None,
+                            "admission_denied",
+                            shard_backfill_queue_depth(&storage_cluster),
+                            None,
+                        );
                     }
 
                     let stop_guard = lock_mutex_unpoisoned(&wake.0);
@@ -1234,6 +1240,7 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
         storage_cluster.process_local_registry_key(),
         SHARD_BACKFILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
+    let queue_depth = shard_backfill_queue_depth(storage_cluster);
     let claim = match storage_cluster.acquire_next_placed_segment_shard_backfill_claim(
         &claim_id,
         owner_token,
@@ -1245,16 +1252,17 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
             emit_shard_backfill_event(
                 Some(claim.work_item.request.data_pg_id),
                 "claim_started",
+                queue_depth,
                 None,
             );
             claim
         }
         Ok(None) => {
-            emit_shard_backfill_event(None, "durable_scan_empty", None);
+            emit_shard_backfill_event(None, "durable_scan_no_claim", queue_depth, None);
             return;
         }
         Err(error) => {
-            emit_shard_backfill_event(None, "claim_failed", None);
+            emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
             let _ = observability::event(
                 TRACE_TARGET,
                 "shard_backfill_claim_error",
@@ -1264,7 +1272,12 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
         }
     };
 
-    emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), "started", None);
+    emit_shard_backfill_event(
+        Some(claim.work_item.request.data_pg_id),
+        "started",
+        None,
+        None,
+    );
     match storage_cluster.backfill_placed_segment_payload_shards_for_work_item(&claim.work_item) {
         Ok(backfilled_acks) => {
             let event = if backfilled_acks.is_empty() {
@@ -1275,6 +1288,7 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
             emit_shard_backfill_event(
                 Some(claim.work_item.request.data_pg_id),
                 event,
+                None,
                 Some(backfilled_acks.len()),
             );
             match storage_cluster.complete_placed_segment_shard_backfill_claim(&claim) {
@@ -1282,6 +1296,7 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
                     emit_shard_backfill_event(
                         Some(claim.work_item.request.data_pg_id),
                         "complete_succeeded",
+                        shard_backfill_queue_depth(storage_cluster),
                         None,
                     );
                 }
@@ -1289,6 +1304,7 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
                     emit_shard_backfill_event(
                         Some(claim.work_item.request.data_pg_id),
                         "complete_stale",
+                        shard_backfill_queue_depth(storage_cluster),
                         None,
                     );
                 }
@@ -1296,6 +1312,7 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
                     emit_shard_backfill_event(
                         Some(claim.work_item.request.data_pg_id),
                         "complete_failed",
+                        shard_backfill_queue_depth(storage_cluster),
                         None,
                     );
                     let _ = observability::event(
@@ -1307,7 +1324,12 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
             }
         }
         Err(error) => {
-            emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), "failed", None);
+            emit_shard_backfill_event(
+                Some(claim.work_item.request.data_pg_id),
+                "failed",
+                None,
+                None,
+            );
             let next_attempt_after =
                 Coordinator::now_millis().saturating_add(SHARD_BACKFILL_ERROR_BACKOFF_MILLIS);
             if let Err(record_error) = storage_cluster
@@ -1320,6 +1342,7 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
                 emit_shard_backfill_event(
                     Some(claim.work_item.request.data_pg_id),
                     "record_error_failed",
+                    shard_backfill_queue_depth(storage_cluster),
                     None,
                 );
                 let _ = observability::event(
@@ -1334,23 +1357,34 @@ fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner
     }
 }
 
+fn shard_backfill_queue_depth(storage_cluster: &StorageCluster) -> Option<usize> {
+    match storage_cluster.placed_segment_shard_backfill_backlog_depth() {
+        Ok(depth) => Some(depth),
+        Err(error) => {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_backfill_backlog_depth_error",
+                Some(format_args!("error={error}")),
+            );
+            None
+        }
+    }
+}
+
 fn emit_shard_backfill_event(
     pg_id: Option<u32>,
     event: &'static str,
+    queue_depth: Option<usize>,
     shards_written: Option<usize>,
 ) {
-    let detail = match (pg_id, shards_written) {
-        (Some(pg_id), Some(shards_written)) => {
-            format!("pg_id={pg_id} event={event} shards_written={shards_written}")
-        }
-        (Some(pg_id), None) => format!("pg_id={pg_id} event={event}"),
-        (None, Some(shards_written)) => format!("event={event} shards_written={shards_written}"),
-        (None, None) => format!("event={event}"),
-    };
-    let _ = observability::event(
+    let _ = observability::emit_shard_backfill_event(
         TRACE_TARGET,
-        "shard_backfill_event",
-        Some(format_args!("{detail}")),
+        observability::ShardBackfillEventSummary {
+            pg_id,
+            event,
+            queue_depth,
+            shards_written,
+        },
     );
 }
 

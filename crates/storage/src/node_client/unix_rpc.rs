@@ -542,6 +542,29 @@ impl UnixStorageNodeClient {
         })
     }
 
+    pub(crate) fn count_placed_segment_shard_backfills(
+        &self,
+        pg_id: PgId,
+    ) -> Result<usize, StoreError> {
+        let request = self.bucket_pg_request(pg_id);
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode placed segment shard backfill count request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillCount,
+            payload,
+        )?;
+        decode_placed_segment_shard_backfill_count_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode placed segment shard backfill count response",
+                error.to_string(),
+            )
+        })
+    }
+
     pub(crate) fn acquire_placed_segment_shard_backfill_claim(
         &self,
         pg_id: PgId,
@@ -919,6 +942,10 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
         pg_id: PgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
         UnixStorageNodeClient::list_placed_segment_shard_backfills(self, pg_id)
+    }
+
+    fn count_placed_segment_shard_backfills(&self, pg_id: PgId) -> Result<usize, StoreError> {
+        UnixStorageNodeClient::count_placed_segment_shard_backfills(self, pg_id)
     }
 
     fn acquire_placed_segment_shard_backfill_claim(

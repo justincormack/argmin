@@ -64,6 +64,7 @@ use crate::storage_rpc::{
     decode_object_read_snapshot_response, decode_object_tags_for_subject_response,
     decode_object_version_response, decode_payload_reclaim_root_response,
     decode_placed_segment_shard_backfill_claim_optional_record_response,
+    decode_placed_segment_shard_backfill_count_response,
     decode_placed_segment_shard_backfills_response,
     decode_placed_segment_shard_repair_claim_optional_record_response,
     decode_placed_segment_shard_repairs_response, decode_put_object_metadata_snapshot_response,

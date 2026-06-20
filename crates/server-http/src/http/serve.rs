@@ -1079,6 +1079,9 @@ fn local_debug_metrics_body() -> String {
             "shard_repair_queue_depth {}\n",
             "shard_repair_event_total {}\n",
             "shard_repair_shards_rewritten_total {}\n",
+            "shard_backfill_queue_depth {}\n",
+            "shard_backfill_event_total {}\n",
+            "shard_backfill_shards_written_total {}\n",
             "background_work_admission_event_total {}\n",
             "background_work_active_total {}\n",
             "background_work_finished_total {}\n",
@@ -1150,6 +1153,9 @@ fn local_debug_metrics_body() -> String {
         snapshot.shard_repair_queue_depth,
         snapshot.shard_repair_event_total,
         snapshot.shard_repair_shards_rewritten_total,
+        snapshot.shard_backfill_queue_depth,
+        snapshot.shard_backfill_event_total,
+        snapshot.shard_backfill_shards_written_total,
         snapshot.background_work_admission_event_total,
         snapshot.background_work_active_total,
         snapshot.background_work_finished_total,
@@ -1269,6 +1275,15 @@ fn local_debug_metrics_body() -> String {
         let _ = writeln!(
             body,
             "shard_repair_event_by_pg_total{{pg_id=\"{}\",event=\"{}\"}} {}",
+            pg_id, event, sample.count
+        );
+    }
+    for sample in observability::shard_backfill_event_dimension_snapshot() {
+        let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
+        let event = debug_metric_label_value(sample.event);
+        let _ = writeln!(
+            body,
+            "shard_backfill_event_by_pg_total{{pg_id=\"{}\",event=\"{}\"}} {}",
             pg_id, event, sample.count
         );
     }
@@ -4603,6 +4618,9 @@ mod tests {
         assert!(response.contains("shard_repair_queue_depth "));
         assert!(response.contains("shard_repair_event_total "));
         assert!(response.contains("shard_repair_shards_rewritten_total "));
+        assert!(response.contains("shard_backfill_queue_depth "));
+        assert!(response.contains("shard_backfill_event_total "));
+        assert!(response.contains("shard_backfill_shards_written_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));

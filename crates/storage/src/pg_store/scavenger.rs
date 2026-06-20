@@ -323,6 +323,24 @@ impl PgStore {
         Ok(backfills)
     }
 
+    pub fn placed_segment_shard_backfill_count(&self) -> Result<usize, StoreError> {
+        let count = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM placed_segment_shard_backfills",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| StoreError::Db {
+                context: "count placed segment shard backfills",
+                source,
+            })?;
+        usize::try_from(count).map_err(|_| StoreError::Db {
+            context: "count placed segment shard backfills range",
+            source: rusqlite::Error::InvalidQuery,
+        })
+    }
+
     pub fn resolve_placed_segment_shard_backfill(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
@@ -2593,6 +2611,10 @@ mod tests {
         assert_eq!(
             store.list_placed_segment_shard_backfills().unwrap().len(),
             PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT
+        );
+        assert_eq!(
+            store.placed_segment_shard_backfill_count().unwrap(),
+            PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT + 1
         );
     }
 

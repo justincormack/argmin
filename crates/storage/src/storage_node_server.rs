@@ -131,6 +131,7 @@ use crate::storage_rpc::{
     encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
     encode_object_version_response, encode_payload_reclaim_root_response,
     encode_placed_segment_shard_backfill_claim_optional_record_response,
+    encode_placed_segment_shard_backfill_count_response,
     encode_placed_segment_shard_backfills_response,
     encode_placed_segment_shard_repair_claim_optional_record_response,
     encode_placed_segment_shard_repairs_response, encode_put_object_metadata_snapshot_response,
@@ -2331,6 +2332,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::PlacedSegmentShardBackfills => {
                 match decode_bucket_pg_request(&frame.payload) {
                     Ok(request) => self.placed_segment_shard_backfills_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentShardBackfillCount => {
+                match decode_bucket_pg_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_backfill_count_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6721,6 +6731,30 @@ impl StorageNodeConnectionHandler {
         match local_client.list_placed_segment_shard_backfills(request.pg_id) {
             Ok(backfills) => {
                 let payload = encode_placed_segment_shard_backfills_response(&backfills)?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_backfill_count_response(
+        &self,
+        request: StorageRpcBucketPgRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.pg_id, "placed segment shard backfill count")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client.count_placed_segment_shard_backfills(request.pg_id) {
+            Ok(count) => {
+                let payload = encode_placed_segment_shard_backfill_count_response(count)?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),

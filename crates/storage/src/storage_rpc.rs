@@ -662,6 +662,7 @@ pub(crate) enum StorageRpcMessageKind {
     PlacedSegmentShardBackfillClaimAcquire = 138,
     PlacedSegmentShardBackfillClaimComplete = 139,
     PlacedSegmentShardBackfillClaimError = 140,
+    PlacedSegmentShardBackfillCount = 141,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -884,6 +885,7 @@ impl StorageRpcMessageKind {
             Self::PlacedSegmentShardBackfillClaimError => {
                 "placed segment shard backfill claim error"
             }
+            Self::PlacedSegmentShardBackfillCount => "placed segment shard backfill count",
         }
     }
 
@@ -1029,6 +1031,7 @@ impl StorageRpcMessageKind {
             138 => Ok(Self::PlacedSegmentShardBackfillClaimAcquire),
             139 => Ok(Self::PlacedSegmentShardBackfillClaimComplete),
             140 => Ok(Self::PlacedSegmentShardBackfillClaimError),
+            141 => Ok(Self::PlacedSegmentShardBackfillCount),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -3242,6 +3245,9 @@ fn message_kind_request_max_payload_len(
                 + STORAGE_RPC_PLACED_SEGMENT_BACKFILL_WORK_ITEM_MAX_LEN
         }
         StorageRpcMessageKind::PlacedSegmentShardBackfills => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardBackfillCount => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::PlacedSegmentShardBackfillClaimAcquire => {
@@ -9636,6 +9642,34 @@ pub(crate) fn decode_placed_segment_shard_backfills_response(
     }
     decoder.finish()?;
     Ok(backfills)
+}
+
+pub(crate) fn encode_placed_segment_shard_backfill_count_response(
+    count: usize,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    put_u64(
+        &mut out,
+        u64::try_from(count).map_err(|_| StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: u64::MAX as usize,
+        })?,
+    );
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_shard_backfill_count_response(
+    bytes: &[u8],
+) -> Result<usize, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = usize::try_from(decoder.read_u64()?).map_err(|_| {
+        StorageRpcPayloadError::PayloadTooLarge {
+            len: usize::MAX,
+            limit: usize::MAX,
+        }
+    })?;
+    decoder.finish()?;
+    Ok(count)
 }
 
 pub(crate) fn encode_read_handle_acquire_request(
@@ -16698,6 +16732,16 @@ mod tests {
             )
             .unwrap(),
             vec![backfill]
+        );
+        assert_eq!(
+            decode_placed_segment_shard_backfill_count_response(
+                &encode_placed_segment_shard_backfill_count_response(
+                    PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT + 1
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT + 1
         );
 
         let claim_acquire = StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest {

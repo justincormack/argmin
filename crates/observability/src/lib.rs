@@ -137,6 +137,9 @@ static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -167,6 +170,8 @@ static OBJECT_PAYLOAD_RECLAIM_DURABLE_SCAN_DIMENSIONS: OnceLock<
     Mutex<Vec<ObjectPayloadReclaimEventDimensionCounter>>,
 > = OnceLock::new();
 static SHARD_REPAIR_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardRepairEventDimensionCounter>>> =
+    OnceLock::new();
+static SHARD_BACKFILL_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardBackfillEventDimensionCounter>>> =
     OnceLock::new();
 static BACKGROUND_WORK_ADMISSION_DIMENSIONS: OnceLock<
     Mutex<Vec<BackgroundWorkAdmissionDimensionCounter>>,
@@ -258,6 +263,13 @@ pub struct ShardRepairEventDimensionSample {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardBackfillEventDimensionSample {
+    pub pg_id: Option<u32>,
+    pub event: &'static str,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundWorkAdmissionDimensionSample {
     pub class: &'static str,
     pub event: &'static str,
@@ -304,6 +316,12 @@ struct ObjectPayloadReclaimEventDimensionCounter {
 }
 
 struct ShardRepairEventDimensionCounter {
+    pg_id: Option<u32>,
+    event: &'static str,
+    count: u64,
+}
+
+struct ShardBackfillEventDimensionCounter {
     pg_id: Option<u32>,
     event: &'static str,
     count: u64,
@@ -452,6 +470,10 @@ fn object_payload_reclaim_durable_scan_dimensions(
 
 fn shard_repair_event_dimensions() -> &'static Mutex<Vec<ShardRepairEventDimensionCounter>> {
     SHARD_REPAIR_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn shard_backfill_event_dimensions() -> &'static Mutex<Vec<ShardBackfillEventDimensionCounter>> {
+    SHARD_BACKFILL_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn background_work_admission_dimensions(
@@ -633,6 +655,26 @@ fn increment_shard_repair_dimension(pg_id: Option<u32>, event: &'static str) {
     }
 }
 
+fn increment_shard_backfill_dimension(pg_id: Option<u32>, event: &'static str) {
+    let mut counters = shard_backfill_event_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters
+        .iter_mut()
+        .find(|counter| counter.pg_id == pg_id && counter.event == event)
+    {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(ShardBackfillEventDimensionCounter {
+            pg_id,
+            event,
+            count: 1,
+        });
+    }
+}
+
 fn increment_background_work_admission_dimension(
     class: &'static str,
     event: &'static str,
@@ -786,6 +828,20 @@ pub fn shard_repair_event_dimension_snapshot() -> Vec<ShardRepairEventDimensionS
         .unwrap_or_else(|err| err.into_inner())
         .iter()
         .map(|counter| ShardRepairEventDimensionSample {
+            pg_id: counter.pg_id,
+            event: counter.event,
+            count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn shard_backfill_event_dimension_snapshot() -> Vec<ShardBackfillEventDimensionSample> {
+    shard_backfill_event_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| ShardBackfillEventDimensionSample {
             pg_id: counter.pg_id,
             event: counter.event,
             count: counter.count,
@@ -1267,6 +1323,14 @@ pub struct ShardRepairEventSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardBackfillEventSummary {
+    pub pg_id: Option<u32>,
+    pub event: &'static str,
+    pub queue_depth: Option<usize>,
+    pub shards_written: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackgroundWorkAdmissionSummary {
     pub class: &'static str,
     pub event: &'static str,
@@ -1366,6 +1430,9 @@ pub struct MetricsSnapshot {
     pub shard_repair_queue_depth: u64,
     pub shard_repair_event_total: u64,
     pub shard_repair_shards_rewritten_total: u64,
+    pub shard_backfill_queue_depth: u64,
+    pub shard_backfill_event_total: u64,
+    pub shard_backfill_shards_written_total: u64,
     pub background_work_admission_event_total: u64,
     pub background_work_active_total: u64,
     pub background_work_finished_total: u64,
@@ -1624,6 +1691,10 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         shard_repair_queue_depth: SHARD_REPAIR_QUEUE_DEPTH.load(Ordering::Relaxed),
         shard_repair_event_total: SHARD_REPAIR_EVENT_TOTAL.load(Ordering::Relaxed),
         shard_repair_shards_rewritten_total: SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_queue_depth: SHARD_BACKFILL_QUEUE_DEPTH.load(Ordering::Relaxed),
+        shard_backfill_event_total: SHARD_BACKFILL_EVENT_TOTAL.load(Ordering::Relaxed),
+        shard_backfill_shards_written_total: SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL
             .load(Ordering::Relaxed),
         background_work_admission_event_total: BACKGROUND_WORK_ADMISSION_EVENT_TOTAL
             .load(Ordering::Relaxed),
@@ -2556,6 +2627,38 @@ pub fn emit_shard_repair_event(target: &'static str, summary: ShardRepairEventSu
     )
 }
 
+pub fn emit_shard_backfill_event(target: &'static str, summary: ShardBackfillEventSummary) -> bool {
+    SHARD_BACKFILL_EVENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if let Some(queue_depth) = summary.queue_depth {
+        SHARD_BACKFILL_QUEUE_DEPTH.store(queue_depth as u64, Ordering::Relaxed);
+    }
+    if let Some(shards_written) = summary.shards_written {
+        SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL.fetch_add(shards_written as u64, Ordering::Relaxed);
+    }
+    increment_shard_backfill_dimension(summary.pg_id, summary.event);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let pg_id = summary
+        .pg_id
+        .map(|pg_id| pg_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut detail = format!("pg_id={} event={}", pg_id, summary.event);
+    if let Some(queue_depth) = summary.queue_depth {
+        detail.push_str(&format!(" queue_depth={queue_depth}"));
+    }
+    if let Some(shards_written) = summary.shards_written {
+        detail.push_str(&format!(" shards_written={shards_written}"));
+    }
+    record_flight_event(&context, target, "shard_backfill_event", detail.clone());
+    event_in_context(
+        &context,
+        target,
+        "shard_backfill_event",
+        Some(format_args!("{detail}")),
+    )
+}
+
 pub fn emit_background_work_admission_event(
     target: &'static str,
     summary: BackgroundWorkAdmissionSummary,
@@ -3303,6 +3406,24 @@ mod tests {
                 shards_rewritten: Some(2),
             },
         );
+        emit_shard_backfill_event(
+            "storage",
+            ShardBackfillEventSummary {
+                pg_id: Some(11),
+                event: "claim_started",
+                queue_depth: Some(3),
+                shards_written: None,
+            },
+        );
+        emit_shard_backfill_event(
+            "storage",
+            ShardBackfillEventSummary {
+                pg_id: Some(11),
+                event: "backfilled",
+                queue_depth: None,
+                shards_written: Some(2),
+            },
+        );
         emit_background_work_admission_event(
             "storage",
             BackgroundWorkAdmissionSummary {
@@ -3595,6 +3716,25 @@ mod tests {
             .iter()
             .any(|sample| sample.pg_id == Some(11)
                 && sample.event == "repaired"
+                && sample.count >= 1));
+        assert_eq!(after.shard_backfill_queue_depth, 3);
+        assert_eq!(
+            after.shard_backfill_event_total,
+            before.shard_backfill_event_total + 2
+        );
+        assert_eq!(
+            after.shard_backfill_shards_written_total,
+            before.shard_backfill_shards_written_total + 2
+        );
+        assert!(shard_backfill_event_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(11)
+                && sample.event == "claim_started"
+                && sample.count >= 1));
+        assert!(shard_backfill_event_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(11)
+                && sample.event == "backfilled"
                 && sample.count >= 1));
         assert_eq!(
             after.background_work_admission_event_total,

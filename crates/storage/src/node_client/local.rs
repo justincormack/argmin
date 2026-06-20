@@ -246,6 +246,11 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
         pg.list_placed_segment_shard_backfills()
     }
 
+    fn count_placed_segment_shard_backfills(&self, pg_id: PgId) -> Result<usize, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.placed_segment_shard_backfill_count()
+    }
+
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
         pg_id: PgId,

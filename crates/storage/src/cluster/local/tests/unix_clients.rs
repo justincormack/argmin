@@ -237,6 +237,10 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         Ok(Vec::new())
     }
 
+    fn count_placed_segment_shard_backfills(&self, _pg_id: PgId) -> Result<usize, StoreError> {
+        Ok(0)
+    }
+
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
         _pg_id: PgId,
