@@ -3041,12 +3041,12 @@ mod tests {
     }
 
     #[test]
-    fn get_bucket_location_response_maps_eu_west_1_to_legacy_eu() {
+    fn get_bucket_location_response_uses_current_eu_west_1_name() {
         let resp = S3Response::get_bucket_location("eu-west-1");
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
-        assert!(body.contains(">EU</LocationConstraint>"));
+        assert!(body.contains(">eu-west-1</LocationConstraint>"));
     }
 
     // ── list_buckets ──────────────────────────────────────────────────

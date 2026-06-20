@@ -45,7 +45,6 @@ pub fn is_legacy_create_bucket_region(region: &str) -> bool {
 pub fn bucket_location_constraint(region: &str) -> Option<&str> {
     match region {
         "us-east-1" => None,
-        "eu-west-1" => Some("EU"),
         other => Some(other),
     }
 }
@@ -1268,7 +1267,7 @@ mod tests {
         assert!(is_legacy_create_bucket_region("us-east-1"));
         assert!(!is_legacy_create_bucket_region("us-west-2"));
         assert_eq!(bucket_location_constraint("us-east-1"), None);
-        assert_eq!(bucket_location_constraint("eu-west-1"), Some("EU"));
+        assert_eq!(bucket_location_constraint("eu-west-1"), Some("eu-west-1"));
         assert_eq!(bucket_location_constraint("us-west-2"), Some("us-west-2"));
     }
 

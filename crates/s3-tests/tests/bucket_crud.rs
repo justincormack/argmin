@@ -53,15 +53,6 @@ async fn put_object(bucket: &str, key: &str, body: &'static [u8]) {
     .await;
 }
 
-fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
-    match region {
-        // The SDK models the legacy us-east-1 null as an empty string.
-        "us-east-1" => Some(""),
-        "eu-west-1" => Some("EU"),
-        other => Some(other),
-    }
-}
-
 fn account_regional_bucket_name(account_id: &str, region: &str) -> String {
     let suffix = format!("-{account_id}-{region}-an");
     let n = ACCOUNT_REGIONAL_BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -407,16 +398,9 @@ fn test_bucket_get_location() {
         let bucket = unique_bucket();
         create_bucket_in_test_region(client, &bucket).await;
 
-        let output = client
-            .get_bucket_location()
-            .bucket(&bucket)
-            .send_retrying_operation_aborted("get bucket location")
-            .await
-            .unwrap();
-        assert_eq!(
-            output.location_constraint().map(|value| value.as_str()),
-            expected_bucket_location_constraint_for_sdk(CTX.region())
-        );
+        let url = s3_tests::bucket_location_url(CTX.endpoint(), &bucket);
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        s3_tests::assert_raw_bucket_location(&response, CTX.region());
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });

@@ -34,14 +34,6 @@ fn endpoint_is_https() -> bool {
     CTX.endpoint().starts_with("https://")
 }
 
-fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
-    match region {
-        "us-east-1" => Some(""),
-        "eu-west-1" => Some("EU"),
-        other => Some(other),
-    }
-}
-
 fn require_https_endpoint() {
     assert!(
         endpoint_is_https(),
@@ -330,6 +322,32 @@ where
         },
     )
     .await;
+}
+
+async fn eventually_raw_bucket_location(
+    description: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> s3_tests::RawResponse {
+    let url = s3_tests::bucket_location_url(CTX.endpoint(), bucket);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let response = send_signed_request_with_credentials(
+            "GET",
+            &url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            credentials,
+        );
+        if response.status == 200 {
+            return response;
+        }
+        if response.status == 403 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        panic!("{description} failed unexpectedly: {response:?}");
+    }
 }
 
 async fn get_object_eventually(
@@ -14677,17 +14695,18 @@ fn test_bucket_policy_get_bucket_location_requires_dedicated_action() {
             .await
             .unwrap();
 
-        let location = eventually_ok_with_retry(
+        let response = eventually_raw_bucket_location(
             "GetBucketLocation allowed with GetBucketLocation policy",
-            60,
-            std::time::Duration::from_millis(500),
-            || alt_client.get_bucket_location().bucket(&bucket).send(),
+            &bucket,
+            SignedRequestCredentials {
+                access_key: CTX.alt_access_key(),
+                secret_key: CTX.alt_secret_key(),
+                region: CTX.region(),
+                tls_ca_pem: CTX.tls_ca_pem(),
+            },
         )
         .await;
-        assert_eq!(
-            location.location_constraint().map(|v| v.as_str()),
-            expected_bucket_location_constraint_for_sdk(CTX.region())
-        );
+        s3_tests::assert_raw_bucket_location(&response, CTX.region());
 
         cleanup(&bucket, &[]).await;
     });

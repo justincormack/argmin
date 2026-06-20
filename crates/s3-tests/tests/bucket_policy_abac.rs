@@ -14,18 +14,12 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, disable_bucket_public_access_block, err_status,
     put_bucket_lifecycle_with_md5, send_signed_request_to_endpoint_for_service_with_credentials,
-    unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
+    send_signed_request_with_credentials, unique_bucket, SendRetryingOperationAborted,
+    SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
 
-fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
-    match region {
-        "us-east-1" => Some(""),
-        "eu-west-1" => Some("EU"),
-        other => Some(other),
-    }
-}
 async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
@@ -192,6 +186,33 @@ where
     )
     .await;
 }
+
+async fn eventually_raw_bucket_location(
+    description: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> s3_tests::RawResponse {
+    let url = s3_tests::bucket_location_url(CTX.endpoint(), bucket);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let response = send_signed_request_with_credentials(
+            "GET",
+            &url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            credentials,
+        );
+        if response.status == 200 {
+            return response;
+        }
+        if response.status == 403 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        panic!("{description} failed unexpectedly: {response:?}");
+    }
+}
+
 async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
     // After a successful GetObject, AWS can keep honoring the old bucket-tag
     // decision for tens of seconds after TagResource has made the new tag
@@ -2170,20 +2191,18 @@ fn test_bucket_policy_get_bucket_location_bucket_tag_condition_when_abac_enabled
         let (public_bucket, private_bucket) =
             create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketLocation").await;
 
-        let location = eventually_ok(
+        let response = eventually_raw_bucket_location(
             "GetBucketLocation allowed for public bucket tag when ABAC is enabled",
-            || {
-                alt_client
-                    .get_bucket_location()
-                    .bucket(&public_bucket)
-                    .send()
+            &public_bucket,
+            SignedRequestCredentials {
+                access_key: CTX.alt_access_key(),
+                secret_key: CTX.alt_secret_key(),
+                region: CTX.region(),
+                tls_ca_pem: CTX.tls_ca_pem(),
             },
         )
         .await;
-        assert_eq!(
-            location.location_constraint().map(|v| v.as_str()),
-            expected_bucket_location_constraint_for_sdk(CTX.region())
-        );
+        s3_tests::assert_raw_bucket_location(&response, CTX.region());
 
         eventually_access_denied(
             "GetBucketLocation denied for private bucket tag when ABAC is enabled",

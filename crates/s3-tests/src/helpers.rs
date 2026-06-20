@@ -1067,6 +1067,54 @@ pub fn object_url(endpoint: &str, bucket: &str, key: &str, query: Option<&str>) 
     }
 }
 
+pub fn bucket_location_url(endpoint: &str, bucket: &str) -> String {
+    format!("{endpoint}/{bucket}?location")
+}
+
+pub fn expected_raw_bucket_location_constraint(region: &str) -> Option<&str> {
+    match region {
+        "us-east-1" => None,
+        other => Some(other),
+    }
+}
+
+pub fn assert_raw_bucket_location(response: &RawResponse, region: &str) {
+    assert_eq!(
+        response.status, 200,
+        "expected GetBucketLocation success, got {response:?}"
+    );
+    assert_eq!(
+        response.body_read_error, None,
+        "failed to read GetBucketLocation body: {response:?}"
+    );
+    assert!(
+        response.body.contains("<LocationConstraint"),
+        "GetBucketLocation response missing LocationConstraint: {}",
+        response.body
+    );
+    match expected_raw_bucket_location_constraint(region) {
+        Some(expected) => assert!(
+            response
+                .body
+                .contains(&format!(">{expected}</LocationConstraint>")),
+            "expected raw LocationConstraint {expected:?}, got body: {}",
+            response.body
+        ),
+        None => {
+            assert!(
+                response.body.contains("/>") || response.body.contains("></LocationConstraint>"),
+                "expected empty raw LocationConstraint for {region}, got body: {}",
+                response.body
+            );
+            assert!(
+                !response.body.contains(">us-east-1</LocationConstraint>"),
+                "us-east-1 must be represented as an empty LocationConstraint, got body: {}",
+                response.body
+            );
+        }
+    }
+}
+
 pub fn presign_url<K, V, I>(
     method: &str,
     url_str: &str,
