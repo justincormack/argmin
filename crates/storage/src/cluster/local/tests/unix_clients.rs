@@ -1,5 +1,7 @@
 use super::*;
 use crate::{
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
+    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
     PlacedSegmentShardRepairRecord,
 };
@@ -215,6 +217,58 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         &self,
         _pg_id: PgId,
         _work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn record_placed_segment_shard_backfill(
+        &self,
+        _pg_id: PgId,
+        _work_item: &PlacedSegmentShardBackfillWorkItem,
+        _last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn list_placed_segment_shard_backfills(
+        &self,
+        _pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn acquire_placed_segment_shard_backfill_claim(
+        &self,
+        _pg_id: PgId,
+        _request: &PlacedSegmentShardBackfillClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
+        Ok(None)
+    }
+
+    fn complete_placed_segment_shard_backfill_claim(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+        _claim: &PlacedSegmentShardBackfillClaimRecord,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    fn record_placed_segment_shard_backfill_claim_error(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+        _claim: &PlacedSegmentShardBackfillClaimRecord,
+        _last_error: &str,
+        _next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    fn resolve_placed_segment_shard_backfill(
+        &self,
+        _pg_id: PgId,
+        _work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
         Ok(())
     }

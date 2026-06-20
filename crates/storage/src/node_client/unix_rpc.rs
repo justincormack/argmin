@@ -489,6 +489,189 @@ impl UnixStorageNodeClient {
         }
     }
 
+    pub(crate) fn record_placed_segment_shard_backfill(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcPlacedSegmentShardBackfillRecordRequest {
+            route: self.bucket_pg_request(pg_id),
+            work_item: *work_item,
+            last_error: last_error.map(ToOwned::to_owned),
+        };
+        let payload =
+            encode_placed_segment_shard_backfill_record_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard backfill record request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillRecord,
+            payload,
+        )?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate placed segment shard backfill record response",
+                "placed segment shard backfill record response payload must be empty".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn list_placed_segment_shard_backfills(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
+        let request = self.bucket_pg_request(pg_id);
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode placed segment shard backfills request",
+                error.to_string(),
+            )
+        })?;
+        let response =
+            self.rpc_request(StorageRpcMessageKind::PlacedSegmentShardBackfills, payload)?;
+        decode_placed_segment_shard_backfills_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode placed segment shard backfills response",
+                error.to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn acquire_placed_segment_shard_backfill_claim(
+        &self,
+        pg_id: PgId,
+        acquire: &PlacedSegmentShardBackfillClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
+        let request = StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest {
+            route: self.bucket_pg_request(pg_id),
+            claim_id: acquire.claim_id.clone(),
+            owner_token: acquire.owner_token.clone(),
+            claimed_at: acquire.claimed_at,
+            lease_deadline: acquire.lease_deadline,
+            now: acquire.now,
+        };
+        let payload = encode_placed_segment_shard_backfill_claim_acquire_request(&request)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard backfill claim acquire request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillClaimAcquire,
+            payload,
+        )?;
+        decode_placed_segment_shard_backfill_claim_optional_record_response(&response)
+            .map(|response| response.record)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode placed segment shard backfill claim acquire response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    pub(crate) fn complete_placed_segment_shard_backfill_claim(
+        &self,
+        pg_id: PgId,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcPlacedSegmentShardBackfillClaimRecordRequest {
+            route: self.bucket_pg_request(pg_id),
+            claim: claim.clone(),
+        };
+        let payload = encode_placed_segment_shard_backfill_claim_record_request(&request).map_err(
+            |error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard backfill claim complete request",
+                    error.to_string(),
+                )
+            },
+        )?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillClaimComplete,
+            payload,
+        )?;
+        decode_metadata_command_bool_response(&response)
+            .map(|response| response.value)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode placed segment shard backfill claim complete response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    pub(crate) fn record_placed_segment_shard_backfill_claim_error(
+        &self,
+        pg_id: PgId,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcPlacedSegmentShardBackfillClaimErrorRequest {
+            route: self.bucket_pg_request(pg_id),
+            claim: claim.clone(),
+            last_error: last_error.to_string(),
+            next_attempt_after,
+        };
+        let payload = encode_placed_segment_shard_backfill_claim_error_request(&request).map_err(
+            |error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard backfill claim error request",
+                    error.to_string(),
+                )
+            },
+        )?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillClaimError,
+            payload,
+        )?;
+        decode_metadata_command_bool_response(&response)
+            .map(|response| response.value)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode placed segment shard backfill claim error response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    pub(crate) fn resolve_placed_segment_shard_backfill(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcPlacedSegmentShardBackfillItemRequest {
+            route: self.bucket_pg_request(pg_id),
+            work_item: *work_item,
+        };
+        let payload =
+            encode_placed_segment_shard_backfill_item_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard backfill resolve request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillResolve,
+            payload,
+        )?;
+        if response.is_empty() {
+            Ok(())
+        } else {
+            Err(self.rpc_payload_error(
+                "validate placed segment shard backfill resolve response",
+                "placed segment shard backfill resolve response payload must be empty".to_string(),
+            ))
+        }
+    }
+
     fn encode_shard_ack_batch(
         &self,
         pg_id: PgId,
@@ -718,6 +901,101 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
         work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::resolve_placed_segment_shard_repair(self, pg_id, work_item)
+    }
+
+    fn record_placed_segment_shard_backfill(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::record_placed_segment_shard_backfill(
+            self, pg_id, work_item, last_error,
+        )
+    }
+
+    fn list_placed_segment_shard_backfills(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
+        UnixStorageNodeClient::list_placed_segment_shard_backfills(self, pg_id)
+    }
+
+    fn acquire_placed_segment_shard_backfill_claim(
+        &self,
+        pg_id: PgId,
+        request: &PlacedSegmentShardBackfillClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
+        if request.cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: request.cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        UnixStorageNodeClient::acquire_placed_segment_shard_backfill_claim(self, pg_id, request)
+    }
+
+    fn complete_placed_segment_shard_backfill_claim(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+    ) -> Result<bool, StoreError> {
+        if claim.cluster_epoch != cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: claim.cluster_epoch,
+                current_epoch: cluster_epoch,
+            });
+        }
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        UnixStorageNodeClient::complete_placed_segment_shard_backfill_claim(self, pg_id, claim)
+    }
+
+    fn record_placed_segment_shard_backfill_claim_error(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        if claim.cluster_epoch != cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: claim.cluster_epoch,
+                current_epoch: cluster_epoch,
+            });
+        }
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        UnixStorageNodeClient::record_placed_segment_shard_backfill_claim_error(
+            self,
+            pg_id,
+            claim,
+            last_error,
+            next_attempt_after,
+        )
+    }
+
+    fn resolve_placed_segment_shard_backfill(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::resolve_placed_segment_shard_backfill(self, pg_id, work_item)
     }
 }
 

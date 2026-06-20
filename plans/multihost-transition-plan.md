@@ -7815,6 +7815,13 @@ PG backfill and migration design notes:
   attempts with a retry deadline, allow expired claim stealing, and require full
   segment request identity for claim completion. Admission policy, worker
   execution, and remote storage-node boundary wiring remain follow-up work.
+- Added storage-node boundary wiring for durable backfill candidates. Backfill
+  record/list/claim/complete/error/resolve now flow through the
+  `ShardAckNodeClient`, in-process storage nodes, Unix RPC codecs, storage-node
+  server dispatch, and storage-cluster helper methods. This makes durable
+  backfill lifecycle operations route through the PG primary across the
+  same-process and Unix-node boundary; worker admission and execution remain
+  follow-up work.
 
 Exit criteria:
 

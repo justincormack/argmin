@@ -995,6 +995,46 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
         pg_id: PgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError>;
+
+    fn record_placed_segment_shard_backfill(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    fn list_placed_segment_shard_backfills(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError>;
+
+    fn acquire_placed_segment_shard_backfill_claim(
+        &self,
+        pg_id: PgId,
+        request: &PlacedSegmentShardBackfillClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError>;
+
+    fn complete_placed_segment_shard_backfill_claim(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+    ) -> Result<bool, StoreError>;
+
+    fn record_placed_segment_shard_backfill_claim_error(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError>;
+
+    fn resolve_placed_segment_shard_backfill(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardScavengerNodeClient: Send + Sync {

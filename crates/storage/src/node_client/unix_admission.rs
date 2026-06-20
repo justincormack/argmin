@@ -423,7 +423,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ShardScavengerShardRows
         | StorageRpcMessageKind::ShardScavengerPayloadReferences
         | StorageRpcMessageKind::ShardScavengerObservations
-        | StorageRpcMessageKind::PlacedSegmentShardRepairs => {
+        | StorageRpcMessageKind::PlacedSegmentShardRepairs
+        | StorageRpcMessageKind::PlacedSegmentShardBackfills => {
             UnixStorageNodeRpcAdmissionClass::List
         }
 
@@ -452,6 +453,11 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::PlacedSegmentShardRepairClaimComplete
         | StorageRpcMessageKind::PlacedSegmentShardRepairClaimError
         | StorageRpcMessageKind::PlacedSegmentShardRepairResolve
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillRecord
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillClaimAcquire
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillClaimComplete
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillClaimError
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillResolve
         | StorageRpcMessageKind::BucketWriteReservationValidate
         | StorageRpcMessageKind::BucketWriteReservationHeartbeat
         | StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad
