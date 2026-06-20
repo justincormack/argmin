@@ -7244,6 +7244,159 @@ impl StorageCluster {
         Ok(copied)
     }
 
+    pub fn backfill_placed_segment_payload_shards(
+        &self,
+        source_route: &PgRouteSnapshot,
+        desired_route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let plan =
+            self.placed_segment_payload_shard_backfill_plan(source_route, desired_route, req)?;
+        if !plan.unrecoverable_targets.is_empty() {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "placed segment backfill cannot satisfy unrecoverable targets {:?}",
+                    plan.unrecoverable_targets
+                ),
+            });
+        }
+        if plan.copy_targets.is_empty() && plan.reconstruction_targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut reconstructed_segment = None;
+        if !plan.reconstruction_targets.is_empty() {
+            let mut segment = Vec::new();
+            if !self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
+                source_route,
+                req,
+                &mut segment,
+            )? {
+                return Err(StoreError::NotFound);
+            }
+            reconstructed_segment = Some(segment);
+        }
+
+        let mut backfilled =
+            Vec::with_capacity(plan.copy_targets.len() + plan.reconstruction_targets.len());
+        for target in &plan.copy_targets {
+            let ack = self.load_payload_shard_ack(req.data_pg_id, &target.shard_key)?;
+            let payload = self
+                .read_payload_shard_for_historical_inspection(target.source, &target.shard_key, ack)
+                .map_err(shard_io_error_to_store)?;
+            let copied_ack = self
+                .repair_payload_shard(target.destination, &target.shard_key, &payload)
+                .map_err(shard_io_error_to_store)?;
+            backfilled.push(WrittenShardAck {
+                key: target.shard_key.clone(),
+                ack: copied_ack,
+            });
+        }
+
+        if !plan.reconstruction_targets.is_empty() {
+            let target_slots: Vec<_> = plan
+                .reconstruction_targets
+                .iter()
+                .map(|shard_index| {
+                    let desired = plan
+                        .desired_health
+                        .shards
+                        .iter()
+                        .find(|shard| shard.shard_index == *shard_index)
+                        .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                            reason: format!(
+                                "backfill reconstruction shard index {} missing from desired health",
+                                shard_index.get()
+                            ),
+                        })?;
+                    Ok((usize::from(shard_index.get()), desired.location))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            let reconstructed =
+                self.local_map.write_erasure_coded_segment_shards_with(
+                    &req.segment_okh,
+                    req.segment_vid,
+                    reconstructed_segment.as_ref().unwrap(),
+                    req.ec,
+                    |shard_batch| {
+                        let mut written = Vec::with_capacity(target_slots.len());
+                        for (slot, target_location) in &target_slots {
+                            let (shard_key, shard_payload) =
+                                shard_batch.get(*slot).ok_or_else(|| {
+                                    StoreError::PayloadShardSetMismatch {
+                                        reason: format!(
+                                            "backfill reconstruction shard index {} outside encoded shard batch of {}",
+                                            slot,
+                                            shard_batch.len()
+                                        ),
+                                    }
+                                })?;
+                            let ack = self
+                                .repair_payload_shard(*target_location, shard_key, shard_payload)
+                                .map_err(shard_io_error_to_store)?;
+                            written.push((shard_key.clone(), ack));
+                        }
+                        Ok(written)
+                    },
+                )?;
+            backfilled.extend(reconstructed);
+        }
+
+        let backfilled_acks: Vec<_> = backfilled
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        self.register_payload_shard_acks(req.data_pg_id, &backfilled_acks)
+            .map_err(|error| match error {
+                ObjectPgActionError::Store(error) => error,
+                other => StoreError::Io {
+                    context: "register backfilled payload shard acks",
+                    source: io::Error::other(other.to_string()),
+                },
+            })?;
+        let target_indices: Vec<_> = plan
+            .copy_targets
+            .iter()
+            .map(|target| target.shard_index)
+            .chain(plan.reconstruction_targets.iter().copied())
+            .collect();
+        self.verify_backfilled_placed_segment_payload_shards(desired_route, req, &target_indices)?;
+        Ok(backfilled)
+    }
+
+    fn verify_backfilled_placed_segment_payload_shards(
+        &self,
+        desired_route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+        backfilled_shard_indices: &[ShardIndex],
+    ) -> Result<(), StoreError> {
+        let desired_health =
+            self.placed_segment_payload_shard_health_for_pg_route_snapshot(desired_route, req)?;
+        for target in backfilled_shard_indices {
+            let Some(shard) = desired_health
+                .shards
+                .iter()
+                .find(|shard| shard.shard_index == *target)
+            else {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "backfilled shard index {} missing from desired health",
+                        target.get()
+                    ),
+                });
+            };
+            if !shard.validation.is_valid() {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "backfilled shard index {} still fails desired-route verification",
+                        target.get()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn placed_segment_payload_shard_health_at_locations(
         &self,
         req: SegmentStoredBytesRequest,
@@ -7518,6 +7671,128 @@ impl StorageCluster {
         self.try_read_placed_segment_recovery_into(req, dst, schedule_repair_on_recovery)
     }
 
+    fn try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
+        &self,
+        route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
+        let k = usize::from(req.ec.k);
+        let total_shards = ec_config.total_shards();
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
+
+        if shard_size == 0 {
+            dst.clear();
+            return Ok(true);
+        }
+
+        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
+        let locations = self
+            .place_payload_shards_for_pg_route_snapshot(route, data_pg, req.ec, &placement_key)
+            .map_err(cluster_build_error_to_store)?;
+        let mut all_shards = vec![None; total_shards];
+        let mut present_count = 0usize;
+
+        for shard_index in 0..k {
+            self.try_load_placed_segment_shard_for_historical_inspection(
+                req.data_pg_id,
+                &req.segment_okh,
+                req.segment_vid,
+                &locations,
+                shard_index,
+                shard_size,
+                &mut all_shards,
+                &mut present_count,
+            )?;
+        }
+
+        if present_count < k {
+            for shard_index in k..total_shards {
+                if present_count >= k {
+                    break;
+                }
+                self.try_load_placed_segment_shard_for_historical_inspection(
+                    req.data_pg_id,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    &locations,
+                    shard_index,
+                    shard_size,
+                    &mut all_shards,
+                    &mut present_count,
+                )?;
+            }
+        }
+
+        if present_count < k {
+            return Ok(false);
+        }
+
+        let mut recovered = None;
+        let mut recovered_ranges = vec![None; k];
+
+        if !(0..k).all(|i| all_shards[i].is_some()) {
+            let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
+            let present_indices: Vec<usize> = (0..total_shards)
+                .filter(|&i| all_shards[i].is_some())
+                .collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+            let codec = erasure_codec_for_shape(req.ec, "build historical segment recovery codec")?;
+            let recovered_len = missing_needed.len() * shard_size;
+            let mut recovered_buf = vec![0; recovered_len];
+            let mut output_refs: Vec<&mut [u8]> = recovered_buf
+                .chunks_exact_mut(shard_size)
+                .take(missing_needed.len())
+                .collect();
+
+            codec
+                .reconstruct(
+                    &present_indices,
+                    &present_refs,
+                    &missing_needed,
+                    &mut output_refs,
+                )
+                .map_err(|error| StoreError::ErasureCoding {
+                    context: "reconstruct placed segment shards from historical route",
+                    reason: error.to_string(),
+                })?;
+
+            for (slot, &missing_idx) in missing_needed.iter().enumerate() {
+                let start = slot * shard_size;
+                recovered_ranges[missing_idx] = Some((start, start + shard_size));
+            }
+            recovered = Some(recovered_buf);
+        }
+
+        dst.clear();
+        dst.reserve(padded);
+        for (idx, shard) in all_shards.iter().take(k).enumerate() {
+            if let Some(shard) = shard.as_ref() {
+                dst.extend_from_slice(shard);
+            } else if let Some((start, end)) = recovered_ranges[idx] {
+                let recovered_buf = recovered.as_ref().unwrap();
+                dst.extend_from_slice(&recovered_buf[start..end]);
+            } else {
+                unreachable!("missing reconstructed shard for historical data index {idx}");
+            }
+        }
+        dst.truncate(req.stored_size);
+        let actual_crc64 = checksum::crc64::checksum(dst);
+        if actual_crc64 != req.segment_crc64 {
+            return Err(StoreError::IntegrityError {
+                expected: req.segment_crc64,
+                actual: actual_crc64,
+            });
+        }
+        Ok(true)
+    }
+
     fn try_read_placed_segment_direct_into(
         &self,
         req: SegmentStoredBytesRequest,
@@ -7761,6 +8036,42 @@ impl StorageCluster {
             Err(error) => {
                 placed_segment_recoverable_shard_error(error)?;
                 record_repair_target(repair_targets, shard_index);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_load_placed_segment_shard_for_historical_inspection(
+        &self,
+        data_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        locations: &[ShardLocation],
+        shard_index: usize,
+        shard_size: usize,
+        all_shards: &mut [Option<Vec<u8>>],
+        present_count: &mut usize,
+    ) -> Result<(), StoreError> {
+        let Some(location) = locations.get(shard_index).copied() else {
+            return Ok(());
+        };
+        let shard_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8);
+        let ack = match self.load_payload_shard_ack(data_pg_id, &shard_key) {
+            Ok(ack) => ack,
+            Err(StoreError::NotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if ack.stored_size != shard_size as u64 {
+            return Ok(());
+        }
+        match self.read_payload_shard_for_historical_inspection(location, &shard_key, ack) {
+            Ok(shard) => {
+                all_shards[shard_index] = Some(shard);
+                *present_count += 1;
+            }
+            Err(error) => {
+                placed_segment_recoverable_shard_error(error)?;
             }
         }
         Ok(())

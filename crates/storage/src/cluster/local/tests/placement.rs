@@ -2424,6 +2424,54 @@ fn placed_segment_payload_direct_copy_backfill_rejects_reconstruction_targets() 
 }
 
 #[test]
+fn placed_segment_payload_backfill_reconstructs_missing_source_targets() {
+    let fixture = backfill_route_fixture(b"phase-eleven-backfill-reconstructs-target");
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    let target = plan.copy_targets[0].shard_index;
+    fixture.remove_source_shard(target);
+
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert!(plan.reconstruction_targets.contains(&target));
+    assert!(plan.unrecoverable_targets.is_empty());
+
+    let backfilled = fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shards(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert!(backfilled
+        .iter()
+        .any(|written| written.key.shard_index() == target));
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert!(plan.is_complete());
+    assert_eq!(plan.already_present.len(), plan.desired_health.total_shards);
+}
+
+#[test]
 fn placed_segment_payload_direct_copy_backfill_rejects_unrecoverable_targets() {
     let fixture = backfill_route_fixture(b"phase-eleven-backfill-unrecoverable");
     let plan = fixture

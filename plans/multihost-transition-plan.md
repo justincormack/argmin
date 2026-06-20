@@ -7798,6 +7798,12 @@ PG backfill and migration design notes:
   verify the desired-route health after copying. EC reconstruction targets,
   durable queueing, worker admission, and remote storage-node execution remain
   follow-up work.
+- Extended the mutating backfill primitive to handle EC-reconstruction targets
+  when the historical source route still has at least `k` valid shards. Storage
+  reconstructs the segment bytes from the historical route, re-encodes only the
+  missing desired-route shard indexes, registers their acks, and verifies the
+  desired-route targets. Durable queueing, worker admission, and remote
+  storage-node execution remain follow-up work.
 
 Exit criteria:
 
