@@ -2184,6 +2184,138 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
 }
 
 #[test]
+fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
+    let tmp = test_util::tempdir();
+    let source_node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let all_node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+        NodeId::new(6),
+    ];
+    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            source_node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join(format!("node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            vec![PgId::new(0)],
+        )
+        .unwrap();
+    let source_epoch = authority.snapshot().cluster_epoch();
+    authority
+        .set_node_membership(
+            NodeId::new(6),
+            crate::control_plane::NodeMembershipState::Active,
+        )
+        .unwrap();
+    authority
+        .set_pg_acting_set(PgId::new(0), all_node_ids[1..].to_vec())
+        .unwrap();
+    let source_route = authority
+        .snapshot()
+        .reconstructed_pg_route_at_epoch(PgId::new(0), source_epoch)
+        .unwrap();
+    let desired_route = authority
+        .snapshot()
+        .reconstructed_pg_route_at_epoch(PgId::new(0), authority.snapshot().cluster_epoch())
+        .unwrap();
+    assert_eq!(source_route.acting_set(), &source_node_ids);
+    assert_eq!(desired_route.acting_set(), &all_node_ids[1..]);
+
+    let configs: Vec<_> = all_node_ids
+        .iter()
+        .map(|&node_id| {
+            LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path()
+                    .join("storage")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect();
+    let source_map = Arc::new(
+        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+            NodeId::new(0),
+            configs.iter().take(source_node_ids.len()).cloned(),
+            &[0],
+            ec_shape,
+            source_route.cluster_epoch(),
+        )
+        .unwrap(),
+    );
+    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let segment = write_committed_direct_segment(&source_cluster, b"phase-eleven-backfill-plan");
+    let req = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        ec: segment.written.ec,
+    };
+    let desired_map = Arc::new(
+        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+            NodeId::new(0),
+            configs,
+            &[0],
+            ec_shape,
+            desired_route.cluster_epoch(),
+        )
+        .unwrap(),
+    );
+    let desired_cluster = crate::StorageCluster::from_local_map(Arc::clone(&desired_map)).unwrap();
+
+    let plan = desired_cluster
+        .placed_segment_payload_shard_backfill_plan(&source_route, &desired_route, req)
+        .unwrap();
+    assert_eq!(
+        plan.source_health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Healthy
+    );
+    assert!(!plan.is_complete());
+    assert!(!plan.copy_targets.is_empty());
+    assert!(plan.reconstruction_targets.is_empty());
+    assert!(plan.unrecoverable_targets.is_empty());
+    assert_eq!(
+        plan.already_present.len() + plan.copy_targets.len(),
+        plan.desired_health.total_shards
+    );
+    for target in &plan.copy_targets {
+        assert_ne!(target.source.node_id(), target.destination.node_id());
+        assert_eq!(target.source.data_pg_id(), target.destination.data_pg_id());
+        assert_eq!(
+            target.source.shard_index(),
+            target.destination.shard_index()
+        );
+        assert_eq!(target.shard_index, target.source.shard_index());
+    }
+}
+
+#[test]
 fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
     let tmp = test_util::tempdir();
     let node_ids = [

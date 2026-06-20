@@ -755,6 +755,33 @@ impl PlacedSegmentShardSetHealth {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillCopyTarget {
+    pub shard_index: ShardIndex,
+    pub shard_key: ShardKey,
+    pub source: ShardLocation,
+    pub destination: ShardLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillPlan {
+    pub source_health: PlacedSegmentShardSetHealth,
+    pub desired_health: PlacedSegmentShardSetHealth,
+    pub already_present: Vec<ShardIndex>,
+    pub copy_targets: Vec<PlacedSegmentShardBackfillCopyTarget>,
+    pub reconstruction_targets: Vec<ShardIndex>,
+    pub unrecoverable_targets: Vec<ShardIndex>,
+}
+
+impl PlacedSegmentShardBackfillPlan {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.copy_targets.is_empty()
+            && self.reconstruction_targets.is_empty()
+            && self.unrecoverable_targets.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlacedSegmentShardHealthReadMode {
     CurrentRoute,
@@ -7123,6 +7150,19 @@ impl StorageCluster {
         )
     }
 
+    pub fn placed_segment_payload_shard_backfill_plan(
+        &self,
+        source_route: &PgRouteSnapshot,
+        desired_route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<PlacedSegmentShardBackfillPlan, StoreError> {
+        let source_health =
+            self.placed_segment_payload_shard_health_for_pg_route_snapshot(source_route, req)?;
+        let desired_health =
+            self.placed_segment_payload_shard_health_for_pg_route_snapshot(desired_route, req)?;
+        build_placed_segment_shard_backfill_plan(source_health, desired_health)
+    }
+
     fn placed_segment_payload_shard_health_at_locations(
         &self,
         req: SegmentStoredBytesRequest,
@@ -8029,6 +8069,70 @@ fn validate_placed_segment_repair_ec_shape(ec: EcShape) -> Result<EcConfig, Stor
     })
 }
 
+fn build_placed_segment_shard_backfill_plan(
+    source_health: PlacedSegmentShardSetHealth,
+    desired_health: PlacedSegmentShardSetHealth,
+) -> Result<PlacedSegmentShardBackfillPlan, StoreError> {
+    if source_health.total_shards != desired_health.total_shards
+        || source_health.required_shards != desired_health.required_shards
+    {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "source shard set {}/{} does not match desired shard set {}/{}",
+                source_health.required_shards,
+                source_health.total_shards,
+                desired_health.required_shards,
+                desired_health.total_shards
+            ),
+        });
+    }
+
+    let mut already_present = Vec::new();
+    let mut copy_targets = Vec::new();
+    let mut reconstruction_targets = Vec::new();
+    let mut unrecoverable_targets = Vec::new();
+    let source_recoverable =
+        !matches!(source_health.risk, PlacedSegmentShardSetRisk::Unrecoverable);
+
+    for desired in &desired_health.shards {
+        if desired.validation.is_valid() {
+            already_present.push(desired.shard_index);
+            continue;
+        }
+        let source = source_health
+            .shards
+            .iter()
+            .find(|source| source.shard_index == desired.shard_index)
+            .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "desired shard index {} has no source shard",
+                    desired.shard_index.get()
+                ),
+            })?;
+        if source.validation.is_valid() {
+            copy_targets.push(PlacedSegmentShardBackfillCopyTarget {
+                shard_index: desired.shard_index,
+                shard_key: desired.shard_key.clone(),
+                source: source.location,
+                destination: desired.location,
+            });
+        } else if source_recoverable {
+            reconstruction_targets.push(desired.shard_index);
+        } else {
+            unrecoverable_targets.push(desired.shard_index);
+        }
+    }
+
+    Ok(PlacedSegmentShardBackfillPlan {
+        source_health,
+        desired_health,
+        already_present,
+        copy_targets,
+        reconstruction_targets,
+        unrecoverable_targets,
+    })
+}
+
 fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<ErasureCodec, StoreError> {
     let config = EcConfig::new(ec.k, ec.m).map_err(|error| StoreError::ErasureCoding {
         context,
@@ -8233,6 +8337,105 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
             std::io::ErrorKind::InvalidData
         ) | ("read shard file", std::io::ErrorKind::UnexpectedEof)
     )
+}
+
+#[cfg(test)]
+mod backfill_plan_tests {
+    use super::*;
+
+    fn backfill_plan_test_health(
+        risk: PlacedSegmentShardSetRisk,
+        valid_indexes: &[u8],
+    ) -> PlacedSegmentShardSetHealth {
+        let valid_indexes: std::collections::HashSet<u8> = valid_indexes.iter().copied().collect();
+        let shards = (0..6)
+            .map(|shard_index| {
+                let shard_index = ShardIndex::new(shard_index);
+                PlacedSegmentShardHealth {
+                    shard_index,
+                    shard_key: ShardKey::new(&[9; 16], 1, shard_index.get()),
+                    location: ShardLocation::new(
+                        ClusterEpoch::INITIAL,
+                        DataPgId::new(PgId::new(0)),
+                        shard_index,
+                        NodeId::new(u32::from(shard_index.get())),
+                    ),
+                    validation: if valid_indexes.contains(&shard_index.get()) {
+                        PlacedSegmentShardValidation::Valid
+                    } else {
+                        PlacedSegmentShardValidation::MissingAck
+                    },
+                }
+            })
+            .collect();
+        PlacedSegmentShardSetHealth {
+            total_shards: 6,
+            required_shards: 4,
+            valid_shards: valid_indexes.len(),
+            risk,
+            shards,
+        }
+    }
+
+    #[test]
+    fn backfill_plan_marks_reconstruction_targets_for_recoverable_source_gaps() {
+        let source_health = backfill_plan_test_health(
+            PlacedSegmentShardSetRisk::Degraded {
+                tolerance_remaining: 0,
+            },
+            &[0, 1, 2, 3],
+        );
+        let desired_health = backfill_plan_test_health(
+            PlacedSegmentShardSetRisk::Degraded {
+                tolerance_remaining: 1,
+            },
+            &[0, 1, 2, 3, 4],
+        );
+
+        let plan = build_placed_segment_shard_backfill_plan(source_health, desired_health).unwrap();
+
+        assert_eq!(
+            plan.already_present,
+            vec![
+                ShardIndex::new(0),
+                ShardIndex::new(1),
+                ShardIndex::new(2),
+                ShardIndex::new(3),
+                ShardIndex::new(4)
+            ]
+        );
+        assert_eq!(plan.copy_targets, Vec::new());
+        assert_eq!(plan.reconstruction_targets, vec![ShardIndex::new(5)]);
+        assert_eq!(plan.unrecoverable_targets, Vec::new());
+    }
+
+    #[test]
+    fn backfill_plan_marks_unrecoverable_targets_for_unrecoverable_source_gaps() {
+        let source_health =
+            backfill_plan_test_health(PlacedSegmentShardSetRisk::Unrecoverable, &[0, 1, 2]);
+        let desired_health = backfill_plan_test_health(
+            PlacedSegmentShardSetRisk::Degraded {
+                tolerance_remaining: 1,
+            },
+            &[0, 1, 2, 3, 4],
+        );
+
+        let plan = build_placed_segment_shard_backfill_plan(source_health, desired_health).unwrap();
+
+        assert_eq!(
+            plan.already_present,
+            vec![
+                ShardIndex::new(0),
+                ShardIndex::new(1),
+                ShardIndex::new(2),
+                ShardIndex::new(3),
+                ShardIndex::new(4)
+            ]
+        );
+        assert_eq!(plan.copy_targets, Vec::new());
+        assert_eq!(plan.reconstruction_targets, Vec::new());
+        assert_eq!(plan.unrecoverable_targets, vec![ShardIndex::new(5)]);
+    }
 }
 
 #[cfg(test)]

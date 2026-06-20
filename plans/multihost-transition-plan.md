@@ -7786,6 +7786,12 @@ PG backfill and migration design notes:
   historical route locations directly from shard files without treating the old
   route as current serving authority; remote storage-node historical inspection
   remains part of the later Unix/storage-node boundary work.
+- Added a read-only backfill planner for one placed segment. Given a verified
+  source route and desired route, storage now classifies desired shard indexes
+  as already present, direct-copy candidates from valid same-index historical
+  shards, EC-reconstruction candidates, or unrecoverable. This is the verified
+  work-item shape a later background worker can enqueue after candidate
+  discovery; it does not mutate shard files yet.
 
 Exit criteria:
 
