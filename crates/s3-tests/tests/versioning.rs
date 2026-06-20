@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, EncodingType,
@@ -174,6 +175,127 @@ async fn put_bucket_versioning_retrying_operation_aborted(
             .send()
     })
     .await;
+    if status == BucketVersioningStatus::Enabled {
+        wait_for_versioned_writes_visible(client, bucket).await;
+    }
+}
+
+async fn wait_for_versioned_writes_visible(client: &aws_sdk_s3::Client, bucket: &str) {
+    let key = "__argmin-versioning-readiness";
+    let mut last_error = None;
+
+    for attempt in 0..40 {
+        let body = format!("versioning-ready-{attempt}");
+        let put =
+            put_object_retrying_operation_aborted(client, bucket, key, body.as_bytes().to_vec())
+                .await;
+
+        if put.version_id().filter(|id| *id != "null").is_none() {
+            last_error = Some("PUT did not return a real version id".to_string());
+            cleanup_versioning_readiness_key(client, bucket, key).await;
+            sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => match response.body.collect().await {
+                Ok(bytes) => {
+                    let bytes = bytes.into_bytes();
+                    if bytes.as_ref() == body.as_bytes() {
+                        cleanup_versioning_readiness_key(client, bucket, key).await;
+                        return;
+                    }
+                    last_error = Some(format!(
+                        "readiness GET returned unexpected body {:?}",
+                        String::from_utf8_lossy(bytes.as_ref())
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(format!("readiness GET body collection failed: {error:?}"));
+                }
+            },
+            Err(error)
+                if error
+                    .as_service_error()
+                    .and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchKey") =>
+            {
+                last_error = Some("readiness GET returned NoSuchKey".to_string());
+            }
+            Err(error) => panic!("versioning readiness GET: {error:?}"),
+        }
+
+        cleanup_versioning_readiness_key(client, bucket, key).await;
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    panic!(
+        "versioned writes did not become visible for {bucket}: {}",
+        last_error.unwrap_or_else(|| "no attempts completed".to_string())
+    );
+}
+
+async fn cleanup_versioning_readiness_key(client: &aws_sdk_s3::Client, bucket: &str, key: &str) {
+    let _ = client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("delete versioning readiness object")
+        .await;
+
+    loop {
+        let resp = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(key)
+            .send_retrying_operation_aborted("list versioning readiness object versions")
+            .await
+            .unwrap();
+
+        let mut objects = Vec::new();
+        for version in resp.versions() {
+            if version.key() == Some(key) {
+                objects.push(
+                    ObjectIdentifier::builder()
+                        .key(key)
+                        .set_version_id(version.version_id().map(str::to_string))
+                        .build()
+                        .unwrap(),
+                );
+            }
+        }
+        for marker in resp.delete_markers() {
+            if marker.key() == Some(key) {
+                objects.push(
+                    ObjectIdentifier::builder()
+                        .key(key)
+                        .set_version_id(marker.version_id().map(str::to_string))
+                        .build()
+                        .unwrap(),
+                );
+            }
+        }
+
+        if objects.is_empty() {
+            return;
+        }
+
+        let resp = delete_objects_retrying_operation_aborted(
+            client,
+            bucket,
+            Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "delete versioning readiness object returned embedded errors: {:?}",
+            resp.errors()
+        );
+    }
 }
 
 fn expected_raw_list_key(decoded_key: &str) -> String {
