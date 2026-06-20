@@ -59,6 +59,12 @@ pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, S
     if let Some(val) = if_match {
         // Wildcard already rejected above, so this cannot fail.
         let etag = SpecificEtag::new(val.to_string()).expect("wildcard already rejected");
+        if etag.as_str() == "*" {
+            return Err(ServerError::NotImplemented {
+                feature: "A header you provided implies functionality that is not implemented"
+                    .to_string(),
+            });
+        }
         return Ok(WriteCondition::IfMatch(etag));
     }
     if if_none_match.is_some() {
@@ -149,6 +155,13 @@ mod tests {
     fn write_if_match_specific_etag_accepted() {
         let req = make_req_with_headers(vec![("if-match", "\"abcdef1234567890\"")]);
         assert!(write_condition_from_headers(&req).is_ok());
+    }
+
+    #[test]
+    fn write_if_match_quoted_star_returns_not_implemented() {
+        let req = make_req_with_headers(vec![("if-match", "\"*\"")]);
+        let err = write_condition_from_headers(&req).unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
     }
 
     #[test]

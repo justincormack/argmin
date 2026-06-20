@@ -27,16 +27,17 @@ pub struct ReadCondition {
     pub if_unmodified_since: Option<u64>,
 }
 
-/// A non-wildcard ETag value for conditional requests.
+/// A specific ETag value for conditional requests.
 ///
-/// Rejects `*` at construction time so that unsupported wildcard forms
-/// cannot be represented in condition types. The stored value is the entity
-/// tag itself; HTTP quote marks are stripped at construction.
+/// Rejects the raw `*` wildcard token at construction time. A quoted entity
+/// tag whose opaque value is `*` is still a specific ETag, and callers must not
+/// evaluate it with wildcard semantics. The stored value is the entity tag
+/// itself; HTTP quote marks are stripped at construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecificEtag(String);
 
 impl SpecificEtag {
-    /// Construct a `SpecificEtag`, rejecting `*` and stripping HTTP quotes.
+    /// Construct a `SpecificEtag`, rejecting raw `*` and stripping HTTP quotes.
     pub fn new(value: String) -> Result<Self, &'static str> {
         if value.trim() == "*" {
             return Err("wildcard ETag not allowed in this context");
@@ -179,6 +180,7 @@ fn etag_matches_one(header_etag: &str, object_etag: &str) -> bool {
 /// Per RFC 7232, these headers can be `*` (matches any) or a comma-separated
 /// list of quoted `ETag` values. S3 primarily uses single `ETag` values, but
 /// we handle lists for spec compliance.
+#[cfg(test)]
 fn etags_match(header_value: &str, object_etag: &str) -> bool {
     let trimmed = header_value.trim();
     if trimmed == "*" {
@@ -274,7 +276,7 @@ pub fn check_write_conditions(
         WriteCondition::IfMatch(required_etag) => match existing_etag {
             None => Err(ServerError::PreconditionFailed),
             Some(obj_etag) => {
-                if etags_match(required_etag.as_str(), obj_etag) {
+                if etag_matches_one(required_etag.as_str(), obj_etag) {
                     Ok(())
                 } else {
                     Err(ServerError::PreconditionFailed)
@@ -530,6 +532,15 @@ mod tests {
     fn specific_etag_stores_unquoted_entity_tag() {
         let etag = SpecificEtag::new(test_etag()).unwrap();
         assert_eq!(etag.as_str(), "abcdef1234567890");
+    }
+
+    #[test]
+    fn write_if_match_quoted_star_is_specific_not_wildcard() {
+        let etag = SpecificEtag::new("\"*\"".to_string()).unwrap();
+        assert_eq!(etag.as_str(), "*");
+        let cond = WriteCondition::IfMatch(etag);
+        let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
     #[test]
