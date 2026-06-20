@@ -1201,7 +1201,7 @@ fn test_post_object_bucket_policy_if_match_string_equals_is_policy_only() {
                     "Resource": format!("arn:aws:s3:::{bucket}/*"),
                     "Condition": {
                         "StringNotEquals": {
-                            "s3:if-match": expected_entity_tag
+                            "s3:if-match": expected_if_match_header
                         }
                     }
                 }

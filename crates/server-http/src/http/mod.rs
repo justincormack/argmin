@@ -3556,7 +3556,7 @@ impl HttpFrontend {
                     None,
                     acl.policy_condition_value(),
                 )
-                .with_if_match(cond.if_match_policy_value())
+                .with_if_match(req.header("if-match"))
                 .with_if_none_match(cond.if_none_match_policy_value())
                 .with_managed_encryption(managed_encryption)
                 .with_sse_customer_algorithm(
