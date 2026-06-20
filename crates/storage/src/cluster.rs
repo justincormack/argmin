@@ -782,6 +782,21 @@ impl PlacedSegmentShardBackfillPlan {
             && self.reconstruction_targets.is_empty()
             && self.unrecoverable_targets.is_empty()
     }
+
+    #[must_use]
+    pub fn source_remaining_tolerance(&self) -> u8 {
+        let tolerance = match self.source_health.risk {
+            PlacedSegmentShardSetRisk::Healthy => self
+                .source_health
+                .total_shards
+                .saturating_sub(self.source_health.required_shards),
+            PlacedSegmentShardSetRisk::Degraded {
+                tolerance_remaining,
+            } => tolerance_remaining,
+            PlacedSegmentShardSetRisk::Unrecoverable => 0,
+        };
+        u8::try_from(tolerance).unwrap_or(u8::MAX)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7126,9 +7141,22 @@ impl StorageCluster {
         work_item: &PlacedSegmentShardBackfillWorkItem,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.record_placed_segment_shard_backfill_with_remaining_tolerance(
+            work_item,
+            work_item.request.ec.m,
+            last_error,
+        )
+    }
+
+    pub fn record_placed_segment_shard_backfill_with_remaining_tolerance(
+        &self,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+        remaining_tolerance: u8,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
         let pg_id = PgId::new(work_item.request.data_pg_id);
         self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .record_placed_segment_shard_backfill(pg_id, work_item, last_error)
+            .record_placed_segment_shard_backfill(pg_id, work_item, remaining_tolerance, last_error)
     }
 
     pub fn list_placed_segment_shard_backfills(
@@ -7323,6 +7351,39 @@ impl StorageCluster {
         let desired_health =
             self.placed_segment_payload_shard_health_for_pg_route_snapshot(desired_route, req)?;
         build_placed_segment_shard_backfill_plan(source_health, desired_health)
+    }
+
+    pub fn record_placed_segment_shard_backfill_for_plan(
+        &self,
+        source_route: &PgRouteSnapshot,
+        desired_route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+        last_error: Option<&str>,
+    ) -> Result<PlacedSegmentShardBackfillPlan, StoreError> {
+        let plan =
+            self.placed_segment_payload_shard_backfill_plan(source_route, desired_route, req)?;
+        if !plan.unrecoverable_targets.is_empty() {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "placed segment backfill plan cannot enqueue unrecoverable targets {:?}",
+                    plan.unrecoverable_targets
+                ),
+            });
+        }
+        if plan.is_complete() {
+            return Ok(plan);
+        }
+        let work_item = PlacedSegmentShardBackfillWorkItem {
+            request: req,
+            source_cluster_epoch: source_route.cluster_epoch(),
+            desired_cluster_epoch: desired_route.cluster_epoch(),
+        };
+        self.record_placed_segment_shard_backfill_with_remaining_tolerance(
+            &work_item,
+            plan.source_remaining_tolerance(),
+            last_error,
+        )?;
+        Ok(plan)
     }
 
     pub fn backfill_placed_segment_payload_shard_direct_copies(

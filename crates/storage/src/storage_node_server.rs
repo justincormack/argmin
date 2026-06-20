@@ -6706,6 +6706,7 @@ impl StorageNodeConnectionHandler {
         match local_client.record_placed_segment_shard_backfill(
             request.route.pg_id,
             &request.work_item,
+            request.remaining_tolerance,
             request.last_error.as_deref(),
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -9482,6 +9483,7 @@ mod tests {
                 source_cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 desired_cluster_epoch: ClusterEpoch::new(2).unwrap(),
             },
+            remaining_tolerance: 2,
             claim_id: "claim-1".to_string(),
             owner_token: "worker-1".to_string(),
             cluster_epoch: claim_epoch,

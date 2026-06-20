@@ -7839,8 +7839,18 @@ PG backfill and migration design notes:
   `shard_backfill_shards_written_total`, and UAT prints the same summary. The
   queue-depth signal uses an exact durable count rather than the bounded row
   listing API, and also counts as durable background backlog for opportunistic
-  scan admission. This is instrumentation only; EC-risk prioritization is still
-  the next scheduling slice.
+  scan admission. This is instrumentation only; scheduling priority is handled
+  by the later EC-risk priority slice.
+- Added the first EC-risk priority signal to durable shard-backfill scheduling.
+  Backfill rows now carry `remaining_tolerance`, the number of additional shard
+  losses the verified source segment can survive before it becomes
+  unrecoverable. Manual/routine records default to EC `m`; producers that have
+  just computed a backfill plan can record the derived source tolerance. The
+  durable claim selector now prefers lower remaining tolerance, then older
+  source epochs for PG-history closure, then age and segment identity. Duplicate
+  observations preserve the most urgent tolerance seen without changing the
+  segment proof tuple. Scanner/candidate integration and more nuanced admission
+  class tuning remain follow-up work.
 
 Exit criteria:
 

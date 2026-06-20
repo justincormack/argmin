@@ -2526,6 +2526,94 @@ fn placed_segment_payload_direct_copy_backfill_rejects_unrecoverable_targets() {
 }
 
 #[test]
+fn placed_segment_payload_backfill_plan_record_derives_durable_priority() {
+    let fixture = backfill_route_fixture(b"phase-eleven-backfill-record-priority");
+    let initial_plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    let degraded_source_target = initial_plan.copy_targets[0].shard_index;
+    fixture.remove_source_shard(degraded_source_target);
+
+    let plan = fixture
+        .desired_cluster
+        .record_placed_segment_shard_backfill_for_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+            None,
+        )
+        .unwrap();
+    assert!(!plan.is_complete());
+    assert_eq!(
+        plan.source_health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Degraded {
+            tolerance_remaining: usize::from(fixture.req.ec.m - 1),
+        }
+    );
+    assert!(plan
+        .reconstruction_targets
+        .contains(&degraded_source_target));
+
+    let rows = fixture
+        .desired_cluster
+        .list_placed_segment_shard_backfills(fixture.req.data_pg_id)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].work_item.request, fixture.req);
+    assert_eq!(
+        rows[0].work_item.source_cluster_epoch,
+        fixture.source_route.cluster_epoch()
+    );
+    assert_eq!(
+        rows[0].work_item.desired_cluster_epoch,
+        fixture.desired_route.cluster_epoch()
+    );
+    assert_eq!(rows[0].remaining_tolerance, fixture.req.ec.m - 1);
+
+    let mut missing = vec![degraded_source_target];
+    for shard_index in 0..(fixture.req.ec.k + fixture.req.ec.m) {
+        let shard_index = ShardIndex::new(shard_index);
+        if !missing.contains(&shard_index) {
+            missing.push(shard_index);
+        }
+        if missing.len() > usize::from(fixture.req.ec.m) {
+            break;
+        }
+    }
+    for shard_index in missing.iter().skip(1) {
+        fixture.remove_source_shard(*shard_index);
+    }
+
+    let err = fixture
+        .desired_cluster
+        .record_placed_segment_shard_backfill_for_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PayloadShardSetMismatch { ref reason } if reason.contains("unrecoverable targets")),
+        "expected unrecoverable plan rejection, got {err:?}"
+    );
+    assert_eq!(
+        fixture
+            .desired_cluster
+            .list_placed_segment_shard_backfills(fixture.req.data_pg_id)
+            .unwrap()
+            .len(),
+        1,
+        "unrecoverable plan must not enqueue another durable backfill row"
+    );
+}
+
+#[test]
 fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
     let tmp = test_util::tempdir();
     let node_ids = [

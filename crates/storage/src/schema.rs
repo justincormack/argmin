@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_backfills (
     ec_m                   INTEGER NOT NULL CHECK (ec_m >= 0),
     source_cluster_epoch   INTEGER NOT NULL CHECK (source_cluster_epoch > 0),
     desired_cluster_epoch  INTEGER NOT NULL CHECK (desired_cluster_epoch > 0),
+    remaining_tolerance    INTEGER NOT NULL CHECK (remaining_tolerance >= 0),
     first_seen_at          INTEGER NOT NULL CHECK (first_seen_at >= 0),
     last_seen_at           INTEGER NOT NULL CHECK (last_seen_at >= 0),
     observation_count      INTEGER NOT NULL CHECK (observation_count > 0),

@@ -177,10 +177,12 @@ impl PgStore {
     pub fn record_placed_segment_shard_backfill(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
+        remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         validate_placed_segment_shard_backfill_work_item(work_item)?;
         validate_placed_segment_shard_backfill_pg(self.pg_id(), work_item)?;
+        validate_placed_segment_shard_backfill_remaining_tolerance(work_item, remaining_tolerance)?;
         if let Some(last_error) = last_error {
             validate_placed_segment_shard_backfill_last_error(last_error)?;
         }
@@ -219,7 +221,8 @@ impl PgStore {
                             "UPDATE placed_segment_shard_backfills \
                              SET last_seen_at = ?6, \
                                  observation_count = observation_count + 1, \
-                                 last_error = COALESCE(?7, last_error) \
+                                 remaining_tolerance = min(remaining_tolerance, ?7), \
+                                 last_error = COALESCE(?8, last_error) \
                              WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
                                AND source_cluster_epoch = ?4 AND desired_cluster_epoch = ?5",
                             params![
@@ -229,6 +232,7 @@ impl PgStore {
                                 work_item.source_cluster_epoch.get(),
                                 work_item.desired_cluster_epoch.get(),
                                 now as i64,
+                                i64::from(remaining_tolerance),
                                 last_error,
                             ],
                         )
@@ -243,9 +247,10 @@ impl PgStore {
                     .execute(
                         "INSERT INTO placed_segment_shard_backfills \
                          (data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
-                          ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, first_seen_at, \
-                          last_seen_at, observation_count, last_error) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 1, ?11)",
+                          ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, \
+                          remaining_tolerance, first_seen_at, last_seen_at, observation_count, \
+                          last_error) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 1, ?12)",
                         params![
                             work_item.request.data_pg_id as i64,
                             work_item.request.segment_okh.as_slice(),
@@ -256,6 +261,7 @@ impl PgStore {
                             work_item.request.ec.m as i64,
                             work_item.source_cluster_epoch.get(),
                             work_item.desired_cluster_epoch.get(),
+                            i64::from(remaining_tolerance),
                             now as i64,
                             last_error,
                         ],
@@ -276,11 +282,12 @@ impl PgStore {
             .conn
             .prepare_cached(
                 "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
-                        ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, first_seen_at, \
-                        last_seen_at, observation_count, last_error \
+                        ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, \
+                        remaining_tolerance, first_seen_at, last_seen_at, observation_count, \
+                        last_error \
                  FROM placed_segment_shard_backfills \
-                 ORDER BY last_seen_at, segment_okh, segment_vid, source_cluster_epoch, \
-                          desired_cluster_epoch \
+                 ORDER BY remaining_tolerance, source_cluster_epoch, last_seen_at, segment_okh, \
+                          segment_vid, desired_cluster_epoch \
                  LIMIT ?1",
             )
             .map_err(|source| StoreError::Db {
@@ -296,7 +303,8 @@ impl PgStore {
                         row.get::<_, i64>(9)?,
                         row.get::<_, i64>(10)?,
                         row.get::<_, i64>(11)?,
-                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 },
             )
@@ -307,13 +315,29 @@ impl PgStore {
 
         let mut backfills = Vec::new();
         for row in rows {
-            let (work_item, first_seen_at, last_seen_at, observation_count, last_error) = row
-                .map_err(|source| StoreError::Db {
-                    context: "read placed segment shard backfill",
-                    source,
+            let (
+                work_item,
+                remaining_tolerance,
+                first_seen_at,
+                last_seen_at,
+                observation_count,
+                last_error,
+            ) = row.map_err(|source| StoreError::Db {
+                context: "read placed segment shard backfill",
+                source,
+            })?;
+            let remaining_tolerance =
+                u8::try_from(remaining_tolerance).map_err(|source| StoreError::Db {
+                    context: "read placed segment shard backfill remaining tolerance",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
                 })?;
+            validate_placed_segment_shard_backfill_remaining_tolerance(
+                &work_item,
+                remaining_tolerance,
+            )?;
             backfills.push(PlacedSegmentShardBackfillRecord {
                 work_item,
+                remaining_tolerance,
                 first_seen_at: first_seen_at as u64,
                 last_seen_at: last_seen_at as u64,
                 observation_count: observation_count as u64,
@@ -440,8 +464,8 @@ impl PgStore {
                          FROM placed_segment_shard_backfills \
                          WHERE next_attempt_after <= ?1 \
                            AND (claim_id IS NULL OR (lease_deadline IS NOT NULL AND lease_deadline <= ?1)) \
-                         ORDER BY last_seen_at, segment_okh, segment_vid, source_cluster_epoch, \
-                                  desired_cluster_epoch \
+                         ORDER BY remaining_tolerance, source_cluster_epoch, last_seen_at, \
+                                  segment_okh, segment_vid, desired_cluster_epoch \
                          LIMIT 1",
                         params![now],
                         placed_segment_shard_backfill_work_item_from_row,
@@ -1874,6 +1898,21 @@ fn validate_placed_segment_shard_backfill_work_item(
     Ok(())
 }
 
+fn validate_placed_segment_shard_backfill_remaining_tolerance(
+    work_item: &PlacedSegmentShardBackfillWorkItem,
+    remaining_tolerance: u8,
+) -> Result<(), StoreError> {
+    if remaining_tolerance > work_item.request.ec.m {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable backfill remaining tolerance {} exceeds EC m={}",
+                remaining_tolerance, work_item.request.ec.m
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_placed_segment_shard_backfill_coalesces_exactly(
     existing: &PlacedSegmentShardBackfillWorkItem,
     incoming: &PlacedSegmentShardBackfillWorkItem,
@@ -1979,6 +2018,10 @@ fn validate_placed_segment_shard_backfill_claim_record(
 ) -> Result<(), StoreError> {
     validate_placed_segment_shard_backfill_work_item(&claim.work_item)?;
     validate_placed_segment_shard_backfill_pg(pg_id, &claim.work_item)?;
+    validate_placed_segment_shard_backfill_remaining_tolerance(
+        &claim.work_item,
+        claim.remaining_tolerance,
+    )?;
     validate_placed_segment_shard_backfill_claim_identity(&claim.claim_id, &claim.owner_token)
 }
 
@@ -2030,13 +2073,13 @@ fn durable_repair_claim_select_sql(where_clause: &str) -> String {
 fn durable_backfill_claim_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
-                ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, claim_id, \
-                owner_token, cluster_epoch, claimed_at, lease_deadline, attempt_count, \
-                last_error \
+                ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, \
+                remaining_tolerance, claim_id, owner_token, cluster_epoch, claimed_at, \
+                lease_deadline, attempt_count, last_error \
          FROM placed_segment_shard_backfills \
          WHERE {where_clause} \
-         ORDER BY last_seen_at, segment_okh, segment_vid, source_cluster_epoch, \
-                  desired_cluster_epoch \
+         ORDER BY remaining_tolerance, source_cluster_epoch, last_seen_at, segment_okh, \
+                  segment_vid, desired_cluster_epoch \
          LIMIT 1"
     )
 }
@@ -2073,10 +2116,28 @@ fn placed_segment_shard_backfill_claim_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<PlacedSegmentShardBackfillClaimRecord, rusqlite::Error> {
     let work_item = placed_segment_shard_backfill_work_item_from_row(row)?;
-    let cluster_epoch = row.get::<_, i64>(11)?;
+    let remaining_tolerance = row.get::<_, i64>(9)?;
+    let remaining_tolerance = u8::try_from(remaining_tolerance).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::other(
+                "durable backfill claim row has invalid remaining tolerance",
+            )),
+        )
+    })?;
+    validate_placed_segment_shard_backfill_remaining_tolerance(&work_item, remaining_tolerance)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::other(error.to_string())),
+            )
+        })?;
+    let cluster_epoch = row.get::<_, i64>(12)?;
     let cluster_epoch = ClusterEpoch::new(cluster_epoch as u64).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            11,
+            12,
             rusqlite::types::Type::Integer,
             Box::new(std::io::Error::other(
                 "durable backfill claim row has invalid cluster epoch",
@@ -2085,15 +2146,16 @@ fn placed_segment_shard_backfill_claim_from_row(
     })?;
     Ok(PlacedSegmentShardBackfillClaimRecord {
         work_item,
-        claim_id: row.get(9)?,
-        owner_token: row.get(10)?,
+        remaining_tolerance,
+        claim_id: row.get(10)?,
+        owner_token: row.get(11)?,
         cluster_epoch,
-        claimed_at: row.get::<_, i64>(12)? as u64,
+        claimed_at: row.get::<_, i64>(13)? as u64,
         lease_deadline: row
-            .get::<_, Option<i64>>(13)?
+            .get::<_, Option<i64>>(14)?
             .map(|deadline| deadline as u64),
-        attempt_count: row.get::<_, i64>(14)? as u64,
-        last_error: row.get(15)?,
+        attempt_count: row.get::<_, i64>(15)? as u64,
+        last_error: row.get(16)?,
     })
 }
 
@@ -2314,13 +2376,17 @@ mod tests {
         };
 
         store
-            .record_placed_segment_shard_backfill(&work_item, Some("first"))
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, Some("first"))
             .unwrap();
         store
-            .record_placed_segment_shard_backfill(&work_item, Some("second"))
+            .record_placed_segment_shard_backfill(
+                &work_item,
+                work_item.request.ec.m,
+                Some("second"),
+            )
             .unwrap();
         store
-            .record_placed_segment_shard_backfill(&work_item, None)
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
 
         drop(store);
@@ -2328,6 +2394,7 @@ mod tests {
         let backfills = reopened.list_placed_segment_shard_backfills().unwrap();
         assert_eq!(backfills.len(), 1);
         assert_eq!(backfills[0].work_item, work_item);
+        assert_eq!(backfills[0].remaining_tolerance, work_item.request.ec.m);
         assert_eq!(backfills[0].observation_count, 3);
         assert_eq!(backfills[0].last_error.as_deref(), Some("second"));
 
@@ -2338,6 +2405,39 @@ mod tests {
             .list_placed_segment_shard_backfills()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn placed_segment_shard_backfill_coalescing_keeps_lowest_remaining_tolerance() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xC2; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+
+        store
+            .record_placed_segment_shard_backfill(&work_item, 2, None)
+            .unwrap();
+        store
+            .record_placed_segment_shard_backfill(&work_item, 0, None)
+            .unwrap();
+        store
+            .record_placed_segment_shard_backfill(&work_item, 1, None)
+            .unwrap();
+
+        let backfills = store.list_placed_segment_shard_backfills().unwrap();
+        assert_eq!(backfills.len(), 1);
+        assert_eq!(backfills[0].remaining_tolerance, 0);
+        assert_eq!(backfills[0].observation_count, 3);
     }
 
     #[test]
@@ -2360,16 +2460,21 @@ mod tests {
         mismatched.request.segment_crc64 = 0x5678;
 
         store
-            .record_placed_segment_shard_backfill(&work_item, Some("first"))
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, Some("first"))
             .unwrap();
         assert!(matches!(
-            store.record_placed_segment_shard_backfill(&mismatched, Some("second")),
+            store.record_placed_segment_shard_backfill(
+                &mismatched,
+                mismatched.request.ec.m,
+                Some("second")
+            ),
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));
 
         let backfills = store.list_placed_segment_shard_backfills().unwrap();
         assert_eq!(backfills.len(), 1);
         assert_eq!(backfills[0].work_item, work_item);
+        assert_eq!(backfills[0].remaining_tolerance, work_item.request.ec.m);
         assert_eq!(backfills[0].observation_count, 1);
         assert_eq!(backfills[0].last_error.as_deref(), Some("first"));
     }
@@ -2394,13 +2499,14 @@ mod tests {
         stale.request.stored_size = 2048;
 
         store
-            .record_placed_segment_shard_backfill(&work_item, None)
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
         assert!(!store.resolve_placed_segment_shard_backfill(&stale).unwrap());
 
         let backfills = store.list_placed_segment_shard_backfills().unwrap();
         assert_eq!(backfills.len(), 1);
         assert_eq!(backfills[0].work_item, work_item);
+        assert_eq!(backfills[0].remaining_tolerance, work_item.request.ec.m);
 
         assert!(store
             .resolve_placed_segment_shard_backfill(&work_item)
@@ -2604,7 +2710,7 @@ mod tests {
                 desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
             };
             store
-                .record_placed_segment_shard_backfill(&work_item, None)
+                .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
                 .unwrap();
         }
 
@@ -2674,7 +2780,7 @@ mod tests {
         };
 
         assert!(matches!(
-            store.record_placed_segment_shard_backfill(&wrong_pg, None),
+            store.record_placed_segment_shard_backfill(&wrong_pg, wrong_pg.request.ec.m, None),
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));
         assert!(matches!(
@@ -2682,7 +2788,11 @@ mod tests {
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));
         assert!(matches!(
-            store.record_placed_segment_shard_backfill(&reversed_epochs, None),
+            store.record_placed_segment_shard_backfill(
+                &reversed_epochs,
+                reversed_epochs.request.ec.m,
+                None
+            ),
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));
     }
@@ -2717,7 +2827,7 @@ mod tests {
             .unwrap()
             .is_none());
         store
-            .record_placed_segment_shard_backfill(&work_item, None)
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
 
         let claim = store
@@ -2764,7 +2874,7 @@ mod tests {
             .record_placed_segment_shard_backfill_claim_error(&claim, "backfill failed", 30)
             .unwrap());
         store
-            .record_placed_segment_shard_backfill(&work_item, None)
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
         assert_eq!(
             store.list_placed_segment_shard_backfills().unwrap()[0]
@@ -2811,6 +2921,57 @@ mod tests {
     }
 
     #[test]
+    fn placed_segment_shard_backfill_claim_prefers_lower_remaining_tolerance() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let routine = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xC0; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+        let urgent = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xC1; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x5678,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+
+        store
+            .record_placed_segment_shard_backfill(&routine, 2, None)
+            .unwrap();
+        store
+            .record_placed_segment_shard_backfill(&urgent, 0, None)
+            .unwrap();
+
+        let claim = store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-priority",
+                "worker-priority",
+                ClusterEpoch::new(7).unwrap(),
+                10,
+                Some(20),
+                10,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.work_item, urgent);
+        assert_eq!(claim.remaining_tolerance, 0);
+    }
+
+    #[test]
     fn placed_segment_shard_backfill_claim_can_be_stolen_after_expiry() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
@@ -2828,7 +2989,7 @@ mod tests {
         };
         let epoch = ClusterEpoch::new(7).unwrap();
         store
-            .record_placed_segment_shard_backfill(&work_item, None)
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
         let first = store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
@@ -2889,7 +3050,7 @@ mod tests {
         };
         let epoch = ClusterEpoch::new(7).unwrap();
         store
-            .record_placed_segment_shard_backfill(&work_item, None)
+            .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
 
         assert!(matches!(

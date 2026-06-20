@@ -1614,6 +1614,7 @@ pub struct PlacedSegmentShardBackfillWorkItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedSegmentShardBackfillRecord {
     pub work_item: PlacedSegmentShardBackfillWorkItem,
+    pub remaining_tolerance: u8,
     pub first_seen_at: u64,
     pub last_seen_at: u64,
     pub observation_count: u64,
@@ -1623,6 +1624,7 @@ pub struct PlacedSegmentShardBackfillRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedSegmentShardBackfillClaimRecord {
     pub work_item: PlacedSegmentShardBackfillWorkItem,
+    pub remaining_tolerance: u8,
     pub claim_id: String,
     pub owner_token: String,
     pub cluster_epoch: ClusterEpoch,

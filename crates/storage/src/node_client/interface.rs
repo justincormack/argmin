@@ -1000,6 +1000,7 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
+        remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError>;
 

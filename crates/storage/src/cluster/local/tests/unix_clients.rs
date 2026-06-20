@@ -225,6 +225,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         &self,
         _pg_id: PgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
+        _remaining_tolerance: u8,
         _last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         Ok(())

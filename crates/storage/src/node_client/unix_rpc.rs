@@ -493,11 +493,13 @@ impl UnixStorageNodeClient {
         &self,
         pg_id: PgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
+        remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillRecordRequest {
             route: self.bucket_pg_request(pg_id),
             work_item: *work_item,
+            remaining_tolerance,
             last_error: last_error.map(ToOwned::to_owned),
         };
         let payload =
@@ -930,10 +932,15 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
         &self,
         pg_id: PgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
+        remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::record_placed_segment_shard_backfill(
-            self, pg_id, work_item, last_error,
+            self,
+            pg_id,
+            work_item,
+            remaining_tolerance,
+            last_error,
         )
     }
 

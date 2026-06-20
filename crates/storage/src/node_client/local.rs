@@ -231,11 +231,12 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
         &self,
         pg_id: PgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
+        remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         validate_placed_segment_shard_backfill_route(pg_id, work_item)?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.record_placed_segment_shard_backfill(work_item, last_error)
+        pg.record_placed_segment_shard_backfill(work_item, remaining_tolerance, last_error)
     }
 
     fn list_placed_segment_shard_backfills(
