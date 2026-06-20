@@ -207,9 +207,9 @@ plan:
 
 - transient-drain waiting is still potentially long in principle, even though
   it no longer uses polling
-- whether that should become bounded wait plus retryable `5xx`, or immediate
-  failure in some cases, is tracked separately in
-  `plans/retry-semantics-plan.md`
+- later bounded-request-work changes resolved this as bounded local work with
+  typed `OperationAborted` / `SlowDown` outcomes rather than unbounded request
+  waiting; see `plans/completed/retry-semantics-plan.md`
 
 ## Order
 
