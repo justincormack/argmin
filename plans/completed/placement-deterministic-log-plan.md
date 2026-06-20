@@ -1,10 +1,37 @@
 ## Placement Deterministic Log Plan
 
-Status: planned
+Status: completed
 
 This plan replaces the `libm` dependency used by the placement crate with an
 internal deterministic natural-log implementation suitable for the placement
 score path.
+
+## Resolution
+
+Completed by:
+
+- `40c0bbf6` (`Restrict placement score log inputs`) introduced the placement-owned
+  `Unit53` domain.
+- `17008a28` (`Add placement core-math reference tooling`) added the committed
+  reference corpus and optional CORE-MATH comparison helper.
+- `48ef186d` (`Port placement log from core-math`) replaced the placement score
+  path with the internal deterministic log implementation and removed `libm` from
+  the placement crate.
+- `45094ca9` (`Add core-math source references`) pinned the upstream CORE-MATH
+  source reference used for the port.
+
+The production score path now constructs a `Unit53` from the hash-derived
+53-bit numerator and calls `deterministic_log_u53`. The implementation is checked
+against a committed fixed corpus generated from CORE-MATH, and
+`scripts/placement-log-core-math` can regenerate or check that corpus when a local
+`tmp/core-math` checkout is available.
+
+A random property test that proves 53-bit/correctly-rounded log output was not
+added. Without an independent high-precision oracle such as MPFR/CORE-MATH at test
+time, such a property test would either duplicate another log implementation in the
+test suite or only check weaker invariants. The committed corpus plus optional
+external comparison helper keeps the production and normal test dependency graph
+small while preserving a reproducible validation path.
 
 The current implementation in
 `crates/placement/src/hash.rs` computes weighted rendezvous scores as:
@@ -200,7 +227,7 @@ After the implementation and tests land:
 Acceptance criteria:
 
 - crate metadata and design docs match the implementation
-- no stale references to `libm::log` remain in placement docs or code
+- no stale references to the old `libm` score path remain in placement docs or code
 
 ## Verification
 

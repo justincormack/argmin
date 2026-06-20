@@ -53,11 +53,12 @@ versions, musl, macOS libm, and between x86-64 and ARM64 — meaning two cluster
 could compute different placements for the same key if they run different hardware or
 libc versions.
 
-To support mixed ARM64/AMD64 and heterogeneous deployments, we use `libm::log` from the
-`libm` crate (rust-lang/libm), which is a pure-Rust port of the musl math library.
-It gives bit-identical results on all IEEE 754-compliant platforms by construction,
-since it never calls the platform libc. This is a one-line change at the call site and
-adds one dependency.
+To support mixed ARM64/AMD64 and heterogeneous deployments, placement uses an internal
+restricted-domain CORE-MATH binary64 `log` port. The score path does not accept an
+arbitrary `f64`; it constructs a placement-owned `Unit53` value from the hash-derived
+53-bit numerator `n in [1, 2^53]`, representing `n / 2^53` in `[2^-53, 1]`. This keeps
+the weighted HRW score on `f64` while making the log input contract explicit and
+platform independent.
 
 **Tie-breaking.** If two nodes have exactly equal scores (probability ~2^-64 per pair),
 the tie is broken by scan order. Because `ClusterMap` stores nodes sorted by `NodeId`
@@ -134,6 +135,7 @@ placement/
     config.rs       -- PlacementConfig, PlacementError
     constraint.rs   -- Admission, PlacementConstraint, built-in constructors
     placer.rs       -- Placer, rendezvous hashing algorithm
+    deterministic_log.rs -- restricted CORE-MATH binary64 log port
     hash.rs         -- hash(key || node_id) -> f64 score helper
 ```
 
@@ -142,8 +144,6 @@ Single crate: `placement`. No sub-crates needed (pure safe Rust, no FFI).
 **Dependencies added by this step:**
 - `rapidhash` — hash function
 - `smallvec` — inline storage for `TopologyKey` segments
-- `libm` — pure-Rust port of musl math; used for `libm::log` to give bit-identical
-  results across x86-64, ARM64, and any other IEEE 754 platform
 - `thiserror` — already in workspace (used by `ec` crate)
 
 ---
@@ -528,8 +528,9 @@ For node i, given input key `K`:
 ```
 hash_input  = K ++ node_id.as_u32().to_le_bytes()   (concatenated)
 h: u64      = rapidhash(hash_input)
-U_i: f64    = ((h >> 11) + 1) as f64 / (1u64 << 53) as f64   // maps to (0, 1]
-score_i     = -libm::log(U_i) / weight_i
+n: u64      = (h >> 11) + 1                              // maps to [1, 2^53]
+U_i         = Unit53(n), representing n / 2^53 in [2^-53, 1]
+score_i     = -deterministic_log_u53(U_i) / weight_i
 ```
 
 Nodes with `weight = 0.0` are skipped before scoring.
@@ -538,9 +539,9 @@ Nodes with `weight = 0.0` are skipped before scoring.
 stores nodes sorted by `NodeId`, a tie is broken in favour of the node with the
 lower `NodeId`. This is deterministic.
 
-**Floating-point note.** `libm::log` is used instead of `f64::ln()` to give
-bit-identical results across x86-64, ARM64, and all other IEEE 754 platforms.
-See the Background section and resolved decision 11.
+**Floating-point note.** The log input is encoded as a placement-owned `Unit53`
+domain value and evaluated with an internal restricted-domain CORE-MATH binary64
+`log` port. See the Background section and resolved decision 11.
 
 ### Streaming selection (O(total_shards) space)
 
@@ -669,18 +670,27 @@ keeping such nodes in their own isolated group.
 All mutable state is stack-local. Safe to share across concurrent threads without
 locking.
 
-### 11. Cross-platform floating-point determinism via libm crate
+### 11. Cross-platform floating-point determinism via restricted CORE-MATH log
 
 `f64::ln()` calls the platform libc's `log()`, which is not required to be correctly
 rounded by IEEE 754. Results can differ between glibc and musl, between glibc versions,
 and between x86-64 and ARM64. A cluster running mixed hardware or a rolling OS upgrade
 could compute inconsistent placements if two nodes disagree on a score.
 
-We use `libm::log` from the `libm` crate (rust-lang/libm). This is a pure-Rust port of
-the musl `log` implementation. Because it contains no platform calls and operates
-entirely on IEEE 754 bit patterns, it gives bit-identical results on every conforming
-platform. The change at the call site is trivial: replace `x.ln()` with `libm::log(x)` (C
-convention: `log` = natural logarithm).
+Placement uses an internal restricted Rust port of the CORE-MATH binary64 `log`
+implementation. The public score formula remains `-log(U) / weight`, but `U` is not
+passed as an arbitrary floating-point value. It is represented by a `Unit53` newtype
+constructed from the 53-bit hash numerator:
+
+```
+n = (hash >> 11) + 1
+U = n / 2^53
+```
+
+This gives placement a narrow, documented domain of `[2^-53, 1]` and avoids platform
+libm calls without retaining an external math dependency. The implementation is checked
+against a committed CORE-MATH reference corpus, with a helper script for regenerating or
+checking that corpus against a local CORE-MATH checkout.
 
 This supports mixed ARM64/AMD64 deployments, heterogeneous libc versions, and partial
 OS upgrades without any operational constraints on homogeneity.
