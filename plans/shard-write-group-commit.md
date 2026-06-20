@@ -23,6 +23,15 @@ For the traced `256 KiB` `PUT` run:
 
 So almost all of the remaining traced `PUT` time is in shard durability.
 
+The disk-backed versioning reproducer in
+`plans/metadata-write-amplification-plan.md` points in the same direction. In
+an EC 4+2 local run, `6006` local shard writes generated `6006` temp-file
+`fdatasync` calls and `6006` parent-directory `fsync` calls. The shard bytes
+were only about `24 KiB` total, but the shard sync calls accounted for about
+`27s` of traced syscall elapsed time, compared with about `11.5s` for SQLite
+write plus sync work. That makes this plan the likely higher-impact follow-up
+for that reproducer as well.
+
 ## Current write shape
 
 Today a direct single-segment `PutObject`:
@@ -57,6 +66,10 @@ This is the main remaining lever that attacks the actual measured bottleneck:
 
 The expensive part now is that each request pays its own file durability
 boundary. Group commit would amortize that cost across multiple requests.
+Even very small batches are potentially valuable: if the batcher can usually
+combine two shard updates that would otherwise flush independently, it should
+roughly halve the shard file and directory sync boundaries for the batched
+portion of the workload.
 
 This is especially attractive for:
 
