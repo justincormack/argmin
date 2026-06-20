@@ -261,6 +261,7 @@ pub struct UploadPartCopyRequest<'a> {
     pub upload: MultipartObjectRequest<'a>,
     pub part_number: u32,
     pub copy_source_range: Option<(u64, u64)>,
+    pub policy_context: PutObjectPolicyContext<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }

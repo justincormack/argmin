@@ -5995,6 +5995,8 @@ fn upload_part_copy_is_consistent_during_concurrent_overwrite() {
                 part_number: 1,
                 copy_source_range: None,
 
+                policy_context: PutObjectPolicyContext::default(),
+
                 source_sse_customer: None,
                 sse_customer: None,
             })
@@ -6471,6 +6473,8 @@ fn upload_part_copy_survives_source_metadata_delete_mid_read() {
             ),
             part_number: 1,
             copy_source_range: None,
+
+            policy_context: PutObjectPolicyContext::default(),
 
             source_sse_customer: None,
             sse_customer: None,

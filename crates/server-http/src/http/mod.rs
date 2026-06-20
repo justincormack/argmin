@@ -31,6 +31,7 @@ use crate::coordinator::MetadataDirective;
 use crate::coordinator::MultipartObjectRequest;
 use crate::coordinator::ObjectRequest;
 use crate::coordinator::ObjectVersionRequest;
+use crate::coordinator::PutObjectPolicyContext;
 use crate::coordinator::TaggingDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::coordinator::{AuthorizePutObjectRequest, AuthorizedPutObjectWrite};
@@ -2790,6 +2791,7 @@ impl HttpFrontend {
                         )?,
                         part_number,
                         copy_source_range,
+                        policy_context: PutObjectPolicyContext::new(Some(copy_source), None, None),
                         source_sse_customer: source_sse_customer.as_ref(),
                         sse_customer: sse_customer.as_ref(),
                     })

@@ -430,22 +430,13 @@ impl Coordinator {
             &acl,
             req.policy_context,
         )?;
-        let copy_source_policy_value = req.source.version_id.map_or_else(
-            || format!("{}/{}", req.source.bucket, req.source.key),
-            |version_id| {
-                format!(
-                    "{}/{}?versionId={}",
-                    req.source.bucket, req.source.key, version_id
-                )
-            },
-        );
         let metadata_directive = req.directive.policy_condition_value();
         let request_object_tags_xml = match &req.tagging {
             TaggingDirective::Copy => None,
             TaggingDirective::Replace(tags) => *tags,
         };
         let copy_policy_context = PutObjectPolicyContext::new(
-            Some(copy_source_policy_value.as_str()),
+            req.policy_context.copy_source,
             metadata_directive,
             acl_policy_context.canned_acl,
         )
@@ -561,19 +552,10 @@ impl Coordinator {
         let upload_id = req.upload.upload_id_typed();
         let part_number = req.part_number;
         let requester = req.upload.requester();
-        let copy_source_policy_value = req.source.version_id.map_or_else(
-            || format!("{}/{}", req.source.bucket, req.source.key),
-            |version_id| {
-                format!(
-                    "{}/{}?versionId={}",
-                    req.source.bucket, req.source.key, version_id
-                )
-            },
-        );
-        let policy_context =
-            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
-                .with_object_creation_operation(false);
+        let policy_context = req
+            .policy_context
+            .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+            .with_object_creation_operation(false);
 
         let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
         let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;

@@ -13,8 +13,8 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
-    send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
-    SendRetryingOperationAborted, SignedRequestCredentials, CTX,
+    send_signed_request, send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key,
+    unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -11824,6 +11824,80 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
 
         cleanup_with_client(client, &dst_bucket, &["copied", "copied-denied"]).await;
         cleanup(&src_bucket, &["public/foo", "private/foo"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_source_condition_uses_leading_slash_encoded_header_value() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+
+        let src_key = "public/space key+plus#hash";
+        let encoded_src_key = "public/space%20key%2Bplus%23hash";
+        let dst_key = "copied";
+        let copy_source = format!("/{src_bucket}/{encoded_src_key}");
+
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            src_key,
+            b"copy-source-normalization".to_vec(),
+        )
+        .await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&dst_bucket),
+                        "Condition": {
+                            "StringNotEquals": {
+                                "s3:x-amz-copy-source": copy_source
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send_retrying_operation_aborted("put copy-source normalization bucket policy")
+            .await
+            .unwrap();
+
+        let dst_url = object_url(CTX.endpoint(), &dst_bucket, dst_key, None);
+        let response = send_signed_request(
+            "PUT",
+            &dst_url,
+            b"",
+            [("x-amz-copy-source", copy_source.as_str())],
+        );
+        assert_eq!(
+            response.status, 200,
+            "expected copy with leading-slash encoded copy-source to match policy, got {} body={}",
+            response.status, response.body
+        );
+
+        let copied = s3_tests::get_object_body_retrying_operation_aborted(
+            client,
+            &dst_bucket,
+            dst_key,
+            None,
+            "get copied object after copy-source normalization policy",
+        )
+        .await;
+        assert_eq!(copied.as_slice(), b"copy-source-normalization");
+
+        cleanup_with_client(client, &dst_bucket, &[dst_key]).await;
+        cleanup_with_client(client, &src_bucket, &[src_key]).await;
     });
 }
 

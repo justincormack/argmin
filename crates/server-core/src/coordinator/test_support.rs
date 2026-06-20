@@ -767,13 +767,13 @@ pub(crate) fn copy_source_with_condition_and_expected_owner<'a>(
     condition: &'a ReadCondition,
     expected_bucket_owner: Option<&'a str>,
 ) -> CopySource<'a> {
-    CopySource {
-        bucket: trusted_bucket_name(bucket),
-        key: trusted_object_key(key),
+    CopySource::new(
+        trusted_bucket_name(bucket),
+        trusted_object_key(key),
         version_id,
         condition,
         expected_bucket_owner,
-    }
+    )
 }
 
 pub(crate) fn delete_object_request<'a>(

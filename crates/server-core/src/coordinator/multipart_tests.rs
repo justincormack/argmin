@@ -7891,6 +7891,8 @@ fn stream_put_upload_part_copy_from_stream_source() {
             part_number: 1,
             copy_source_range: None,
 
+            policy_context: PutObjectPolicyContext::default(),
+
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -7970,6 +7972,8 @@ fn upload_part_copy_streams_multisegment_source_and_persists_checksum() {
             ),
             part_number: 1,
             copy_source_range: None,
+
+            policy_context: PutObjectPolicyContext::default(),
 
             source_sse_customer: None,
             sse_customer: None,
@@ -8142,6 +8146,7 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -8225,6 +8230,7 @@ fn upload_part_copy_invalid_part_number_exceeds_max() {
             ),
             part_number: 10_001,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -8286,6 +8292,8 @@ fn upload_part_copy_rejects_non_owner_requester() {
             part_number: 1,
             copy_source_range: None,
 
+            policy_context: PutObjectPolicyContext::default(),
+
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -8346,6 +8354,8 @@ fn authorize_upload_part_copy_rejects_non_owner_requester() {
             ),
             part_number: 1,
             copy_source_range: None,
+
+            policy_context: PutObjectPolicyContext::default(),
 
             source_sse_customer: None,
             sse_customer: None,

@@ -1576,7 +1576,7 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
-            policy_context: PutObjectPolicyContext::default(),
+            policy_context: PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
             source_sse_customer: None,
             destination_encryption: WriteEncryptionRequest::none(),
             object_lock: ObjectLockState::default(),
@@ -1600,7 +1600,7 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
-            policy_context: PutObjectPolicyContext::default(),
+            policy_context: PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
             source_sse_customer: None,
             destination_encryption: WriteEncryptionRequest::none(),
             object_lock: ObjectLockState::default(),
@@ -1638,7 +1638,7 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
-            policy_context: PutObjectPolicyContext::default(),
+            policy_context: PutObjectPolicyContext::new(Some("src/private/foo"), None, None),
             source_sse_customer: None,
             destination_encryption: WriteEncryptionRequest::none(),
             object_lock: ObjectLockState::default(),
@@ -2638,6 +2638,8 @@ fn upload_part_copy_bucket_policy_copy_source_controls_access() {
             part_number: 1,
             copy_source_range: None,
 
+            policy_context: PutObjectPolicyContext::default(),
+
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -2656,6 +2658,8 @@ fn upload_part_copy_bucket_policy_copy_source_controls_access() {
             ),
             part_number: 2,
             copy_source_range: None,
+
+            policy_context: PutObjectPolicyContext::default(),
 
             source_sse_customer: None,
             sse_customer: None,
@@ -2760,6 +2764,7 @@ fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -2794,6 +2799,7 @@ fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
             ),
             part_number: 2,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -2902,6 +2908,7 @@ fn upload_part_copy_bucket_policy_existing_tag_source_controls_access() {
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -2939,6 +2946,7 @@ fn upload_part_copy_bucket_policy_existing_tag_source_controls_access() {
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -6721,6 +6729,7 @@ fn bucket_policy_does_not_grant_upload_part_copy_for_private_foreign_owned_sourc
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })

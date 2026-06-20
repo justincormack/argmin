@@ -6317,6 +6317,7 @@ mod phase6_harness {
                 upload: phase6_multipart_object_request(dst_bucket, DST_KEY, upload_id, requester),
                 part_number: 1,
                 copy_source_range: None,
+                policy_context: PutObjectPolicyContext::new(Some("*source-key"), None, None),
                 source_sse_customer: None,
                 sse_customer: None,
             })
@@ -6374,36 +6375,40 @@ mod phase6_harness {
         fixtures: &IdentityFixtures,
         scenario: CopyObjectScenario,
     ) -> PutObjectPolicyContext<'static> {
-        PutObjectPolicyContext::new(None, None, scenario.acl.canned_acl_condition_value())
-            .with_acl_grant_headers(
-                match scenario.acl {
-                    CopyAclShape::GrantRead => {
-                        Some(copy_grant_read_header(fixtures, CopyContextShape::Exact))
-                    }
-                    _ => None,
-                },
-                match scenario.acl {
-                    CopyAclShape::GrantWrite => {
-                        Some(copy_grant_write_header(fixtures, CopyContextShape::Exact))
-                    }
-                    _ => None,
-                },
-                match scenario.acl {
-                    CopyAclShape::GrantReadAcp => Some(copy_grant_read_acp_header(
-                        fixtures,
-                        CopyContextShape::Exact,
-                    )),
-                    _ => None,
-                },
-                match scenario.acl {
-                    CopyAclShape::GrantWriteAcp => Some(copy_grant_write_acp_header(
-                        fixtures,
-                        CopyContextShape::Exact,
-                    )),
-                    _ => None,
-                },
-                None,
-            )
+        PutObjectPolicyContext::new(
+            Some("*source-key"),
+            None,
+            scenario.acl.canned_acl_condition_value(),
+        )
+        .with_acl_grant_headers(
+            match scenario.acl {
+                CopyAclShape::GrantRead => {
+                    Some(copy_grant_read_header(fixtures, CopyContextShape::Exact))
+                }
+                _ => None,
+            },
+            match scenario.acl {
+                CopyAclShape::GrantWrite => {
+                    Some(copy_grant_write_header(fixtures, CopyContextShape::Exact))
+                }
+                _ => None,
+            },
+            match scenario.acl {
+                CopyAclShape::GrantReadAcp => Some(copy_grant_read_acp_header(
+                    fixtures,
+                    CopyContextShape::Exact,
+                )),
+                _ => None,
+            },
+            match scenario.acl {
+                CopyAclShape::GrantWriteAcp => Some(copy_grant_write_acp_header(
+                    fixtures,
+                    CopyContextShape::Exact,
+                )),
+                _ => None,
+            },
+            None,
+        )
     }
 
     fn copy_source_policy_value(context: CopyContextShape) -> &'static str {

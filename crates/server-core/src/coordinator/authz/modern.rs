@@ -220,19 +220,10 @@ impl Coordinator {
         let upload_id = req.upload.upload_id_typed();
         let part_number = req.part_number;
         let requester = req.upload.requester();
-        let copy_source_policy_value = req.source.version_id.map_or_else(
-            || format!("{}/{}", req.source.bucket, req.source.key),
-            |version_id| {
-                format!(
-                    "{}/{}?versionId={}",
-                    req.source.bucket, req.source.key, version_id
-                )
-            },
-        );
-        let policy_context =
-            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
-                .with_object_creation_operation(false);
+        let policy_context = req
+            .policy_context
+            .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+            .with_object_creation_operation(false);
         let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*dst_bucket_info);
         let modern_bucket = BoeBucketSummary::assume_boe(&modern_bucket_info);

@@ -735,6 +735,7 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -1985,6 +1986,7 @@ fn upload_part_copy_source_payload_read_resource_exhaustion_maps_to_slow_down() 
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -2058,6 +2060,7 @@ fn upload_part_copy_range_source_payload_read_resource_exhaustion_maps_to_slow_d
             ),
             part_number: 1,
             copy_source_range: Some((2, 12)),
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
@@ -3728,6 +3731,7 @@ fn upload_part_copy_destination_finalize_maps_command_log_conflict_to_operation_
             ),
             part_number: 1,
             copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
             source_sse_customer: None,
             sse_customer: None,
         })
