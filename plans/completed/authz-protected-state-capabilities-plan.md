@@ -1,6 +1,47 @@
 ## Authz Protected State Capabilities Plan
 
-Status: in progress
+Status: completed / superseded as an active plan
+
+## Resolution
+
+This plan is complete for the protected multipart state capability work that
+motivated it.
+
+Current state:
+
+- public multipart operation paths use operation-specific authz entrypoints
+  that return typed authorized values before operation code consumes protected
+  upload state
+- `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`,
+  `AbortMultipartUpload`, and `ListParts` all flow through authorized multipart
+  upload snapshots or operation-specific authorized results
+- storage helpers for protected multipart part listing, part write,
+  completion, stream-session creation, and authorized abort now require
+  `AuthorizedMultipartUploadRecord` rather than accepting an arbitrary
+  `MultipartUploadRecord`
+- storage revalidates authorized multipart upload records when preparing
+  stream sessions, completion, and abort commands, so stale authorized snapshots
+  cannot silently mutate a changed upload
+- AWS-facing coverage now pins the important multipart management visibility
+  cases, including same-account non-initiator `AccessDenied`, missing upload
+  `NoSuchUpload`, aborted/completed upload behavior, and abort races with
+  already-started `UploadPart`
+- local authz model/stateful coverage now exercises multipart write/manage
+  authorization and reclaim/lifetime races
+
+The literal source-level guard/lint proposed below did not land. The main
+structural guard is now the nominal storage API shape: protected multipart
+helpers require `AuthorizedMultipartUploadRecord`, while remaining raw
+multipart lookup helpers are used by authz, lifecycle/background maintenance,
+RPC decoding, or tests. A broad source-level lint for every protected storage
+read would be a separate hardening project and should not keep this multipart
+capability plan open.
+
+Broader object and bucket protected-state normalization continued in related
+completed plans, especially
+`plans/completed/internal-authz-normalization-plan.md`,
+`plans/completed/authz-model-testing-plan.md`, and
+`plans/completed/coordinator-storage-capability-plan.md`.
 
 Current slice:
 
