@@ -100,6 +100,7 @@ async fn create_versioned_boe_bucket(client: &aws_sdk_s3::Client) -> String {
         .send()
         .await
         .unwrap();
+    s3_tests::wait_for_versioned_writes_visible(client, &bucket).await;
     bucket
 }
 

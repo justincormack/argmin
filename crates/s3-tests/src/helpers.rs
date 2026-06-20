@@ -1806,6 +1806,132 @@ pub async fn put_object_retrying_operation_aborted(
     .await
 }
 
+pub async fn wait_for_versioned_writes_visible(client: &Client, bucket: &str) {
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+    const READINESS_KEY: &str = "__argmin-versioning-readiness";
+
+    let mut last_error = None;
+
+    for attempt in 0..40 {
+        let body = format!("versioning-ready-{attempt}");
+        let put =
+            put_object_retrying_operation_aborted(client, bucket, READINESS_KEY, body.into_bytes())
+                .await;
+
+        if put.version_id().filter(|id| *id != "null").is_none() {
+            last_error = Some("PUT did not return a real version id".to_string());
+            cleanup_versioning_readiness_key(client, bucket).await;
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
+        }
+
+        match client
+            .get_object()
+            .bucket(bucket)
+            .key(READINESS_KEY)
+            .send()
+            .await
+        {
+            Ok(response) => match response.body.collect().await {
+                Ok(bytes) => {
+                    let bytes = bytes.into_bytes();
+                    if bytes.as_ref() == format!("versioning-ready-{attempt}").as_bytes() {
+                        cleanup_versioning_readiness_key(client, bucket).await;
+                        return;
+                    }
+                    last_error = Some(format!(
+                        "readiness GET returned unexpected body {:?}",
+                        String::from_utf8_lossy(bytes.as_ref())
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(format!("readiness GET body collection failed: {error:?}"));
+                }
+            },
+            Err(error)
+                if error
+                    .as_service_error()
+                    .and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchKey") =>
+            {
+                last_error = Some("readiness GET returned NoSuchKey".to_string());
+            }
+            Err(error) => panic!("versioning readiness GET: {error:?}"),
+        }
+
+        cleanup_versioning_readiness_key(client, bucket).await;
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+
+    panic!(
+        "versioned writes did not become visible for {bucket}: {}",
+        last_error.unwrap_or_else(|| "no attempts completed".to_string())
+    );
+}
+
+async fn cleanup_versioning_readiness_key(client: &Client, bucket: &str) {
+    let _ = client
+        .delete_object()
+        .bucket(bucket)
+        .key("__argmin-versioning-readiness")
+        .send_retrying_operation_aborted("delete versioning readiness object")
+        .await;
+
+    loop {
+        let resp = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix("__argmin-versioning-readiness")
+            .send_retrying_operation_aborted("list versioning readiness object versions")
+            .await
+            .unwrap();
+
+        let mut objects = Vec::new();
+        for version in resp.versions() {
+            if version.key() == Some("__argmin-versioning-readiness") {
+                objects.push(
+                    ObjectIdentifier::builder()
+                        .key("__argmin-versioning-readiness")
+                        .set_version_id(version.version_id().map(str::to_string))
+                        .build()
+                        .unwrap(),
+                );
+            }
+        }
+        for marker in resp.delete_markers() {
+            if marker.key() == Some("__argmin-versioning-readiness") {
+                objects.push(
+                    ObjectIdentifier::builder()
+                        .key("__argmin-versioning-readiness")
+                        .set_version_id(marker.version_id().map(str::to_string))
+                        .build()
+                        .unwrap(),
+                );
+            }
+        }
+
+        if objects.is_empty() {
+            return;
+        }
+
+        let resp = delete_objects_retrying_operation_aborted(
+            client,
+            bucket,
+            Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            resp.errors().is_empty(),
+            "delete versioning readiness object returned embedded errors: {:?}",
+            resp.errors()
+        );
+    }
+}
+
 pub async fn delete_object_retrying_operation_aborted(
     client: &Client,
     bucket: &str,
