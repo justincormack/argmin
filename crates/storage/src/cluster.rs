@@ -7163,6 +7163,87 @@ impl StorageCluster {
         build_placed_segment_shard_backfill_plan(source_health, desired_health)
     }
 
+    pub fn backfill_placed_segment_payload_shard_direct_copies(
+        &self,
+        source_route: &PgRouteSnapshot,
+        desired_route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let plan =
+            self.placed_segment_payload_shard_backfill_plan(source_route, desired_route, req)?;
+        if !plan.unrecoverable_targets.is_empty() {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "placed segment direct-copy backfill cannot satisfy unrecoverable targets {:?}",
+                    plan.unrecoverable_targets
+                ),
+            });
+        }
+        if !plan.reconstruction_targets.is_empty() {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason:
+                    "placed segment direct-copy backfill cannot satisfy EC reconstruction targets"
+                        .to_string(),
+            });
+        }
+        if plan.copy_targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut copied = Vec::with_capacity(plan.copy_targets.len());
+        for target in &plan.copy_targets {
+            let ack = self.load_payload_shard_ack(req.data_pg_id, &target.shard_key)?;
+            let payload = self
+                .read_payload_shard_for_historical_inspection(target.source, &target.shard_key, ack)
+                .map_err(shard_io_error_to_store)?;
+            let copied_ack = self
+                .repair_payload_shard(target.destination, &target.shard_key, &payload)
+                .map_err(shard_io_error_to_store)?;
+            copied.push(WrittenShardAck {
+                key: target.shard_key.clone(),
+                ack: copied_ack,
+            });
+        }
+
+        let copied_acks: Vec<_> = copied
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        self.register_payload_shard_acks(req.data_pg_id, &copied_acks)
+            .map_err(|error| match error {
+                ObjectPgActionError::Store(error) => error,
+                other => StoreError::Io {
+                    context: "register backfilled payload shard acks",
+                    source: io::Error::other(other.to_string()),
+                },
+            })?;
+        let desired_health =
+            self.placed_segment_payload_shard_health_for_pg_route_snapshot(desired_route, req)?;
+        for target in &plan.copy_targets {
+            let Some(shard) = desired_health
+                .shards
+                .iter()
+                .find(|shard| shard.shard_index == target.shard_index)
+            else {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "backfilled shard index {} missing from desired health",
+                        target.shard_index.get()
+                    ),
+                });
+            };
+            if !shard.validation.is_valid() {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "backfilled shard index {} still fails desired-route verification",
+                        target.shard_index.get()
+                    ),
+                });
+            }
+        }
+        Ok(copied)
+    }
+
     fn placed_segment_payload_shard_health_at_locations(
         &self,
         req: SegmentStoredBytesRequest,

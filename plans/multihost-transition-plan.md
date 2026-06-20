@@ -7792,6 +7792,12 @@ PG backfill and migration design notes:
   shards, EC-reconstruction candidates, or unrecoverable. This is the verified
   work-item shape a later background worker can enqueue after candidate
   discovery; it does not mutate shard files yet.
+- Added the first mutating backfill primitive for direct-copy targets. Storage
+  can now copy valid same-index historical shards to desired-route locations
+  through repair-specific write plumbing, register the copied shard acks, and
+  verify the desired-route health after copying. EC reconstruction targets,
+  durable queueing, worker admission, and remote storage-node execution remain
+  follow-up work.
 
 Exit criteria:
 

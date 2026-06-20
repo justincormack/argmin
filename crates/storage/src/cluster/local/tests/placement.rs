@@ -2183,8 +2183,33 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
     assert_eq!(health.repair_targets(), vec![missing_shard]);
 }
 
-#[test]
-fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
+struct BackfillRouteFixture {
+    _tmp: test_util::TempDir,
+    source_cluster: Arc<crate::StorageCluster>,
+    desired_cluster: Arc<crate::StorageCluster>,
+    source_route: crate::control_plane::PgRouteSnapshot,
+    desired_route: crate::control_plane::PgRouteSnapshot,
+    req: crate::SegmentStoredBytesRequest,
+    segment: CommittedDirectSegment,
+}
+
+impl BackfillRouteFixture {
+    fn remove_source_shard(&self, shard_index: ShardIndex) {
+        let shard_path = self
+            .source_cluster
+            .test_payload_shard_file_path(
+                self.segment.written.data_pg_id,
+                self.segment.written.ec,
+                &self.segment.segment_okh,
+                self.segment.generation_id,
+                shard_index.get(),
+            )
+            .unwrap();
+        std::fs::remove_file(shard_path).unwrap();
+    }
+}
+
+fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
     let tmp = test_util::tempdir();
     let source_node_ids = [
         NodeId::new(0),
@@ -2268,7 +2293,7 @@ fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
         .unwrap(),
     );
     let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
-    let segment = write_committed_direct_segment(&source_cluster, b"phase-eleven-backfill-plan");
+    let segment = write_committed_direct_segment(&source_cluster, payload);
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
@@ -2289,8 +2314,28 @@ fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
     );
     let desired_cluster = crate::StorageCluster::from_local_map(Arc::clone(&desired_map)).unwrap();
 
-    let plan = desired_cluster
-        .placed_segment_payload_shard_backfill_plan(&source_route, &desired_route, req)
+    BackfillRouteFixture {
+        _tmp: tmp,
+        source_cluster,
+        desired_cluster,
+        source_route,
+        desired_route,
+        req,
+        segment,
+    }
+}
+
+#[test]
+fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
+    let fixture = backfill_route_fixture(b"phase-eleven-backfill-plan");
+
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
         .unwrap();
     assert_eq!(
         plan.source_health.risk,
@@ -2313,6 +2358,123 @@ fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
         );
         assert_eq!(target.shard_index, target.source.shard_index());
     }
+
+    let copied = fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shard_direct_copies(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert_eq!(copied.len(), plan.copy_targets.len());
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert!(plan.is_complete());
+    assert_eq!(plan.already_present.len(), plan.desired_health.total_shards);
+}
+
+#[test]
+fn placed_segment_payload_direct_copy_backfill_rejects_reconstruction_targets() {
+    let fixture = backfill_route_fixture(b"phase-eleven-backfill-reconstruction");
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    let target = plan.copy_targets[0].shard_index;
+    fixture.remove_source_shard(target);
+
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert!(plan
+        .copy_targets
+        .iter()
+        .all(|copy| copy.shard_index != target));
+    assert!(plan.reconstruction_targets.contains(&target));
+    assert!(plan.unrecoverable_targets.is_empty());
+
+    let err = fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shard_direct_copies(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PayloadShardSetMismatch { ref reason } if reason.contains("EC reconstruction targets")),
+        "expected reconstruction rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn placed_segment_payload_direct_copy_backfill_rejects_unrecoverable_targets() {
+    let fixture = backfill_route_fixture(b"phase-eleven-backfill-unrecoverable");
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    let target = plan.copy_targets[0].shard_index;
+    let mut missing = vec![target];
+    for shard_index in 0..(fixture.req.ec.k + fixture.req.ec.m) {
+        let shard_index = ShardIndex::new(shard_index);
+        if !missing.contains(&shard_index) {
+            missing.push(shard_index);
+        }
+        if missing.len() > usize::from(fixture.req.ec.m) {
+            break;
+        }
+    }
+    for shard_index in &missing {
+        fixture.remove_source_shard(*shard_index);
+    }
+
+    let plan = fixture
+        .desired_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert_eq!(
+        plan.source_health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Unrecoverable
+    );
+    assert!(plan.unrecoverable_targets.contains(&target));
+
+    let err = fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shard_direct_copies(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PayloadShardSetMismatch { ref reason } if reason.contains("unrecoverable targets")),
+        "expected unrecoverable rejection, got {err:?}"
+    );
 }
 
 #[test]
