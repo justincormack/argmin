@@ -1,0 +1,201 @@
+Quoted star If-Match becomes wildcard on writes
+Link: https://chatgpt.com/codex/cloud/security/findings/e40a17e3d8e481919881159112293a6a?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: baf8625
+Author: justin@specialbusservice.com
+Created: 20/06/2026, 17:28:32
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Fixed by commit `930504d1` (`Reject quoted wildcard write if-match`).
+
+The finding was valid. `If-Match: "*"` on write requests could be accepted at
+the HTTP boundary, normalized to the bare entity-tag value `*`, and then passed
+to the wildcard-aware ETag matcher used by write precondition evaluation. That
+made the quoted entity tag act like `If-Match: *` for existing objects.
+
+The fix has two parts:
+
+- Write-condition evaluation for `WriteCondition::IfMatch(SpecificEtag)` now
+  uses single specific-ETag comparison instead of the wildcard/list matcher, so
+  an internal specific ETag whose opaque value is `*` cannot match every object.
+- The HTTP write-condition parser now rejects `If-Match: "*"` with
+  `NotImplemented`/501, matching AWS behavior for write `If-Match` wildcard
+  forms.
+
+Regression coverage:
+
+- `crates/server-core/src/conditional.rs:write_if_match_quoted_star_is_specific_not_wildcard`
+  verifies a quoted-star `SpecificEtag` does not act as a wildcard in core write
+  checks.
+- `crates/server-http/src/http/conditional.rs:write_if_match_quoted_star_returns_not_implemented`
+  verifies the HTTP write parser rejects quoted-star `If-Match`.
+- `crates/s3-tests/tests/conditional.rs:test_put_object_ifmatch_quoted_star_returns_not_implemented`
+  locks down AWS-compatible behavior and verifies the existing object is not
+  overwritten.
+
+AWS-facing validation:
+
+- `./scripts/aws-tests --region us-east-1 --test conditional test_put_object_ifmatch_quoted_star_returns_not_implemented`
+
+# Summary
+Introduced: quote stripping in SpecificEtag::new happens after checking for the unsupported wildcard. The stripped value can become exactly *, and the existing write-condition matcher interprets that as a wildcard.
+SpecificEtag::new previously rejected only the raw wildcard token and otherwise preserved the caller-provided ETag string. This commit now strips surrounding HTTP quotes after the wildcard check. As a result, the valid quoted entity tag "*" is stored internally as * even though SpecificEtag is intended to be non-wildcard. Write precondition evaluation then passes that value to etags_match(), which special-cases * as matching any existing object. A client can therefore send If-Match: "*" and have it behave like a wildcard overwrite of any existing object, despite the HTTP parser only rejecting the unquoted If-Match: * form. This affects PutObject-style writes that use WriteCondition::IfMatch, including normal/streaming puts, CopyObject destination conditions, and multipart completion. The impact is limited because the caller still needs write authorization, but it can bypass conditional-write integrity controls or bucket-policy schemes that rely on If-Match being a real specific ETag.
+
+# Validation
+## Rubric
+- [x] Confirm `SpecificEtag::new` can represent a wildcard after accepting a quoted HTTP entity tag (`"*"`) even though raw `*` is rejected.
+- [x] Confirm the HTTP write-condition parser rejects unquoted `If-Match: *` but accepts quoted `If-Match: "*"` and returns `WriteCondition::IfMatch`.
+- [x] Confirm write precondition evaluation passes the stored specific ETag string into the generic matcher that special-cases bare `*` as wildcard.
+- [x] Dynamically demonstrate that `IfMatch("*")` succeeds against an existing object with a different ETag, while still failing for absent objects, proving wildcard-over-existing-object behavior.
+- [x] Attempt compiled-stack validation methods: direct debug execution, valgrind/ASan availability check, and debugger tracing; LLDB trace captured the vulnerable value at the write-condition check.
+## Report
+Validated the finding. The vulnerable flow is present in the checked-out commit baf862538dea2feed097d67a3d65fc8c93afd83d: `SpecificEtag::new` rejects only raw `*` before quote stripping, then stores `"*"` as bare `*` (`crates/server-core/src/conditional.rs:40-49`). The HTTP write parser rejects only unquoted `If-Match: *` (`crates/server-http/src/http/conditional.rs:33-41`) and then calls `SpecificEtag::new` for other If-Match values (`crates/server-http/src/http/conditional.rs:59-62`). The write checker passes `required_etag.as_str()` into `etags_match` (`crates/server-core/src/conditional.rs:274-278`), and `etags_match` treats bare `*` as wildcard (`crates/server-core/src/conditional.rs:182-185`).
+
+I added targeted PoC integration tests. The core PoC asserts raw `*` is rejected, quoted `"*"` is accepted and stored as `*`, and `check_write_conditions(IfMatch("*"), Some("definitely-different-etag"))` succeeds (`crates/server-core/tests/poc_quoted_star.rs:4-21`). The HTTP PoC constructs an `S3Request` with `if-match: "*"`, confirms raw `*` is rejected, confirms quoted-star parses to `WriteCondition::IfMatch` with `etag.as_str() == "*"`, then confirms it matches an existing different ETag (`crates/server-http/tests/poc_quoted_star_http.rs:18-31`). Both tests passed: `test quoted_star_specific_etag_becomes_wildcard_for_write_if_match ... ok` and `test http_if_match_quoted_star_is_accepted_then_matches_any_existing_etag ... ok`.
+
+Crash attempt: this is a logic/integrity bug, not a memory-safety bug; the targeted debug test binary executed successfully and did not crash. Valgrind attempt: `valgrind not installed`. GDB attempt through `rust-gdb` failed because `gdb` is not installed. I used LLDB successfully. The LLDB breakpoint at `crates/server-core/src/conditional.rs:277` stopped inside `check_write_conditions`; `frame variable --depth 8 *required_etag` showed the internal pointer value was `"*"`, while `obj_etag` was the different string `abcdef1234567890`, and the test then continued to `ok`. This confirms the accepted quoted-star If-Match reaches the wildcard-sensitive write-condition matcher and succeeds against a nonmatching existing ETag.
+
+# Evidence
+crates/server-core/src/conditional.rs (L182 to 185)
+  Note: The generic ETag matcher treats the bare string * as a wildcard match for any existing object.
+```
+fn etags_match(header_value: &str, object_etag: &str) -> bool {
+    let trimmed = header_value.trim();
+    if trimmed == "*" {
+        return true;
+```
+
+crates/server-core/src/conditional.rs (L274 to 278)
+  Note: Write If-Match preconditions use etags_match() on SpecificEtag::as_str(), so the stripped quoted-star value is evaluated as a wildcard.
+```
+        WriteCondition::IfMatch(required_etag) => match existing_etag {
+            None => Err(ServerError::PreconditionFailed),
+            Some(obj_etag) => {
+                if etags_match(required_etag.as_str(), obj_etag) {
+                    Ok(())
+```
+
+crates/server-core/src/conditional.rs (L40 to 49)
+  Note: The constructor checks for raw * before stripping quotes, so the quoted entity tag "*" is accepted and stored as the bare string *.
+```
+    pub fn new(value: String) -> Result<Self, &'static str> {
+        if value.trim() == "*" {
+            return Err("wildcard ETag not allowed in this context");
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value);
+        Ok(Self(value.to_string()))
+```
+
+crates/server-http/src/http/conditional.rs (L33 to 61)
+  Note: The HTTP write-condition parser rejects only an unquoted If-Match: * header, then constructs SpecificEtag from other values such as If-Match: "*".
+```
+    // Reject unsupported forms first.
+    if let Some(val) = if_match {
+        if val.trim() == "*" {
+            return Err(ServerError::NotImplemented {
+                feature: "A header you provided implies functionality that is not implemented"
+                    .to_string(),
+            });
+        }
+    }
+    if let Some(val) = if_none_match {
+        if val.trim() != "*" {
+            return Err(ServerError::NotImplemented {
+                feature: "A header you provided implies functionality that is not implemented"
+                    .to_string(),
+            });
+        }
+    }
+
+    // S3 does not support both If-Match and If-None-Match on the same write.
+    if if_match.is_some() && if_none_match.is_some() {
+        return Err(ServerError::NotImplemented {
+            feature: "A header you provided implies functionality that is not implemented"
+                .to_string(),
+        });
+    }
+
+    if let Some(val) = if_match {
+        // Wildcard already rejected above, so this cannot fail.
+        let etag = SpecificEtag::new(val.to_string()).expect("wildcard already rejected");
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. Evidence shows a real reachable flaw in production runtime code: If-Match: "*" is accepted by server-http, normalized by SpecificEtag::new to bare *, and treated as wildcard by server-core write-condition evaluation. The attack path is network-reachable through normal S3 writes and executable PoC validation demonstrated success against a different existing ETag. The severity is not high or critical because the attacker still needs write authorization on the target object/bucket or a public-write configuration; there is no authentication bypass, cross-tenant data read, credential exposure, RCE, or broad privilege escalation. The impact is meaningful but limited to object integrity and conditional-policy bypass.
+## Likelihood
+high - The vulnerable input is a single attacker-controlled HTTP header and the code path is normal runtime behavior across several write APIs. Practical exploitation requires the attacker already have PutObject-equivalent permission or a public-write bucket, and depends on conditional-write semantics being security-relevant in the deployment. | Remote network vector
+## Impact
+medium - The bug can cause unauthorized-by-condition overwrites of existing object data where If-Match is intended to enforce a specific ETag. It can undermine compare-and-swap workflows and bucket policies using s3:if-match. However, it does not by itself grant write permission, bypass SigV4, disclose object contents, or execute code.
+## Assumptions
+- Argmin-s3 is deployed as the S3-compatible HTTP frontend and is reachable by clients allowed to issue PutObject, CopyObject, streaming PutObject, or CompleteMultipartUpload requests.
+- The attacker has write authorization for the target bucket/key, or the bucket is intentionally configured to allow public writes.
+- The security impact matters when applications or bucket policies rely on If-Match as a real object ETag for compare-and-swap, lost-update prevention, or conditional overwrite enforcement.
+- Network reachability to the argmin-s3 HTTP endpoint
+- Ability to send an HTTP S3 write request with attacker-controlled headers
+- Write authorization on the target bucket/key through SigV4 credentials, bucket policy, ACL, or public-write configuration
+- An existing object for If-Match to be evaluated against
+## Path
+Client
+  |
+  | PUT/CopyObject/CompleteMultipartUpload + If-Match: "*"
+  v
+argmin-s3 HTTP frontend
+  |
+  | SigV4/authz must allow write
+  v
+write_condition_from_headers
+  |
+  | raw '*' rejected, quoted '"*"' accepted
+  v
+SpecificEtag::new -> stores '*'
+  |
+  v
+check_write_conditions -> etags_match('*', existing_etag) == true
+  |
+  v
+Authorized overwrite succeeds despite wrong ETag
+## Path evidence
+- `crates/argmin-s3/Cargo.toml:1-7` - Defines the production argmin-s3 binary, confirming the affected server components are part of the main product.
+- `crates/argmin-s3/src/config.rs:101-130` - Documents environment-driven listener, TLS, credentials, worker, and connection settings; default listen address is 127.0.0.1:9000 but it is configurable.
+- `crates/argmin-s3/src/main.rs:888-968` - Binds the configured TCP listener and starts either HTTP or TLS HTTP serving with max connection and in-flight request limits.
+- `crates/server-http/src/http/mod.rs:853-915` - Normal request handling routes S3 operations, authenticates non-OPTIONS requests, and dispatches authenticated requests to the coordinator.
+- `crates/server-http/src/http/mod.rs:3094-3124` - Shows SigV4 authentication is enforced for normal requests, with unauthenticated requests represented as anonymous for later authorization decisions.
+- `crates/server-http/src/http/conditional.rs:33-62` - HTTP write-condition parser rejects only raw If-Match: * and accepts other values, including quoted "*", by passing them to SpecificEtag::new.
+- `crates/server-core/src/conditional.rs:40-49` - SpecificEtag::new checks for wildcard before stripping quotes, so the quoted entity tag "*" is stored internally as bare *.
+- `crates/server-core/src/conditional.rs:182-185` - The generic ETag matcher treats a bare * string as a wildcard match.
+- `crates/server-core/src/conditional.rs:261-280` - WriteCondition::IfMatch evaluates SpecificEtag::as_str() through the wildcard-aware etags_match function.
+- `crates/server-http/src/http/mod.rs:1458-1461` - CopyObject destination writes parse destination conditional headers using write_condition_from_headers.
+- `crates/server-http/src/http/mod.rs:1592-1618` - Buffered PutObject parses write conditions from attacker-controlled HTTP headers before calling coordinator.put_object.
+- `crates/server-http/src/http/mod.rs:2838-2864` - CompleteMultipartUpload parses write conditions from request headers before coordinator completion.
+- `crates/server-http/src/http/mod.rs:3869-3898` - Streaming PutObject parses write conditions from request headers and prepares an authorized write.
+- `crates/server-core/src/coordinator/put.rs:288-306` - Direct PutObject commit checks write conditions against the existing object snapshot.
+- `crates/server-core/src/coordinator/multipart.rs:442-450` - Multipart completion checks the supplied write condition against the existing destination ETag.
+- `crates/auth/src/bucket_policy/condition_key.rs:256-262` - Bucket-policy condition key s3:if-match exists, supporting the claim that deployments may rely on If-Match semantics for authorization policy.
+## Narrative
+The finding is a real, in-scope runtime vulnerability. The argmin-s3 binary exposes an S3-compatible HTTP server; write requests are authenticated and dispatched through server-http, and the affected conditional-write code is used by production PutObject, CopyObject, streaming PutObject, and multipart completion paths. The bug is that raw If-Match: * is rejected, but quoted If-Match: "*" is accepted, quote-stripped into bare *, and later evaluated by a matcher that treats * as wildcard. Validation evidence included executable PoC tests showing the quoted-star value reaches check_write_conditions and succeeds against a different existing ETag. Severity remains medium: exploitation is simple once the attacker can send a write request, but it does not bypass SigV4 authentication or normal bucket/key write authorization; the main impact is integrity loss where conditional-write semantics or bucket policy depend on If-Match being a real specific ETag.
+## Controls
+- SigV4 authentication for normal S3 requests
+- Anonymous requester path is still subject to bucket/object authorization
+- Bucket/object authorization in server-core before writes
+- Configurable listener defaults to 127.0.0.1:9000
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Max connection and max in-flight request admission controls
+- HTTP header/body idle timeouts
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or load-balancer manifests were found in the repository checkout, so actual public internet exposure cannot be confirmed statically.
+- Static analysis did not inspect any live deployment configuration, bucket policies, ACLs, or real use of s3:if-match conditions.
+- The project defaults to 127.0.0.1:9000, but operators can configure ARGMIN_LISTEN_ADDR to a remotely reachable interface.
+- The precise business impact depends on whether clients or bucket policies rely on If-Match as a security/integrity control rather than merely an optional concurrency hint.
