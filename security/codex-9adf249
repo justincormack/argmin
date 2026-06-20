@@ -1,0 +1,268 @@
+Multipart completion ignores legacy checksum headers
+Link: https://chatgpt.com/codex/cloud/security/findings/55fba6aa496c8191904f80fe46ac01e0?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 9adf249
+Author: justin@specialbusservice.com
+Created: 19/06/2026, 19:40:10
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Invalid for the AWS-compatibility target. The reported behavior is real, but it
+matches the AWS-observed CompleteMultipartUpload behavior for legacy checksum
+headers on multipart uploads created without `x-amz-checksum-algorithm`.
+
+Commit `6e3f69ce` (`Harden new checksum compatibility tests`) locked down this
+split:
+
+- CRC32, CRC32C, SHA1, and SHA256 object-level CompleteMultipartUpload checksum
+  headers are accepted but ignored when the multipart upload was created without
+  a checksum algorithm. No object checksum metadata is stored.
+- MD5, SHA512, XXHASH64, XXHASH3, and XXHASH128 require the multipart upload
+  create checksum algorithm and are rejected when used unconfigured.
+- If the multipart upload is configured with a checksum algorithm, final object
+  checksum mismatches are validated and return `BadDigest`.
+
+AWS-facing coverage:
+
+- `crates/s3-tests/tests/checksums.rs:test_complete_multipart_legacy_object_checksum_without_create_algorithm_is_ignored`
+- `crates/s3-tests/tests/checksums.rs:test_complete_multipart_new_object_checksum_without_create_algorithm_rejected`
+
+Local coordinator coverage:
+
+- `crates/server-core/src/coordinator/multipart_tests.rs:complete_multipart_ignores_legacy_object_checksum_header_without_upload_algorithm`
+- `crates/server-core/src/coordinator/multipart_tests.rs:complete_multipart_rejects_new_object_checksum_header_without_upload_algorithm`
+
+The original finding therefore correctly identifies an ignored checksum header,
+but that ignored header is deliberate AWS S3 compatibility rather than a
+security defect in Argmin.
+
+# Summary
+Introduced: the new accepts_unconfigured_complete_multipart_header exception causes CompleteMultipartUpload to silently ignore selected checksum headers instead of rejecting or validating them when the upload was not created with a checksum algorithm.
+CompleteMultipartUpload now accepts certain checksum headers even when the multipart upload has no configured checksum algorithm. In that case checksum_value is None, so the later comparison against the client-supplied checksum is skipped. A request can therefore include an incorrect x-amz-checksum-sha256, x-amz-checksum-sha1, x-amz-checksum-crc32, or x-amz-checksum-crc32c header and still receive a successful completion. This weakens the object integrity contract for clients relying on the server to reject multipart completion when the supplied object checksum does not match.
+
+# Validation
+## Rubric
+- [x] Confirm CompleteMultipartUpload receives object-level checksum headers from HTTP and passes them to the coordinator.
+- [x] Confirm unconfigured multipart uploads produce `checksum_algo == None` and therefore `checksum_value == None`.
+- [x] Confirm CRC32/CRC32C/SHA1/SHA256 are explicitly allowed by `accepts_unconfigured_complete_multipart_header` when no upload checksum algorithm exists.
+- [x] Dynamically reproduce success with a wrong SHA256 CompleteMultipartUpload checksum on an upload created without a checksum algorithm.
+- [x] Attempt crash/Valgrind/ASan/debugger validation before final code-understanding; direct run did not crash, Valgrind unavailable, ASan unavailable on stable, LLDB trace confirmed the vulnerable branch.
+## Report
+Validated the finding against commit 9adf249663e72acaf45e32a0d9a8c20048a14c90.
+
+Evidence:
+1. Source review confirms the bypass path. `crates/checksum/src/types.rs:150-156` defines `accepts_unconfigured_complete_multipart_header` for CRC32, CRC32C, SHA1, and SHA256. In `crates/server-core/src/coordinator/multipart.rs:578-679`, `checksum_value` is set to `None` when the multipart upload has no configured checksum algorithm/type. Then `multipart.rs:681-709` accepts a claimed checksum if the upload algorithm is `None` and the claimed algorithm is one of those accepted legacy algorithms; the actual comparison only runs under `if let Some(ref computed) = checksum_value`, so it is skipped when `checksum_value == None`. HTTP exposure is present at `crates/server-http/src/http/mod.rs:2842-2870`, where CompleteMultipartUpload extracts the object checksum header and passes it as `claimed_checksum` into the coordinator.
+2. Dynamic reproduction used the in-tree PoC test `crates/server-core/src/coordinator/multipart_tests.rs:5994-6028`. It creates a multipart upload with no checksum configuration, uploads one part, supplies an intentionally wrong SHA256 object checksum header (`base64([0u8; 32])`), and calls `complete_multipart_upload(...).unwrap()`. The result asserts `checksum_algorithm == None`, `checksum_type == None`, and `checksum_value == None`, proving the supplied SHA256 checksum was accepted but ignored.
+3. Command output: `cargo test -p server-core complete_multipart_ignores_legacy_object_checksum_header_without_upload_algorithm -- --nocapture` completed with `test coordinator::multipart_tests::complete_multipart_ignores_legacy_object_checksum_header_without_upload_algorithm ... ok` and `1 passed`.
+4. Crash/ASan/Valgrind attempts: this is an integrity logic bug, so no crash is expected. The direct debug test did not crash. `valgrind` was not installed (`bash: command not found: valgrind`). ASan via `RUSTFLAGS='-Z sanitizer=address'` failed because the installed Rust toolchain is stable and rejects `-Z` options.
+5. LLDB debugger validation: a breakpoint at `multipart.rs:681` showed `checksum_algo = None`, `checksum_value = None`, and `claimed_checksum` present. A breakpoint at `multipart.rs:694` was hit in the `None if claimed.algorithm().accepts_unconfigured_complete_multipart_header() => {}` arm, with backtrace from `multipart_tests.rs:6009`, then continuing allowed the test to pass. This confirms the vulnerable branch is actually executed.
+
+# Evidence
+crates/checksum/src/types.rs (L150 to 156)
+  Note: New helper explicitly marks CRC32, CRC32C, SHA1, and SHA256 CompleteMultipartUpload checksum headers as acceptable but ignored when the upload was not configured with a checksum algorithm.
+```
+    /// Algorithms whose CompleteMultipartUpload checksum header is accepted
+    /// but ignored when the multipart upload was not created with an
+    /// algorithm.
+    #[must_use]
+    pub fn accepts_unconfigured_complete_multipart_header(self) -> bool {
+        matches!(self, Self::Crc32 | Self::Crc32c | Self::Sha1 | Self::Sha256)
+    }
+```
+
+crates/server-core/src/coordinator/multipart.rs (L578 to 678)
+  Note: checksum_value is only computed when the multipart upload has a configured checksum algorithm and type; without that configuration it remains None.
+```
+            let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD;
+                match ctype {
+                    ChecksumType::Composite => {
+                        let mut concat = Vec::new();
+                        for part in &part_records {
+                            match &part.checksum {
+                                Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
+                                None => {
+                                    return Err(ServerError::InvalidRequest {
+                                    reason:
+                                        "COMPOSITE checksum requires all parts to have checksums"
+                                            .to_string(),
+                                });
+                                }
+                            }
+                        }
+                        let hash = compute_checksum(algo, &concat);
+                        Some(format!(
+                            "{}-{}",
+                            b64.encode(hash.bytes()),
+                            part_records.len()
+                        ))
+                    }
+                    ChecksumType::FullObject => match algo {
+                        ChecksumAlgorithm::Crc32 => {
+                            let mut combined: u32 = 0;
+                            for part in &part_records {
+                                let bytes = part.checksum.as_ref().ok_or_else(|| {
+                                ServerError::InvalidRequest {
+                                    reason: "FULL_OBJECT checksum requires all parts to have checksums"
+                                        .to_string(),
+                                }
+                            })?;
+                                let part_crc =
+                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC32 checksum length".to_string(),
+                                        },
+                                    )?);
+                                combined = checksum::crc32::combine(combined, part_crc, part.size);
+                            }
+                            Some(b64.encode(combined.to_be_bytes()))
+                        }
+                        ChecksumAlgorithm::Crc32c => {
+                            let mut combined: u32 = 0;
+                            for part in &part_records {
+                                let bytes = part.checksum.as_ref().ok_or_else(|| {
+                                ServerError::InvalidRequest {
+                                    reason: "FULL_OBJECT checksum requires all parts to have checksums"
+                                        .to_string(),
+                                }
+                            })?;
+                                let part_crc =
+                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC32C checksum length".to_string(),
+                                        },
+                                    )?);
+                                combined = checksum::crc32c::combine(combined, part_crc, part.size);
+                            }
+                            Some(b64.encode(combined.to_be_bytes()))
+                        }
+                        ChecksumAlgorithm::Crc64nvme => {
+                            let mut combined: u64 = 0;
+                            for part in &part_records {
+                                let bytes = part.checksum.as_ref().ok_or_else(|| {
+                                ServerError::InvalidRequest {
+                                    reason: "FULL_OBJECT checksum requires all parts to have checksums"
+                                        .to_string(),
+                                }
+                            })?;
+                                let part_crc =
+                                    u64::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC64NVME checksum length".to_string(),
+                                        },
+                                    )?);
+                                combined = checksum::crc64::combine(combined, part_crc, part.size);
+                            }
+                            Some(b64.encode(combined.to_be_bytes()))
+                        }
+                        ChecksumAlgorithm::Sha1
+                        | ChecksumAlgorithm::Sha256
+                        | ChecksumAlgorithm::Md5
+                        | ChecksumAlgorithm::XxHash64
+                        | ChecksumAlgorithm::XxHash3
+                        | ChecksumAlgorithm::XxHash128
+                        | ChecksumAlgorithm::Sha512 => {
+                            return Err(ServerError::InternalError {
+                                reason: format!(
+                                    "FULL_OBJECT checksum type is not supported for {}",
+                                    algo.as_str()
+                                ),
+                            });
+                        }
+                    },
+                }
+            } else {
+                None
+```
+
+crates/server-core/src/coordinator/multipart.rs (L681 to 707)
+  Note: When checksum_algo is None and the claimed algorithm is one of the accepted unconfigured legacy algorithms, the code takes the empty branch and then skips validation because checksum_value is None.
+```
+            if let Some(claimed) = claimed_checksum {
+                match checksum_algo {
+                    Some(upload_algo) if claimed.algorithm() != upload_algo => {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "checksum header algorithm {} does not match upload algorithm {}",
+                                claimed.algorithm().as_str(),
+                                upload_algo.as_str()
+                            ),
+                        });
+                    }
+                    None if claimed
+                        .algorithm()
+                        .accepts_unconfigured_complete_multipart_header() => {}
+                    None => {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "checksum header sent but upload has no checksum algorithm"
+                                .to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+                if let Some(ref computed) = checksum_value {
+                    if computed != claimed.encoded_value() {
+                        return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
+                            header_name: claimed.algorithm().header_name().to_string(),
+                        });
+```
+
+crates/server-http/src/http/mod.rs (L2842 to 2846)
+  Note: CompleteMultipartUpload extracts the client-provided object-level checksum header and passes it to the coordinator, where it can be silently ignored.
+```
+                let cond = write_condition_from_headers(req)?;
+                // Extract object-level checksum claim from request headers as a raw
+                // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
+                // so we cannot decode them as plain base64.
+                let claimed_checksum = extract_encoded_checksum_header(req)?;
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The finding is real and reachable in the production HTTP S3 CompleteMultipartUpload path, with code evidence and an executable PoC showing an intentionally wrong SHA256 checksum accepted for an unconfigured multipart upload. However, authn/authz gates remain in place, the attacker must already be allowed to write/complete the multipart upload, the bug does not expose data or credentials, and it does not enable code execution, auth bypass, or cross-tenant modification. The security consequence is limited to weakened object integrity validation for authorized writes, matching medium rather than high or critical.
+## Likelihood
+high - The vulnerable path is easy to trigger over the normal S3 API and has an executable in-tree PoC, but practical exploitation requires write authorization and a multipart upload created without checksum configuration. Default exposure is loopback and no public ingress/IaC was found. | Remote network vector
+## Impact
+medium - The impact is an integrity validation bypass for multipart object completion: a bad client-supplied object checksum can be accepted. It does not grant unauthorized read/write/delete access, leak secrets, affect availability, or cross an identity boundary. The affected object is one the requester is already allowed to complete/write.
+## Assumptions
+- argmin-s3 is deployed with the frontend role enabled and reachable by the attacker over its configured HTTP/HTTPS listener.
+- The attacker has credentials or bucket permissions sufficient to create/upload/complete multipart uploads for the targeted bucket/key.
+- The multipart upload was created without x-amz-checksum-algorithm/x-amz-checksum-type, and the client sends a CompleteMultipartUpload checksum value header for CRC32, CRC32C, SHA1, or SHA256.
+- reachable S3 HTTP endpoint
+- valid write authorization or public-write bucket policy/ACL
+- multipart upload created without a configured checksum algorithm
+- attacker-controlled CompleteMultipartUpload request with a legacy checksum header
+## Path
+S3 client -> argmin-s3 listener -> CompleteMultipartUpload handler -> claimed_checksum -> coordinator branch (checksum_algo=None, checksum_value=None) -> object committed
+## Path evidence
+- `crates/argmin-s3/src/main.rs:888-966` - Production argmin-s3 binds the configured TCP listener and starts the HTTP/HTTPS serve loop with frontend workers.
+- `crates/argmin-s3/src/config.rs:101-106` - Runtime configuration requires S3 credentials and defaults ARGMIN_LISTEN_ADDR to 127.0.0.1:9000, with optional TLS paths.
+- `crates/server-http/src/http/router.rs:618-628` - POST object requests with uploadId are routed to S3Operation::CompleteMultipartUpload.
+- `crates/server-http/src/http/mod.rs:858-913` - HTTP frontend routes requests, authenticates non-OPTIONS operations, and dispatches authenticated requests.
+- `crates/server-http/src/http/mod.rs:2826-2868` - CompleteMultipartUpload handler parses the XML body, extracts the object-level checksum header, and passes claimed_checksum to the coordinator request.
+- `crates/checksum/src/types.rs:150-156` - CRC32, CRC32C, SHA1, and SHA256 are marked as accepted for unconfigured CompleteMultipartUpload checksum headers.
+- `crates/server-core/src/coordinator/multipart.rs:578-679` - checksum_value is only computed when both checksum_algo and checksum_type are present; otherwise it remains None.
+- `crates/server-core/src/coordinator/multipart.rs:681-709` - When checksum_algo is None and the claimed algorithm is accepted, no error is returned; validation only occurs if checksum_value is Some, so an unconfigured upload skips comparison.
+- `crates/server-core/src/coordinator/multipart_tests.rs:5994-6028` - Executable regression/PoC test creates an unconfigured multipart upload, supplies an intentionally wrong SHA256 checksum, and completion succeeds with no checksum metadata.
+## Narrative
+This is a real, in-scope runtime integrity bug. CompleteMultipartUpload is reachable over the product HTTP S3 API after normal authentication/authorization. The handler extracts attacker-controlled checksum headers and passes them to the coordinator. In the coordinator, uploads without checksum configuration produce checksum_value = None; CRC32, CRC32C, SHA1, and SHA256 claims are explicitly accepted in that state; and the comparison is guarded by if let Some(ref computed), so it is skipped. The in-tree executable test demonstrates completion with an intentionally wrong SHA256 checksum. Severity remains medium rather than high/critical because exploitation requires write authorization and does not bypass authentication, expose data, execute code, or modify objects the attacker could not already write.
+## Controls
+- AWS SigV4 request authentication
+- bucket policy/ACL write authorization before multipart completion
+- x-amz-content-sha256 verification for buffered requests when provided
+- duplicate and contradictory checksum headers rejected in extract_encoded_checksum_header
+- connection and in-flight request admission limits
+- optional direct TLS via ARGMIN_TLS_CERT_PATH/ARGMIN_TLS_KEY_PATH
+- default listener is loopback 127.0.0.1:9000
+## Blindspots
+- Static review found no Kubernetes, load balancer, or deployment manifest proving public internet exposure; ARGMIN_LISTEN_ADDR is environment-controlled.
+- No cloud APIs were called, so actual deployed network reachability and secret-management posture are unknown.
+- The provided PoC is an in-tree coordinator test rather than a full end-to-end HTTP client test, although the HTTP handler path passes the same claimed_checksum into the coordinator.
