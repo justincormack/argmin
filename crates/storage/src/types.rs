@@ -1620,8 +1620,32 @@ pub struct PlacedSegmentShardBackfillRecord {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillClaimRecord {
+    pub work_item: PlacedSegmentShardBackfillWorkItem,
+    pub claim_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub claimed_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillClaimAcquire {
+    pub claim_id: String,
+    pub owner_token: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub claimed_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub now: u64,
+}
+
 pub const PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT: usize = 1024;
 pub const PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN: usize = 4096;
+pub const PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN: usize = 128;
+pub const PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN: usize = 128;
 
 /// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.
 ///

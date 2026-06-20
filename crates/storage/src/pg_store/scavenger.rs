@@ -355,6 +355,178 @@ impl PgStore {
         Ok(updated > 0)
     }
 
+    pub fn acquire_placed_segment_shard_backfill_claim(
+        &self,
+        request: &PlacedSegmentShardBackfillClaimAcquire,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
+        validate_placed_segment_shard_backfill_claim_identity(
+            &request.claim_id,
+            &request.owner_token,
+        )?;
+        let Some(lease_deadline_value) = request.lease_deadline else {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "durable backfill claim lease deadline is required".to_string(),
+            });
+        };
+        if lease_deadline_value <= request.claimed_at {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "durable backfill claim lease deadline must be after claimed_at"
+                    .to_string(),
+            });
+        }
+        let claimed_at = durable_repair_u64_to_i64(
+            request.claimed_at,
+            "acquire placed segment shard backfill claim claimed_at",
+        )?;
+        let lease_deadline = durable_repair_u64_to_i64(
+            lease_deadline_value,
+            "acquire placed segment shard backfill claim lease_deadline",
+        )?;
+        let now = durable_repair_u64_to_i64(
+            request.now,
+            "acquire placed segment shard backfill claim now",
+        )?;
+
+        self.with_durable_repair_txn(
+            "acquire placed segment shard backfill claim (begin txn)",
+            "acquire placed segment shard backfill claim (commit txn)",
+            |store| {
+                let existing_sql = durable_backfill_claim_select_sql(
+                    "claim_id = ?1 AND owner_token = ?2 AND cluster_epoch = ?3",
+                );
+                if let Some(existing) = store
+                    .conn
+                    .query_row(
+                        &existing_sql,
+                        params![
+                            &request.claim_id,
+                            &request.owner_token,
+                            request.cluster_epoch.get()
+                        ],
+                        placed_segment_shard_backfill_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| StoreError::Db {
+                        context: "load existing placed segment shard backfill claim",
+                        source,
+                    })?
+                {
+                    return Ok(Some(existing));
+                }
+
+                let candidate = store
+                    .conn
+                    .query_row(
+                        "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
+                                ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch \
+                         FROM placed_segment_shard_backfills \
+                         WHERE next_attempt_after <= ?1 \
+                           AND (claim_id IS NULL OR (lease_deadline IS NOT NULL AND lease_deadline <= ?1)) \
+                         ORDER BY last_seen_at, segment_okh, segment_vid, source_cluster_epoch, \
+                                  desired_cluster_epoch \
+                         LIMIT 1",
+                        params![now],
+                        placed_segment_shard_backfill_work_item_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| StoreError::Db {
+                        context: "load claimable placed segment shard backfill",
+                        source,
+                    })?;
+
+                let Some(candidate) = candidate else {
+                    return Ok(None);
+                };
+                store
+                    .conn
+                    .execute(
+                        "UPDATE placed_segment_shard_backfills \
+                         SET claim_id = ?10, owner_token = ?11, cluster_epoch = ?12, \
+                             claimed_at = ?13, lease_deadline = ?14, \
+                             attempt_count = attempt_count + 1 \
+                         WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
+                           AND stored_size = ?4 AND segment_crc64 = ?5 AND ec_k = ?6 AND ec_m = ?7 \
+                           AND source_cluster_epoch = ?8 AND desired_cluster_epoch = ?9",
+                        params![
+                            candidate.request.data_pg_id as i64,
+                            candidate.request.segment_okh.as_slice(),
+                            candidate.request.segment_vid.get() as i64,
+                            candidate.request.stored_size as i64,
+                            candidate.request.segment_crc64 as i64,
+                            candidate.request.ec.k as i64,
+                            candidate.request.ec.m as i64,
+                            candidate.source_cluster_epoch.get(),
+                            candidate.desired_cluster_epoch.get(),
+                            &request.claim_id,
+                            &request.owner_token,
+                            request.cluster_epoch.get(),
+                            claimed_at,
+                            lease_deadline,
+                        ],
+                    )
+                    .map_err(|source| StoreError::Db {
+                        context: "install placed segment shard backfill claim",
+                        source,
+                    })?;
+
+                let reload_sql = durable_backfill_claim_select_sql(
+                    "claim_id = ?1 AND owner_token = ?2 AND cluster_epoch = ?3",
+                );
+                store
+                    .conn
+                    .query_row(
+                        &reload_sql,
+                        params![
+                            &request.claim_id,
+                            &request.owner_token,
+                            request.cluster_epoch.get()
+                        ],
+                        placed_segment_shard_backfill_claim_from_row,
+                    )
+                    .optional()
+                    .map_err(|source| StoreError::Db {
+                        context: "reload placed segment shard backfill claim",
+                        source,
+                    })
+            },
+        )
+    }
+
+    pub fn complete_placed_segment_shard_backfill_claim(
+        &self,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_backfill_claim_record(self.pg_id(), claim)?;
+        let updated = self
+            .conn
+            .execute(
+                "DELETE FROM placed_segment_shard_backfills \
+                 WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
+                   AND stored_size = ?4 AND segment_crc64 = ?5 AND ec_k = ?6 AND ec_m = ?7 \
+                   AND source_cluster_epoch = ?8 AND desired_cluster_epoch = ?9 \
+                   AND claim_id = ?10 AND owner_token = ?11 AND cluster_epoch = ?12",
+                params![
+                    claim.work_item.request.data_pg_id as i64,
+                    claim.work_item.request.segment_okh.as_slice(),
+                    claim.work_item.request.segment_vid.get() as i64,
+                    claim.work_item.request.stored_size as i64,
+                    claim.work_item.request.segment_crc64 as i64,
+                    claim.work_item.request.ec.k as i64,
+                    claim.work_item.request.ec.m as i64,
+                    claim.work_item.source_cluster_epoch.get(),
+                    claim.work_item.desired_cluster_epoch.get(),
+                    claim.claim_id,
+                    claim.owner_token,
+                    claim.cluster_epoch.get(),
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "complete placed segment shard backfill claim",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
     pub fn acquire_placed_segment_shard_repair_claim(
         &self,
         request: &PlacedSegmentShardRepairClaimAcquire,
@@ -577,6 +749,53 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "record placed segment shard repair claim error",
+                source,
+            })?;
+        Ok(updated > 0)
+    }
+
+    pub fn record_placed_segment_shard_backfill_claim_error(
+        &self,
+        claim: &PlacedSegmentShardBackfillClaimRecord,
+        last_error: &str,
+        next_attempt_after: u64,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_backfill_claim_record(self.pg_id(), claim)?;
+        validate_placed_segment_shard_backfill_last_error(last_error)?;
+        let next_attempt_after = durable_repair_u64_to_i64(
+            next_attempt_after,
+            "record placed segment shard backfill claim error next_attempt_after",
+        )?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE placed_segment_shard_backfills \
+                 SET claim_id = NULL, owner_token = NULL, cluster_epoch = NULL, \
+                     claimed_at = NULL, lease_deadline = NULL, \
+                     next_attempt_after = ?13, last_error = ?14 \
+                 WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
+                   AND stored_size = ?4 AND segment_crc64 = ?5 AND ec_k = ?6 AND ec_m = ?7 \
+                   AND source_cluster_epoch = ?8 AND desired_cluster_epoch = ?9 \
+                   AND claim_id = ?10 AND owner_token = ?11 AND cluster_epoch = ?12",
+                params![
+                    claim.work_item.request.data_pg_id as i64,
+                    claim.work_item.request.segment_okh.as_slice(),
+                    claim.work_item.request.segment_vid.get() as i64,
+                    claim.work_item.request.stored_size as i64,
+                    claim.work_item.request.segment_crc64 as i64,
+                    claim.work_item.request.ec.k as i64,
+                    claim.work_item.request.ec.m as i64,
+                    claim.work_item.source_cluster_epoch.get(),
+                    claim.work_item.desired_cluster_epoch.get(),
+                    claim.claim_id,
+                    claim.owner_token,
+                    claim.cluster_epoch.get(),
+                    next_attempt_after,
+                    last_error,
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "record placed segment shard backfill claim error",
                 source,
             })?;
         Ok(updated > 0)
@@ -1701,6 +1920,50 @@ fn validate_placed_segment_shard_repair_claim_record(
     validate_placed_segment_shard_repair_claim_identity(&claim.claim_id, &claim.owner_token)
 }
 
+fn validate_placed_segment_shard_backfill_claim_identity(
+    claim_id: &str,
+    owner_token: &str,
+) -> Result<(), StoreError> {
+    if claim_id.is_empty() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "durable backfill claim id is empty".to_string(),
+        });
+    }
+    if owner_token.is_empty() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "durable backfill owner token is empty".to_string(),
+        });
+    }
+    if claim_id.len() > PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable backfill claim id length {} exceeds {}",
+                claim_id.len(),
+                PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN
+            ),
+        });
+    }
+    if owner_token.len() > PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable backfill owner token length {} exceeds {}",
+                owner_token.len(),
+                PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_backfill_claim_record(
+    pg_id: u32,
+    claim: &PlacedSegmentShardBackfillClaimRecord,
+) -> Result<(), StoreError> {
+    validate_placed_segment_shard_backfill_work_item(&claim.work_item)?;
+    validate_placed_segment_shard_backfill_pg(pg_id, &claim.work_item)?;
+    validate_placed_segment_shard_backfill_claim_identity(&claim.claim_id, &claim.owner_token)
+}
+
 fn validate_placed_segment_shard_repair_last_error(last_error: &str) -> Result<(), StoreError> {
     if last_error.len() > PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN {
         return Err(StoreError::PayloadShardSetMismatch {
@@ -1746,6 +2009,20 @@ fn durable_repair_claim_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn durable_backfill_claim_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
+                ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch, claim_id, \
+                owner_token, cluster_epoch, claimed_at, lease_deadline, attempt_count, \
+                last_error \
+         FROM placed_segment_shard_backfills \
+         WHERE {where_clause} \
+         ORDER BY last_seen_at, segment_okh, segment_vid, source_cluster_epoch, \
+                  desired_cluster_epoch \
+         LIMIT 1"
+    )
+}
+
 fn placed_segment_shard_repair_claim_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<PlacedSegmentShardRepairClaimRecord, rusqlite::Error> {
@@ -1771,6 +2048,34 @@ fn placed_segment_shard_repair_claim_from_row(
             .map(|deadline| deadline as u64),
         attempt_count: row.get::<_, i64>(13)? as u64,
         last_error: row.get(14)?,
+    })
+}
+
+fn placed_segment_shard_backfill_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<PlacedSegmentShardBackfillClaimRecord, rusqlite::Error> {
+    let work_item = placed_segment_shard_backfill_work_item_from_row(row)?;
+    let cluster_epoch = row.get::<_, i64>(11)?;
+    let cluster_epoch = ClusterEpoch::new(cluster_epoch as u64).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::other(
+                "durable backfill claim row has invalid cluster epoch",
+            )),
+        )
+    })?;
+    Ok(PlacedSegmentShardBackfillClaimRecord {
+        work_item,
+        claim_id: row.get(9)?,
+        owner_token: row.get(10)?,
+        cluster_epoch,
+        claimed_at: row.get::<_, i64>(12)? as u64,
+        lease_deadline: row
+            .get::<_, Option<i64>>(13)?
+            .map(|deadline| deadline as u64),
+        attempt_count: row.get::<_, i64>(14)? as u64,
+        last_error: row.get(15)?,
     })
 }
 
@@ -1903,6 +2208,24 @@ mod tests {
         now: u64,
     ) -> PlacedSegmentShardRepairClaimAcquire {
         PlacedSegmentShardRepairClaimAcquire {
+            claim_id: claim_id.to_string(),
+            owner_token: owner_token.to_string(),
+            cluster_epoch: epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        }
+    }
+
+    fn backfill_claim_acquire(
+        claim_id: &str,
+        owner_token: &str,
+        epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> PlacedSegmentShardBackfillClaimAcquire {
+        PlacedSegmentShardBackfillClaimAcquire {
             claim_id: claim_id.to_string(),
             owner_token: owner_token.to_string(),
             cluster_epoch: epoch,
@@ -2343,6 +2666,230 @@ mod tests {
     }
 
     #[test]
+    fn placed_segment_shard_backfill_claim_is_single_owner_and_retries_after_backoff() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xBC; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+        let epoch = ClusterEpoch::new(7).unwrap();
+
+        assert!(store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-0",
+                "worker-0",
+                epoch,
+                9,
+                Some(19),
+                9
+            ))
+            .unwrap()
+            .is_none());
+        store
+            .record_placed_segment_shard_backfill(&work_item, None)
+            .unwrap();
+
+        let claim = store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-1",
+                "worker-1",
+                epoch,
+                10,
+                Some(20),
+                10,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.work_item, work_item);
+        assert_eq!(claim.attempt_count, 1);
+
+        assert_eq!(
+            store
+                .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                    "claim-1",
+                    "worker-1",
+                    epoch,
+                    11,
+                    Some(21),
+                    11,
+                ))
+                .unwrap()
+                .unwrap(),
+            claim
+        );
+        assert!(store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                12,
+                Some(22),
+                12,
+            ))
+            .unwrap()
+            .is_none());
+
+        assert!(store
+            .record_placed_segment_shard_backfill_claim_error(&claim, "backfill failed", 30)
+            .unwrap());
+        store
+            .record_placed_segment_shard_backfill(&work_item, None)
+            .unwrap();
+        assert_eq!(
+            store.list_placed_segment_shard_backfills().unwrap()[0]
+                .last_error
+                .as_deref(),
+            Some("backfill failed")
+        );
+        assert!(store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                29,
+                Some(39),
+                29,
+            ))
+            .unwrap()
+            .is_none());
+
+        let retry = store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                30,
+                Some(40),
+                30,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.work_item, work_item);
+        assert_eq!(retry.attempt_count, 2);
+        assert_eq!(retry.last_error.as_deref(), Some("backfill failed"));
+        assert!(!store
+            .complete_placed_segment_shard_backfill_claim(&claim)
+            .unwrap());
+        assert!(store
+            .complete_placed_segment_shard_backfill_claim(&retry)
+            .unwrap());
+        assert!(store
+            .list_placed_segment_shard_backfills()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn placed_segment_shard_backfill_claim_can_be_stolen_after_expiry() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xBD; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+        let epoch = ClusterEpoch::new(7).unwrap();
+        store
+            .record_placed_segment_shard_backfill(&work_item, None)
+            .unwrap();
+        let first = store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-1",
+                "worker-1",
+                epoch,
+                10,
+                Some(20),
+                10,
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert!(store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                19,
+                Some(29),
+                19,
+            ))
+            .unwrap()
+            .is_none());
+        let stolen = store
+            .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-2",
+                "worker-2",
+                epoch,
+                20,
+                Some(30),
+                20,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stolen.work_item, work_item);
+        assert_eq!(stolen.attempt_count, 2);
+        assert!(!store
+            .complete_placed_segment_shard_backfill_claim(&first)
+            .unwrap());
+    }
+
+    #[test]
+    fn placed_segment_shard_backfill_claim_requires_finite_forward_lease() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xBE; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+        let epoch = ClusterEpoch::new(7).unwrap();
+        store
+            .record_placed_segment_shard_backfill(&work_item, None)
+            .unwrap();
+
+        assert!(matches!(
+            store.acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-1", "worker-1", epoch, 10, None, 10
+            )),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+        assert!(matches!(
+            store.acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
+                "claim-1",
+                "worker-1",
+                epoch,
+                10,
+                Some(10),
+                10
+            )),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn placed_segment_shard_repair_schema_rejects_missing_crc_row() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
@@ -2364,6 +2911,38 @@ mod tests {
                     10i64,
                     20i64,
                     1i64,
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
+    }
+
+    #[test]
+    fn placed_segment_shard_backfill_schema_rejects_partial_claim_row() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let err = store
+            .conn
+            .execute(
+                "INSERT INTO placed_segment_shard_backfills \
+                 (data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, ec_k, ec_m, \
+                  source_cluster_epoch, desired_cluster_epoch, first_seen_at, last_seen_at, \
+                  observation_count, claim_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    7i64,
+                    [0xBFu8; 16].as_slice(),
+                    42i64,
+                    1024i64,
+                    0x1234i64,
+                    4i64,
+                    2i64,
+                    3i64,
+                    5i64,
+                    10i64,
+                    20i64,
+                    1i64,
+                    "claim-1",
                 ],
             )
             .unwrap_err();

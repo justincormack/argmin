@@ -7809,8 +7809,12 @@ PG backfill and migration design notes:
   source/desired cluster epochs; it deliberately does not persist an exact
   placement vector, so the later worker must reconstruct both routes from
   retained cluster-map history. The first slice supports record/list/resolve
-  with coalescing and validation; claim/retry wiring, admission, and execution
-  remain follow-up work.
+  with coalescing and validation.
+- Added durable PG-store claim/retry wiring for backfill candidates. Backfill
+  rows now use a single-owner finite-lease claim, preserve rows on failed
+  attempts with a retry deadline, allow expired claim stealing, and require full
+  segment request identity for claim completion. Admission policy, worker
+  execution, and remote storage-node boundary wiring remain follow-up work.
 
 Exit criteria:
 

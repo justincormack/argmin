@@ -82,8 +82,20 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_backfills (
     first_seen_at          INTEGER NOT NULL CHECK (first_seen_at >= 0),
     last_seen_at           INTEGER NOT NULL CHECK (last_seen_at >= 0),
     observation_count      INTEGER NOT NULL CHECK (observation_count > 0),
+    claim_id               TEXT,
+    owner_token            TEXT,
+    cluster_epoch          INTEGER CHECK (cluster_epoch IS NULL OR cluster_epoch > 0),
+    claimed_at             INTEGER CHECK (claimed_at IS NULL OR claimed_at >= 0),
+    lease_deadline         INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_after     INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_after >= 0),
     last_error             TEXT,
     CHECK (source_cluster_epoch <= desired_cluster_epoch),
+    CHECK (
+        (claim_id IS NULL AND owner_token IS NULL AND cluster_epoch IS NULL AND claimed_at IS NULL AND lease_deadline IS NULL)
+        OR
+        (claim_id IS NOT NULL AND owner_token IS NOT NULL AND cluster_epoch IS NOT NULL AND claimed_at IS NOT NULL AND lease_deadline IS NOT NULL)
+    ),
     PRIMARY KEY (data_pg_id, segment_okh, segment_vid, source_cluster_epoch, desired_cluster_epoch)
 )";
 
