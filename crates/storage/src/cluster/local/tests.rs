@@ -803,6 +803,7 @@ fn assert_direct_put_metadata_on_acting_nodes(
         segment_crc64: commit_req.segment_crc64,
         segment_okh: commit_req.segment_okh,
         segment_vid: commit_req.segment_vid,
+        placement_cluster_epoch: map.epoch(),
         data_pg_id: commit_req.data_pg_id,
         ec_k: commit_req.ec.k,
         ec_m: commit_req.ec.m,
@@ -1375,6 +1376,7 @@ fn upload_streamed_test_multipart_part(
                         segment_okh: staged.segment_okh,
                         segment_vid: staged.segment_vid,
                         data_pg_id: staged.data_pg_id,
+                        placement_cluster_epoch: staged.placement_cluster_epoch,
                         ec_k: staged.ec_k,
                         ec_m: staged.ec_m,
                     })
@@ -1402,6 +1404,7 @@ fn upload_streamed_test_multipart_part(
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     };

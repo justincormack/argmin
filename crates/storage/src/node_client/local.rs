@@ -3027,6 +3027,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             segment_okh,
             segment_vid,
             data_pg_id,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: ec.k,
             ec_m: ec.m,
         };
@@ -3101,6 +3102,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             segment_okh: request.request.segment_okh,
             segment_vid: request.request.segment_vid,
             data_pg_id: request.request.data_pg_id,
+            placement_cluster_epoch: request.cluster_epoch,
             ec_k: request.request.ec.k,
             ec_m: request.request.ec.m,
         };
@@ -3228,6 +3230,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 data_pg_id: segment.data_pg_id,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,
                 ec_m: segment.ec_m,
             })
@@ -3348,6 +3351,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 data_pg_id: segment.data_pg_id,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,
                 ec_m: segment.ec_m,
             })

@@ -1179,6 +1179,7 @@ impl Coordinator {
                             segment_okh: segment.segment_okh,
                             segment_vid: segment.segment_vid,
                             data_pg_id: segment.data_pg_id,
+                            placement_cluster_epoch: segment.placement_cluster_epoch,
                             ec_k: segment.ec_k,
                             ec_m: segment.ec_m,
                         })

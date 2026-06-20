@@ -1190,8 +1190,8 @@ impl PgStore {
             .prepare_cached(
                 "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (prepare insert part segments)",
@@ -1224,6 +1224,7 @@ impl PgStore {
                 segment.segment_okh.as_slice(),
                 segment.segment_vid.get() as i64,
                 segment.data_pg_id,
+                segment.placement_cluster_epoch.get() as i64,
                 segment.ec_k,
                 segment.ec_m,
             ])
@@ -2276,6 +2277,7 @@ impl PgStore {
                         || staged.segment_okh != segment.segment_okh
                         || staged.segment_vid != segment.segment_vid
                         || staged.data_pg_id != segment.data_pg_id
+                        || staged.placement_cluster_epoch != segment.placement_cluster_epoch
                         || staged.ec_k != segment.ec_k
                         || staged.ec_m != segment.ec_m
                 })
@@ -2377,8 +2379,8 @@ impl PgStore {
             .prepare_cached(
                 "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare insert multipart part segments explicit",
@@ -2397,6 +2399,7 @@ impl PgStore {
                 segment.segment_okh.as_slice(),
                 segment.segment_vid.get() as i64,
                 segment.data_pg_id,
+                segment.placement_cluster_epoch.get() as i64,
                 segment.ec_k,
                 segment.ec_m,
             ])
@@ -4255,8 +4258,8 @@ impl PgStore {
             .prepare_cached(
                 "INSERT INTO object_segments \
                  (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                  data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit segment object (prepare insert segments)",
@@ -4286,6 +4289,7 @@ impl PgStore {
                 segment.segment_okh.as_slice(),
                 segment.segment_vid.get() as i64,
                 segment.data_pg_id,
+                segment.placement_cluster_epoch.get() as i64,
                 segment.ec_k,
                 segment.ec_m,
             ])
@@ -9532,7 +9536,7 @@ impl PgMetadataStore for PgStore {
 
                 let mut prev_stmt = self.conn.prepare_cached(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                 segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                 segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3 \
                  ORDER BY segment_index ASC",
@@ -9562,8 +9566,13 @@ impl PgMetadataStore for PgStore {
                                 "segment_vid",
                             )?,
                             data_pg_id: row.get(10)?,
-                            ec_k: row.get(11)?,
-                            ec_m: row.get(12)?,
+                            placement_cluster_epoch: Self::parse_cluster_epoch(
+                                row.get::<_, i64>(11)?,
+                                11,
+                                "placement_cluster_epoch",
+                            )?,
+                            ec_k: row.get(12)?,
+                            ec_m: row.get(13)?,
                         })
                     },
                 )?;
@@ -9604,8 +9613,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 )?;
                 for segment in segments {
                     if segment.upload_id != part.upload_id
@@ -9630,6 +9639,7 @@ impl PgMetadataStore for PgStore {
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
                         segment.data_pg_id,
+                        segment.placement_cluster_epoch.get() as i64,
                         segment.ec_k,
                         segment.ec_m,
                     ])?;
@@ -10115,7 +10125,7 @@ impl PgMetadataStore for PgStore {
             let (omitted_streaming_segments, omitted_streaming_part_numbers) = {
                 let mut stmt = self.conn.prepare_cached(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
                      FROM multipart_part_segments \
                      WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND version_id = ?4 \
                      ORDER BY part_number, segment_index",
@@ -10146,8 +10156,13 @@ impl PgMetadataStore for PgStore {
                                 "segment_vid",
                             )?,
                             data_pg_id: row.get(10)?,
-                            ec_k: row.get(11)?,
-                            ec_m: row.get(12)?,
+                            placement_cluster_epoch: Self::parse_cluster_epoch(
+                                row.get::<_, i64>(11)?,
+                                11,
+                                "placement_cluster_epoch",
+                            )?,
+                            ec_k: row.get(12)?,
+                            ec_m: row.get(13)?,
                         })
                     },
                 )?;
@@ -10643,7 +10658,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT session_id, segment_index, size, segment_okh, segment_vid, data_pg_id, \
-                 segment_crc64, payload_crc64, ec_k, ec_m FROM stream_upload_segments \
+                 placement_cluster_epoch, segment_crc64, payload_crc64, ec_k, ec_m FROM stream_upload_segments \
                  WHERE session_id = ?1 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -10659,8 +10674,8 @@ impl PgMetadataStore for PgStore {
                     session_id: row.get(0)?,
                     segment_index: row.get(1)?,
                     size: row.get::<_, i64>(2)? as u64,
-                    segment_crc64: row.get::<_, i64>(6)? as u64,
-                    payload_crc64: row.get::<_, i64>(7)? as u64,
+                    segment_crc64: row.get::<_, i64>(7)? as u64,
+                    payload_crc64: row.get::<_, i64>(8)? as u64,
                     segment_okh: okh,
                     segment_vid: Self::parse_generation_id(
                         row.get::<_, i64>(4)?,
@@ -10668,8 +10683,13 @@ impl PgMetadataStore for PgStore {
                         "segment_vid",
                     )?,
                     data_pg_id: row.get(5)?,
-                    ec_k: row.get(8)?,
-                    ec_m: row.get(9)?,
+                    placement_cluster_epoch: Self::parse_cluster_epoch(
+                        row.get::<_, i64>(6)?,
+                        6,
+                        "placement_cluster_epoch",
+                    )?,
+                    ec_k: row.get(9)?,
+                    ec_m: row.get(10)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -10819,8 +10839,8 @@ impl PgMetadataStore for PgStore {
                 .prepare_cached(
                     "INSERT INTO object_segments \
                      (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                      data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (prepare insert segments)",
@@ -10850,6 +10870,7 @@ impl PgMetadataStore for PgStore {
                     segment.segment_okh.as_slice(),
                     segment.segment_vid.get() as i64,
                     segment.data_pg_id,
+                    segment.placement_cluster_epoch.get() as i64,
                     segment.ec_k,
                     segment.ec_m,
                 ])
@@ -10980,7 +11001,7 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .prepare_cached(
                         "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                         segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                         segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m FROM multipart_part_segments \
                          WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
                          ORDER BY segment_index ASC",
                     )
@@ -11011,8 +11032,13 @@ impl PgMetadataStore for PgStore {
                                     "segment_vid",
                                 )?,
                                 data_pg_id: row.get(10)?,
-                                ec_k: row.get(11)?,
-                                ec_m: row.get(12)?,
+                                placement_cluster_epoch: Self::parse_cluster_epoch(
+                                    row.get::<_, i64>(11)?,
+                                    11,
+                                    "placement_cluster_epoch",
+                                )?,
+                                ec_k: row.get(12)?,
+                                ec_m: row.get(13)?,
                             })
                         },
                     )
@@ -11052,8 +11078,8 @@ impl PgMetadataStore for PgStore {
                     .prepare_cached(
                         "INSERT INTO multipart_part_segments \
                          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                          segment_vid, data_pg_id, ec_k, ec_m) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                          segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (prepare insert segments)",
@@ -11082,6 +11108,7 @@ impl PgMetadataStore for PgStore {
                         segment.segment_okh.as_slice(),
                         segment.segment_vid.get() as i64,
                         segment.data_pg_id,
+                        segment.placement_cluster_epoch.get() as i64,
                         segment.ec_k,
                         segment.ec_m,
                     ])
@@ -11134,7 +11161,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                 data_pg_id, ec_k, ec_m FROM object_segments \
+                 data_pg_id, placement_cluster_epoch, ec_k, ec_m FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY segment_index ASC",
             )
@@ -11161,8 +11188,13 @@ impl PgMetadataStore for PgStore {
                         "segment_vid",
                     )?,
                     data_pg_id: row.get(8)?,
-                    ec_k: row.get(9)?,
-                    ec_m: row.get(10)?,
+                    placement_cluster_epoch: Self::parse_cluster_epoch(
+                        row.get::<_, i64>(9)?,
+                        9,
+                        "placement_cluster_epoch",
+                    )?,
+                    ec_k: row.get(10)?,
+                    ec_m: row.get(11)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -11201,7 +11233,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                 segment_vid, data_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                 segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
                  ORDER BY segment_index ASC",
             )
@@ -11232,8 +11264,13 @@ impl PgMetadataStore for PgStore {
                             "segment_vid",
                         )?,
                         data_pg_id: row.get(10)?,
-                        ec_k: row.get(11)?,
-                        ec_m: row.get(12)?,
+                        placement_cluster_epoch: Self::parse_cluster_epoch(
+                            row.get::<_, i64>(11)?,
+                            11,
+                            "placement_cluster_epoch",
+                        )?,
+                        ec_k: row.get(12)?,
+                        ec_m: row.get(13)?,
                     })
                 },
             )
@@ -11263,7 +11300,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
                  FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
                  ORDER BY segment_index ASC",
@@ -11293,8 +11330,13 @@ impl PgMetadataStore for PgStore {
                         "segment_vid",
                     )?,
                     data_pg_id: row.get(10)?,
-                    ec_k: row.get(11)?,
-                    ec_m: row.get(12)?,
+                    placement_cluster_epoch: Self::parse_cluster_epoch(
+                        row.get::<_, i64>(11)?,
+                        11,
+                        "placement_cluster_epoch",
+                    )?,
+                    ec_k: row.get(12)?,
+                    ec_m: row.get(13)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -11327,7 +11369,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 \
                  ORDER BY part_number, segment_index",
@@ -11356,8 +11398,13 @@ impl PgMetadataStore for PgStore {
                         "segment_vid",
                     )?,
                     data_pg_id: row.get(10)?,
-                    ec_k: row.get(11)?,
-                    ec_m: row.get(12)?,
+                    placement_cluster_epoch: Self::parse_cluster_epoch(
+                        row.get::<_, i64>(11)?,
+                        11,
+                        "placement_cluster_epoch",
+                    )?,
+                    ec_k: row.get(12)?,
+                    ec_m: row.get(13)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -11568,8 +11615,8 @@ impl PgStore {
         self.conn
                 .execute(
                     "INSERT INTO stream_upload_segments \
-                 (session_id, segment_index, size, segment_crc64, payload_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (session_id, segment_index, size, segment_crc64, payload_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     segment.session_id,
                     segment.segment_index,
@@ -11579,6 +11626,7 @@ impl PgStore {
                     segment.segment_okh.as_slice(),
                     segment.segment_vid.get() as i64,
                     segment.data_pg_id,
+                    segment.placement_cluster_epoch.get() as i64,
                     segment.ec_k,
                     segment.ec_m,
                 ],

@@ -129,6 +129,27 @@ impl PgStore {
         })
     }
 
+    pub(super) fn parse_cluster_epoch(
+        raw: i64,
+        col_idx: usize,
+        field_name: &'static str,
+    ) -> Result<ClusterEpoch, rusqlite::Error> {
+        let value = u64::try_from(raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("negative {field_name}: {raw}")),
+            )
+        })?;
+        ClusterEpoch::new(value).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid zero {field_name}")),
+            )
+        })
+    }
+
     pub(super) fn parse_stream_target(
         op_kind_raw: u8,
         upload_id: Option<UploadId>,

@@ -1294,6 +1294,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                     segment_okh: staged.segment_okh,
                     segment_vid: staged.segment_vid,
                     data_pg_id: staged.data_pg_id,
+                    placement_cluster_epoch: staged.placement_cluster_epoch,
                     ec_k: staged.ec_k,
                     ec_m: staged.ec_m,
                 })
@@ -1321,6 +1322,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];

@@ -223,6 +223,7 @@ impl SharedStorageNode {
             segment_okh,
             segment_vid,
             data_pg_id,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: self.default_ec_shape.k,
             ec_m: self.default_ec_shape.m,
         };

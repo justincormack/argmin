@@ -469,6 +469,7 @@ fn streaming_upload_part_lifecycle() {
             segment_okh: hash,
             segment_vid: GenerationId::MIN,
             data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
             ec_m: 2,
         })
@@ -487,6 +488,7 @@ fn streaming_upload_part_lifecycle() {
         segment_okh: hash,
         segment_vid: GenerationId::MIN,
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     }];
@@ -939,6 +941,7 @@ fn multipart_abort_cleanup() {
         segment_okh: hash,
         segment_vid: GenerationId::MIN,
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     }];
@@ -1171,6 +1174,7 @@ fn persistence_complex_state_through_reopen() {
                 segment_okh: [0xEE; 16],
                 segment_vid: GenerationId::MIN,
                 data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
                 ec_m: 2,
             })

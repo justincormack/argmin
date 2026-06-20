@@ -7851,6 +7851,15 @@ PG backfill and migration design notes:
   observations preserve the most urgent tolerance seen without changing the
   segment proof tuple. Scanner/candidate integration and more nuanced admission
   class tuning remain follow-up work.
+- Added a placement-history hint to persisted segment metadata. Object
+  segments, stream staging segments, and committed multipart part segments now
+  record the `placement_cluster_epoch` used when their shard set was written.
+  This is still not a per-segment placement vector: scanners and backfill
+  workers must reconstruct locations from data PG, EC shape, stable shard
+  identity, the recorded epoch hint, and retained cluster-map history. Direct
+  non-streamed multipart part shard sets still need equivalent placement-epoch
+  attribution before scanner output can safely enqueue backfill rows for that
+  payload form.
 
 Exit criteria:
 

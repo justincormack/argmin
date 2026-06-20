@@ -94,6 +94,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
         segment_okh: [3; 16],
         segment_vid,
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     };
@@ -236,6 +237,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         segment_okh: [4; 16],
         segment_vid: GenerationId::new(20).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     };
@@ -1497,6 +1499,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         segment_okh: request.segment_okh,
         segment_vid: GenerationId::new(1).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 1,
         ec_m: 0,
     };
@@ -1641,6 +1644,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
         segment_okh: [4; 16],
         segment_vid: GenerationId::new(10).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     };
@@ -1711,6 +1715,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 data_pg_id: segment.data_pg_id,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,
                 ec_m: segment.ec_m,
             }],
@@ -1868,6 +1873,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
                 segment_okh: [5; 16],
                 segment_vid: GenerationId::new(32).unwrap(),
                 data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -1902,6 +1908,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
         segment_okh: [5; 16],
         segment_vid: GenerationId::new(32).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     }];

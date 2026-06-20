@@ -342,6 +342,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (session_id, segment_index),
@@ -360,6 +361,7 @@ CREATE TABLE IF NOT EXISTS object_segments (
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, segment_index)
@@ -524,6 +526,7 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     data_pg_id   INTEGER NOT NULL,
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
@@ -791,6 +794,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
+    migrate_segment_placement_epoch_columns(conn)?;
     migrate_part_payload_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
     migrate_acl_grant_columns(conn)?;
@@ -946,6 +950,26 @@ fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error>
         "ALTER TABLE stream_upload_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE object_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE multipart_part_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
+    ];
+    for sql in &migrations {
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                // Column already exists, skip.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn migrate_segment_placement_epoch_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let migrations = [
+        "ALTER TABLE stream_upload_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE object_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE multipart_part_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
     ];
     for sql in &migrations {
         match conn.execute(sql, []) {

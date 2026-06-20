@@ -2882,8 +2882,8 @@ fn metadata_state_digest_covers_object_segments() {
         .execute(
             "INSERT INTO object_segments \
              (bucket, key, version_id, segment_index, size, segment_crc64, \
-              segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 bucket.as_str(),
                 key.as_str(),
@@ -2892,6 +2892,7 @@ fn metadata_state_digest_covers_object_segments() {
                 32_i64,
                 99_i64,
                 okh.as_slice(),
+                1_i64,
                 1_i64,
                 1_i64,
                 4_i64,
@@ -2928,8 +2929,8 @@ fn metadata_state_digest_covers_multipart_part_segments() {
         .execute(
             "INSERT INTO multipart_part_segments \
              (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-              segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 bucket.as_str(),
                 key.as_str(),
@@ -2940,6 +2941,7 @@ fn metadata_state_digest_covers_multipart_part_segments() {
                 32_i64,
                 99_i64,
                 okh.as_slice(),
+                1_i64,
                 1_i64,
                 1_i64,
                 4_i64,
@@ -2976,8 +2978,8 @@ fn metadata_state_digest_covers_multipart_part_staging_segments() {
         .execute(
             "INSERT INTO multipart_part_segments \
              (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-              segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 bucket.as_str(),
                 key.as_str(),
@@ -2988,6 +2990,7 @@ fn metadata_state_digest_covers_multipart_part_staging_segments() {
                 32_i64,
                 99_i64,
                 okh.as_slice(),
+                1_i64,
                 1_i64,
                 1_i64,
                 4_i64,
@@ -3301,8 +3304,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
                 .execute(
                     "INSERT INTO stream_upload_segments \
                      (session_id, segment_index, size, segment_crc64, payload_crc64, segment_okh, \
-                      segment_vid, data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         "seg-session",
                         0_i64,
@@ -3310,6 +3313,7 @@ fn metadata_state_digest_covers_stream_upload_state() {
                         99_i64,
                         99_i64,
                         okh.as_slice(),
+                        1_i64,
                         1_i64,
                         1_i64,
                         4_i64,

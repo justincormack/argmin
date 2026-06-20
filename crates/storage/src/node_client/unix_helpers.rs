@@ -1053,6 +1053,7 @@ impl UnixStorageNodeClient {
                 || actual.segment_okh != expected.segment_okh
                 || actual.segment_vid != expected.segment_vid
                 || actual.data_pg_id != expected.data_pg_id
+                || actual.placement_cluster_epoch != expected.placement_cluster_epoch
                 || actual.ec_k != expected.ec_k
                 || actual.ec_m != expected.ec_m
             {
@@ -1804,6 +1805,7 @@ impl UnixStorageNodeClient {
             || segment.segment_okh != request.request.segment_okh
             || segment.segment_vid != request.request.segment_vid
             || segment.data_pg_id != request.request.data_pg_id
+            || segment.placement_cluster_epoch != request.cluster_epoch
             || segment.ec_k != request.request.ec.k
             || segment.ec_m != request.request.ec.m
         {

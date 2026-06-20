@@ -456,6 +456,7 @@ fn upload_copied_test_multipart_part(
                         segment_okh: staged.segment_okh,
                         segment_vid: staged.segment_vid,
                         data_pg_id: staged.data_pg_id,
+                        placement_cluster_epoch: staged.placement_cluster_epoch,
                         ec_k: staged.ec_k,
                         ec_m: staged.ec_m,
                     })

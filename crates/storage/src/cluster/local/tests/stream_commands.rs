@@ -2011,6 +2011,7 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
@@ -2147,6 +2148,7 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
@@ -2520,6 +2522,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
@@ -2696,6 +2699,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
@@ -2896,6 +2900,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
@@ -3100,6 +3105,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         segment_okh: segment.segment_okh,
         segment_vid: segment.segment_vid,
         data_pg_id: segment.data_pg_id,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
@@ -3389,6 +3395,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                     segment_okh: staged.segment_okh,
                     segment_vid: staged.segment_vid,
                     data_pg_id: staged.data_pg_id,
+                    placement_cluster_epoch: staged.placement_cluster_epoch,
                     ec_k: staged.ec_k,
                     ec_m: staged.ec_m,
                 })
@@ -3720,6 +3727,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                     segment_okh: staged.segment_okh,
                     segment_vid: staged.segment_vid,
                     data_pg_id: staged.data_pg_id,
+                    placement_cluster_epoch: staged.placement_cluster_epoch,
                     ec_k: staged.ec_k,
                     ec_m: staged.ec_m,
                 })

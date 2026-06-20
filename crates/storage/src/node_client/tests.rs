@@ -259,6 +259,7 @@ fn test_object_read_multipart_segment(
         segment_okh: [7; 16],
         segment_vid: GenerationId::new(30 + u64::from(part_number)).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     }

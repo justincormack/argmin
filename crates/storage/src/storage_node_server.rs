@@ -4625,10 +4625,13 @@ impl StorageNodeConnectionHandler {
             &request.object.key,
             &request.request,
         ) {
-            Ok((target, segment)) => StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
-                target,
-                segment: Box::new(segment),
-            },
+            Ok((target, mut segment)) => {
+                segment.placement_cluster_epoch = request.object.cluster_epoch;
+                StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
+                    target,
+                    segment: Box::new(segment),
+                }
+            }
             Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
                 StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
                     session_id: request.request.session_id,

@@ -5285,6 +5285,7 @@ fn stream_segment_append_and_list() {
                 segment_okh: [i as u8; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 data_pg_id: i,
+                placement_cluster_epoch: ClusterEpoch::new(u64::from(i) + 10).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
             })
@@ -5305,6 +5306,10 @@ fn stream_segment_append_and_list() {
     assert_eq!(segments[2].segment_crc64, 12);
     assert_eq!(segments[0].segment_okh, [0u8; 16]);
     assert_eq!(segments[2].data_pg_id, 2);
+    assert_eq!(
+        segments[2].placement_cluster_epoch,
+        ClusterEpoch::new(12).unwrap()
+    );
 }
 
 #[test]
@@ -5344,6 +5349,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         segment_okh: [0x44; 16],
         segment_vid: GenerationId::new(1).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     };
@@ -5385,6 +5391,7 @@ fn stream_segment_cascade_delete() {
             segment_okh: [0xAA; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
             ec_m: 2,
         })
@@ -5436,6 +5443,7 @@ fn put_object_with_segments_persists_manifest() {
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::MIN,
                     data_pg_id: 0,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -5449,6 +5457,7 @@ fn put_object_with_segments_persists_manifest() {
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::MIN,
                     data_pg_id: 0,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -5505,6 +5514,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::MIN,
                 data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5541,6 +5551,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 segment_okh: [2; 16],
                 segment_vid: GenerationId::MIN,
                 data_pg_id: 1,
+                placement_cluster_epoch: ClusterEpoch::new(7).unwrap(),
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5558,6 +5569,10 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 200);
     assert_eq!(segments[0].segment_okh, [2; 16]);
+    assert_eq!(
+        segments[0].placement_cluster_epoch,
+        ClusterEpoch::new(7).unwrap()
+    );
 }
 
 #[test]
@@ -5594,6 +5609,7 @@ fn delete_object_segments_cleanup() {
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -5624,16 +5640,16 @@ fn multipart_part_segments_crud() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, 41, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
+          segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, 41, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 13, 4, 2)",
         [multipart_upload_id("uid-1").into_string()],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, 42, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
+          segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, 42, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 14, 4, 2)",
         [multipart_upload_id("uid-1").into_string()],
     )
     .unwrap();
@@ -5654,6 +5670,10 @@ fn multipart_part_segments_crud() {
     assert_eq!(segments[1].segment_index, 1);
     assert_eq!(segments[1].size, 2_000_000);
     assert_eq!(segments[1].segment_crc64, 42);
+    assert_eq!(
+        segments[1].placement_cluster_epoch,
+        ClusterEpoch::new(14).unwrap()
+    );
 
     // Delete
     store
@@ -5724,6 +5744,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         segment_okh: [fill; 16],
         segment_vid: GenerationId::MIN,
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     };
@@ -5828,6 +5849,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             data_pg_id: i,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
             ec_m: 2,
         })
@@ -5877,6 +5899,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         segment_okh: [0x22; 16],
         segment_vid: GenerationId::new(2).unwrap(),
         data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
     }];
@@ -6041,6 +6064,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
                     data_pg_id: 0,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -6056,6 +6080,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
                     data_pg_id: 1,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
                     ec_k: 4,
                     ec_m: 2,
                 },
@@ -6603,6 +6628,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -6684,6 +6710,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
                 ec_m: 2,
             }],
@@ -6707,8 +6734,8 @@ fn malformed_segment_okh_returns_db_error() {
     conn.execute(
         "INSERT INTO object_segments \
          (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
-          segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 0, 0, 100, 99, X'AABB', 1, 0, 4, 2)",
+          segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+         VALUES ('bucket', 'k', 0, 0, 100, 99, X'AABB', 1, 0, 1, 4, 2)",
         [],
     )
     .unwrap();
@@ -6731,8 +6758,8 @@ fn malformed_multipart_segment_okh_returns_db_error() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'AABB', 1, 0, 4, 2)",
+          segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'AABB', 1, 0, 1, 4, 2)",
         [multipart_upload_id("mpu-bad").into_string()],
     )
     .unwrap();
@@ -7969,8 +7996,8 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-          segment_crc64, segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
+          segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'00112233445566778899AABBCCDDEEFF', 1, 0, 1, 4, 2)",
         [multipart_upload_id("mpu-seg").into_string()],
     )
     .unwrap();

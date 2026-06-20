@@ -371,17 +371,18 @@ const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_ABORT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
-const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize = 4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
+const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize =
+    4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
-    4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
+    4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
     4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
-    4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2;
+    4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 4
@@ -12690,6 +12691,7 @@ impl<'a> StorageRpcDecoder<'a> {
             segment_okh: self.read_fixed_16_bytes("stream upload segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
+            placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
         })
@@ -13137,6 +13139,7 @@ impl<'a> StorageRpcDecoder<'a> {
             segment_okh: self.read_fixed_16_bytes("object segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
+            placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
         })
@@ -13178,6 +13181,7 @@ impl<'a> StorageRpcDecoder<'a> {
             segment_okh: self.read_fixed_16_bytes("multipart part segment OKH")?,
             segment_vid: self.read_generation_id()?,
             data_pg_id: self.read_u32()?,
+            placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
         })
@@ -14614,6 +14618,7 @@ fn put_stream_upload_segment_record(out: &mut Vec<u8>, segment: &StreamUploadSeg
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
+    put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
 }
@@ -15086,6 +15091,7 @@ fn put_object_segment_record(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
+    put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
 }
@@ -15122,6 +15128,7 @@ fn put_multipart_part_segment_record(out: &mut Vec<u8>, segment: &MultipartPartS
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
+    put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
 }
@@ -15649,6 +15656,41 @@ mod tests {
             decode_storage_rpc_frame_with_limit(&bytes, 3),
             Err(StorageRpcFrameError::PayloadTooLarge { len: 4, limit: 3 })
         );
+    }
+
+    #[test]
+    fn segment_record_count_guards_include_placement_epoch() {
+        for (min_record_len, old_record_len, message) in [
+            (
+                STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN,
+                4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2,
+                "object segment count exceeds payload",
+            ),
+            (
+                STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN,
+                4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 2,
+                "stream upload segment count exceeds payload",
+            ),
+            (
+                STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
+                4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 2,
+                "multipart part segment count exceeds payload",
+            ),
+        ] {
+            assert_eq!(min_record_len, old_record_len + 8);
+
+            let mut bytes = Vec::new();
+            put_u32(&mut bytes, 1);
+            bytes.resize(bytes.len() + old_record_len, 0);
+
+            let mut decoder = StorageRpcDecoder::new(&bytes);
+            assert_eq!(
+                decoder.read_bounded_remaining_count(min_record_len, message),
+                Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    message
+                ))
+            );
+        }
     }
 
     #[test]
@@ -18780,6 +18822,20 @@ mod tests {
         assert_eq!(decoded, snapshot_request);
 
         let checksum = ChecksumBytes::new([1, 2, 3, 4]).unwrap();
+        let object_segment = ObjectSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::from_u64(7),
+            segment_index: 0,
+            size: 12,
+            segment_crc64: 98,
+            segment_okh: [2; 16],
+            segment_vid: GenerationId::new(10).unwrap(),
+            data_pg_id: 5,
+            placement_cluster_epoch: ClusterEpoch::new(9).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+        };
         let part = ObjectPartRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -18808,13 +18864,14 @@ mod tests {
             segment_okh: [4; 16],
             segment_vid: GenerationId::new(12).unwrap(),
             data_pg_id: 5,
+            placement_cluster_epoch: ClusterEpoch::new(11).unwrap(),
             ec_k: 4,
             ec_m: 2,
         };
         let response = StorageRpcObjectReadSnapshotResponse {
             outcome: StorageRpcObjectReadSnapshotOutcome::Loaded(Box::new(ObjectReadSnapshot {
                 stored,
-                object_segments: Vec::new(),
+                object_segments: vec![object_segment],
                 multipart_parts: vec![part],
                 multipart_part_segments: vec![segment],
             })),

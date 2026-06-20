@@ -3724,6 +3724,8 @@ pub struct StreamUploadSegmentRecord {
     pub segment_vid: GenerationId,
     /// PG where this segment's shards are stored.
     pub data_pg_id: u32,
+    /// Cluster-map epoch used to place this segment's shard set.
+    pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
 }
@@ -3785,6 +3787,8 @@ pub struct ObjectSegmentRecord {
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
+    /// Cluster-map epoch used to place this segment's shard set.
+    pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
 }
@@ -3804,6 +3808,8 @@ pub struct MultipartPartSegmentRecord {
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub data_pg_id: u32,
+    /// Cluster-map epoch used to place this segment's shard set.
+    pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
 }

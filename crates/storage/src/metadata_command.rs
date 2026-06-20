@@ -1883,6 +1883,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         GenerationId::new(self.read_u64()?).ok_or_else(|| format!("{field} must be non-zero"))
     }
 
+    fn read_cluster_epoch(&mut self, field: &'static str) -> Result<ClusterEpoch, String> {
+        ClusterEpoch::new(self.read_u64()?).ok_or_else(|| format!("{field} must be non-zero"))
+    }
+
     fn read_version_id(&mut self) -> Result<VersionId, String> {
         Ok(VersionId::from_u64(self.read_u64()?))
     }
@@ -2104,6 +2108,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_bytes()?;
         self.read_nonzero_u64("object segment VID")?;
         self.read_u32()?;
+        self.read_cluster_epoch("object segment placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
         Ok(())
@@ -2120,6 +2125,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             segment_okh: self.read_fixed_bytes("object segment OKH")?,
             segment_vid: self.read_generation_id("object segment VID")?,
             data_pg_id: self.read_u32()?,
+            placement_cluster_epoch: self.read_cluster_epoch("object segment placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
         })
@@ -2213,6 +2219,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_bytes()?;
         self.read_nonzero_u64("multipart part segment VID")?;
         self.read_u32()?;
+        self.read_cluster_epoch("multipart part segment placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
         Ok(())
@@ -2231,6 +2238,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             segment_okh: self.read_fixed_bytes("multipart part segment OKH")?,
             segment_vid: self.read_generation_id("multipart part segment VID")?,
             data_pg_id: self.read_u32()?,
+            placement_cluster_epoch: self
+                .read_cluster_epoch("multipart part segment placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
         })
@@ -2329,6 +2338,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_bytes()?;
         self.read_nonzero_u64("stream upload segment VID")?;
         self.read_u32()?;
+        self.read_cluster_epoch("stream upload segment placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
         Ok(())
@@ -2344,6 +2354,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             segment_okh: self.read_fixed_bytes("stream upload segment OKH")?,
             segment_vid: self.read_generation_id("stream upload segment VID")?,
             data_pg_id: self.read_u32()?,
+            placement_cluster_epoch: self
+                .read_cluster_epoch("stream upload segment placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
         })
@@ -3476,6 +3488,7 @@ fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
+    put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
 }
@@ -3531,6 +3544,7 @@ fn encode_multipart_part_segment(out: &mut Vec<u8>, segment: &MultipartPartSegme
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
+    put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
 }
@@ -3558,6 +3572,7 @@ fn encode_stream_upload_segment(out: &mut Vec<u8>, segment: &StreamUploadSegment
     put_bytes(out, &segment.segment_okh);
     put_u64(out, segment.segment_vid.get());
     put_u32(out, segment.data_pg_id);
+    put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
 }
@@ -4725,6 +4740,7 @@ mod tests {
             segment_okh: [7; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
+            placement_cluster_epoch: ClusterEpoch::new(7).unwrap(),
             ec_k: 2,
             ec_m: 1,
         };
@@ -4849,6 +4865,7 @@ mod tests {
             segment_okh: [12; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
+            placement_cluster_epoch: ClusterEpoch::new(8).unwrap(),
             ec_k: 2,
             ec_m: 1,
         };
@@ -4864,6 +4881,7 @@ mod tests {
             segment_okh: [10; 16],
             segment_vid: generation_id,
             data_pg_id: 2,
+            placement_cluster_epoch: ClusterEpoch::new(9).unwrap(),
             ec_k: 2,
             ec_m: 1,
         };
@@ -5286,9 +5304,9 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0x1e712152d885dc1f,
-                0x0bf1842505b04e6d,
-                0x4906ba7e71a28b40,
+                0x5531f7e6bf78ef78,
+                0x9b5a7f09485bffb3,
+                0x035d73a1a4da061f,
                 0x903cf2da427ff645,
                 0x22e816661cec7274,
                 0xe7353d51b6609ac8,
@@ -5301,13 +5319,13 @@ mod tests {
                 0x48fb53d34217c071,
                 0x60d07b32ba40633a,
                 0x5905759308d55e48,
-                0x722e76a80ad6b753,
+                0x8940e203e3a025ce,
                 0x2d6608601fded1d8,
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,
-                0xce0268549819ae28,
-                0x5f1aa1cea13e9196,
-                0xe73984452d023876,
+                0x506bcf86cc513234,
+                0xad26c80659b2eba1,
+                0x9d7ca8b27a004b60,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,
                 0xba43f79ea2af20cb,

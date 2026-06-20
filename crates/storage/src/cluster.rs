@@ -5845,6 +5845,7 @@ impl StorageCluster {
             segment_okh: req.segment_okh,
             segment_vid: req.segment_vid,
             data_pg_id: req.data_pg_id,
+            placement_cluster_epoch: self.operation_epoch(),
             ec_k: req.ec.k,
             ec_m: req.ec.m,
         };
@@ -6162,7 +6163,10 @@ impl StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        mutation_client.prepare_stream_segment_append(pg_id, bucket, key, request)
+        let (target, mut segment_record) =
+            mutation_client.prepare_stream_segment_append(pg_id, bucket, key, request)?;
+        segment_record.placement_cluster_epoch = self.operation_epoch();
+        Ok((target, segment_record))
     }
 
     pub fn write_stream_segment_payload_shards(
