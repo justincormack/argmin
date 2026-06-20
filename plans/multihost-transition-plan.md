@@ -7767,6 +7767,12 @@ PG backfill and migration design notes:
   model, so the first backfill risk semantics are exercised by current-route
   repair tests before historical placement resolution or a mutating backfill
   worker is added.
+- Added the first read-only historical placement reconstruction primitive. The
+  storage layer can now place a segment shard set from an explicit PG acting
+  set and cluster epoch without consulting the current route state. Current
+  placement still uses the existing active-route path, but this gives backfill
+  planning a deterministic way to reconstruct old shard locations from retained
+  PG/cluster-map history without adding per-segment placement vectors.
 
 Exit criteria:
 

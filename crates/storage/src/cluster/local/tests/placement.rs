@@ -80,6 +80,70 @@ fn places_payload_shards_deterministically_on_distinct_nodes() {
 }
 
 #[test]
+fn places_payload_shards_for_explicit_pg_route_without_current_route_lookup() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+        NodeId::new(6),
+        NodeId::new(7),
+    ];
+    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let cluster =
+        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape)
+            .unwrap();
+    let data_pg_id = DataPgId::new(crate::PgId::new(3));
+    let placement_key = b"historical-placement-key";
+
+    let current = cluster
+        .place_payload_shards(data_pg_id, ec_shape, placement_key)
+        .unwrap();
+    let explicit_current = cluster
+        .place_payload_shards_for_pg_route(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            ec_shape,
+            placement_key,
+            &node_ids,
+        )
+        .unwrap();
+
+    assert_eq!(explicit_current, current);
+
+    let historical_epoch = ClusterEpoch::new(7).unwrap();
+    let historical_acting_set = &node_ids[..usize::from(ec_shape.k + ec_shape.m)];
+    let historical = cluster
+        .place_payload_shards_for_pg_route(
+            historical_epoch,
+            data_pg_id,
+            ec_shape,
+            placement_key,
+            historical_acting_set,
+        )
+        .unwrap();
+
+    assert_eq!(historical.len(), usize::from(ec_shape.k + ec_shape.m));
+    assert!(historical
+        .iter()
+        .all(|location| location.cluster_epoch() == historical_epoch));
+    assert!(historical
+        .iter()
+        .all(|location| historical_acting_set.contains(&location.node_id())));
+    assert_eq!(
+        historical
+            .iter()
+            .map(ShardLocation::node_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        historical.len()
+    );
+}
+
+#[test]
 fn payload_shard_node_selects_one_placed_shard() {
     let tmp = test_util::tempdir();
     let node_ids = [

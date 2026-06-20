@@ -3066,6 +3066,37 @@ impl LocalClusterMap {
             .collect())
     }
 
+    pub fn place_payload_shards_for_pg_route(
+        cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec_shape: EcShape,
+        stable_placement_key: &[u8],
+        acting_set: &[NodeId],
+    ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
+        let ec_config = ec_config_for_shape(ec_shape)?;
+        let total_shards = ec_config.total_shards();
+        let placement_map = build_local_placement_map(acting_set.iter().copied())?;
+        let placer = local_payload_placer(&placement_map, ec_shape)?;
+        let placement_key = payload_shard_placement_key(data_pg_id, stable_placement_key);
+        let mut node_ids = vec![NodeId::new(0); total_shards];
+        placer
+            .place(&placement_key, &mut node_ids)
+            .map_err(|error| placement_error_for_shape(ec_shape, error))?;
+
+        Ok(node_ids
+            .into_iter()
+            .enumerate()
+            .map(|(shard_index, node_id)| {
+                ShardLocation::new(
+                    cluster_epoch,
+                    data_pg_id,
+                    ShardIndex::new(shard_index as u8),
+                    node_id,
+                )
+            })
+            .collect())
+    }
+
     pub fn payload_shard_node(
         &self,
         operation_epoch: ClusterEpoch,

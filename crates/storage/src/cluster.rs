@@ -3286,6 +3286,23 @@ impl StorageCluster {
         )
     }
 
+    pub fn place_payload_shards_for_pg_route(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec_shape: EcShape,
+        stable_placement_key: &[u8],
+        acting_set: &[NodeId],
+    ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
+        LocalClusterMap::place_payload_shards_for_pg_route(
+            cluster_epoch,
+            data_pg_id,
+            ec_shape,
+            stable_placement_key,
+            acting_set,
+        )
+    }
+
     pub fn payload_shard_node(
         &self,
         data_pg_id: DataPgId,
@@ -7034,20 +7051,24 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
-        let ec_config =
-            EcConfig::new(req.ec.k, req.ec.m).map_err(|error| StoreError::ErasureCoding {
-                context: "inspect placed segment repair targets EC shape",
-                reason: error.to_string(),
-            })?;
-        let k = usize::from(req.ec.k);
-        let padded = req.stored_size.div_ceil(k) * k;
-        let shard_size = padded / k;
-
+        validate_placed_segment_repair_ec_shape(req.ec)?;
         let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
             .place_payload_shards(data_pg, req.ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
+        self.placed_segment_payload_shard_health_at_locations(req, &locations)
+    }
+
+    fn placed_segment_payload_shard_health_at_locations(
+        &self,
+        req: SegmentStoredBytesRequest,
+        locations: &[ShardLocation],
+    ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
+        let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
+        let k = usize::from(req.ec.k);
+        let padded = req.stored_size.div_ceil(k) * k;
+        let shard_size = padded / k;
         let mut shards = Vec::with_capacity(ec_config.total_shards());
         let mut valid_shards = 0usize;
 
@@ -7926,6 +7947,13 @@ fn segment_payload_placement_key(segment_okh: &[u8; 16], segment_vid: Generation
     key[..16].copy_from_slice(segment_okh);
     key[16..].copy_from_slice(&segment_vid.get().to_be_bytes());
     key
+}
+
+fn validate_placed_segment_repair_ec_shape(ec: EcShape) -> Result<EcConfig, StoreError> {
+    EcConfig::new(ec.k, ec.m).map_err(|error| StoreError::ErasureCoding {
+        context: "inspect placed segment repair targets EC shape",
+        reason: error.to_string(),
+    })
 }
 
 fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<ErasureCodec, StoreError> {
