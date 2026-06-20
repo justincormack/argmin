@@ -66,6 +66,27 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_repairs (
     PRIMARY KEY (segment_okh, segment_vid, shard_index)
 )";
 
+/// Durable backfill queue for segment shard sets whose desired PG placement
+/// differs from the historical placement used by existing segment metadata.
+const CREATE_PLACED_SEGMENT_SHARD_BACKFILLS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS placed_segment_shard_backfills (
+    data_pg_id             INTEGER NOT NULL CHECK (data_pg_id >= 0),
+    segment_okh            BLOB NOT NULL CHECK (length(segment_okh) = 16),
+    segment_vid            INTEGER NOT NULL CHECK (segment_vid > 0),
+    stored_size            INTEGER NOT NULL CHECK (stored_size >= 0),
+    segment_crc64          INTEGER NOT NULL,
+    ec_k                   INTEGER NOT NULL CHECK (ec_k > 0),
+    ec_m                   INTEGER NOT NULL CHECK (ec_m >= 0),
+    source_cluster_epoch   INTEGER NOT NULL CHECK (source_cluster_epoch > 0),
+    desired_cluster_epoch  INTEGER NOT NULL CHECK (desired_cluster_epoch > 0),
+    first_seen_at          INTEGER NOT NULL CHECK (first_seen_at >= 0),
+    last_seen_at           INTEGER NOT NULL CHECK (last_seen_at >= 0),
+    observation_count      INTEGER NOT NULL CHECK (observation_count > 0),
+    last_error             TEXT,
+    CHECK (source_cluster_epoch <= desired_cluster_epoch),
+    PRIMARY KEY (data_pg_id, segment_okh, segment_vid, source_cluster_epoch, desired_cluster_epoch)
+)";
+
 /// Per-PG object metadata table.
 const CREATE_OBJECTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS objects (
@@ -702,6 +723,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_SHARDS_TABLE, [])?;
     conn.execute(CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE, [])?;
     conn.execute(CREATE_PLACED_SEGMENT_SHARD_REPAIRS_TABLE, [])?;
+    conn.execute(CREATE_PLACED_SEGMENT_SHARD_BACKFILLS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_VERSION_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_WRITE_COUNTERS_TABLE, [])?;

@@ -7802,8 +7802,15 @@ PG backfill and migration design notes:
   when the historical source route still has at least `k` valid shards. Storage
   reconstructs the segment bytes from the historical route, re-encodes only the
   missing desired-route shard indexes, registers their acks, and verifies the
-  desired-route targets. Durable queueing, worker admission, and remote
-  storage-node execution remain follow-up work.
+  desired-route targets. Worker admission and remote storage-node execution
+  remain follow-up work.
+- Added the first durable PG-store backfill candidate table. The durable row is
+  segment-level and records the data PG, segment identity, EC shape, and
+  source/desired cluster epochs; it deliberately does not persist an exact
+  placement vector, so the later worker must reconstruct both routes from
+  retained cluster-map history. The first slice supports record/list/resolve
+  with coalescing and validation; claim/retry wiring, admission, and execution
+  remain follow-up work.
 
 Exit criteria:
 
