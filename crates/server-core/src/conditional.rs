@@ -30,20 +30,26 @@ pub struct ReadCondition {
 /// A non-wildcard ETag value for conditional requests.
 ///
 /// Rejects `*` at construction time so that unsupported wildcard forms
-/// cannot be represented in condition types.
+/// cannot be represented in condition types. The stored value is the entity
+/// tag itself; HTTP quote marks are stripped at construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecificEtag(String);
 
 impl SpecificEtag {
-    /// Construct a `SpecificEtag`, rejecting `*`.
+    /// Construct a `SpecificEtag`, rejecting `*` and stripping HTTP quotes.
     pub fn new(value: String) -> Result<Self, &'static str> {
         if value.trim() == "*" {
             return Err("wildcard ETag not allowed in this context");
         }
-        Ok(Self(value))
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value);
+        Ok(Self(value.to_string()))
     }
 
-    /// The underlying ETag string.
+    /// The underlying entity tag value, without HTTP quote marks.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -518,6 +524,18 @@ mod tests {
     fn write_if_match_allows_matching_overwrite() {
         let cond = WriteCondition::IfMatch(SpecificEtag::new(test_etag()).unwrap());
         assert!(check_write_conditions(&cond, Some(&test_etag())).is_ok());
+    }
+
+    #[test]
+    fn specific_etag_stores_unquoted_entity_tag() {
+        let etag = SpecificEtag::new(test_etag()).unwrap();
+        assert_eq!(etag.as_str(), "abcdef1234567890");
+    }
+
+    #[test]
+    fn write_if_match_policy_value_uses_entity_tag() {
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(test_etag()).unwrap());
+        assert_eq!(cond.if_match_policy_value(), Some("abcdef1234567890"));
     }
 
     #[test]

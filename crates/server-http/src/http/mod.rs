@@ -3927,7 +3927,9 @@ impl HttpFrontend {
                                 grant_full_control: req.header("x-amz-grant-full-control"),
                             },
                             conditions: PutObjectConditionalHeaders {
-                                if_match: req.header("if-match"),
+                                if_match: req
+                                    .header("if-match")
+                                    .map(if_match_header_entity_tag_value),
                                 if_none_match: req.header("if-none-match"),
                             },
                         },
@@ -5855,10 +5857,17 @@ fn put_object_policy_context_from_request<'a>(
             grant_full_control: req.header("x-amz-grant-full-control"),
         },
         conditions: PutObjectConditionalHeaders {
-            if_match: req.header("if-match"),
+            if_match: req.header("if-match").map(if_match_header_entity_tag_value),
             if_none_match: req.header("if-none-match"),
         },
     })
+}
+
+fn if_match_header_entity_tag_value(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -6093,6 +6102,20 @@ mod tests {
             signing_region: Some("us-east-1".to_string()),
             streaming: None,
         }
+    }
+
+    #[test]
+    fn put_object_policy_context_stores_if_match_entity_tag() {
+        let policy_context =
+            put_object_policy_context_from_request_fields(PutObjectPolicyContextFields {
+                conditions: PutObjectConditionalHeaders {
+                    if_match: Some(if_match_header_entity_tag_value("\"abcdef1234567890\"")),
+                    if_none_match: None,
+                },
+                ..Default::default()
+            });
+
+        assert_eq!(policy_context.if_match, Some("abcdef1234567890"));
     }
 
     fn create_test_bucket(coord: &Coordinator, name: &str) {

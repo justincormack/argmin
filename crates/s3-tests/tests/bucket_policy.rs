@@ -12225,7 +12225,7 @@ fn test_bucket_policy_put_object_if_match_condition() {
         let alt_client = CTX.alt_client();
         let bucket = create_bucket_allowing_public_policy(client).await;
         let key = "if-match-object";
-        let etag = client
+        let etag_header = client
             .put_object()
             .bucket(&bucket)
             .key(key)
@@ -12236,6 +12236,7 @@ fn test_bucket_policy_put_object_if_match_condition() {
             .e_tag()
             .expect("expected ETag")
             .to_string();
+        let entity_tag = etag_header.trim_matches('"').to_string();
 
         client
             .put_bucket_policy()
@@ -12251,7 +12252,7 @@ fn test_bucket_policy_put_object_if_match_condition() {
                             "Resource": bucket_wildcard_resource(&bucket),
                             "Condition": {
                                 "StringEquals": {
-                                    "s3:if-match": etag
+                                    "s3:if-match": entity_tag
                                 }
                             }
                         },
@@ -12284,7 +12285,7 @@ fn test_bucket_policy_put_object_if_match_condition() {
                 .put_object()
                 .bucket(&bucket)
                 .key(key)
-                .if_match(&etag)
+                .if_match(&etag_header)
                 .body(ByteStream::from_static(b"new"))
                 .send()
         })

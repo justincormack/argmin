@@ -1176,7 +1176,8 @@ fn test_post_object_bucket_policy_if_match_string_equals_is_policy_only() {
         let wrong_key = "post-object-if-match-equals-wrong";
         let header_key = "post-object-if-match-equals-header";
         let convergence_key = "post-object-if-match-equals-convergence";
-        let expected_if_match = "\"post-policy-etag\"";
+        let expected_entity_tag = "post-policy-etag";
+        let expected_if_match_header = format!("\"{expected_entity_tag}\"");
         let file_data = b"POST Object with exact If-Match policy";
 
         let policy = serde_json::json!({
@@ -1200,7 +1201,7 @@ fn test_post_object_bucket_policy_if_match_string_equals_is_policy_only() {
                     "Resource": format!("arn:aws:s3:::{bucket}/*"),
                     "Condition": {
                         "StringNotEquals": {
-                            "s3:if-match": expected_if_match
+                            "s3:if-match": expected_entity_tag
                         }
                     }
                 }
@@ -1271,7 +1272,7 @@ fn test_post_object_bucket_policy_if_match_string_equals_is_policy_only() {
             &field_refs,
             file_data,
             "test.txt",
-            &[("If-Match", expected_if_match)],
+            &[("If-Match", expected_if_match_header.as_str())],
         );
         assert_eq!(status, 204, "expected 204, got {status} body={body}");
 
@@ -1280,7 +1281,7 @@ fn test_post_object_bucket_policy_if_match_string_equals_is_policy_only() {
             &field_refs,
             b"overwrite",
             "test.txt",
-            &[("If-Match", expected_if_match)],
+            &[("If-Match", expected_if_match_header.as_str())],
         );
         assert_eq!(
             repeat.0, 204,
