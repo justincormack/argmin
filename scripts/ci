@@ -21,6 +21,7 @@ Run the standard local CI checks:
   8. ./scripts/uat-s3-tests --smoke storage-node-restart
   9. ./scripts/uat-s3-tests --smoke storage-node-kill-fails-closed
   10. ./scripts/uat-s3-tests --smoke control-plane-runtime-map
+  11. ./scripts/uat-s3-tests --smoke shard-repair
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -74,3 +75,4 @@ run_cmd "multihost UAT s3-tests" ./scripts/uat-s3-tests
 run_cmd "multihost UAT storage-node restart smoke" ./scripts/uat-s3-tests --smoke storage-node-restart
 run_cmd "multihost UAT storage-node kill smoke" ./scripts/uat-s3-tests --smoke storage-node-kill-fails-closed
 run_cmd "multihost UAT control-plane runtime-map smoke" ./scripts/uat-s3-tests --smoke control-plane-runtime-map
+run_cmd "multihost UAT shard repair smoke" ./scripts/uat-s3-tests --smoke shard-repair
