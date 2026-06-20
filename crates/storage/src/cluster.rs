@@ -705,6 +705,56 @@ impl ShardLocation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacedSegmentShardValidation {
+    Valid,
+    MissingAck,
+    WrongSize { expected: u64, actual: u64 },
+    Unreadable { reason: String },
+}
+
+impl PlacedSegmentShardValidation {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardHealth {
+    pub shard_index: ShardIndex,
+    pub shard_key: ShardKey,
+    pub location: ShardLocation,
+    pub validation: PlacedSegmentShardValidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacedSegmentShardSetRisk {
+    Healthy,
+    Degraded { tolerance_remaining: usize },
+    Unrecoverable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardSetHealth {
+    pub total_shards: usize,
+    pub required_shards: usize,
+    pub valid_shards: usize,
+    pub risk: PlacedSegmentShardSetRisk,
+    pub shards: Vec<PlacedSegmentShardHealth>,
+}
+
+impl PlacedSegmentShardSetHealth {
+    #[must_use]
+    pub fn repair_targets(&self) -> Vec<ShardIndex> {
+        self.shards
+            .iter()
+            .filter(|shard| !shard.validation.is_valid())
+            .map(|shard| shard.shard_index)
+            .collect()
+    }
+}
+
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
     storage_clients: Vec<Arc<dyn StorageNodeClient>>,
@@ -6972,6 +7022,17 @@ impl StorageCluster {
         &self,
         req: SegmentStoredBytesRequest,
     ) -> Result<Vec<ShardIndex>, StoreError> {
+        let health = self.placed_segment_payload_shard_health(req)?;
+        if matches!(health.risk, PlacedSegmentShardSetRisk::Unrecoverable) {
+            return Err(StoreError::NotFound);
+        }
+        Ok(health.repair_targets())
+    }
+
+    pub fn placed_segment_payload_shard_health(
+        &self,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
         let ec_config =
             EcConfig::new(req.ec.k, req.ec.m).map_err(|error| StoreError::ErasureCoding {
@@ -6979,54 +7040,75 @@ impl StorageCluster {
                 reason: error.to_string(),
             })?;
         let k = usize::from(req.ec.k);
-        let m = usize::from(req.ec.m);
         let padded = req.stored_size.div_ceil(k) * k;
         let shard_size = padded / k;
-        if shard_size == 0 {
-            return Ok(Vec::new());
-        }
 
         let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
             .place_payload_shards(data_pg, req.ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
-        let mut repair_targets = Vec::new();
+        let mut shards = Vec::with_capacity(ec_config.total_shards());
+        let mut valid_shards = 0usize;
 
         for shard_index in 0..ec_config.total_shards() as u8 {
             let shard_key = ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index);
-            let needs_repair = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
+            let location = locations
+                .get(usize::from(shard_index))
+                .copied()
+                .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "inspect shard index {} outside {} placed shards",
+                        shard_index,
+                        locations.len()
+                    ),
+                })?;
+            let validation = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
                 Ok(ack) if ack.stored_size == shard_size as u64 => {
-                    let location = locations
-                        .get(usize::from(shard_index))
-                        .copied()
-                        .ok_or_else(|| StoreError::PayloadShardSetMismatch {
-                            reason: format!(
-                                "inspect shard index {} outside {} placed shards",
-                                shard_index,
-                                locations.len()
-                            ),
-                        })?;
                     match self.read_payload_shard(location, &shard_key, ack) {
-                        Ok(_) => false,
+                        Ok(_) => {
+                            valid_shards += 1;
+                            PlacedSegmentShardValidation::Valid
+                        }
                         Err(error) => {
+                            let reason = error.to_string();
                             placed_segment_recoverable_shard_error(error)?;
-                            true
+                            PlacedSegmentShardValidation::Unreadable { reason }
                         }
                     }
                 }
-                Ok(_) | Err(StoreError::NotFound) => true,
+                Ok(ack) => PlacedSegmentShardValidation::WrongSize {
+                    expected: shard_size as u64,
+                    actual: ack.stored_size,
+                },
+                Err(StoreError::NotFound) => PlacedSegmentShardValidation::MissingAck,
                 Err(error) => return Err(error),
             };
-            if needs_repair {
-                repair_targets.push(ShardIndex::new(shard_index));
-            }
+            shards.push(PlacedSegmentShardHealth {
+                shard_index: ShardIndex::new(shard_index),
+                shard_key,
+                location,
+                validation,
+            });
         }
 
-        if repair_targets.len() > m {
-            return Err(StoreError::NotFound);
-        }
-        Ok(repair_targets)
+        let risk = if valid_shards == ec_config.total_shards() {
+            PlacedSegmentShardSetRisk::Healthy
+        } else if valid_shards >= k {
+            PlacedSegmentShardSetRisk::Degraded {
+                tolerance_remaining: valid_shards - k,
+            }
+        } else {
+            PlacedSegmentShardSetRisk::Unrecoverable
+        };
+
+        Ok(PlacedSegmentShardSetHealth {
+            total_shards: ec_config.total_shards(),
+            required_shards: k,
+            valid_shards,
+            risk,
+            shards,
+        })
     }
 
     pub fn repair_placed_segment_payload_shards_if_needed(

@@ -1798,6 +1798,18 @@ fn placed_segment_recovery_rejects_more_missing_shards_than_ec_can_tolerate() {
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
 
+    let health = cluster.placed_segment_payload_shard_health(req).unwrap();
+    assert_eq!(
+        health.total_shards,
+        usize::from(segment.written.ec.k + segment.written.ec.m)
+    );
+    assert_eq!(health.required_shards, usize::from(segment.written.ec.k));
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Unrecoverable
+    );
+    assert_eq!(health.repair_targets(), missing_shards);
+
     let err = cluster
         .placed_segment_payload_shard_repair_targets(req)
         .unwrap_err();
@@ -1942,6 +1954,32 @@ fn placed_segment_payload_shard_repair_targets_identifies_and_clears_missing_and
         segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
+    let health = cluster.placed_segment_payload_shard_health(req).unwrap();
+    assert_eq!(
+        health.total_shards,
+        usize::from(segment.written.ec.k + segment.written.ec.m)
+    );
+    assert_eq!(health.required_shards, usize::from(segment.written.ec.k));
+    assert_eq!(
+        health.valid_shards,
+        usize::from(segment.written.ec.k + segment.written.ec.m) - 2
+    );
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Degraded {
+            tolerance_remaining: 0,
+        }
+    );
+    assert_eq!(health.repair_targets(), vec![missing_shard, corrupt_shard]);
+    assert!(matches!(
+        health.shards[usize::from(missing_shard.get())].validation,
+        crate::cluster::PlacedSegmentShardValidation::Unreadable { .. }
+    ));
+    assert!(matches!(
+        health.shards[usize::from(corrupt_shard.get())].validation,
+        crate::cluster::PlacedSegmentShardValidation::Unreadable { .. }
+    ));
+
     let targets = cluster
         .placed_segment_payload_shard_repair_targets(req)
         .unwrap();
@@ -1957,6 +1995,12 @@ fn placed_segment_payload_shard_repair_targets_identifies_and_clears_missing_and
             .unwrap(),
         Vec::<ShardIndex>::new()
     );
+    let health = cluster.placed_segment_payload_shard_health(req).unwrap();
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Healthy
+    );
+    assert!(health.repair_targets().is_empty());
 }
 
 #[test]
@@ -2011,19 +2055,79 @@ fn repair_placed_segment_payload_shards_if_needed_noops_for_clean_segment() {
     )
     .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-eleven-clean-repair-noop");
+    let req = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        ec: segment.written.ec,
+    };
+    let health = cluster.placed_segment_payload_shard_health(req).unwrap();
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Healthy
+    );
+    assert_eq!(
+        health.valid_shards,
+        usize::from(segment.written.ec.k + segment.written.ec.m)
+    );
+    assert!(health.repair_targets().is_empty());
 
     let repaired = cluster
-        .repair_placed_segment_payload_shards_if_needed(crate::SegmentStoredBytesRequest {
-            data_pg_id: segment.written.data_pg_id,
-            segment_okh: segment.segment_okh,
-            segment_vid: segment.generation_id,
-            stored_size: segment.payload.len(),
-            segment_crc64: checksum::crc64::checksum(&segment.payload),
-            ec: segment.written.ec,
-        })
+        .repair_placed_segment_payload_shards_if_needed(req)
         .unwrap();
 
     assert!(repaired.is_empty());
+}
+
+#[test]
+fn placed_segment_payload_shard_health_treats_zero_byte_segment_as_full_shard_set() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"");
+    let req = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: 0,
+        segment_crc64: checksum::crc64::checksum(&[]),
+        ec: segment.written.ec,
+    };
+
+    let health = cluster.placed_segment_payload_shard_health(req).unwrap();
+
+    assert_eq!(
+        health.total_shards,
+        usize::from(segment.written.ec.k + segment.written.ec.m)
+    );
+    assert_eq!(health.required_shards, usize::from(segment.written.ec.k));
+    assert_eq!(health.valid_shards, health.total_shards);
+    assert_eq!(
+        health.risk,
+        crate::cluster::PlacedSegmentShardSetRisk::Healthy
+    );
+    assert!(health.repair_targets().is_empty());
+    assert!(health.shards.iter().all(|shard| {
+        matches!(
+            shard.validation,
+            crate::cluster::PlacedSegmentShardValidation::Valid
+        )
+    }));
 }
 
 #[test]

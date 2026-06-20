@@ -7760,6 +7760,13 @@ PG backfill and migration design notes:
   limit should receive increasing priority relative to other background work,
   while still preserving foreground S3 capacity and the rule that new writes
   never intentionally omit shards.
+- Started the read-only backfill foundation by factoring placed-segment shard
+  inspection into a health summary with per-shard validation state, valid shard
+  counts, repair targets, and healthy/degraded/unrecoverable risk. Existing
+  shard repair target selection is now a compatibility wrapper over that health
+  model, so the first backfill risk semantics are exercised by current-route
+  repair tests before historical placement resolution or a mutating backfill
+  worker is added.
 
 Exit criteria:
 
