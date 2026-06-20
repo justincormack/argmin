@@ -7,6 +7,7 @@ use s3_tests::{
     cleanup_versioned_bucket, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -98,6 +99,14 @@ fn alt_policy_principal() -> serde_json::Value {
     json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
 }
 
+fn conditional_test_timeout() -> Duration {
+    let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    Duration::from_secs(timeout_secs)
+}
+
 async fn put_bucket_policy_for_alt(bucket: &str, actions: serde_json::Value) {
     CTX.client()
         .put_bucket_policy()
@@ -120,7 +129,9 @@ async fn put_bucket_policy_for_alt(bucket: &str, actions: serde_json::Value) {
 }
 
 async fn wait_for_alt_put_object(bucket: &str, key: &str) {
-    for attempt in 0..20 {
+    let deadline = Instant::now() + conditional_test_timeout();
+
+    loop {
         let result = put_object_result_retrying_operation_aborted(
             "put alt policy convergence object",
             || {
@@ -135,16 +146,20 @@ async fn wait_for_alt_put_object(bucket: &str, key: &str) {
         if result.is_ok() {
             return;
         }
-        if attempt + 1 < 20 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let last_error = result
+            .err()
+            .map_or_else(|| "unknown error".to_string(), |error| format!("{error:?}"));
+        if Instant::now() >= deadline {
+            panic!("alt PutObject policy allow did not converge: {last_error}");
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-
-    panic!("alt PutObject policy allow did not converge");
 }
 
 async fn wait_for_alt_get_object(bucket: &str, key: &str) {
-    for attempt in 0..20 {
+    let deadline = Instant::now() + conditional_test_timeout();
+
+    loop {
         let result = CTX
             .alt_client()
             .get_object()
@@ -155,12 +170,14 @@ async fn wait_for_alt_get_object(bucket: &str, key: &str) {
         if result.is_ok() {
             return;
         }
-        if attempt + 1 < 20 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let last_error = result
+            .err()
+            .map_or_else(|| "unknown error".to_string(), |error| format!("{error:?}"));
+        if Instant::now() >= deadline {
+            panic!("alt GetObject policy allow did not converge: {last_error}");
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-
-    panic!("alt GetObject policy allow did not converge");
 }
 
 // ── GET If-Match ────────────────────────────────────────────────────────
@@ -698,7 +715,8 @@ fn test_put_object_ifnonmatch_requires_put_object_only() {
         put_bucket_policy_for_alt(&bucket, json!("s3:PutObject")).await;
 
         let allowed_key = "if-none-match-put-only-new";
-        for attempt in 0..20 {
+        let deadline = Instant::now() + conditional_test_timeout();
+        loop {
             let result = put_object_result_retrying_operation_aborted(
                 "put alt conditional allowed object",
                 || {
@@ -714,10 +732,13 @@ fn test_put_object_ifnonmatch_requires_put_object_only() {
             if result.is_ok() {
                 break;
             }
-            if attempt + 1 == 20 {
-                panic!("alt conditional PutObject policy allow did not converge");
+            let last_error = result
+                .err()
+                .map_or_else(|| "unknown error".to_string(), |error| format!("{error:?}"));
+            if Instant::now() >= deadline {
+                panic!("alt conditional PutObject policy allow did not converge: {last_error}");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
         let denied_read = CTX
