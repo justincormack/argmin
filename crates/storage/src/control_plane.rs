@@ -10,7 +10,9 @@ use thiserror::Error;
 
 use crate::{ClusterEpoch, PgId, PgState};
 
-const CLUSTER_MAP_HISTORY_LIMIT: usize = 32;
+// PG backfill can lag a burst of placement changes; retain enough recent
+// snapshots that scanner references can still reconstruct historical routes.
+const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
@@ -1089,6 +1091,14 @@ pub trait ControlPlaneRuntimeMapSource {
         &self,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
+}
+
+pub trait ControlPlaneAdmin {
+    fn set_pg_acting_set(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2174,6 +2184,16 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
     }
 }
 
+impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> {
+    fn set_pg_acting_set(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::set_pg_acting_set(self, pg_id, acting_set)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UnixControlPlaneClient {
     socket_path: PathBuf,
@@ -2226,6 +2246,24 @@ impl UnixControlPlaneClient {
         }
         decode_control_plane_rpc_response(response_payload)
     }
+
+    pub fn set_pg_acting_set(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, pg_id, &acting_set)?;
+        let payload = self.send_request(ControlPlaneRpcKind::SetPgActingSet, &payload)?;
+        let mut reader = PayloadReader::new(&payload);
+        let raw_cluster_epoch = reader.read_u64()?;
+        let cluster_epoch =
+            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
+            })?;
+        reader.finish()?;
+        Ok(cluster_epoch)
+    }
 }
 
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
@@ -2264,7 +2302,7 @@ pub fn handle_control_plane_unix_stream<T>(
     authority_now_ms: u64,
 ) -> Result<(), ControlPlaneError>
 where
-    T: ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
 {
     let request = read_control_plane_unix_request(stream)?;
     let response = build_control_plane_unix_response(control_plane, request, authority_now_ms)?;
@@ -2296,7 +2334,7 @@ pub fn build_control_plane_unix_response<T>(
     authority_now_ms: u64,
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
 where
-    T: ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
 {
     let ControlPlaneRpcRequest { kind, payload } = request;
     let response = match kind {
@@ -2326,6 +2364,19 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::SetPgActingSet => {
+            let mut reader = PayloadReader::new(&payload);
+            let (pg_id, acting_set) = read_pg_acting_set_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane.set_pg_acting_set(pg_id, acting_set) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_u64(&mut response, snapshot.cluster_epoch().get());
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
     };
     let payload = encode_control_plane_rpc_response(response)?;
     Ok(ControlPlaneRpcResponse { kind, payload })
@@ -2345,7 +2396,7 @@ pub fn respond_control_plane_unix_request<T>(
     authority_now_ms: u64,
 ) -> Result<(), ControlPlaneError>
 where
-    T: ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
 {
     let response = build_control_plane_unix_response(control_plane, request, authority_now_ms)?;
     write_control_plane_unix_response(stream, response)
@@ -2355,6 +2406,7 @@ where
 enum ControlPlaneRpcKind {
     RuntimeMapSnapshot = 1,
     RefreshNodeHeartbeat = 2,
+    SetPgActingSet = 3,
 }
 
 impl ControlPlaneRpcKind {
@@ -2362,6 +2414,7 @@ impl ControlPlaneRpcKind {
         match value {
             1 => Ok(Self::RuntimeMapSnapshot),
             2 => Ok(Self::RefreshNodeHeartbeat),
+            3 => Ok(Self::SetPgActingSet),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -2561,6 +2614,32 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         requested_lease_duration_ms,
         pg_observations,
     })
+}
+
+fn write_pg_acting_set_request(
+    out: &mut Vec<u8>,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+) -> Result<(), ControlPlaneError> {
+    write_u32(out, pg_id.get());
+    write_u32(out, len_as_u32(acting_set.len(), "acting set")?);
+    for node_id in acting_set {
+        write_u32(out, node_id.as_u32());
+    }
+    Ok(())
+}
+
+fn read_pg_acting_set_request(
+    reader: &mut PayloadReader<'_>,
+) -> Result<(PgId, Vec<NodeId>), ControlPlaneError> {
+    let pg_id = PgId::new(reader.read_u32()?);
+    let node_count =
+        reader.read_collection_len("acting set", CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN)?;
+    let mut acting_set = Vec::with_capacity(node_count);
+    for _ in 0..node_count {
+        acting_set.push(NodeId::new(reader.read_u32()?));
+    }
+    Ok((pg_id, acting_set))
 }
 
 fn write_heartbeat_lease(
@@ -3536,7 +3615,10 @@ fn validate_current_pg_observations(
                     "node PG observation references PG outside node acting set",
                 ));
             }
-            if pg.state == PgState::Active && observation.state == PgState::Active {
+            if pg.state == PgState::Active
+                && pg.active_primary == Some(node.node_id)
+                && observation.state == PgState::Active
+            {
                 if observation.has_pending_metadata_command {
                     return Err(parse_error(
                         line,
@@ -3920,7 +4002,10 @@ fn validate_pg_heartbeat_observations(
                 pg_id: observation.pg_id.get(),
             });
         }
-        if pg.state == PgState::Active && observation.state == PgState::Active {
+        if pg.state == PgState::Active
+            && pg.active_primary == Some(node_id)
+            && observation.state == PgState::Active
+        {
             if observation.has_pending_metadata_command {
                 return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
                     pg_id: observation.pg_id.get(),
@@ -4532,6 +4617,44 @@ mod tests {
         assert_eq!(
             refresh.runtime_map().nodes()[0].endpoint(),
             "/tmp/argmin-node-1.sock"
+        );
+    }
+
+    #[test]
+    fn unix_control_plane_client_sets_pg_acting_set_live() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let previous_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_000).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let cluster_epoch = client
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch > previous_epoch);
+        let authority =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
+            &[NodeId::new(1), NodeId::new(2)]
         );
     }
 
@@ -6182,6 +6305,84 @@ mod tests {
             .snapshot()
             .runtime_map_for_storage_node_refresh(2_030, NodeId::new(2))
             .is_err());
+    }
+
+    #[test]
+    fn non_primary_active_observation_may_lag_active_primary_metadata_proof() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(path.clone());
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(24), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        for node_id in [1, 2] {
+            heartbeat_with_pg_observation(&mut authority, node_id, 24, PgState::Peering, 2_000);
+        }
+        authority
+            .complete_pg_peering(
+                PgId::new(24),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+
+        let accepted_proof = PgMetadataProof {
+            applied_log_index: 2,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let stale_proof = PgMetadataProof::empty();
+        let mut next_snapshot = authority.snapshot().clone();
+        {
+            let pg = next_snapshot.pgs.get_mut(&PgId::new(24)).unwrap();
+            pg.active_metadata_proof = Some(accepted_proof);
+        }
+        let active_epoch = next_snapshot.cluster_epoch();
+        for node_id in [1, 2] {
+            let node = next_snapshot.nodes.get_mut(&NodeId::new(node_id)).unwrap();
+            node.last_observed_epoch = Some(active_epoch);
+            node.last_heartbeat_ms = Some(2_011);
+            node.lease_deadline_ms = Some(3_011);
+            node.pg_observations.insert(
+                PgId::new(24),
+                NodePgObservationRecord {
+                    pg_id: PgId::new(24),
+                    state: PgState::Active,
+                    observed_epoch: active_epoch,
+                    observed_at_ms: 2_011,
+                    metadata_proof: if node_id == 1 {
+                        accepted_proof
+                    } else {
+                        stale_proof
+                    },
+                    has_pending_metadata_command: false,
+                },
+            );
+        }
+        authority.commit_snapshot(next_snapshot).unwrap();
+
+        let mut stale_replica_heartbeat =
+            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 2_020);
+        stale_replica_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(24),
+            state: PgState::Active,
+            metadata_proof: stale_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(stale_replica_heartbeat, 2_020).unwrap();
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(24), 2_021),
+            Some(NodeId::new(1))
+        );
+        assert!(authority.snapshot().runtime_map(2_021).is_ok());
     }
 
     #[test]

@@ -55,6 +55,7 @@ const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
+const BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 1;
 const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
 const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
@@ -69,6 +70,7 @@ type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundWorkClass {
     KnownDamageRepair,
+    BackfillCandidateScan,
     RoutineBackfill,
     ReclaimCleanup,
     LifecycleCleanup,
@@ -80,6 +82,7 @@ impl BackgroundWorkClass {
     fn name(self) -> &'static str {
         match self {
             Self::KnownDamageRepair => "known_damage_repair",
+            Self::BackfillCandidateScan => "backfill_candidate_scan",
             Self::RoutineBackfill => "routine_backfill",
             Self::ReclaimCleanup => "reclaim_cleanup",
             Self::LifecycleCleanup => "lifecycle_cleanup",
@@ -92,6 +95,7 @@ impl BackgroundWorkClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundWorkAdmissionLimits {
     known_damage_repair: usize,
+    backfill_candidate_scan: usize,
     routine_backfill: usize,
     reclaim_cleanup: usize,
     lifecycle_cleanup: usize,
@@ -103,6 +107,7 @@ impl Default for BackgroundWorkAdmissionLimits {
     fn default() -> Self {
         Self {
             known_damage_repair: BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT,
+            backfill_candidate_scan: BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT,
             routine_backfill: BACKGROUND_ROUTINE_BACKFILL_LIMIT,
             reclaim_cleanup: BACKGROUND_RECLAIM_CLEANUP_LIMIT,
             lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
@@ -117,6 +122,7 @@ struct BackgroundWorkAdmission {
     limits: BackgroundWorkAdmissionLimits,
     pressure: Mutex<BackgroundWorkPressureState>,
     known_damage_repair_active: AtomicUsize,
+    backfill_candidate_scan_active: AtomicUsize,
     routine_backfill_active: AtomicUsize,
     reclaim_cleanup_active: AtomicUsize,
     lifecycle_cleanup_active: AtomicUsize,
@@ -154,6 +160,7 @@ impl BackgroundWorkAdmission {
             limits,
             pressure: Mutex::new(BackgroundWorkPressureState::default()),
             known_damage_repair_active: AtomicUsize::new(0),
+            backfill_candidate_scan_active: AtomicUsize::new(0),
             routine_backfill_active: AtomicUsize::new(0),
             reclaim_cleanup_active: AtomicUsize::new(0),
             lifecycle_cleanup_active: AtomicUsize::new(0),
@@ -200,7 +207,7 @@ impl BackgroundWorkAdmission {
             | BackgroundWorkClass::ReclaimCleanup
             | BackgroundWorkClass::LifecycleCleanup
             | BackgroundWorkClass::StreamSessionCleanup => None,
-            BackgroundWorkClass::RoutineBackfill => {
+            BackgroundWorkClass::BackfillCandidateScan | BackgroundWorkClass::RoutineBackfill => {
                 let pressure = self.observe_pressure();
                 if pressure.foreground {
                     Some("denied_foreground_pressure")
@@ -231,6 +238,7 @@ impl BackgroundWorkAdmission {
     fn counter_for(&self, class: BackgroundWorkClass) -> &AtomicUsize {
         match class {
             BackgroundWorkClass::KnownDamageRepair => &self.known_damage_repair_active,
+            BackgroundWorkClass::BackfillCandidateScan => &self.backfill_candidate_scan_active,
             BackgroundWorkClass::RoutineBackfill => &self.routine_backfill_active,
             BackgroundWorkClass::ReclaimCleanup => &self.reclaim_cleanup_active,
             BackgroundWorkClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
@@ -242,6 +250,7 @@ impl BackgroundWorkAdmission {
     fn limit_for(&self, class: BackgroundWorkClass) -> usize {
         match class {
             BackgroundWorkClass::KnownDamageRepair => self.limits.known_damage_repair,
+            BackgroundWorkClass::BackfillCandidateScan => self.limits.backfill_candidate_scan,
             BackgroundWorkClass::RoutineBackfill => self.limits.routine_backfill,
             BackgroundWorkClass::ReclaimCleanup => self.limits.reclaim_cleanup,
             BackgroundWorkClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
@@ -252,6 +261,7 @@ impl BackgroundWorkAdmission {
 
     fn active_total(&self) -> usize {
         self.known_damage_repair_active.load(Ordering::Acquire)
+            + self.backfill_candidate_scan_active.load(Ordering::Acquire)
             + self.routine_backfill_active.load(Ordering::Acquire)
             + self.reclaim_cleanup_active.load(Ordering::Acquire)
             + self.lifecycle_cleanup_active.load(Ordering::Acquire)
@@ -799,6 +809,10 @@ impl ShardScavengerSweeper {
                                     Some(format_args!("error={error}")),
                                 );
                             }
+                        }
+                        if let Some(_permit) =
+                            admission.try_acquire(BackgroundWorkClass::BackfillCandidateScan)
+                        {
                             match storage_cluster
                                 .enqueue_placed_segment_shard_backfills_from_scavenger_references()
                             {
@@ -812,6 +826,7 @@ impl ShardScavengerSweeper {
                                             already_complete: summary.already_complete,
                                             enqueued: summary.enqueued,
                                             unrecoverable: summary.unrecoverable,
+                                            deferred: summary.deferred,
                                             failed: summary.failed,
                                             limit_reached: summary.limit_reached,
                                         },
@@ -1412,11 +1427,21 @@ fn run_one_placed_segment_shard_backfill(
             }
         }
         Err(error) => {
-            emit_shard_backfill_event(
-                Some(claim.work_item.request.data_pg_id),
-                "failed",
-                None,
-                None,
+            let event = if shard_backfill_error_is_stale_retry(&error) {
+                "stale_retry"
+            } else {
+                "failed"
+            };
+            emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), event, None, None);
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_backfill_error",
+                Some(format_args!(
+                    "pg_id={} source_epoch={} desired_epoch={} error={error}",
+                    claim.work_item.request.data_pg_id,
+                    claim.work_item.source_cluster_epoch,
+                    claim.work_item.desired_cluster_epoch,
+                )),
             );
             let next_attempt_after =
                 Coordinator::now_millis().saturating_add(SHARD_BACKFILL_ERROR_BACKOFF_MILLIS);
@@ -1460,6 +1485,31 @@ fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> Backgrou
     } else {
         BackgroundWorkClass::RoutineBackfill
     }
+}
+
+fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
+    match error {
+        StoreError::ShardStore { source, .. } => shard_backfill_error_is_stale_retry(source),
+        StoreError::StalePayloadOperation { .. }
+        | StoreError::StaleMetadataPrimaryBridge { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::RouteMapExpired { .. }
+        | StoreError::StaleShardOperation { .. }
+        | StoreError::StaleShardLocation { .. }
+        | StoreError::StorageRpcResourceExhausted { .. } => true,
+        StoreError::StorageRpc { message, .. } => {
+            shard_backfill_remote_error_is_stale_retry(message.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn shard_backfill_remote_error_is_stale_retry(message: &str) -> bool {
+    message.starts_with("StaleShardLocation: ")
+        || message.starts_with("InactivePgRoute: ")
+        || message.starts_with("NonActingSetAccess: ")
+        || message.starts_with("WrongClusterEpoch: ")
 }
 
 fn shard_backfill_queue_depth(storage_cluster: &StorageCluster) -> Option<usize> {
@@ -2542,6 +2592,7 @@ mod tests {
         let admission = Arc::new(BackgroundWorkAdmission::with_limits(
             BackgroundWorkAdmissionLimits {
                 known_damage_repair: 1,
+                backfill_candidate_scan: 1,
                 routine_backfill: 1,
                 reclaim_cleanup: 1,
                 lifecycle_cleanup: 1,
@@ -2597,6 +2648,17 @@ mod tests {
 
         drop(repair_permit);
         assert_eq!(admission.active_total(), 3);
+        let backfill_candidate_scan_permit = admission
+            .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
+            .expect("backfill candidate scan should have its own class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
+                .is_none(),
+            "second backfill candidate scan permit should be denied at limit"
+        );
+        assert_eq!(admission.active_total(), 4);
+        drop(backfill_candidate_scan_permit);
         let routine_backfill_permit = admission
             .try_acquire(BackgroundWorkClass::RoutineBackfill)
             .expect("routine backfill should have its own class limit");
@@ -2623,6 +2685,7 @@ mod tests {
         let admission = Arc::new(BackgroundWorkAdmission::with_limits(
             BackgroundWorkAdmissionLimits {
                 known_damage_repair: 1,
+                backfill_candidate_scan: 1,
                 routine_backfill: 1,
                 reclaim_cleanup: 0,
                 lifecycle_cleanup: 0,
@@ -2640,7 +2703,17 @@ mod tests {
                 .is_none(),
             "routine backfill should wait while known-damage work is active"
         );
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
+                .is_none(),
+            "backfill candidate scan should wait while known-damage work is active"
+        );
         drop(repair_permit);
+        let scan_permit = admission
+            .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
+            .expect("backfill candidate scan should run once known-damage work is idle");
+        drop(scan_permit);
         let routine_permit = admission
             .try_acquire(BackgroundWorkClass::RoutineBackfill)
             .expect("routine backfill should run once known-damage work is idle");
@@ -2665,6 +2738,39 @@ mod tests {
             shard_backfill_admission_class(0, 0),
             BackgroundWorkClass::RoutineBackfill
         );
+    }
+
+    #[test]
+    fn shard_backfill_error_classifies_stale_retries() {
+        assert!(shard_backfill_error_is_stale_retry(
+            &StoreError::StalePayloadOperation {
+                pg_id: 7,
+                operation_epoch: storage::ClusterEpoch::INITIAL,
+                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+            }
+        ));
+        assert!(shard_backfill_error_is_stale_retry(
+            &StoreError::ShardStore {
+                node_id: 2,
+                pg_id: 7,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                source: Box::new(StoreError::StaleShardLocation {
+                    node_id: 2,
+                    pg_id: 7,
+                    location_epoch: storage::ClusterEpoch::INITIAL,
+                    current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+                }),
+            }
+        ));
+        assert!(shard_backfill_error_is_stale_retry(
+            &StoreError::StorageRpc {
+                node_id: 2,
+                operation: "shard repair write",
+                message: "StaleShardLocation: request route epoch 10 does not match storage-node epoch 11"
+                    .to_string(),
+            }
+        ));
+        assert!(!shard_backfill_error_is_stale_retry(&StoreError::NotFound));
     }
 
     #[test]

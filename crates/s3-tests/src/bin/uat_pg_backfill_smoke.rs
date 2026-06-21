@@ -1,15 +1,16 @@
 use std::path::Path;
 
 use s3_tests::{
-    build_client_with_ca, delete_bucket_retrying_operation_aborted,
-    delete_object_retrying_operation_aborted, get_object_body_retrying_operation_aborted,
-    put_object_retrying_operation_aborted, retrying_operation_aborted_result, unique_bucket, RT,
+    aws_sdk_s3::error::ProvideErrorMetadata, build_client_with_ca,
+    delete_bucket_retrying_operation_aborted, delete_object_retrying_operation_aborted,
+    get_object_body_retrying_operation_aborted, put_object_retrying_operation_aborted,
+    retrying_operation_aborted_result, unique_bucket, RT,
 };
 use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
     );
     std::process::exit(2);
 }
@@ -78,9 +79,11 @@ async fn get_object_body(
 
 async fn cleanup_bucket(client: &s3_tests::aws_sdk_s3::Client, bucket: &str, keys: &[String]) {
     for key in keys {
-        delete_object_retrying_operation_aborted(client, bucket, key)
-            .await
-            .unwrap_or_else(|error| panic!("delete UAT object {bucket}/{key}: {error:?}"));
+        match delete_object_retrying_operation_aborted(client, bucket, key).await {
+            Ok(_) => {}
+            Err(error) if error.code() == Some("NoSuchBucket") => return,
+            Err(error) => panic!("delete UAT object {bucket}/{key}: {error:?}"),
+        }
     }
     delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
@@ -94,11 +97,11 @@ fn pg_topology_from_env() -> PgTopology {
     PgTopology::new(&pg_ids).expect("UAT PG topology must be valid")
 }
 
-fn choose_key_with_distinct_data_pg(
+fn find_key_with_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
     target_data_pg: Option<u32>,
-) -> (String, u32) {
+) -> Option<(String, u32)> {
     let topology = pg_topology_from_env();
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
     let bucket_pg = topology.bucket_metadata_pg_for(&bucket_name).get();
@@ -117,8 +120,19 @@ fn choose_key_with_distinct_data_pg(
             && data_pg != object_pg
             && target_data_pg.is_none_or(|target| data_pg == target)
         {
-            return (key, data_pg);
+            return Some((key, data_pg));
         }
+    }
+    None
+}
+
+fn choose_key_with_distinct_data_pg(
+    bucket: &str,
+    key_prefix: &str,
+    target_data_pg: Option<u32>,
+) -> (String, u32) {
+    if let Some(key) = find_key_with_distinct_data_pg(bucket, key_prefix, target_data_pg) {
+        return key;
     }
     panic!("could not find UAT key with distinct bucket/object metadata PG and data PG");
 }
@@ -170,14 +184,38 @@ fn main() {
             let Some(body_file) = args.next() else {
                 usage();
             };
+            let target_data_pg = args.next().map(|arg| {
+                arg.into_string()
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_else(|| usage())
+            });
             if args.next().is_some() {
                 usage();
             }
             run(async {
                 let client = client_from_env();
-                let bucket = unique_bucket();
-                create_bucket(&client, &bucket).await;
-                let (key, data_pg) = choose_key_with_distinct_data_pg(&bucket, &key_prefix, None);
+                let (bucket, key, data_pg) = if target_data_pg.is_some() {
+                    let (bucket, key, data_pg) = (0..100)
+                        .find_map(|_| {
+                            let bucket = unique_bucket();
+                            find_key_with_distinct_data_pg(&bucket, &key_prefix, target_data_pg)
+                                .map(|(key, data_pg)| (bucket, key, data_pg))
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "could not find UAT bucket/key for target data PG {target_data_pg:?}"
+                            )
+                        });
+                    create_bucket(&client, &bucket).await;
+                    (bucket, key, data_pg)
+                } else {
+                    let bucket = unique_bucket();
+                    create_bucket(&client, &bucket).await;
+                    let (key, data_pg) =
+                        choose_key_with_distinct_data_pg(&bucket, &key_prefix, None);
+                    (bucket, key, data_pg)
+                };
                 let body = read_body(Path::new(&body_file));
                 put_object(&client, &bucket, &key, body).await;
                 std::fs::write(&bucket_file, format!("{bucket}\n")).unwrap_or_else(|error| {

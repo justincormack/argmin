@@ -147,6 +147,7 @@ static SHARD_BACKFILL_CANDIDATE_ALREADY_QUEUED_TOTAL: AtomicU64 = AtomicU64::new
 static SHARD_BACKFILL_CANDIDATE_ALREADY_COMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_ENQUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_UNRECOVERABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_LIMIT_REACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_SCAN_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1348,6 +1349,7 @@ pub struct ShardBackfillCandidateScanSummary {
     pub already_complete: usize,
     pub enqueued: usize,
     pub unrecoverable: usize,
+    pub deferred: usize,
     pub failed: usize,
     pub limit_reached: bool,
 }
@@ -1462,6 +1464,7 @@ pub struct MetricsSnapshot {
     pub shard_backfill_candidate_already_complete_total: u64,
     pub shard_backfill_candidate_enqueued_total: u64,
     pub shard_backfill_candidate_unrecoverable_total: u64,
+    pub shard_backfill_candidate_deferred_total: u64,
     pub shard_backfill_candidate_failed_total: u64,
     pub shard_backfill_candidate_limit_reached_total: u64,
     pub shard_backfill_candidate_scan_error_total: u64,
@@ -1741,6 +1744,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         shard_backfill_candidate_enqueued_total: SHARD_BACKFILL_CANDIDATE_ENQUEUED_TOTAL
             .load(Ordering::Relaxed),
         shard_backfill_candidate_unrecoverable_total: SHARD_BACKFILL_CANDIDATE_UNRECOVERABLE_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_deferred_total: SHARD_BACKFILL_CANDIDATE_DEFERRED_TOTAL
             .load(Ordering::Relaxed),
         shard_backfill_candidate_failed_total: SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL
             .load(Ordering::Relaxed),
@@ -2726,6 +2731,7 @@ pub fn emit_shard_backfill_candidate_scan(
     SHARD_BACKFILL_CANDIDATE_ENQUEUED_TOTAL.fetch_add(summary.enqueued as u64, Ordering::Relaxed);
     SHARD_BACKFILL_CANDIDATE_UNRECOVERABLE_TOTAL
         .fetch_add(summary.unrecoverable as u64, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_DEFERRED_TOTAL.fetch_add(summary.deferred as u64, Ordering::Relaxed);
     SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL.fetch_add(summary.failed as u64, Ordering::Relaxed);
     if summary.limit_reached {
         SHARD_BACKFILL_CANDIDATE_LIMIT_REACHED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -2734,13 +2740,14 @@ pub fn emit_shard_backfill_candidate_scan(
         return false;
     };
     let detail = format!(
-        "scanned={} current_epoch={} already_queued={} already_complete={} enqueued={} unrecoverable={} failed={} limit_reached={}",
+        "scanned={} current_epoch={} already_queued={} already_complete={} enqueued={} unrecoverable={} deferred={} failed={} limit_reached={}",
         summary.scanned,
         summary.current_epoch,
         summary.already_queued,
         summary.already_complete,
         summary.enqueued,
         summary.unrecoverable,
+        summary.deferred,
         summary.failed,
         summary.limit_reached,
     );
@@ -3556,6 +3563,7 @@ mod tests {
                 already_complete: 1,
                 enqueued: 3,
                 unrecoverable: 1,
+                deferred: 6,
                 failed: 4,
                 limit_reached: true,
             },
@@ -3900,6 +3908,10 @@ mod tests {
         assert_eq!(
             after.shard_backfill_candidate_unrecoverable_total,
             before.shard_backfill_candidate_unrecoverable_total + 1
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_deferred_total,
+            before.shard_backfill_candidate_deferred_total + 6
         );
         assert_eq!(
             after.shard_backfill_candidate_failed_total,

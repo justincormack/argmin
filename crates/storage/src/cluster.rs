@@ -784,6 +784,7 @@ pub struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
     pub already_complete: usize,
     pub enqueued: usize,
     pub unrecoverable: usize,
+    pub deferred: usize,
     pub failed: usize,
     pub limit_reached: bool,
 }
@@ -7255,13 +7256,29 @@ impl StorageCluster {
             if route.state() != PgState::Active {
                 continue;
             }
-            let node = self
+            let node = match self
                 .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
-            for reference in node
-                .shard_scavenger_client()
-                .list_shard_scavenger_payload_references(route.pg_id())?
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())
             {
+                Ok(node) => node,
+                Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
+                    summary.deferred += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let references = match node
+                .shard_scavenger_client()
+                .list_shard_scavenger_payload_references(route.pg_id())
+            {
+                Ok(references) => references,
+                Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
+                    summary.deferred += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for reference in references {
                 let Some((request, source_epoch)) =
                     self.backfill_candidate_from_scavenger_reference(reference)
                 else {
@@ -7286,8 +7303,8 @@ impl StorageCluster {
                         continue;
                     }
                     Ok(false) => {}
-                    Err(_) => {
-                        summary.failed += 1;
+                    Err(error) => {
+                        note_shard_backfill_candidate_error(&mut summary, &error);
                         continue;
                     }
                 }
@@ -7299,27 +7316,42 @@ impl StorageCluster {
                 let pg_id = PgId::new(request.data_pg_id);
                 let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
                     Ok(route) => route,
-                    Err(_) => {
-                        summary.failed += 1;
+                    Err(error) => {
+                        note_shard_backfill_candidate_error(&mut summary, &error);
                         continue;
                     }
                 };
                 let desired_route = match self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch)
                 {
                     Ok(route) => route,
-                    Err(_) => {
-                        summary.failed += 1;
+                    Err(error) => {
+                        note_shard_backfill_candidate_error(&mut summary, &error);
                         continue;
                     }
                 };
+                match self.placed_segment_payload_shard_locations_are_equal(
+                    &source_route,
+                    &desired_route,
+                    request,
+                ) {
+                    Ok(true) => {
+                        summary.already_complete += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        note_shard_backfill_candidate_error(&mut summary, &error);
+                        continue;
+                    }
+                }
                 let plan = match self.placed_segment_payload_shard_backfill_plan(
                     &source_route,
                     &desired_route,
                     request,
                 ) {
                     Ok(plan) => plan,
-                    Err(_) => {
-                        summary.failed += 1;
+                    Err(error) => {
+                        note_shard_backfill_candidate_error(&mut summary, &error);
                         continue;
                     }
                 };
@@ -7337,15 +7369,50 @@ impl StorageCluster {
                         plan.source_remaining_tolerance(),
                         None,
                     )
+                    .map_err(|error| note_shard_backfill_candidate_error(&mut summary, &error))
                     .is_err()
                 {
-                    summary.failed += 1;
                     continue;
                 }
                 summary.enqueued += 1;
             }
         }
         Ok(summary)
+    }
+
+    fn placed_segment_payload_shard_locations_are_equal(
+        &self,
+        source_route: &PgRouteSnapshot,
+        desired_route: &PgRouteSnapshot,
+        req: SegmentStoredBytesRequest,
+    ) -> Result<bool, StoreError> {
+        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
+        let source_locations = self
+            .place_payload_shards_for_pg_route_snapshot(
+                source_route,
+                data_pg,
+                req.ec,
+                &placement_key,
+            )
+            .map_err(cluster_build_error_to_store)?;
+        let desired_locations = self
+            .place_payload_shards_for_pg_route_snapshot(
+                desired_route,
+                data_pg,
+                req.ec,
+                &placement_key,
+            )
+            .map_err(cluster_build_error_to_store)?;
+        Ok(source_locations.len() == desired_locations.len()
+            && source_locations
+                .iter()
+                .zip(desired_locations.iter())
+                .all(|(source, desired)| {
+                    source.data_pg_id() == desired.data_pg_id()
+                        && source.shard_index() == desired.shard_index()
+                        && source.node_id() == desired.node_id()
+                }))
     }
 
     fn backfill_candidate_from_scavenger_reference(
@@ -7811,8 +7878,16 @@ impl StorageCluster {
         let pg_id = PgId::new(work_item.request.data_pg_id);
         let source_route =
             self.reconstructed_pg_route_at_epoch(pg_id, work_item.source_cluster_epoch)?;
-        let desired_route =
-            self.reconstructed_pg_route_at_epoch(pg_id, work_item.desired_cluster_epoch)?;
+        // Backfill rows capture the desired global epoch observed by the scanner. Later
+        // unrelated PG changes can supersede that epoch while this PG's target route is
+        // still the current desired placement, so execute toward the current route once
+        // this handle has caught up to the recorded desired epoch.
+        let desired_epoch = if self.operation_epoch() >= work_item.desired_cluster_epoch {
+            self.operation_epoch()
+        } else {
+            work_item.desired_cluster_epoch
+        };
+        let desired_route = self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch)?;
         self.backfill_placed_segment_payload_shards(
             &source_route,
             &desired_route,
@@ -9029,6 +9104,44 @@ fn build_placed_segment_shard_backfill_plan(
         reconstruction_targets,
         unrecoverable_targets,
     })
+}
+
+fn note_shard_backfill_candidate_error(
+    summary: &mut PlacedSegmentShardBackfillCandidateEnqueueSummary,
+    error: &StoreError,
+) {
+    if shard_backfill_candidate_error_is_deferred(error) {
+        summary.deferred += 1;
+    } else {
+        summary.failed += 1;
+    }
+}
+
+fn shard_backfill_candidate_error_is_deferred(error: &StoreError) -> bool {
+    match error {
+        StoreError::ShardStore { source, .. } => shard_backfill_candidate_error_is_deferred(source),
+        StoreError::PgNotActive { .. }
+        | StoreError::ShardPgNotActive { .. }
+        | StoreError::StalePayloadOperation { .. }
+        | StoreError::StaleMetadataPrimaryBridge { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::RouteMapExpired { .. }
+        | StoreError::StaleShardOperation { .. }
+        | StoreError::StaleShardLocation { .. }
+        | StoreError::StorageRpcResourceExhausted { .. } => true,
+        StoreError::StorageRpc { message, .. } => {
+            is_retryable_remote_pg_route_error(message.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn is_retryable_remote_pg_route_error(message: &str) -> bool {
+    message.starts_with("StaleShardLocation: ")
+        || message.starts_with("InactivePgRoute: ")
+        || message.starts_with("NonActingSetAccess: ")
+        || message.starts_with("WrongClusterEpoch: ")
 }
 
 fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<ErasureCodec, StoreError> {

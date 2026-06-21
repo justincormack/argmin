@@ -684,7 +684,7 @@ async fn handle(
     );
 
     if state.config.local_debug_endpoint {
-        if let Some(resp) = local_debug_response(req.method(), req.uri().path()) {
+        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
             return Ok(s3_response_to_hyper(
                 resp,
                 None,
@@ -969,10 +969,14 @@ async fn handle(
     ))
 }
 
-fn local_debug_response(method: &http::Method, path: &str) -> Option<S3Response> {
+fn local_debug_response(
+    state: &Arc<ServerState>,
+    method: &http::Method,
+    path: &str,
+) -> Option<S3Response> {
     match (method, path) {
         (&http::Method::GET, "/__argmin/debug/metrics") => {
-            let body = local_debug_metrics_body();
+            let body = local_debug_metrics_body(state);
             Some(S3Response {
                 status_code: 200,
                 headers: vec![
@@ -1017,12 +1021,25 @@ fn local_debug_response(method: &http::Method, path: &str) -> Option<S3Response>
     }
 }
 
-fn local_debug_metrics_body() -> String {
+fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
     use std::fmt::Write as _;
 
     let snapshot = observability::metrics_snapshot();
+    let frontend_storage_cluster_epoch = state
+        .pool
+        .iter()
+        .map(|frontend| {
+            frontend
+                .coordinator
+                .storage_node_for_request()
+                .cluster_epoch()
+                .get()
+        })
+        .max()
+        .unwrap_or(0);
     let mut body = format!(
         concat!(
+            "frontend_storage_cluster_epoch {}\n",
             "request_start_total {}\n",
             "inflight_requests {}\n",
             "request_finish_total {}\n",
@@ -1089,6 +1106,7 @@ fn local_debug_metrics_body() -> String {
             "shard_backfill_candidate_already_complete_total {}\n",
             "shard_backfill_candidate_enqueued_total {}\n",
             "shard_backfill_candidate_unrecoverable_total {}\n",
+            "shard_backfill_candidate_deferred_total {}\n",
             "shard_backfill_candidate_failed_total {}\n",
             "shard_backfill_candidate_limit_reached_total {}\n",
             "shard_backfill_candidate_scan_error_total {}\n",
@@ -1107,6 +1125,7 @@ fn local_debug_metrics_body() -> String {
             "stream_upload_segment_append_error_total {}\n",
             "stream_upload_finalize_error_total {}\n"
         ),
+        frontend_storage_cluster_epoch,
         snapshot.request_start_total,
         snapshot.inflight_requests,
         snapshot.request_finish_total,
@@ -1173,6 +1192,7 @@ fn local_debug_metrics_body() -> String {
         snapshot.shard_backfill_candidate_already_complete_total,
         snapshot.shard_backfill_candidate_enqueued_total,
         snapshot.shard_backfill_candidate_unrecoverable_total,
+        snapshot.shard_backfill_candidate_deferred_total,
         snapshot.shard_backfill_candidate_failed_total,
         snapshot.shard_backfill_candidate_limit_reached_total,
         snapshot.shard_backfill_candidate_scan_error_total,
@@ -4648,6 +4668,7 @@ mod tests {
         assert!(response.contains("shard_backfill_candidate_already_complete_total "));
         assert!(response.contains("shard_backfill_candidate_enqueued_total "));
         assert!(response.contains("shard_backfill_candidate_unrecoverable_total "));
+        assert!(response.contains("shard_backfill_candidate_deferred_total "));
         assert!(response.contains("shard_backfill_candidate_failed_total "));
         assert!(response.contains("shard_backfill_candidate_limit_reached_total "));
         assert!(response.contains("shard_backfill_candidate_scan_error_total "));

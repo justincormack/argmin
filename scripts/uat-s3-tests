@@ -149,9 +149,6 @@ fi
 if ! [[ "$repeat_count" =~ ^[1-9][0-9]*$ ]]; then
     die "--repeat must be a positive integer"
 fi
-if [[ -n "$smoke" && "$repeat_count" != "1" ]]; then
-    die "--repeat cannot be combined with --smoke"
-fi
 if [[ -n "$server_binary" ]]; then
     if [[ "$server_binary" == */* ]]; then
         [[ -x "$server_binary" ]] || die "--binary path is not executable: $server_binary"
@@ -186,11 +183,18 @@ if [[ "$smoke" == "pg-backfill-migration" ]]; then
     export ARGMIN_EC_K=1
     export ARGMIN_EC_M=1
     export ARGMIN_LOCAL_NODE_COUNT=3
-    export ARGMIN_PG_COUNT=3
+    pg_backfill_default_pg_count="$repeat_count"
+    if ((pg_backfill_default_pg_count < 3)); then
+        pg_backfill_default_pg_count=3
+    fi
+    export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$pg_backfill_default_pg_count}"
     export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
-    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-5000}"
+    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
+    if ((repeat_count > ARGMIN_PG_COUNT)); then
+        die "pg-backfill-migration --repeat requires ARGMIN_PG_COUNT >= repeat count"
+    fi
 fi
 if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
@@ -202,6 +206,8 @@ mkdir -p "$logs_dir"
 mkdir -p "$sockets_dir"
 chmod 700 "$sockets_dir"
 server_log="$logs_dir/argmin-s3.log"
+shard_repair_smoke_cmd=()
+pg_backfill_smoke_cmd=()
 
 host="${listen_addr%:*}"
 port="${listen_addr##*:}"
@@ -430,18 +436,17 @@ set_pg_acting_set() {
     shift
     shift
     echo "== argmin-s3 UAT set PG $pg_id acting set: $label =="
-    kill_control_plane
-    print_command "${server_cmd[@]}" control-plane-set-pg-acting-set "$control_plane_state_path" "$pg_id" "$@"
-    "${server_cmd[@]}" control-plane-set-pg-acting-set "$control_plane_state_path" "$pg_id" "$@"
-    start_control_plane
-    wait_for_control_plane_socket
+    print_command "${server_cmd[@]}" control-plane-set-pg-acting-set-live "$control_plane_socket_path" "$pg_id" "$@"
+    "${server_cmd[@]}" control-plane-set-pg-acting-set-live "$control_plane_socket_path" "$pg_id" "$@"
 }
 
 set_all_pg_acting_sets() {
     local label="$1"
     shift
     for ((pg_id = 0; pg_id < ARGMIN_PG_COUNT; pg_id++)); do
-        set_pg_acting_set "$label" "$pg_id" "$@"
+        echo "== argmin-s3 UAT set PG $pg_id acting set: $label =="
+        print_command "${server_cmd[@]}" control-plane-set-pg-acting-set-live "$control_plane_socket_path" "$pg_id" "$@"
+        "${server_cmd[@]}" control-plane-set-pg-acting-set-live "$control_plane_socket_path" "$pg_id" "$@"
     done
 }
 
@@ -474,29 +479,7 @@ wait_for_control_plane_node_epochs_aligned() {
     start="$(date +%s)"
     while true; do
         local aligned_epoch
-        aligned_epoch="$(
-            awk -F, -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
-                /^node=/ {
-                    if ($2 != "active" || $3 != "healthy" || $5 !~ /^[0-9]+$/) {
-                        ok = 0
-                        bad = 1
-                        next
-                    }
-                    count += 1
-                    if (epoch == "") {
-                        epoch = $5
-                    } else if ($5 != epoch) {
-                        ok = 0
-                        bad = 1
-                    }
-                }
-                END {
-                    if (count == expected_count && bad != 1 && epoch != "") {
-                        print epoch
-                    }
-                }
-            ' "$control_plane_state_path"
-        )"
+        aligned_epoch="$(control_plane_node_aligned_epoch)"
         if [[ -n "$aligned_epoch" ]]; then
             echo "== argmin-s3 UAT storage nodes aligned at runtime epoch $aligned_epoch =="
             return 0
@@ -504,6 +487,80 @@ wait_for_control_plane_node_epochs_aligned() {
         if (($(date +%s) - start >= deadline_seconds)); then
             tail -n 80 "$control_plane_state_path" >&2 || true
             die "timed out waiting for storage-node runtime-map epochs to align"
+        fi
+        sleep 0.1
+    done
+}
+
+control_plane_node_aligned_epoch() {
+    awk -F, -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
+        /^node=/ {
+            if ($2 != "active" || $3 != "healthy" || $5 !~ /^[0-9]+$/) {
+                ok = 0
+                bad = 1
+                next
+            }
+            count += 1
+            if (epoch == "") {
+                epoch = $5
+            } else if ($5 != epoch) {
+                ok = 0
+                bad = 1
+            }
+        }
+        END {
+            if (count == expected_count && bad != 1 && epoch != "") {
+                print epoch
+            }
+        }
+    ' "$control_plane_state_path"
+}
+
+wait_for_control_plane_runtime_map_ready() {
+    local deadline_seconds="$1"
+    local min_epoch="${2:-1}"
+    local start
+    start="$(date +%s)"
+    while true; do
+        local map_status
+        if map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>/dev/null)"; then
+            local runtime_epoch
+            local pg_routes
+            local active_serving_pg_routes
+            read -r runtime_epoch pg_routes active_serving_pg_routes <<<"$map_status"
+            if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$pg_routes" =~ ^[0-9]+$ && "$active_serving_pg_routes" =~ ^[0-9]+$ ]] \
+                && ((runtime_epoch >= min_epoch && pg_routes == ARGMIN_PG_COUNT && active_serving_pg_routes == ARGMIN_PG_COUNT)); then
+                echo "== argmin-s3 UAT control-plane runtime map ready at epoch $runtime_epoch with $active_serving_pg_routes/$pg_routes serving PG routes =="
+                return 0
+            fi
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            "${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" >&2 || true
+            tail -n 120 "$control_plane_state_path" >&2 || true
+            die "timed out waiting for control-plane runtime map readiness"
+        fi
+        sleep 0.1
+    done
+}
+
+wait_for_frontend_storage_epoch_at_least() {
+    local expected_epoch="$1"
+    local deadline_seconds="$2"
+    local metrics_path="$3"
+    local start
+    start="$(date +%s)"
+    while true; do
+        if sample_frontend_metrics "$metrics_path"; then
+            local frontend_epoch
+            frontend_epoch="$(latest_metric_sample_value "$metrics_path" frontend_storage_cluster_epoch)"
+            if ((frontend_epoch >= expected_epoch)); then
+                echo "== argmin-s3 UAT frontend storage epoch $frontend_epoch >= $expected_epoch =="
+                return 0
+            fi
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            cat "$metrics_path" >&2 || true
+            die "timed out waiting for frontend storage epoch to reach $expected_epoch"
         fi
         sleep 0.1
     done
@@ -635,6 +692,20 @@ wait_for_shard_repair_completion_metrics() {
 wait_for_shard_backfill_completion_metrics() {
     local metrics_path="$1"
     local deadline_seconds="$2"
+    local min_scan_total="${3:-1}"
+    local min_enqueued="${4:-1}"
+    local min_written="${5:-1}"
+    local min_completed="${6:-1}"
+    local min_routine_admitted="${7:-1}"
+    local min_routine_finished="${8:-1}"
+    local max_candidate_failed="${9:-0}"
+    local max_scan_error="${10:-0}"
+    local max_complete_failed="${11:-0}"
+    local max_failed="${12:-0}"
+    local max_record_error_failed="${13:-0}"
+    local target_pg_id="${14:-}"
+    local min_pg_backfilled="${15:-0}"
+    local min_pg_completed="${16:-0}"
     local start
     start="$(date +%s)"
     while true; do
@@ -646,6 +717,15 @@ wait_for_shard_backfill_completion_metrics() {
         local queue_depth
         local routine_admitted
         local routine_finished
+        local candidate_failed
+        local candidate_deferred
+        local scan_error
+        local complete_failed
+        local failed
+        local stale_retry
+        local record_error_failed
+        local pg_backfilled=0
+        local pg_completed=0
         scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
         enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
         written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
@@ -653,8 +733,23 @@ wait_for_shard_backfill_completion_metrics() {
         queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
         routine_admitted="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill)"
         routine_finished="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill)"
-        if ((scan_total >= 1 && enqueued >= 1 && written >= 1 && completed >= 1 && queue_depth == 0 && routine_admitted >= 1 && routine_finished >= 1)); then
-            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished =="
+        candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
+        candidate_deferred="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_deferred_total)"
+        scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
+        complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
+        failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
+        stale_retry="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event stale_retry)"
+        record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
+        if [[ -n "$target_pg_id" ]]; then
+            pg_backfilled="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$target_pg_id" event backfilled)"
+            pg_completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$target_pg_id" event complete_succeeded)"
+        fi
+        if ((candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
+            cat "$metrics_path" >&2 || true
+            die "shard backfill worker hard-failure metrics increased: candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
+        fi
+        if ((scan_total >= min_scan_total && enqueued >= min_enqueued && written >= min_written && completed >= min_completed && queue_depth == 0 && routine_admitted >= min_routine_admitted && routine_finished >= min_routine_finished && pg_backfilled >= min_pg_backfilled && pg_completed >= min_pg_completed)); then
+            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed candidate_deferred=$candidate_deferred candidate_failed=$candidate_failed scan_error=$scan_error stale_retry=$stale_retry failed=$failed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished pg_id=${target_pg_id:-any} pg_backfilled=$pg_backfilled pg_complete_succeeded=$pg_completed =="
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
@@ -736,6 +831,7 @@ print_slowdown_summary() {
         local shard_backfill_candidate_already_complete
         local shard_backfill_candidate_enqueued
         local shard_backfill_candidate_unrecoverable
+        local shard_backfill_candidate_deferred
         local shard_backfill_candidate_failed
         local shard_backfill_candidate_limit_reached
         local shard_backfill_candidate_scan_error
@@ -747,6 +843,7 @@ print_slowdown_summary() {
         local shard_backfill_complete_succeeded
         local shard_backfill_complete_stale
         local shard_backfill_complete_failed
+        local shard_backfill_stale_retry
         local shard_backfill_failed
         local shard_backfill_record_error_failed
         local background_work_event
@@ -758,6 +855,11 @@ print_slowdown_summary() {
         local background_work_known_damage_denied_foreground_pressure
         local background_work_known_damage_denied_backlog_pressure
         local background_work_known_damage_finished
+        local background_work_backfill_candidate_scan_admitted
+        local background_work_backfill_candidate_scan_denied_limit
+        local background_work_backfill_candidate_scan_denied_foreground_pressure
+        local background_work_backfill_candidate_scan_denied_backlog_pressure
+        local background_work_backfill_candidate_scan_finished
         local background_work_routine_backfill_admitted
         local background_work_routine_backfill_denied_limit
         local background_work_routine_backfill_denied_foreground_pressure
@@ -844,6 +946,7 @@ print_slowdown_summary() {
         shard_backfill_candidate_already_complete="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_already_complete_total)"
         shard_backfill_candidate_enqueued="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_enqueued_total)"
         shard_backfill_candidate_unrecoverable="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_unrecoverable_total)"
+        shard_backfill_candidate_deferred="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_deferred_total)"
         shard_backfill_candidate_failed="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_failed_total)"
         shard_backfill_candidate_limit_reached="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_limit_reached_total)"
         shard_backfill_candidate_scan_error="$(latest_metric_sample_value "$metrics_log" shard_backfill_candidate_scan_error_total)"
@@ -855,6 +958,7 @@ print_slowdown_summary() {
         shard_backfill_complete_succeeded="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event complete_succeeded)"
         shard_backfill_complete_stale="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event complete_stale)"
         shard_backfill_complete_failed="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event complete_failed)"
+        shard_backfill_stale_retry="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event stale_retry)"
         shard_backfill_failed="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event failed)"
         shard_backfill_record_error_failed="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event record_error_failed)"
         background_work_event="$(latest_metric_sample_value "$metrics_log" background_work_admission_event_total)"
@@ -866,6 +970,11 @@ print_slowdown_summary() {
         background_work_known_damage_denied_foreground_pressure="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_foreground_pressure class known_damage_repair)"
         background_work_known_damage_denied_backlog_pressure="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_backlog_pressure class known_damage_repair)"
         background_work_known_damage_finished="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event finished class known_damage_repair)"
+        background_work_backfill_candidate_scan_admitted="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event admitted class backfill_candidate_scan)"
+        background_work_backfill_candidate_scan_denied_limit="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_limit class backfill_candidate_scan)"
+        background_work_backfill_candidate_scan_denied_foreground_pressure="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_foreground_pressure class backfill_candidate_scan)"
+        background_work_backfill_candidate_scan_denied_backlog_pressure="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_backlog_pressure class backfill_candidate_scan)"
+        background_work_backfill_candidate_scan_finished="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event finished class backfill_candidate_scan)"
         background_work_routine_backfill_admitted="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event admitted class routine_backfill)"
         background_work_routine_backfill_denied_limit="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_limit class routine_backfill)"
         background_work_routine_backfill_denied_foreground_pressure="$(latest_metric_family_label_sum "$metrics_log" background_work_admission_by_class_total event denied_foreground_pressure class routine_backfill)"
@@ -904,10 +1013,10 @@ print_slowdown_summary() {
         echo "shard_repair queue_depth=$shard_repair_queue_depth event_total=$shard_repair_event shards_rewritten_total=$shard_repair_shards_rewritten" >&2
         echo "shard_repair_events durable_scan_empty=$shard_repair_durable_scan_empty durable_scan_queued=$shard_repair_durable_scan_queued durable_scan_no_new_enqueue=$shard_repair_durable_scan_no_new_enqueue queued=$shard_repair_queued queue_full=$shard_repair_queue_full deduped=$shard_repair_deduped started=$shard_repair_started resolved_clean=$shard_repair_resolved_clean repaired=$shard_repair_repaired complete_succeeded=$shard_repair_complete_succeeded complete_stale=$shard_repair_complete_stale complete_failed=$shard_repair_complete_failed failed=$shard_repair_failed unrecoverable=$shard_repair_unrecoverable" >&2
         echo "shard_backfill queue_depth=$shard_backfill_queue_depth event_total=$shard_backfill_event shards_written_total=$shard_backfill_shards_written" >&2
-        echo "shard_backfill_candidate_scan scan_total=$shard_backfill_candidate_scan scanned_total=$shard_backfill_candidate_scanned current_epoch_total=$shard_backfill_candidate_current_epoch already_queued_total=$shard_backfill_candidate_already_queued already_complete_total=$shard_backfill_candidate_already_complete enqueued_total=$shard_backfill_candidate_enqueued unrecoverable_total=$shard_backfill_candidate_unrecoverable failed_total=$shard_backfill_candidate_failed limit_reached_total=$shard_backfill_candidate_limit_reached scan_error_total=$shard_backfill_candidate_scan_error" >&2
-        echo "shard_backfill_events durable_scan_no_claim=$shard_backfill_durable_scan_no_claim claim_started=$shard_backfill_claim_started started=$shard_backfill_started resolved_clean=$shard_backfill_resolved_clean backfilled=$shard_backfill_backfilled complete_succeeded=$shard_backfill_complete_succeeded complete_stale=$shard_backfill_complete_stale complete_failed=$shard_backfill_complete_failed failed=$shard_backfill_failed record_error_failed=$shard_backfill_record_error_failed" >&2
+        echo "shard_backfill_candidate_scan scan_total=$shard_backfill_candidate_scan scanned_total=$shard_backfill_candidate_scanned current_epoch_total=$shard_backfill_candidate_current_epoch already_queued_total=$shard_backfill_candidate_already_queued already_complete_total=$shard_backfill_candidate_already_complete enqueued_total=$shard_backfill_candidate_enqueued unrecoverable_total=$shard_backfill_candidate_unrecoverable deferred_total=$shard_backfill_candidate_deferred failed_total=$shard_backfill_candidate_failed limit_reached_total=$shard_backfill_candidate_limit_reached scan_error_total=$shard_backfill_candidate_scan_error" >&2
+        echo "shard_backfill_events durable_scan_no_claim=$shard_backfill_durable_scan_no_claim claim_started=$shard_backfill_claim_started started=$shard_backfill_started resolved_clean=$shard_backfill_resolved_clean backfilled=$shard_backfill_backfilled complete_succeeded=$shard_backfill_complete_succeeded complete_stale=$shard_backfill_complete_stale complete_failed=$shard_backfill_complete_failed stale_retry=$shard_backfill_stale_retry failed=$shard_backfill_failed record_error_failed=$shard_backfill_record_error_failed" >&2
         echo "background_work event_total=$background_work_event active=$background_work_active finished=$background_work_finished elapsed_us_total=$background_work_elapsed_us" >&2
-        echo "background_work_classes known_damage_repair_admitted=$background_work_known_damage_admitted known_damage_repair_denied_limit=$background_work_known_damage_denied_limit known_damage_repair_denied_foreground_pressure=$background_work_known_damage_denied_foreground_pressure known_damage_repair_denied_backlog_pressure=$background_work_known_damage_denied_backlog_pressure known_damage_repair_finished=$background_work_known_damage_finished routine_backfill_admitted=$background_work_routine_backfill_admitted routine_backfill_denied_limit=$background_work_routine_backfill_denied_limit routine_backfill_denied_foreground_pressure=$background_work_routine_backfill_denied_foreground_pressure routine_backfill_denied_backlog_pressure=$background_work_routine_backfill_denied_backlog_pressure routine_backfill_finished=$background_work_routine_backfill_finished reclaim_cleanup_admitted=$background_work_reclaim_cleanup_admitted reclaim_cleanup_denied_limit=$background_work_reclaim_cleanup_denied_limit reclaim_cleanup_denied_foreground_pressure=$background_work_reclaim_cleanup_denied_foreground_pressure reclaim_cleanup_denied_backlog_pressure=$background_work_reclaim_cleanup_denied_backlog_pressure reclaim_cleanup_finished=$background_work_reclaim_cleanup_finished lifecycle_cleanup_admitted=$background_work_lifecycle_cleanup_admitted lifecycle_cleanup_denied_limit=$background_work_lifecycle_cleanup_denied_limit lifecycle_cleanup_denied_foreground_pressure=$background_work_lifecycle_cleanup_denied_foreground_pressure lifecycle_cleanup_denied_backlog_pressure=$background_work_lifecycle_cleanup_denied_backlog_pressure lifecycle_cleanup_finished=$background_work_lifecycle_cleanup_finished stream_session_cleanup_admitted=$background_work_stream_session_cleanup_admitted stream_session_cleanup_denied_limit=$background_work_stream_session_cleanup_denied_limit stream_session_cleanup_denied_foreground_pressure=$background_work_stream_session_cleanup_denied_foreground_pressure stream_session_cleanup_denied_backlog_pressure=$background_work_stream_session_cleanup_denied_backlog_pressure stream_session_cleanup_finished=$background_work_stream_session_cleanup_finished opportunistic_scan_admitted=$background_work_opportunistic_scan_admitted opportunistic_scan_denied_limit=$background_work_opportunistic_scan_denied_limit opportunistic_scan_denied_foreground_pressure=$background_work_opportunistic_scan_denied_foreground_pressure opportunistic_scan_denied_backlog_pressure=$background_work_opportunistic_scan_denied_backlog_pressure opportunistic_scan_finished=$background_work_opportunistic_scan_finished" >&2
+        echo "background_work_classes known_damage_repair_admitted=$background_work_known_damage_admitted known_damage_repair_denied_limit=$background_work_known_damage_denied_limit known_damage_repair_denied_foreground_pressure=$background_work_known_damage_denied_foreground_pressure known_damage_repair_denied_backlog_pressure=$background_work_known_damage_denied_backlog_pressure known_damage_repair_finished=$background_work_known_damage_finished backfill_candidate_scan_admitted=$background_work_backfill_candidate_scan_admitted backfill_candidate_scan_denied_limit=$background_work_backfill_candidate_scan_denied_limit backfill_candidate_scan_denied_foreground_pressure=$background_work_backfill_candidate_scan_denied_foreground_pressure backfill_candidate_scan_denied_backlog_pressure=$background_work_backfill_candidate_scan_denied_backlog_pressure backfill_candidate_scan_finished=$background_work_backfill_candidate_scan_finished routine_backfill_admitted=$background_work_routine_backfill_admitted routine_backfill_denied_limit=$background_work_routine_backfill_denied_limit routine_backfill_denied_foreground_pressure=$background_work_routine_backfill_denied_foreground_pressure routine_backfill_denied_backlog_pressure=$background_work_routine_backfill_denied_backlog_pressure routine_backfill_finished=$background_work_routine_backfill_finished reclaim_cleanup_admitted=$background_work_reclaim_cleanup_admitted reclaim_cleanup_denied_limit=$background_work_reclaim_cleanup_denied_limit reclaim_cleanup_denied_foreground_pressure=$background_work_reclaim_cleanup_denied_foreground_pressure reclaim_cleanup_denied_backlog_pressure=$background_work_reclaim_cleanup_denied_backlog_pressure reclaim_cleanup_finished=$background_work_reclaim_cleanup_finished lifecycle_cleanup_admitted=$background_work_lifecycle_cleanup_admitted lifecycle_cleanup_denied_limit=$background_work_lifecycle_cleanup_denied_limit lifecycle_cleanup_denied_foreground_pressure=$background_work_lifecycle_cleanup_denied_foreground_pressure lifecycle_cleanup_denied_backlog_pressure=$background_work_lifecycle_cleanup_denied_backlog_pressure lifecycle_cleanup_finished=$background_work_lifecycle_cleanup_finished stream_session_cleanup_admitted=$background_work_stream_session_cleanup_admitted stream_session_cleanup_denied_limit=$background_work_stream_session_cleanup_denied_limit stream_session_cleanup_denied_foreground_pressure=$background_work_stream_session_cleanup_denied_foreground_pressure stream_session_cleanup_denied_backlog_pressure=$background_work_stream_session_cleanup_denied_backlog_pressure stream_session_cleanup_finished=$background_work_stream_session_cleanup_finished opportunistic_scan_admitted=$background_work_opportunistic_scan_admitted opportunistic_scan_denied_limit=$background_work_opportunistic_scan_denied_limit opportunistic_scan_denied_foreground_pressure=$background_work_opportunistic_scan_denied_foreground_pressure opportunistic_scan_denied_backlog_pressure=$background_work_opportunistic_scan_denied_backlog_pressure opportunistic_scan_finished=$background_work_opportunistic_scan_finished" >&2
         echo "metadata_recovery_top admission" >&2
         latest_metric_family_top "$metrics_log" metadata_command_recovery_admission_by_pg_command_total 10 >&2 || true
         echo "metadata_recovery_top outcome" >&2
@@ -1051,6 +1160,18 @@ else
     server_cmd+=(--)
 fi
 
+if [[ "$smoke" == "shard-repair" ]]; then
+    echo "== argmin-s3 UAT shard repair smoke helper build =="
+    print_command cargo build -p s3-tests --bin uat_shard_repair_smoke
+    cargo build -p s3-tests --bin uat_shard_repair_smoke
+    shard_repair_smoke_cmd=("$ROOT/target/debug/uat_shard_repair_smoke")
+elif [[ "$smoke" == "pg-backfill-migration" ]]; then
+    echo "== argmin-s3 UAT PG backfill smoke helper build =="
+    print_command cargo build -p s3-tests --bin uat_pg_backfill_smoke
+    cargo build -p s3-tests --bin uat_pg_backfill_smoke
+    pg_backfill_smoke_cmd=("$ROOT/target/debug/uat_pg_backfill_smoke")
+fi
+
 if [[ "$topology" == "local" ]]; then
     start_process "local server" "$server_log" env \
         -u ARGMIN_STORAGE_NODE_ID \
@@ -1092,10 +1213,8 @@ else
     done
 
     if [[ "$smoke" == "pg-backfill-migration" ]]; then
-        wait_for_control_plane_pg_active 0 10 "0:1"
-        wait_for_control_plane_pg_active 1 10 "0:1"
-        wait_for_control_plane_pg_active 2 10 "0:1"
         wait_for_control_plane_node_epochs_aligned 10
+        wait_for_control_plane_runtime_map_ready 10 "$(control_plane_node_aligned_epoch)"
     fi
 
     frontend_log="$logs_dir/frontend.log"
@@ -1248,13 +1367,11 @@ run_shard_repair_smoke() {
     printf 'argmin shard repair UAT payload\n%.0s' {1..512} >"$body_file"
     : >"$shard_marker"
 
-    local smoke_cmd=(cargo run -q -p s3-tests --bin uat_shard_repair_smoke --)
-
     echo "== argmin-s3 UAT shard repair put =="
     printf '+'
-    printf ' %q' "${smoke_cmd[@]}" put "$bucket_file" "$key" "$body_file"
+    printf ' %q' "${shard_repair_smoke_cmd[@]}" put "$bucket_file" "$key" "$body_file"
     printf '\n'
-    "${smoke_cmd[@]}" put "$bucket_file" "$key" "$body_file"
+    "${shard_repair_smoke_cmd[@]}" put "$bucket_file" "$key" "$body_file"
 
     wait_for_storage_shard_files "$((ARGMIN_EC_K + ARGMIN_EC_M))" 10 "$shard_marker"
     corrupt_storage_data_shard_file "$corrupted_path_file" "$shard_marker"
@@ -1262,9 +1379,9 @@ run_shard_repair_smoke() {
 
     echo "== argmin-s3 UAT shard repair foreground recovery read =="
     printf '+'
-    printf ' %q' "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+    printf ' %q' "${shard_repair_smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
     printf '\n'
-    "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+    "${shard_repair_smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
 
     wait_for_shard_repair_completion_metrics "$metrics_path" 20
     if cmp -s "$(cat "$corrupted_path_file")" "$corrupted_copy"; then
@@ -1273,20 +1390,21 @@ run_shard_repair_smoke() {
 
     echo "== argmin-s3 UAT shard repair post-repair read =="
     printf '+'
-    printf ' %q' "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+    printf ' %q' "${shard_repair_smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
     printf '\n'
-    "${smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
+    "${shard_repair_smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
 
     echo "== argmin-s3 UAT shard repair cleanup =="
     printf '+'
-    printf ' %q' "${smoke_cmd[@]}" cleanup "$bucket_file" "$key"
+    printf ' %q' "${shard_repair_smoke_cmd[@]}" cleanup "$bucket_file" "$key"
     printf '\n'
-    "${smoke_cmd[@]}" cleanup "$bucket_file" "$key"
+    "${shard_repair_smoke_cmd[@]}" cleanup "$bucket_file" "$key"
     echo "PASS: shard repair UAT smoke repaired a read-discovered corrupt shard"
 }
 
 run_pg_backfill_migration_smoke() {
-    local smoke_dir="$data_dir/pg-backfill-migration-smoke"
+    local iteration="${1:-1}"
+    local smoke_dir="$data_dir/pg-backfill-migration-smoke/iteration-$iteration"
     local bucket_file="$smoke_dir/bucket"
     local old_key_file="$smoke_dir/old-key"
     local new_key_file="$smoke_dir/new-key"
@@ -1294,56 +1412,187 @@ run_pg_backfill_migration_smoke() {
     local old_body_file="$smoke_dir/old-body.bin"
     local new_body_file="$smoke_dir/new-body.bin"
     local metrics_path="$smoke_dir/metrics.prom"
+    local target_data_pg=$((iteration - 1))
     mkdir -p "$smoke_dir"
     printf 'argmin PG backfill old-placement payload\n%.0s' {1..512} >"$old_body_file"
     printf 'argmin PG backfill new-placement payload\n%.0s' {1..512} >"$new_body_file"
 
-    local smoke_cmd=(cargo run -q -p s3-tests --bin uat_pg_backfill_smoke --)
+    if ((repeat_count > 1)); then
+        echo "== argmin-s3 UAT PG backfill migration iteration $iteration/$repeat_count =="
+    fi
 
-    sleep 2
+    set_pg_acting_set "old placement nodes 0,1 for PG backfill iteration $iteration" "$target_data_pg" 0 1
+    wait_for_control_plane_pg_active "$target_data_pg" 10 "0:1"
+    wait_for_control_plane_node_epochs_aligned 10
+    wait_for_control_plane_runtime_map_ready 10 "$(control_plane_node_aligned_epoch)"
+    wait_for_frontend_storage_epoch_at_least "$(control_plane_node_aligned_epoch)" 10 "$metrics_path"
+    sample_frontend_metrics "$metrics_path"
+    local reset_min_scan_total
+    local reset_min_enqueued
+    local reset_min_written
+    local reset_min_completed
+    local reset_min_routine_admitted
+    local reset_min_routine_finished
+    local reset_max_candidate_failed
+    local reset_max_scan_error
+    local reset_max_complete_failed
+    local reset_max_failed
+    local reset_max_record_error_failed
+    reset_min_scan_total="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total) + 1))"
+    reset_min_enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
+    reset_min_written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
+    reset_min_completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_succeeded)"
+    reset_min_routine_admitted="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill)"
+    reset_min_routine_finished="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill)"
+    reset_max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
+    reset_max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
+    reset_max_complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
+    reset_max_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
+    reset_max_record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
+    wait_for_shard_backfill_completion_metrics \
+        "$metrics_path" \
+        20 \
+        "$reset_min_scan_total" \
+        "$reset_min_enqueued" \
+        "$reset_min_written" \
+        "$reset_min_completed" \
+        "$reset_min_routine_admitted" \
+        "$reset_min_routine_finished" \
+        "$reset_max_candidate_failed" \
+        "$reset_max_scan_error" \
+        "$reset_max_complete_failed" \
+        "$reset_max_failed" \
+        "$reset_max_record_error_failed"
 
     echo "== argmin-s3 UAT PG backfill old-placement put =="
-    print_command "${smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" uat-pg-backfill-old-object "$old_body_file"
-    "${smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" uat-pg-backfill-old-object "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" "uat-pg-backfill-old-object-$iteration" "$old_body_file" "$target_data_pg"
+    "${pg_backfill_smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" "uat-pg-backfill-old-object-$iteration" "$old_body_file" "$target_data_pg"
     local old_key
     old_key="$(tr -d '[:space:]' <"$old_key_file")"
     local data_pg
     data_pg="$(tr -d '[:space:]' <"$data_pg_file")"
 
     echo "== argmin-s3 UAT PG backfill old-placement read =="
-    print_command "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
-    "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+
+    sample_frontend_metrics "$metrics_path"
+    local min_scan_total
+    local min_enqueued
+    local min_written
+    local min_completed
+    local min_routine_admitted
+    local min_routine_finished
+    local max_candidate_failed
+    local max_scan_error
+    local max_complete_failed
+    local max_failed
+    local max_record_error_failed
+    local min_pg_backfilled
+    local min_pg_completed
+    min_scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
+    min_enqueued="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total) + 1))"
+    min_written="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total) + 1))"
+    min_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_succeeded) + 1))"
+    min_routine_admitted="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill) + 1))"
+    min_routine_finished="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill) + 1))"
+    min_pg_backfilled="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$data_pg" event backfilled) + 1))"
+    min_pg_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$data_pg" event complete_succeeded) + 1))"
 
     set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
     wait_for_control_plane_pg_active "$data_pg" 10 "0:2"
     wait_for_control_plane_node_epochs_aligned 10
+    wait_for_control_plane_runtime_map_ready 10 "$(control_plane_node_aligned_epoch)"
+    wait_for_frontend_storage_epoch_at_least "$(control_plane_node_aligned_epoch)" 10 "$metrics_path"
+    max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
+    max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
+    max_complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
+    max_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
+    max_record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
 
     echo "== argmin-s3 UAT PG backfill historical read after acting-set change =="
-    print_command "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
-    "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
 
     echo "== argmin-s3 UAT PG backfill new-placement put =="
-    print_command "${smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" uat-pg-backfill-new-object "$new_body_file" "$data_pg"
-    "${smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" uat-pg-backfill-new-object "$new_body_file" "$data_pg"
+    print_command "${pg_backfill_smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" "uat-pg-backfill-new-object-$iteration" "$new_body_file" "$data_pg"
+    "${pg_backfill_smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" "uat-pg-backfill-new-object-$iteration" "$new_body_file" "$data_pg"
     local new_key
     new_key="$(tr -d '[:space:]' <"$new_key_file")"
 
     echo "== argmin-s3 UAT PG backfill new-placement read =="
-    print_command "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
-    "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
 
-    wait_for_shard_backfill_completion_metrics "$metrics_path" 30
+    wait_for_shard_backfill_completion_metrics \
+        "$metrics_path" \
+        30 \
+        "$min_scan_total" \
+        "$min_enqueued" \
+        "$min_written" \
+        "$min_completed" \
+        "$min_routine_admitted" \
+        "$min_routine_finished" \
+        "$max_candidate_failed" \
+        "$max_scan_error" \
+        "$max_complete_failed" \
+        "$max_failed" \
+        "$max_record_error_failed" \
+        "$data_pg" \
+        "$min_pg_backfilled" \
+        "$min_pg_completed"
 
     echo "== argmin-s3 UAT PG backfill post-backfill reads =="
-    print_command "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
-    "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
-    print_command "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
-    "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
 
-    echo "== argmin-s3 UAT PG backfill cleanup =="
-    print_command "${smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
-    "${smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
     echo "PASS: PG backfill migration UAT smoke migrated an old-placement object after an acting-set change"
+}
+
+cleanup_pg_backfill_migration_smoke() {
+    local iteration="$1"
+    local smoke_dir="$data_dir/pg-backfill-migration-smoke/iteration-$iteration"
+    local bucket_file="$smoke_dir/bucket"
+    local old_key_file="$smoke_dir/old-key"
+    local new_key_file="$smoke_dir/new-key"
+    [[ -s "$bucket_file" && -s "$old_key_file" && -s "$new_key_file" ]] || return 0
+
+    local old_key
+    local new_key
+    old_key="$(tr -d '[:space:]' <"$old_key_file")"
+    new_key="$(tr -d '[:space:]' <"$new_key_file")"
+
+    echo "== argmin-s3 UAT PG backfill cleanup iteration $iteration =="
+    print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+}
+
+assert_pg_backfill_migration_final_clean() {
+    local metrics_path="$1"
+    local max_candidate_failed="$2"
+    local max_scan_error="$3"
+    local max_complete_failed="$4"
+    local max_failed="$5"
+    local max_record_error_failed="$6"
+    sample_frontend_metrics "$metrics_path"
+    local queue_depth
+    local candidate_failed
+    local scan_error
+    local complete_failed
+    local failed
+    local record_error_failed
+    queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
+    candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
+    scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
+    complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
+    failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
+    record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
+    if ((queue_depth != 0 || candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
+        cat "$metrics_path" >&2 || true
+        die "PG backfill smoke left hard-failure state: queue_depth=$queue_depth candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
+    fi
 }
 
 if [[ "$smoke" == "storage-node-restart" ]]; then
@@ -1364,9 +1613,33 @@ elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
     sleep 1
     run_nextest "control-plane runtime-map post-restart s3-tests smoke" test_object_read_not_exist
 elif [[ "$smoke" == "shard-repair" ]]; then
-    run_shard_repair_smoke
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        if ((repeat_count > 1)); then
+            echo "== argmin-s3 UAT shard repair iteration $iteration/$repeat_count =="
+        fi
+        run_shard_repair_smoke
+    done
 elif [[ "$smoke" == "pg-backfill-migration" ]]; then
-    run_pg_backfill_migration_smoke
+    pg_backfill_metrics_log="$logs_dir/frontend-metrics-samples.log"
+    sample_frontend_metrics "$pg_backfill_metrics_log"
+    pg_backfill_initial_candidate_failed="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_candidate_failed_total)"
+    pg_backfill_initial_scan_error="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_candidate_scan_error_total)"
+    pg_backfill_initial_complete_failed="$(latest_metric_family_label_sum "$pg_backfill_metrics_log" shard_backfill_event_by_pg_total event complete_failed)"
+    pg_backfill_initial_failed="$(latest_metric_family_label_sum "$pg_backfill_metrics_log" shard_backfill_event_by_pg_total event failed)"
+    pg_backfill_initial_record_error_failed="$(latest_metric_family_label_sum "$pg_backfill_metrics_log" shard_backfill_event_by_pg_total event record_error_failed)"
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        run_pg_backfill_migration_smoke "$iteration"
+    done
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        cleanup_pg_backfill_migration_smoke "$iteration"
+    done
+    assert_pg_backfill_migration_final_clean \
+        "$pg_backfill_metrics_log" \
+        "$pg_backfill_initial_candidate_failed" \
+        "$pg_backfill_initial_scan_error" \
+        "$pg_backfill_initial_complete_failed" \
+        "$pg_backfill_initial_failed" \
+        "$pg_backfill_initial_record_error_failed"
 else
     run_nextest "s3-tests" "${cargo_args[@]}"
 fi

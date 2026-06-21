@@ -249,46 +249,65 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
     let mut args = std::env::args_os();
     let _program = args.next();
     let command = args.next()?;
-    if command != "control-plane-set-pg-acting-set" {
-        return None;
-    }
-
-    let Some(state_path) = args.next() else {
-        eprintln!(
-            "usage: argmin-s3 control-plane-set-pg-acting-set <state-path> <pg-id> <node-id>..."
-        );
-        return Some(2);
-    };
-    let Some(pg_id) = args
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<u32>().ok())
-        .map(PgId::new)
-    else {
-        eprintln!(
-            "usage: argmin-s3 control-plane-set-pg-acting-set <state-path> <pg-id> <node-id>..."
-        );
-        return Some(2);
-    };
-    let mut acting_set = Vec::new();
-    for node_id in args {
-        let Some(node_id) = node_id
-            .into_string()
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .map(NodeId::new)
-        else {
-            eprintln!("node ids must be unsigned integers");
+    if command == "control-plane-runtime-map-ready" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
             return Some(2);
         };
-        acting_set.push(node_id);
-    }
-    if acting_set.is_empty() {
-        eprintln!("acting set must contain at least one node");
-        return Some(2);
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match control_plane_runtime_map_ready(Path::new(&path)) {
+            Ok((epoch, pg_routes, active_serving_pg_routes)) => {
+                println!("{} {} {}", epoch.get(), pg_routes, active_serving_pg_routes);
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
     }
 
-    match set_control_plane_pg_acting_set(Path::new(&state_path), pg_id, acting_set) {
+    let live = if command == "control-plane-set-pg-acting-set" {
+        false
+    } else if command == "control-plane-set-pg-acting-set-live" {
+        true
+    } else {
+        return None;
+    };
+
+    let usage_path = if live { "socket-path" } else { "state-path" };
+    let Some(path) = args.next() else {
+        eprintln!(
+            "usage: argmin-s3 {} <{}> <pg-id> <node-id>...",
+            command.to_string_lossy(),
+            usage_path
+        );
+        return Some(2);
+    };
+    let Some((pg_id, acting_set)) = parse_control_plane_pg_acting_set_args(args) else {
+        eprintln!(
+            "usage: argmin-s3 {} <{}> <pg-id> <node-id>...",
+            command.to_string_lossy(),
+            usage_path
+        );
+        return Some(2);
+    };
+
+    let result = if live {
+        set_control_plane_pg_acting_set_live(Path::new(&path), pg_id, acting_set)
+    } else {
+        set_control_plane_pg_acting_set(Path::new(&path), pg_id, acting_set)
+    };
+    match result {
         Ok(epoch) => {
             eprintln!(
                 "control-plane set PG {} acting set at epoch {}",
@@ -304,6 +323,29 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
     }
 }
 
+fn parse_control_plane_pg_acting_set_args(
+    mut args: impl Iterator<Item = OsString>,
+) -> Option<(PgId, Vec<NodeId>)> {
+    let pg_id = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(PgId::new)?;
+    let mut acting_set = Vec::new();
+    for node_id in args {
+        let node_id = node_id
+            .into_string()
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(NodeId::new)?;
+        acting_set.push(node_id);
+    }
+    if acting_set.is_empty() {
+        return None;
+    }
+    Some((pg_id, acting_set))
+}
+
 fn set_control_plane_pg_acting_set(
     state_path: &Path,
     pg_id: PgId,
@@ -317,6 +359,37 @@ fn set_control_plane_pg_acting_set(
         .set_pg_acting_set(pg_id, acting_set)
         .map_err(|error| format!("failed to set PG acting set: {error}"))?;
     Ok(snapshot.cluster_epoch())
+}
+
+fn set_control_plane_pg_acting_set_live(
+    socket_path: &Path,
+    pg_id: PgId,
+    acting_set: Vec<NodeId>,
+) -> Result<ClusterEpoch, String> {
+    UnixControlPlaneClient::new(socket_path)
+        .set_pg_acting_set(pg_id, acting_set)
+        .map_err(|error| format!("failed to set live PG acting set: {error}"))
+}
+
+fn control_plane_runtime_map_ready(
+    socket_path: &Path,
+) -> Result<(ClusterEpoch, usize, usize), String> {
+    let runtime_map = UnixControlPlaneClient::new(socket_path)
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
+    let pg_routes = runtime_map.pg_routes().len();
+    let active_serving_pg_routes = runtime_map
+        .pg_routes()
+        .iter()
+        .filter(|route| {
+            route.state() == PgState::Active && route.primary_lease_deadline_ms().is_some()
+        })
+        .count();
+    Ok((
+        runtime_map.cluster_epoch(),
+        pg_routes,
+        active_serving_pg_routes,
+    ))
 }
 
 fn run_control_plane_process(config: &ServerConfig) -> ! {

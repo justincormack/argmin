@@ -2210,6 +2210,8 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
 
 struct BackfillRouteFixture {
     _tmp: test_util::TempDir,
+    configs: Vec<LocalNodeStoreConfig>,
+    ec_shape: EcShape,
     source_cluster: Arc<crate::StorageCluster>,
     desired_cluster: Arc<crate::StorageCluster>,
     source_route: crate::control_plane::PgRouteSnapshot,
@@ -2380,7 +2382,7 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
     };
     let mut desired_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
         NodeId::new(0),
-        configs,
+        configs.clone(),
         &[0, 1],
         ec_shape,
         desired_route.cluster_epoch(),
@@ -2396,6 +2398,8 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
 
     BackfillRouteFixture {
         _tmp: tmp,
+        configs: configs.clone(),
+        ec_shape,
         source_cluster,
         desired_cluster,
         source_route,
@@ -2551,6 +2555,57 @@ fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
         .unwrap();
     assert!(plan.is_complete());
     assert_eq!(plan.already_present.len(), plan.desired_health.total_shards);
+}
+
+#[test]
+fn placed_segment_payload_backfill_work_item_targets_current_pg_route() {
+    let fixture = backfill_route_fixture(b"phase-eleven-backfill-current-route");
+    let current_epoch = ClusterEpoch::new(fixture.desired_route.cluster_epoch().get() + 1).unwrap();
+    let current_routes = fixture
+        .desired_cluster
+        .local_pg_routes()
+        .map(|route| {
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                current_epoch,
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        fixture.configs.clone(),
+        &[0, 1],
+        fixture.ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes([fixture.source_route.clone()]);
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    let work_item = crate::PlacedSegmentShardBackfillWorkItem {
+        request: fixture.req,
+        source_cluster_epoch: fixture.source_route.cluster_epoch(),
+        desired_cluster_epoch: fixture.desired_route.cluster_epoch(),
+    };
+
+    let backfilled = current_cluster
+        .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+        .unwrap();
+    assert!(!backfilled.is_empty());
+    let current_route = current_cluster
+        .reconstructed_pg_route_at_epoch(PgId::new(fixture.req.data_pg_id), current_epoch)
+        .unwrap();
+    let plan = current_cluster
+        .placed_segment_payload_shard_backfill_plan(
+            &fixture.source_route,
+            &current_route,
+            fixture.req,
+        )
+        .unwrap();
+    assert!(plan.is_complete());
 }
 
 #[test]
@@ -2811,6 +2866,7 @@ fn shard_scavenger_backfill_candidate_scan_records_historical_payloads() {
             already_complete: 0,
             enqueued: 1,
             unrecoverable: 0,
+            deferred: 0,
             failed: 0,
             limit_reached: false,
         }
@@ -2830,6 +2886,73 @@ fn shard_scavenger_backfill_candidate_scan_records_historical_payloads() {
         rows[0].work_item.desired_cluster_epoch,
         fixture.desired_route.cluster_epoch()
     );
+}
+
+#[test]
+fn shard_scavenger_backfill_candidate_scan_skips_unchanged_effective_placement() {
+    let fixture = backfill_route_fixture(b"phase-eleven-scanner-backfill-same-placement");
+    let source_epoch = fixture.source_route.cluster_epoch();
+    let desired_epoch = fixture.desired_route.cluster_epoch();
+    assert_ne!(source_epoch, desired_epoch);
+
+    let desired_route_pg1 = fixture
+        .desired_cluster
+        .reconstructed_pg_route_at_epoch(PgId::new(1), desired_epoch)
+        .unwrap();
+    let mut same_placement_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        fixture.configs.clone(),
+        &[0, 1],
+        fixture.ec_shape,
+        desired_epoch,
+        [
+            LocalPgRoute::from(&fixture.desired_route),
+            LocalPgRoute::from(&desired_route_pg1),
+        ],
+    )
+    .unwrap();
+    let same_placement_historical_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        source_epoch,
+        fixture.desired_route.pg_id(),
+        fixture.desired_route.primary_node_id(),
+        fixture.desired_route.acting_set().to_vec(),
+        PgState::Active,
+    );
+    same_placement_map.test_install_historical_pg_routes([same_placement_historical_route]);
+    let same_placement_cluster =
+        crate::StorageCluster::from_local_map(Arc::new(same_placement_map)).unwrap();
+
+    let bucket = crate::BucketName::try_from("backfill-scan-same-bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("backfill-scan-same-key".to_string()).unwrap();
+    record_backfill_scavenger_object_segment_reference(
+        &same_placement_cluster,
+        source_epoch,
+        fixture.req,
+        bucket,
+        key,
+    );
+
+    let summary = same_placement_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references()
+        .unwrap();
+    assert_eq!(
+        summary,
+        crate::cluster::PlacedSegmentShardBackfillCandidateEnqueueSummary {
+            scanned: 1,
+            current_epoch: 0,
+            already_queued: 0,
+            already_complete: 1,
+            enqueued: 0,
+            unrecoverable: 0,
+            deferred: 0,
+            failed: 0,
+            limit_reached: false,
+        }
+    );
+    assert!(same_placement_cluster
+        .list_placed_segment_shard_backfills(fixture.req.data_pg_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -2915,6 +3038,7 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
             already_complete: 0,
             enqueued: 1,
             unrecoverable: 0,
+            deferred: 0,
             failed: 0,
             limit_reached: false,
         }
