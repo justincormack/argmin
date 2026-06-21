@@ -804,25 +804,22 @@ impl ShardScavengerSweeper {
                                 .enqueue_placed_segment_shard_backfills_from_scavenger_references()
                             {
                                 Ok(summary) => {
-                                    let _ = observability::event(
+                                    let _ = observability::emit_shard_backfill_candidate_scan(
                                         TRACE_TARGET,
-                                        "shard_backfill_candidate_scan",
-                                        Some(format_args!(
-                                            "scanned={} current_epoch={} already_complete={} enqueued={} unrecoverable={} failed={}",
-                                            summary.scanned,
-                                            summary.current_epoch,
-                                            summary.already_complete,
-                                            summary.enqueued,
-                                            summary.unrecoverable,
-                                            summary.failed,
-                                        )),
+                                        observability::ShardBackfillCandidateScanSummary {
+                                            scanned: summary.scanned,
+                                            current_epoch: summary.current_epoch,
+                                            already_complete: summary.already_complete,
+                                            enqueued: summary.enqueued,
+                                            unrecoverable: summary.unrecoverable,
+                                            failed: summary.failed,
+                                        },
                                     );
                                 }
                                 Err(error) => {
-                                    let _ = observability::event(
+                                    let _ = observability::emit_shard_backfill_candidate_scan_error(
                                         TRACE_TARGET,
-                                        "shard_backfill_candidate_scan_error",
-                                        Some(format_args!("error={error}")),
+                                        &error,
                                     );
                                 }
                             }

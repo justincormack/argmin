@@ -7897,6 +7897,13 @@ PG backfill and migration design notes:
   waits behind active known-damage repair, keeping low-risk PG convergence from
   competing with foreground work while still allowing urgent EC-safety backfill
   to progress.
+- Added shard-backfill candidate-scan metrics. The shard scavenger's
+  historical-placement candidate pass now increments aggregate counters for
+  scan invocations, candidates scanned, current-epoch skips, already-complete
+  candidates, durable enqueues, unrecoverable candidates, and failed
+  verifications, plus separate hard scan errors. This keeps scanner discovery
+  visible in the local debug metrics and UAT summary separately from durable
+  worker claim/execution events.
 
 Exit criteria:
 

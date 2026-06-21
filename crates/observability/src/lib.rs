@@ -140,6 +140,14 @@ static SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_SCANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_CURRENT_EPOCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_ALREADY_COMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_ENQUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_UNRECOVERABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_CANDIDATE_SCAN_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1331,6 +1339,16 @@ pub struct ShardBackfillEventSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardBackfillCandidateScanSummary {
+    pub scanned: usize,
+    pub current_epoch: usize,
+    pub already_complete: usize,
+    pub enqueued: usize,
+    pub unrecoverable: usize,
+    pub failed: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackgroundWorkAdmissionSummary {
     pub class: &'static str,
     pub event: &'static str,
@@ -1433,6 +1451,14 @@ pub struct MetricsSnapshot {
     pub shard_backfill_queue_depth: u64,
     pub shard_backfill_event_total: u64,
     pub shard_backfill_shards_written_total: u64,
+    pub shard_backfill_candidate_scan_total: u64,
+    pub shard_backfill_candidate_scanned_total: u64,
+    pub shard_backfill_candidate_current_epoch_total: u64,
+    pub shard_backfill_candidate_already_complete_total: u64,
+    pub shard_backfill_candidate_enqueued_total: u64,
+    pub shard_backfill_candidate_unrecoverable_total: u64,
+    pub shard_backfill_candidate_failed_total: u64,
+    pub shard_backfill_candidate_scan_error_total: u64,
     pub background_work_admission_event_total: u64,
     pub background_work_active_total: u64,
     pub background_work_finished_total: u64,
@@ -1695,6 +1721,22 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         shard_backfill_queue_depth: SHARD_BACKFILL_QUEUE_DEPTH.load(Ordering::Relaxed),
         shard_backfill_event_total: SHARD_BACKFILL_EVENT_TOTAL.load(Ordering::Relaxed),
         shard_backfill_shards_written_total: SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_scan_total: SHARD_BACKFILL_CANDIDATE_SCAN_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_scanned_total: SHARD_BACKFILL_CANDIDATE_SCANNED_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_current_epoch_total: SHARD_BACKFILL_CANDIDATE_CURRENT_EPOCH_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_already_complete_total:
+            SHARD_BACKFILL_CANDIDATE_ALREADY_COMPLETE_TOTAL.load(Ordering::Relaxed),
+        shard_backfill_candidate_enqueued_total: SHARD_BACKFILL_CANDIDATE_ENQUEUED_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_unrecoverable_total: SHARD_BACKFILL_CANDIDATE_UNRECOVERABLE_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_failed_total: SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_candidate_scan_error_total: SHARD_BACKFILL_CANDIDATE_SCAN_ERROR_TOTAL
             .load(Ordering::Relaxed),
         background_work_admission_event_total: BACKGROUND_WORK_ADMISSION_EVENT_TOTAL
             .load(Ordering::Relaxed),
@@ -2659,6 +2701,70 @@ pub fn emit_shard_backfill_event(target: &'static str, summary: ShardBackfillEve
     )
 }
 
+pub fn emit_shard_backfill_candidate_scan(
+    target: &'static str,
+    summary: ShardBackfillCandidateScanSummary,
+) -> bool {
+    SHARD_BACKFILL_CANDIDATE_SCAN_TOTAL.fetch_add(1, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_SCANNED_TOTAL.fetch_add(summary.scanned as u64, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_CURRENT_EPOCH_TOTAL
+        .fetch_add(summary.current_epoch as u64, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_ALREADY_COMPLETE_TOTAL
+        .fetch_add(summary.already_complete as u64, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_ENQUEUED_TOTAL.fetch_add(summary.enqueued as u64, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_UNRECOVERABLE_TOTAL
+        .fetch_add(summary.unrecoverable as u64, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL.fetch_add(summary.failed as u64, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = format!(
+        "scanned={} current_epoch={} already_complete={} enqueued={} unrecoverable={} failed={}",
+        summary.scanned,
+        summary.current_epoch,
+        summary.already_complete,
+        summary.enqueued,
+        summary.unrecoverable,
+        summary.failed,
+    );
+    record_flight_event(
+        &context,
+        target,
+        "shard_backfill_candidate_scan",
+        detail.clone(),
+    );
+    event_in_context(
+        &context,
+        target,
+        "shard_backfill_candidate_scan",
+        Some(format_args!("{detail}")),
+    )
+}
+
+pub fn emit_shard_backfill_candidate_scan_error(
+    target: &'static str,
+    error: &impl fmt::Display,
+) -> bool {
+    SHARD_BACKFILL_CANDIDATE_SCAN_TOTAL.fetch_add(1, Ordering::Relaxed);
+    SHARD_BACKFILL_CANDIDATE_SCAN_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = truncate_detail(format!("error={error}"));
+    record_flight_event(
+        &context,
+        target,
+        "shard_backfill_candidate_scan_error",
+        detail.clone(),
+    );
+    event_in_context(
+        &context,
+        target,
+        "shard_backfill_candidate_scan_error",
+        Some(format_args!("{detail}")),
+    )
+}
+
 pub fn emit_background_work_admission_event(
     target: &'static str,
     summary: BackgroundWorkAdmissionSummary,
@@ -3424,6 +3530,18 @@ mod tests {
                 shards_written: Some(2),
             },
         );
+        emit_shard_backfill_candidate_scan(
+            "storage",
+            ShardBackfillCandidateScanSummary {
+                scanned: 7,
+                current_epoch: 2,
+                already_complete: 1,
+                enqueued: 3,
+                unrecoverable: 1,
+                failed: 4,
+            },
+        );
+        emit_shard_backfill_candidate_scan_error("storage", &"scanner unavailable");
         emit_background_work_admission_event(
             "storage",
             BackgroundWorkAdmissionSummary {
@@ -3736,6 +3854,38 @@ mod tests {
             .any(|sample| sample.pg_id == Some(11)
                 && sample.event == "backfilled"
                 && sample.count >= 1));
+        assert_eq!(
+            after.shard_backfill_candidate_scan_total,
+            before.shard_backfill_candidate_scan_total + 2
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_scanned_total,
+            before.shard_backfill_candidate_scanned_total + 7
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_current_epoch_total,
+            before.shard_backfill_candidate_current_epoch_total + 2
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_already_complete_total,
+            before.shard_backfill_candidate_already_complete_total + 1
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_enqueued_total,
+            before.shard_backfill_candidate_enqueued_total + 3
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_unrecoverable_total,
+            before.shard_backfill_candidate_unrecoverable_total + 1
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_failed_total,
+            before.shard_backfill_candidate_failed_total + 4
+        );
+        assert_eq!(
+            after.shard_backfill_candidate_scan_error_total,
+            before.shard_backfill_candidate_scan_error_total + 1
+        );
         assert_eq!(
             after.background_work_admission_event_total,
             before.background_work_admission_event_total + 2
