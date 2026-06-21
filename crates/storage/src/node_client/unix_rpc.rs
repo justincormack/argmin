@@ -70,6 +70,26 @@ impl UnixStorageNodeClient {
         })
     }
 
+    pub(crate) fn read_placed_shard_for_historical_inspection(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        let request = StorageRpcShardReadRequest {
+            location,
+            shard_key: key.clone(),
+            expected_ack,
+        };
+        let payload = encode_shard_read_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode historical shard read request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardHistoricalRead, payload)?;
+        decode_shard_read_response(&response, expected_ack).map_err(|error| {
+            self.rpc_payload_error("decode historical shard read response", error.to_string())
+        })
+    }
+
     pub(crate) fn read_placed_shard_range(
         &self,
         data_pg_id: DataPgId,
@@ -771,6 +791,20 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
         UnixStorageNodeClient::read_placed_shard(self, data_pg_id, key, expected_ack)
+    }
+
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        UnixStorageNodeClient::read_placed_shard_for_historical_inspection(
+            self,
+            location,
+            key,
+            expected_ack,
+        )
     }
 
     fn read_placed_shard_into(

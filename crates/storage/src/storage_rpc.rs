@@ -666,6 +666,7 @@ pub(crate) enum StorageRpcMessageKind {
     PlacedSegmentShardBackfillClaimComplete = 139,
     PlacedSegmentShardBackfillClaimError = 140,
     PlacedSegmentShardBackfillCount = 141,
+    ShardHistoricalRead = 142,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +724,7 @@ impl StorageRpcMessageKind {
             Self::ShardWrite => "shard write",
             Self::ShardRepairWrite => "shard repair write",
             Self::ShardRead => "shard read",
+            Self::ShardHistoricalRead => "shard historical read",
             Self::ShardReadRange => "shard read range",
             Self::ShardDelete => "shard delete",
             Self::ReadHandlesAcquire => "read handles acquire",
@@ -1035,6 +1037,7 @@ impl StorageRpcMessageKind {
             139 => Ok(Self::PlacedSegmentShardBackfillClaimComplete),
             140 => Ok(Self::PlacedSegmentShardBackfillClaimError),
             141 => Ok(Self::PlacedSegmentShardBackfillCount),
+            142 => Ok(Self::ShardHistoricalRead),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -3198,7 +3201,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ReadHandlesRelease => {
             STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::ShardRead => STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardRead | StorageRpcMessageKind::ShardHistoricalRead => {
+            STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ShardReadRange => STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardAckLoad | StorageRpcMessageKind::ShardAckDelete => {

@@ -395,6 +395,7 @@ pub(crate) fn storage_rpc_admission_class(
         StorageRpcMessageKind::Health => UnixStorageNodeRpcAdmissionClass::Control,
 
         StorageRpcMessageKind::ShardRead
+        | StorageRpcMessageKind::ShardHistoricalRead
         | StorageRpcMessageKind::ShardReadRange
         | StorageRpcMessageKind::ReadHandlesAcquire
         | StorageRpcMessageKind::BucketHeadRaw

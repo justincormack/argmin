@@ -63,6 +63,18 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
         })
     }
 
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        _location: ShardLocation,
+        _key: &ShardKey,
+        _expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Io {
+            context: "recording shard client historical read",
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    }
+
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,
@@ -3019,6 +3031,81 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
             .validate_written_shard_ack(&written.key, written.ack)
             .unwrap();
     }
+}
+
+#[test]
+fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let target_node = NodeId::new(1);
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map =
+        LocalClusterMap::open(&tmp.path().join("frontend"), &node_ids, &[0], ec_shape).unwrap();
+    let socket_path = tmp.path().join("sockets").join("historical-node-1.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let remote_data_dir = tmp.path().join("historical-remote-node-1");
+    let data_pg_id = DataPgId::new(PgId::new(0));
+    let historical_epoch = ClusterEpoch::new(7).unwrap();
+    let location = ShardLocation::new(
+        historical_epoch,
+        data_pg_id,
+        ShardIndex::new(0),
+        target_node,
+    );
+    let shard_key = ShardKey::new(&[0x7b; 16], 3, location.shard_index().get());
+    let payload = b"historical shard inspection over unix";
+    let remote = SharedStorageNode::open_with_default_ec_shape(
+        &remote_data_dir,
+        &[data_pg_id.get()],
+        ec_shape,
+    )
+    .unwrap();
+    let ack = remote
+        .write_shard_file(data_pg_id.get(), &shard_key, payload)
+        .unwrap();
+
+    let server = Arc::new(
+        StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id: target_node,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_valid_until_ms: None,
+            data_dir: remote_data_dir,
+            default_ec_shape: ec_shape,
+            pg_ids: vec![data_pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: data_pg_id.get(),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(0),
+                acting_set: node_ids.to_vec(),
+            }],
+        })
+        .unwrap(),
+    );
+    let server_thread = {
+        let server = Arc::clone(&server);
+        thread::spawn(move || server.accept_one().unwrap())
+    };
+    map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
+        target_node,
+        socket_path,
+    )])
+    .unwrap();
+
+    let observed = map
+        .read_payload_shard_for_historical_inspection(location, &shard_key, ack)
+        .unwrap();
+
+    assert_eq!(observed, payload);
+    assert!(matches!(
+        map.node(target_node)
+            .unwrap()
+            .storage_node()
+            .read_shard_file(data_pg_id.get(), &shard_key),
+        Err(StoreError::NotFound)
+    ));
+    server_thread.join().unwrap();
 }
 
 #[test]

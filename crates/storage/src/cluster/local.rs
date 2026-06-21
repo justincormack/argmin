@@ -3251,8 +3251,8 @@ impl LocalClusterMap {
                 cluster_epoch: location.cluster_epoch(),
             })?;
         let data = node
-            .storage_node()
-            .read_shard_file(location.data_pg_id().get(), key)
+            .shard_client()
+            .read_placed_shard_for_historical_inspection(location, key, expected)
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),

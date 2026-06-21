@@ -7783,9 +7783,14 @@ PG backfill and migration design notes:
   summary through a reconstructed PG route, which is the read-only verification
   step needed before a later backfill worker queues mutating repair/migration
   work from PG-history candidates. The local-cluster implementation can inspect
-  historical route locations directly from shard files without treating the old
-  route as current serving authority; remote storage-node historical inspection
-  remains part of the later Unix/storage-node boundary work.
+  historical route locations without treating the old route as current serving
+  authority.
+- Added the Unix storage-node boundary for non-serving historical shard
+  inspection. The storage-node RPC protocol now has a dedicated historical
+  shard read that carries the reconstructed `ShardLocation`, validates node/PG
+  ownership without treating the historical epoch as current serving authority,
+  and still verifies the expected size/CRC before returning bytes. Existing
+  serving `ShardRead` and read-handle RPCs remain active-route/epoch gated.
 - Added a read-only backfill planner for one placed segment. Given a verified
   source route and desired route, storage now classifies desired shard indexes
   as already present, direct-copy candidates from valid same-index historical
@@ -7796,14 +7801,12 @@ PG backfill and migration design notes:
   can now copy valid same-index historical shards to desired-route locations
   through repair-specific write plumbing, register the copied shard acks, and
   verify the desired-route health after copying. EC reconstruction targets,
-  durable queueing, worker admission, and remote storage-node execution remain
-  follow-up work.
+  durable queueing, and worker admission remain follow-up work.
 - Extended the mutating backfill primitive to handle EC-reconstruction targets
   when the historical source route still has at least `k` valid shards. Storage
   reconstructs the segment bytes from the historical route, re-encodes only the
   missing desired-route shard indexes, registers their acks, and verifies the
-  desired-route targets. Worker admission and remote storage-node execution
-  remain follow-up work.
+  desired-route targets. Worker admission remains follow-up work.
 - Added the first durable PG-store backfill candidate table. The durable row is
   segment-level and records the data PG, segment identity, EC shape, and
   source/desired cluster epochs; it deliberately does not persist an exact
@@ -7814,7 +7817,7 @@ PG backfill and migration design notes:
   rows now use a single-owner finite-lease claim, preserve rows on failed
   attempts with a retry deadline, allow expired claim stealing, and require full
   segment request identity for claim completion. Admission policy, worker
-  execution, and remote storage-node boundary wiring remain follow-up work.
+  execution, and end-to-end remote worker coverage remain follow-up work.
 - Added storage-node boundary wiring for durable backfill candidates. Backfill
   record/list/claim/complete/error/resolve now flow through the
   `ShardAckNodeClient`, in-process storage nodes, Unix RPC codecs, storage-node

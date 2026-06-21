@@ -915,6 +915,15 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError>;
 
+    /// Non-serving read used by repair/backfill to inspect reconstructed
+    /// historical placements without treating them as current route authority.
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError>;
+
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,

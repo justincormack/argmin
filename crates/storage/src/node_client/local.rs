@@ -96,6 +96,23 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
         self.storage_node.read_shard_file(data_pg_id.get(), key)
     }
 
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        _expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        if location.node_id() != self.node_id {
+            return Err(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            });
+        }
+        self.storage_node
+            .read_shard_file(location.data_pg_id().get(), key)
+    }
+
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,

@@ -2156,6 +2156,15 @@ impl StorageNodeConnectionHandler {
                     message: error.to_string(),
                 }),
             },
+            StorageRpcMessageKind::ShardHistoricalRead => {
+                match decode_shard_read_request(&frame.payload) {
+                    Ok(request) => self.shard_historical_read_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ShardReadRange => {
                 match decode_shard_read_range_request(&frame.payload) {
                     Ok(request) => self.shard_read_range_response(request),
@@ -6153,6 +6162,24 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_shard_location(request.location) {
             return encode_storage_rpc_error_response(&error);
         }
+        self.shard_read_file_response(request)
+    }
+
+    fn shard_historical_read_response(
+        &self,
+        request: StorageRpcShardReadRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_shard_location_for_historical_inspection(request.location)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        self.shard_read_file_response(request)
+    }
+
+    fn shard_read_file_response(
+        &self,
+        request: StorageRpcShardReadRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         let response = match self
             .node
             .read_shard_file(request.location.data_pg_id().get(), &request.shard_key)
@@ -8074,6 +8101,30 @@ impl StorageNodeConnectionHandler {
             location.cluster_epoch(),
             PgId::new(location.data_pg_id().get()),
         )
+    }
+
+    fn validate_shard_location_for_historical_inspection(
+        &self,
+        location: ShardLocation,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if location.node_id() != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    location.node_id().as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let pg_id = location.data_pg_id().get();
+        if !self.config.pg_ids.contains(&pg_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {pg_id} is not configured on this storage node"),
+            });
+        }
+        Ok(())
     }
 
     fn validate_pg_route(
