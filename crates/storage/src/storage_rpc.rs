@@ -688,6 +688,7 @@ pub(crate) enum StorageRpcErrorCode {
     BucketWriteDrainConflict = 14,
     BucketWriteDrainNotFound = 15,
     ReclaimClaimConflict = 16,
+    NotFound = 17,
 }
 
 impl StorageRpcErrorCode {
@@ -709,6 +710,7 @@ impl StorageRpcErrorCode {
             14 => Ok(Self::BucketWriteDrainConflict),
             15 => Ok(Self::BucketWriteDrainNotFound),
             16 => Ok(Self::ReclaimClaimConflict),
+            17 => Ok(Self::NotFound),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),

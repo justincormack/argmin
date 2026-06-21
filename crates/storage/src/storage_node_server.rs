@@ -8970,9 +8970,15 @@ fn validate_placed_segment_shard_backfill_claim_route_epoch(
 }
 
 fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
-    StorageRpcErrorResponse {
-        code: StorageRpcErrorCode::Internal,
-        message: error.to_string(),
+    match error {
+        StoreError::NotFound => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::NotFound,
+            message: "not found".to_string(),
+        },
+        error => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: error.to_string(),
+        },
     }
 }
 
@@ -11271,6 +11277,41 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::Internal);
         assert!(error.message.contains("ack mismatch"));
+    }
+
+    #[test]
+    fn storage_node_server_preserves_missing_historical_shard_error() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let location = test_location(1, 0, 7);
+        let request = StorageRpcShardReadRequest {
+            location,
+            shard_key: test_shard_key(0),
+            expected_ack: WriteAck {
+                stored_size: 9,
+                crc64: 0x1234,
+            },
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardHistoricalRead,
+            encode_shard_read_request(&request).unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::NotFound);
+        assert_eq!(error.message, "not found");
     }
 
     #[test]

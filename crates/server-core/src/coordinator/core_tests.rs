@@ -6,16 +6,22 @@ use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
 use crate::coordinator::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use storage::storage_node_server::{
+    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+};
 use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
-    LocalNodeStoreConfig, MetadataCommandApplyTestKind, PgId, PlacedSegmentShardBackfillWorkItem,
-    SegmentStoredBytesRequest, ShardScavengerObservationReason, StorageCluster,
+    LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
+    MetadataCommandApplyTestKind, NodeId, PgId, PgState, PlacedSegmentShardBackfillWorkItem,
+    SegmentStoredBytesRequest, ShardScavengerObservationReason, SharedStorageNode, StorageCluster,
     StorageClusterRuntimeMapHandle,
 };
 
@@ -83,6 +89,45 @@ fn setup_coordinator_with_only_shard_backfill_worker(
         ),
     )
     .unwrap()
+}
+
+fn make_private_socket_dir(path: &std::path::Path) {
+    std::fs::create_dir_all(path).unwrap();
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+fn spawn_storage_node_server_loop(
+    server: Arc<StorageNodeServer>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match server.accept_one() {
+                Ok(()) => {}
+                Err(error) if stop.load(Ordering::SeqCst) => {
+                    let _ = error;
+                    break;
+                }
+                Err(error) => panic!("storage node server failed: {error}"),
+            }
+        }
+    })
+}
+
+fn stop_storage_node_server_loops(
+    stop: Arc<AtomicBool>,
+    socket_paths: &[PathBuf],
+    threads: Vec<thread::JoinHandle<()>>,
+) {
+    stop.store(true, Ordering::SeqCst);
+    for socket_path in socket_paths {
+        let _ = UnixStream::connect(socket_path);
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]
@@ -210,6 +255,248 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn shard_backfill_worker_executes_remote_storage_node_work() {
+    let tmp = test_util::tempdir();
+    let source_node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let desired_node_ids = [
+        NodeId::new(0),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+        NodeId::new(6),
+    ];
+    let all_node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+        NodeId::new(6),
+    ];
+    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let pg_id = PgId::new(0);
+    let mut authority = storage::control_plane::SingleAuthorityControlPlane::open(
+        storage::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            source_node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join("sockets")
+                            .join(format!("node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            vec![pg_id],
+        )
+        .unwrap();
+    let source_epoch = authority.snapshot().cluster_epoch();
+    authority
+        .set_node_membership(
+            NodeId::new(6),
+            storage::control_plane::NodeMembershipState::Active,
+        )
+        .unwrap();
+    authority
+        .set_pg_acting_set(pg_id, desired_node_ids.to_vec())
+        .unwrap();
+    let source_route = authority
+        .snapshot()
+        .reconstructed_pg_route_at_epoch(pg_id, source_epoch)
+        .unwrap();
+    let source_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        source_route.cluster_epoch(),
+        source_route.pg_id(),
+        source_route.primary_node_id(),
+        source_route.acting_set().to_vec(),
+        PgState::Active,
+    );
+    let desired_route = authority
+        .snapshot()
+        .reconstructed_pg_route_at_epoch(pg_id, authority.snapshot().cluster_epoch())
+        .unwrap();
+    let desired_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        desired_route.cluster_epoch(),
+        desired_route.pg_id(),
+        desired_route.primary_node_id(),
+        desired_route.acting_set().to_vec(),
+        PgState::Active,
+    );
+    assert_eq!(source_route.acting_set(), &source_node_ids);
+    assert_eq!(desired_route.acting_set(), &desired_node_ids);
+
+    let configs: Vec<_> = all_node_ids
+        .iter()
+        .map(|&node_id| {
+            LocalNodeStoreConfig::new(
+                node_id,
+                tmp.path()
+                    .join("storage")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect();
+    let source_map = Arc::new(
+        LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+            NodeId::new(0),
+            configs.iter().take(source_node_ids.len()).cloned(),
+            &[pg_id.get()],
+            ec_shape,
+            source_route.cluster_epoch(),
+            [LocalPgRoute::from(&source_route)],
+        )
+        .unwrap(),
+    );
+    let source_cluster = StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let bucket = trusted_bucket_name("remote-backfill-bucket");
+    let key = trusted_object_key("remote-backfill-key");
+    let segment_okh = [0xD7; 16];
+    let segment_vid = GenerationId::MIN;
+    let payload = b"remote storage-node shard backfill worker";
+    let written_segment = source_cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            segment_vid,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    source_cluster
+        .test_register_payload_shard_acks(
+            written_segment.data_pg_id,
+            &written_segment.written_shards,
+        )
+        .unwrap();
+    let work_item = PlacedSegmentShardBackfillWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id: written_segment.data_pg_id,
+            segment_okh,
+            segment_vid,
+            stored_size: payload.len(),
+            segment_crc64: checksum::crc64::checksum(payload),
+            ec: written_segment.ec,
+        },
+        source_cluster_epoch: source_route.cluster_epoch(),
+        desired_cluster_epoch: desired_route.cluster_epoch(),
+    };
+    drop(source_cluster);
+    drop(source_map);
+
+    let socket_dir = tmp.path().join("sockets-desired");
+    make_private_socket_dir(&socket_dir);
+    let mut server_threads = Vec::new();
+    let mut wake_socket_paths = Vec::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut client_configs = Vec::new();
+    for config in &configs {
+        let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
+        let server_config = StorageNodeProcessConfig {
+            node_id: config.node_id(),
+            cluster_epoch: desired_route.cluster_epoch(),
+            route_map_valid_until_ms: None,
+            data_dir: config.data_dir().to_path_buf(),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute::from(&desired_route)],
+        };
+        let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
+        for _ in 0..4 {
+            server_threads.push(spawn_storage_node_server_loop(
+                Arc::clone(&server),
+                Arc::clone(&stop),
+            ));
+            wake_socket_paths.push(socket_path.clone());
+        }
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(
+            config.node_id(),
+            socket_path.clone(),
+        ));
+    }
+
+    let mut desired_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &[pg_id.get()],
+        ec_shape,
+        desired_route.cluster_epoch(),
+        [LocalPgRoute::from(&desired_route)],
+    )
+    .unwrap();
+    desired_map.test_install_historical_pg_routes([source_route.clone()]);
+    desired_map
+        .install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let desired_cluster = StorageCluster::from_local_map(Arc::new(desired_map)).unwrap();
+    let source_health = desired_cluster
+        .placed_segment_payload_shard_health_for_pg_route_snapshot(&source_route, work_item.request)
+        .unwrap();
+    assert_eq!(
+        source_health.risk,
+        storage::PlacedSegmentShardSetRisk::Healthy
+    );
+    let before = desired_cluster
+        .placed_segment_payload_shard_health_for_pg_route_snapshot(
+            &desired_route,
+            work_item.request,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            before.risk,
+            storage::PlacedSegmentShardSetRisk::Unrecoverable
+        ),
+        "expected unrecoverable desired-route health before backfill, got {before:?}"
+    );
+    assert!(before
+        .shards
+        .iter()
+        .any(|shard| shard.location.node_id() == NodeId::new(6) && !shard.validation.is_valid()));
+
+    desired_cluster
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+    super::runtime::run_one_placed_segment_shard_backfill(&desired_cluster, "remote-backfill-test");
+
+    let rows = desired_cluster
+        .list_placed_segment_shard_backfills(written_segment.data_pg_id)
+        .unwrap();
+    assert!(rows.is_empty(), "backfill row should complete: {rows:?}");
+    let after = desired_cluster
+        .placed_segment_payload_shard_health_for_pg_route_snapshot(
+            &desired_route,
+            work_item.request,
+        )
+        .unwrap();
+    assert_eq!(after.risk, storage::PlacedSegmentShardSetRisk::Healthy);
+    assert!(after
+        .shards
+        .iter()
+        .filter(|shard| shard.location.node_id() == NodeId::new(6))
+        .all(|shard| shard.validation.is_valid()));
+
+    stop_storage_node_server_loops(stop, &wake_socket_paths, server_threads);
 }
 
 #[test]

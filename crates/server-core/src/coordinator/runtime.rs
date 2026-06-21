@@ -1261,7 +1261,10 @@ impl ShardBackfillSweeper {
     }
 }
 
-fn run_one_placed_segment_shard_backfill(storage_cluster: &StorageCluster, owner_token: &str) {
+pub(super) fn run_one_placed_segment_shard_backfill(
+    storage_cluster: &StorageCluster,
+    owner_token: &str,
+) {
     let now_ms = Coordinator::now_millis();
     let claim_id = format!(
         "shard-backfill-{}-{}",

@@ -289,6 +289,7 @@ fn storage_rpc_response_error(
             operation: kind.operation_name(),
             message: error.message,
         },
+        StorageRpcErrorCode::NotFound => StoreError::NotFound,
         code => StoreError::StorageRpc {
             node_id: node_id.as_u32(),
             operation: kind.operation_name(),

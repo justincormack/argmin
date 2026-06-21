@@ -633,10 +633,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     assert!(matches!(
         err,
         ShardIoError::Store {
-            source: StoreError::StorageRpc {
-                operation: "shard read",
-                ..
-            },
+            source: StoreError::NotFound,
             ..
         }
     ));
@@ -3205,13 +3202,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
         )
         .unwrap_err();
     assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::StorageRpc {
-                operation: "shard ack validate",
-                ..
-            })
-        ),
+        matches!(err, crate::ObjectPgActionError::Store(StoreError::NotFound)),
         "missing remote ack row should fail publish validation, got {err:?}"
     );
 
@@ -3372,13 +3363,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
         )
         .unwrap_err();
     assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::StorageRpc {
-                operation: "shard ack validate",
-                ..
-            })
-        ),
+        matches!(err, crate::ObjectPgActionError::Store(StoreError::NotFound)),
         "wrong-node remote ack rows should fail publish validation, got {err:?}"
     );
 

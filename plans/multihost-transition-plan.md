@@ -7834,6 +7834,15 @@ PG backfill and migration design notes:
   single-lane worker using the existing known-damage background admission; the
   remaining follow-up is the risk/priority model that distinguishes urgent
   EC-safety backfill from routine convergence and integrates scanner output.
+- Added end-to-end remote storage-node coverage for durable backfill worker
+  execution. The regression test writes a segment under a historical route,
+  serves the desired epoch through real `StorageNodeServer` Unix RPC endpoints,
+  records a durable backfill row, runs the coordinator worker once, and verifies
+  the durable row completes and the desired-route shard set becomes healthy.
+  This also pinned the Unix RPC error boundary: missing historical shard reads
+  now preserve `StoreError::NotFound` through a dedicated `NotFound` RPC
+  error code, so desired-route gaps classify as recoverable shard health instead
+  of fatal internal storage RPC failures.
 - Added first-class shard-backfill observability. The worker now emits
   structured backfill events for durable scans with no claimable work, claims,
   starts, no-op resolutions, real shard writes, failures, and completion
