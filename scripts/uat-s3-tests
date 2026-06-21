@@ -22,7 +22,8 @@ Options:
   --repeat N            Repeat the selected s3-tests command N times (default: 1)
   --smoke NAME           Run a focused smoke instead of the full suite:
                          storage-node-restart, storage-node-kill-fails-closed,
-                         control-plane-runtime-map, shard-repair
+                         control-plane-runtime-map, shard-repair,
+                         pg-backfill-migration
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
@@ -133,10 +134,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair)
+    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair|pg-backfill-migration)
         ;;
     *)
-        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, or shard-repair"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, shard-repair, or pg-backfill-migration"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -180,6 +181,16 @@ if [[ "$smoke" == "control-plane-runtime-map" ]]; then
     export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-1000}"
+fi
+if [[ "$smoke" == "pg-backfill-migration" ]]; then
+    export ARGMIN_EC_K=1
+    export ARGMIN_EC_M=1
+    export ARGMIN_LOCAL_NODE_COUNT=3
+    export ARGMIN_PG_COUNT=3
+    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-5000}"
+    export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
 fi
 if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
@@ -400,6 +411,104 @@ kill_storage_node() {
     fi
 }
 
+kill_control_plane() {
+    echo "== argmin-s3 UAT kill control-plane =="
+    for index in "${!server_names[@]}"; do
+        if [[ "${server_names[$index]}" == "control-plane" ]]; then
+            local pid="${server_pids[$index]}"
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+set_pg_acting_set() {
+    local label="$1"
+    local pg_id="$2"
+    shift
+    shift
+    echo "== argmin-s3 UAT set PG $pg_id acting set: $label =="
+    kill_control_plane
+    print_command "${server_cmd[@]}" control-plane-set-pg-acting-set "$control_plane_state_path" "$pg_id" "$@"
+    "${server_cmd[@]}" control-plane-set-pg-acting-set "$control_plane_state_path" "$pg_id" "$@"
+    start_control_plane
+    wait_for_control_plane_socket
+}
+
+set_all_pg_acting_sets() {
+    local label="$1"
+    shift
+    for ((pg_id = 0; pg_id < ARGMIN_PG_COUNT; pg_id++)); do
+        set_pg_acting_set "$label" "$pg_id" "$@"
+    done
+}
+
+wait_for_control_plane_pg_active() {
+    local pg_id="$1"
+    local deadline_seconds="$2"
+    local expected_acting_set="${3:-}"
+    local start
+    start="$(date +%s)"
+    while true; do
+        local active_pattern="^pg=$pg_id,active,"
+        if [[ -n "$expected_acting_set" ]]; then
+            active_pattern="^pg=$pg_id,active,$expected_acting_set,"
+        fi
+        if grep -q "$active_pattern" "$control_plane_state_path" 2>/dev/null; then
+            echo "== argmin-s3 UAT PG $pg_id is active =="
+            return 0
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            tail -n 80 "$control_plane_state_path" >&2 || true
+            die "timed out waiting for PG $pg_id to become active"
+        fi
+        sleep 0.1
+    done
+}
+
+wait_for_control_plane_node_epochs_aligned() {
+    local deadline_seconds="$1"
+    local start
+    start="$(date +%s)"
+    while true; do
+        local aligned_epoch
+        aligned_epoch="$(
+            awk -F, -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
+                /^node=/ {
+                    if ($2 != "active" || $3 != "healthy" || $5 !~ /^[0-9]+$/) {
+                        ok = 0
+                        bad = 1
+                        next
+                    }
+                    count += 1
+                    if (epoch == "") {
+                        epoch = $5
+                    } else if ($5 != epoch) {
+                        ok = 0
+                        bad = 1
+                    }
+                }
+                END {
+                    if (count == expected_count && bad != 1 && epoch != "") {
+                        print epoch
+                    }
+                }
+            ' "$control_plane_state_path"
+        )"
+        if [[ -n "$aligned_epoch" ]]; then
+            echo "== argmin-s3 UAT storage nodes aligned at runtime epoch $aligned_epoch =="
+            return 0
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            tail -n 80 "$control_plane_state_path" >&2 || true
+            die "timed out waiting for storage-node runtime-map epochs to align"
+        fi
+        sleep 0.1
+    done
+}
+
 latest_metric_sample_value() {
     local metrics_log="$1"
     local metric_name="$2"
@@ -518,6 +627,39 @@ wait_for_shard_repair_completion_metrics() {
         if (($(date +%s) - start >= deadline_seconds)); then
             cat "$metrics_path" >&2 || true
             die "timed out waiting for shard repair completion metrics"
+        fi
+        sleep 0.2
+    done
+}
+
+wait_for_shard_backfill_completion_metrics() {
+    local metrics_path="$1"
+    local deadline_seconds="$2"
+    local start
+    start="$(date +%s)"
+    while true; do
+        sample_frontend_metrics "$metrics_path"
+        local scan_total
+        local enqueued
+        local written
+        local completed
+        local queue_depth
+        local routine_admitted
+        local routine_finished
+        scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
+        enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
+        written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
+        completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_succeeded)"
+        queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
+        routine_admitted="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill)"
+        routine_finished="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill)"
+        if ((scan_total >= 1 && enqueued >= 1 && written >= 1 && completed >= 1 && queue_depth == 0 && routine_admitted >= 1 && routine_finished >= 1)); then
+            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished =="
+            return 0
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            cat "$metrics_path" >&2 || true
+            die "timed out waiting for shard backfill completion metrics"
         fi
         sleep 0.2
     done
@@ -933,9 +1075,12 @@ else
         echo "${socket_entries[*]}"
     )"
 
-    if [[ "$smoke" == "control-plane-runtime-map" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "pg-backfill-migration" ]]; then
         start_control_plane
         wait_for_control_plane_socket
+        if [[ "$smoke" == "pg-backfill-migration" ]]; then
+            set_all_pg_acting_sets "initial old placement nodes 0,1" 0 1
+        fi
     fi
 
     for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
@@ -946,8 +1091,15 @@ else
         wait_for_storage_node_socket "$node_id"
     done
 
+    if [[ "$smoke" == "pg-backfill-migration" ]]; then
+        wait_for_control_plane_pg_active 0 10 "0:1"
+        wait_for_control_plane_pg_active 1 10 "0:1"
+        wait_for_control_plane_pg_active 2 10 "0:1"
+        wait_for_control_plane_node_epochs_aligned 10
+    fi
+
     frontend_log="$logs_dir/frontend.log"
-    if [[ "$smoke" == "control-plane-runtime-map" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "pg-backfill-migration" ]]; then
         start_process "frontend" "$frontend_log" env \
             -u ARGMIN_STORAGE_NODE_ID \
             -u ARGMIN_STORAGE_NODE_DATA_DIR \
@@ -1133,6 +1285,67 @@ run_shard_repair_smoke() {
     echo "PASS: shard repair UAT smoke repaired a read-discovered corrupt shard"
 }
 
+run_pg_backfill_migration_smoke() {
+    local smoke_dir="$data_dir/pg-backfill-migration-smoke"
+    local bucket_file="$smoke_dir/bucket"
+    local old_key_file="$smoke_dir/old-key"
+    local new_key_file="$smoke_dir/new-key"
+    local data_pg_file="$smoke_dir/data-pg"
+    local old_body_file="$smoke_dir/old-body.bin"
+    local new_body_file="$smoke_dir/new-body.bin"
+    local metrics_path="$smoke_dir/metrics.prom"
+    mkdir -p "$smoke_dir"
+    printf 'argmin PG backfill old-placement payload\n%.0s' {1..512} >"$old_body_file"
+    printf 'argmin PG backfill new-placement payload\n%.0s' {1..512} >"$new_body_file"
+
+    local smoke_cmd=(cargo run -q -p s3-tests --bin uat_pg_backfill_smoke --)
+
+    sleep 2
+
+    echo "== argmin-s3 UAT PG backfill old-placement put =="
+    print_command "${smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" uat-pg-backfill-old-object "$old_body_file"
+    "${smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" uat-pg-backfill-old-object "$old_body_file"
+    local old_key
+    old_key="$(tr -d '[:space:]' <"$old_key_file")"
+    local data_pg
+    data_pg="$(tr -d '[:space:]' <"$data_pg_file")"
+
+    echo "== argmin-s3 UAT PG backfill old-placement read =="
+    print_command "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+
+    set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
+    wait_for_control_plane_pg_active "$data_pg" 10 "0:2"
+    wait_for_control_plane_node_epochs_aligned 10
+
+    echo "== argmin-s3 UAT PG backfill historical read after acting-set change =="
+    print_command "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+
+    echo "== argmin-s3 UAT PG backfill new-placement put =="
+    print_command "${smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" uat-pg-backfill-new-object "$new_body_file" "$data_pg"
+    "${smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" uat-pg-backfill-new-object "$new_body_file" "$data_pg"
+    local new_key
+    new_key="$(tr -d '[:space:]' <"$new_key_file")"
+
+    echo "== argmin-s3 UAT PG backfill new-placement read =="
+    print_command "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+
+    wait_for_shard_backfill_completion_metrics "$metrics_path" 30
+
+    echo "== argmin-s3 UAT PG backfill post-backfill reads =="
+    print_command "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+
+    echo "== argmin-s3 UAT PG backfill cleanup =="
+    print_command "${smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    "${smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    echo "PASS: PG backfill migration UAT smoke migrated an old-placement object after an acting-set change"
+}
+
 if [[ "$smoke" == "storage-node-restart" ]]; then
     run_nextest "pre-restart s3-tests smoke" test_object_default_content_type
     restart_storage_node 0
@@ -1152,6 +1365,8 @@ elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
     run_nextest "control-plane runtime-map post-restart s3-tests smoke" test_object_read_not_exist
 elif [[ "$smoke" == "shard-repair" ]]; then
     run_shard_repair_smoke
+elif [[ "$smoke" == "pg-backfill-migration" ]]; then
+    run_pg_backfill_migration_smoke
 else
     run_nextest "s3-tests" "${cargo_args[@]}"
 fi

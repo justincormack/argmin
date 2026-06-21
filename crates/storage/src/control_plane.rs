@@ -394,6 +394,18 @@ impl ClusterControlSnapshot {
                 // map. Let only that primary receive the Active handoff map so it can
                 // install the route and report the current Active observation.
             }
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation { .. })
+                if !record.acting_set.contains(&refreshing_node_id) =>
+            {
+                return Ok(PgRouteSnapshot {
+                    cluster_epoch: self.cluster_epoch,
+                    pg_id,
+                    primary_node_id: primary,
+                    acting_set: record.acting_set.clone(),
+                    state: PgState::Active,
+                    primary_lease_deadline_ms: None,
+                });
+            }
             Err(error) => return Err(error),
         }
         Ok(PgRouteSnapshot {
@@ -5736,6 +5748,77 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_refresh_does_not_block_non_actor_on_pending_active_handoff() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(70), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 70, PgState::Peering, 1_010);
+        authority
+            .complete_pg_peering(
+                PgId::new(70),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                1_011,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 70, PgState::Active, 1_012);
+        authority
+            .set_pg_acting_set(PgId::new(71), vec![NodeId::new(2)])
+            .unwrap();
+        let mut next_snapshot = authority.snapshot().clone();
+        {
+            let pg = next_snapshot.pgs.get_mut(&PgId::new(71)).unwrap();
+            pg.state = PgState::Active;
+            pg.active_primary = Some(NodeId::new(2));
+            pg.active_metadata_proof = Some(PgMetadataProof::empty());
+        }
+        next_snapshot.bump_epoch().unwrap();
+        authority.commit_snapshot(next_snapshot).unwrap();
+
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let pg_71 = authority.snapshot().pg(PgId::new(71)).unwrap();
+        assert_eq!(pg_71.state(), PgState::Active);
+        assert_eq!(pg_71.active_primary(), Some(NodeId::new(2)));
+        assert!(authority.snapshot().runtime_map(1_013).is_err());
+
+        let mut unrelated_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 1_014);
+        unrelated_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(70),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
+        }];
+        let refresh = authority
+            .refresh_node_heartbeat(unrelated_heartbeat, 1_014)
+            .unwrap();
+        let unrelated_route = refresh
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(70))
+            .unwrap();
+        assert_eq!(unrelated_route.state(), PgState::Active);
+        let pending_handoff_route = refresh
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(71))
+            .unwrap();
+        assert_eq!(pending_handoff_route.state(), PgState::Active);
+        assert_eq!(pending_handoff_route.primary_node_id(), NodeId::new(2));
+        assert_eq!(pending_handoff_route.primary_lease_deadline_ms(), None);
+    }
+
+    #[test]
     fn active_pg_primary_is_bound_by_peering_completion() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -6727,7 +6810,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_unbounded_to_bounded_same_epoch() {
+    fn storage_cluster_runtime_map_handle_accepts_unbounded_to_bounded_same_epoch() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -6782,16 +6865,11 @@ mod tests {
         assert_eq!(unbounded_cluster.route_map_valid_until_ms(), None);
         assert!(active_cluster.route_map_valid_until_ms().is_some());
 
-        assert!(matches!(
-            handle.install(active_cluster),
-            Err(
-                crate::cluster::StorageClusterRuntimeMapRefreshError::ValidityRegression {
-                    current: None,
-                    candidate: Some(_),
-                }
-            )
-        ));
-        assert_eq!(handle.current().route_map_valid_until_ms(), None);
+        handle.install(active_cluster).unwrap();
+        assert_eq!(
+            handle.current().route_map_valid_until_ms(),
+            active_map.valid_until_ms()
+        );
     }
 
     #[test]
@@ -7069,14 +7147,17 @@ mod tests {
             node_1_config.socket_path,
             std::path::PathBuf::from("node-1.sock")
         );
-        assert_eq!(node_1_config.pg_ids, vec![34]);
-        assert_eq!(node_1_config.pg_routes.len(), 1);
+        assert_eq!(node_1_config.pg_ids, vec![34, 35]);
+        assert_eq!(node_1_config.pg_routes.len(), 2);
         assert_eq!(node_1_config.pg_routes[0].pg_id, 34);
         assert_eq!(node_1_config.pg_routes[0].state, PgState::Active);
         assert_eq!(
             node_1_config.pg_routes[0].acting_set,
             vec![NodeId::new(1), NodeId::new(2)]
         );
+        assert_eq!(node_1_config.pg_routes[1].pg_id, 35);
+        assert_eq!(node_1_config.pg_routes[1].state, PgState::Peering);
+        assert_eq!(node_1_config.pg_routes[1].acting_set, vec![NodeId::new(2)]);
 
         let node_2_config = crate::storage_node_server::StorageNodeProcessConfig::from_runtime_map(
             NodeId::new(2),

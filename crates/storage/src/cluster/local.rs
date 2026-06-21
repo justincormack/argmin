@@ -1309,7 +1309,6 @@ pub struct LocalClusterMap {
     default_ec_shape: EcShape,
     pg_routes: BTreeMap<PgId, LocalPgRoute>,
     historical_pg_routes: BTreeMap<(ClusterEpoch, PgId), PgRouteSnapshot>,
-    placement_map: placement::ClusterMap,
     runtime_state: Arc<LocalClusterRuntimeState>,
     process_local_registry_key: usize,
 }
@@ -1471,7 +1470,6 @@ impl LocalClusterMap {
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
             route_map_valid_until_ms: None,
-            placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1560,7 +1558,6 @@ impl LocalClusterMap {
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
             route_map_valid_until_ms,
-            placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1704,7 +1701,6 @@ impl LocalClusterMap {
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
             route_map_valid_until_ms: None,
-            placement_map,
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -3119,28 +3115,14 @@ impl LocalClusterMap {
         stable_placement_key: &[u8],
     ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
         self.require_current_epoch_for_placement(operation_epoch, data_pg_id.pg_id())?;
-        self.require_active_pg_for_placement(data_pg_id.pg_id())?;
-        let ec_config = ec_config_for_shape(ec_shape)?;
-        let total_shards = ec_config.total_shards();
-        let placer = local_payload_placer(&self.placement_map, ec_shape)?;
-        let placement_key = payload_shard_placement_key(data_pg_id, stable_placement_key);
-        let mut node_ids = vec![NodeId::new(0); total_shards];
-        placer
-            .place(&placement_key, &mut node_ids)
-            .map_err(|error| placement_error_for_shape(ec_shape, error))?;
-
-        Ok(node_ids
-            .into_iter()
-            .enumerate()
-            .map(|(shard_index, node_id)| {
-                ShardLocation::new(
-                    operation_epoch,
-                    data_pg_id,
-                    ShardIndex::new(shard_index as u8),
-                    node_id,
-                )
-            })
-            .collect())
+        let route = self.require_active_pg_for_placement(data_pg_id.pg_id())?;
+        Self::place_payload_shards_for_pg_route(
+            operation_epoch,
+            data_pg_id,
+            ec_shape,
+            stable_placement_key,
+            route.acting_set(),
+        )
     }
 
     pub fn place_payload_shards_for_pg_route(
@@ -3439,7 +3421,10 @@ impl LocalClusterMap {
         Ok(())
     }
 
-    fn require_active_pg_for_placement(&self, pg_id: PgId) -> Result<(), ClusterBuildError> {
+    fn require_active_pg_for_placement(
+        &self,
+        pg_id: PgId,
+    ) -> Result<&LocalPgRoute, ClusterBuildError> {
         let route = self
             .pg_routes
             .get(&pg_id)
@@ -3454,7 +3439,7 @@ impl LocalClusterMap {
                 state: route.state(),
             });
         }
-        Ok(())
+        Ok(route)
     }
 
     fn require_active_pg_for_shard_io(

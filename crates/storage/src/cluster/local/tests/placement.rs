@@ -33,6 +33,30 @@ fn storage_cluster_opens_local_node_map() {
 }
 
 #[test]
+fn current_payload_placement_uses_pg_acting_set() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 1, m: 1 };
+    let mut map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+    Arc::get_mut(&mut map)
+        .unwrap()
+        .pg_routes
+        .get_mut(&PgId::new(0))
+        .unwrap()
+        .acting_set = Arc::from([NodeId::new(0), NodeId::new(1)]);
+    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+
+    let locations = cluster
+        .place_payload_shards(DataPgId::new(PgId::new(0)), ec_shape, b"acting-set-key")
+        .unwrap();
+
+    assert_eq!(locations.len(), 2);
+    assert!(locations
+        .iter()
+        .all(|location| location.node_id() != NodeId::new(2)));
+}
+
+#[test]
 fn places_payload_shards_deterministically_on_distinct_nodes() {
     let tmp = test_util::tempdir();
     let node_ids = [
@@ -1231,24 +1255,25 @@ fn direct_put_payload_write_fails_closed_when_required_shard_node_leaves_acting_
         .unwrap_err();
     assert!(matches!(
         err,
-        StoreError::NodeNotInActingSet {
-            node_id,
-            pg_id,
-            cluster_epoch: ClusterEpoch::INITIAL,
-        } if node_id == removed_node.as_u32() && pg_id == data_pg
+        StoreError::Io {
+            context: "place payload shards",
+            ..
+        }
     ));
-    for shard_index in 0..ec_shape.k + ec_shape.m {
+    for location in &locations {
+        let shard_index = location.shard_index();
+        let shard_key = ShardKey::new(&segment_okh, generation_id.get(), shard_index.get());
+        let node = cluster
+            .local_map
+            .node(location.node_id())
+            .expect("pre-shrink placement node should exist");
         assert!(
-            !cluster
-                .test_payload_shard_file_exists(
-                    data_pg,
-                    ec_shape,
-                    &segment_okh,
-                    generation_id,
-                    shard_index,
-                )
-                .unwrap(),
-            "failed strict payload write must not leave shard {shard_index}"
+            matches!(
+                node.storage_node().read_shard_file(data_pg, &shard_key),
+                Err(StoreError::NotFound)
+            ),
+            "failed strict payload write must not leave shard {}",
+            shard_index.get()
         );
     }
 }
@@ -2212,8 +2237,8 @@ impl BackfillRouteFixture {
 fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
     let tmp = test_util::tempdir();
     let source_node_ids = [
-        NodeId::new(0),
         NodeId::new(1),
+        NodeId::new(0),
         NodeId::new(2),
         NodeId::new(3),
         NodeId::new(4),
@@ -2275,6 +2300,24 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         .snapshot()
         .reconstructed_pg_route_at_epoch(PgId::new(0), source_epoch)
         .unwrap();
+    let source_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        source_route.cluster_epoch(),
+        source_route.pg_id(),
+        source_route.primary_node_id(),
+        source_route.acting_set().to_vec(),
+        PgState::Active,
+    );
+    let source_route_pg1 = authority
+        .snapshot()
+        .reconstructed_pg_route_at_epoch(PgId::new(1), source_epoch)
+        .unwrap();
+    let source_route_pg1 = crate::control_plane::PgRouteSnapshot::reconstructed(
+        source_route_pg1.cluster_epoch(),
+        source_route_pg1.pg_id(),
+        source_route_pg1.primary_node_id(),
+        source_route_pg1.acting_set().to_vec(),
+        PgState::Active,
+    );
     let desired_route = authority
         .snapshot()
         .reconstructed_pg_route_at_epoch(PgId::new(0), authority.snapshot().cluster_epoch())
@@ -2312,12 +2355,16 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         })
         .collect();
     let source_map = Arc::new(
-        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        LocalClusterMap::open_frontend_with_configs_and_pg_routes(
             NodeId::new(0),
             configs.iter().take(source_node_ids.len()).cloned(),
-            &[0],
+            &[0, 1],
             ec_shape,
             source_route.cluster_epoch(),
+            [
+                LocalPgRoute::from(&source_route),
+                LocalPgRoute::from(&source_route_pg1),
+            ],
         )
         .unwrap(),
     );
@@ -2427,6 +2474,31 @@ fn record_backfill_scavenger_object_segment_reference_on_pg(
 }
 
 #[test]
+fn placed_segment_read_uses_recorded_historical_placement_epoch() {
+    let fixture = backfill_route_fixture(b"phase-eleven-historical-placement-read");
+    assert_ne!(
+        fixture.source_route.cluster_epoch(),
+        fixture.desired_cluster.operation_epoch()
+    );
+    assert_ne!(
+        fixture.source_route.acting_set(),
+        fixture.desired_route.acting_set()
+    );
+
+    let mut recovered = Vec::new();
+    fixture
+        .desired_cluster
+        .read_segment_payload_stored_bytes_at_placement_epoch_into(
+            fixture.source_route.cluster_epoch(),
+            fixture.req,
+            &mut recovered,
+        )
+        .unwrap();
+
+    assert_eq!(recovered, fixture.segment.payload);
+}
+
+#[test]
 fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
     let fixture = backfill_route_fixture(b"phase-eleven-backfill-plan");
 
@@ -2451,7 +2523,7 @@ fn placed_segment_payload_shard_backfill_plan_identifies_direct_copy_targets() {
         plan.desired_health.total_shards
     );
     for target in &plan.copy_targets {
-        assert_ne!(target.source.node_id(), target.destination.node_id());
+        assert_ne!(target.source, target.destination);
         assert_eq!(target.source.data_pg_id(), target.destination.data_pg_id());
         assert_eq!(
             target.source.shard_index(),

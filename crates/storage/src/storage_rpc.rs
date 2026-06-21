@@ -668,6 +668,7 @@ pub(crate) enum StorageRpcMessageKind {
     PlacedSegmentShardBackfillCount = 141,
     ShardHistoricalRead = 142,
     PlacedSegmentShardBackfillExists = 143,
+    ShardAckHistoricalLoad = 144,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -738,6 +739,7 @@ impl StorageRpcMessageKind {
             Self::ShardAckRecord => "shard ack record",
             Self::ShardAckValidate => "shard ack validate",
             Self::ShardAckLoad => "shard ack load",
+            Self::ShardAckHistoricalLoad => "shard ack historical load",
             Self::ShardAckDelete => "shard ack delete",
             Self::ShardScavengerListFiles => "shard scavenger list files",
             Self::ShardScavengerShardRows => "shard scavenger shard rows",
@@ -1043,6 +1045,7 @@ impl StorageRpcMessageKind {
             141 => Ok(Self::PlacedSegmentShardBackfillCount),
             142 => Ok(Self::ShardHistoricalRead),
             143 => Ok(Self::PlacedSegmentShardBackfillExists),
+            144 => Ok(Self::ShardAckHistoricalLoad),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -3211,9 +3214,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ShardReadRange => STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
-        StorageRpcMessageKind::ShardAckLoad | StorageRpcMessageKind::ShardAckDelete => {
-            STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN
-        }
+        StorageRpcMessageKind::ShardAckLoad
+        | StorageRpcMessageKind::ShardAckHistoricalLoad
+        | StorageRpcMessageKind::ShardAckDelete => STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
             STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN
         }
@@ -17388,6 +17391,11 @@ mod tests {
             ),
             (
                 StorageRpcMessageKind::ShardAckLoad,
+                STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardAckHistoricalLoad,
                 STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN,
             ),

@@ -963,6 +963,12 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
 
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError>;
+
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
 
     fn record_placed_segment_shard_repair(

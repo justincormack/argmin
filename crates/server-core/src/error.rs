@@ -574,6 +574,15 @@ fn store_error_is_resource_exhausted(error: &StoreError) -> bool {
 
 fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
     match error {
+        StoreError::NotFound => "store_not_found",
+        StoreError::IntegrityError { .. } => "store_integrity_error",
+        StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
+        StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+        StoreError::PgNotFound { .. } => "pg_not_found",
+        StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",
+        StoreError::ShardPgNotFound { .. } => "shard_pg_not_found",
+        StoreError::PgNotActive { .. } => "pg_not_active",
+        StoreError::ShardPgNotActive { .. } => "shard_pg_not_active",
         StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
         StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
         StoreError::MetadataCommandContention { .. } => "metadata_command_contention",
@@ -595,13 +604,40 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
                 "shard_store_storage_rpc_shard_delete_in_progress"
             }
             "storage_rpc_error" => "shard_store_storage_rpc_error",
+            "stale_payload_operation" => "shard_store_stale_payload_operation",
             _ => "shard_store_error",
         },
+        StoreError::RouteMapExpired { .. } => "route_map_expired",
+        StoreError::StalePayloadOperation { .. } => "stale_payload_operation",
+        StoreError::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
+        StoreError::StaleMetadataOperation { .. } => "stale_metadata_operation",
+        StoreError::StaleMetadataRoute { .. } => "stale_metadata_route",
+        StoreError::StaleMetadataCommand { .. } => "stale_metadata_command",
+        StoreError::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
+        StoreError::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",
+        StoreError::MetadataCommandReplicaStateMissing { .. } => {
+            "metadata_command_replica_state_missing"
+        }
+        StoreError::StaleShardOperation { .. } => "stale_shard_operation",
+        StoreError::StaleShardLocation { .. } => "stale_shard_location",
+        StoreError::NodeNotFound { .. } => "storage_node_not_found",
+        StoreError::NodeNotInActingSet { .. } => "storage_node_not_in_acting_set",
+        StoreError::ShardIndexMismatch { .. } => "shard_index_mismatch",
+        StoreError::ShardScavengerObservationWrongPg { .. } => {
+            "shard_scavenger_observation_wrong_pg"
+        }
+        StoreError::ShardScavengerObservationShardIndexMismatch { .. } => {
+            "shard_scavenger_observation_shard_index_mismatch"
+        }
+        StoreError::ShardScavengerObservationInconsistentReason { .. } => {
+            "shard_scavenger_observation_inconsistent_reason"
+        }
+        StoreError::InvalidKeyLength { .. } => "invalid_shard_key_length",
+        StoreError::InvalidShardKeyHex => "invalid_shard_key_hex",
         StoreError::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
         StoreError::Io { .. } => "store_io_error",
         StoreError::Db { .. } => "store_db_error",
         StoreError::ErasureCoding { .. } => "store_erasure_coding_error",
-        _ => "store_error",
     }
 }
 

@@ -1220,7 +1220,6 @@ impl StorageClusterRuntimeMapHandle {
 
 fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
     match (current, candidate) {
-        (None, Some(_)) => true,
         (Some(current), Some(candidate)) => candidate < current,
         _ => false,
     }
@@ -7034,8 +7033,29 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
+        self.read_segment_payload_stored_bytes_at_placement_epoch_into(
+            self.operation_epoch(),
+            req,
+            dst,
+        )
+    }
+
+    pub fn read_segment_payload_stored_bytes_at_placement_epoch_into(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
-        match self.try_read_placed_segment_stored_bytes_into(req, dst, true)? {
+        let found = if placement_cluster_epoch == self.operation_epoch() {
+            self.try_read_placed_segment_stored_bytes_into(req, dst, true)?
+        } else {
+            let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+            let route =
+                self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
+            self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(&route, req, dst)?
+        };
+        match found {
             true => Ok(()),
             false => {
                 dst.clear();
@@ -7506,6 +7526,7 @@ impl StorageCluster {
             req,
             &locations,
             PlacedSegmentShardHealthReadMode::CurrentRoute,
+            None,
         )
     }
 
@@ -7524,6 +7545,7 @@ impl StorageCluster {
             req,
             &locations,
             PlacedSegmentShardHealthReadMode::HistoricalInspection,
+            Some(route),
         )
     }
 
@@ -7602,7 +7624,11 @@ impl StorageCluster {
 
         let mut copied = Vec::with_capacity(plan.copy_targets.len());
         for target in &plan.copy_targets {
-            let ack = self.load_payload_shard_ack(req.data_pg_id, &target.shard_key)?;
+            let ack = self.load_payload_shard_ack_for_pg_route_snapshot(
+                source_route,
+                req.data_pg_id,
+                &target.shard_key,
+            )?;
             let payload = self
                 .read_payload_shard_for_historical_inspection(target.source, &target.shard_key, ack)
                 .map_err(shard_io_error_to_store)?;
@@ -7690,7 +7716,11 @@ impl StorageCluster {
         let mut backfilled =
             Vec::with_capacity(plan.copy_targets.len() + plan.reconstruction_targets.len());
         for target in &plan.copy_targets {
-            let ack = self.load_payload_shard_ack(req.data_pg_id, &target.shard_key)?;
+            let ack = self.load_payload_shard_ack_for_pg_route_snapshot(
+                source_route,
+                req.data_pg_id,
+                &target.shard_key,
+            )?;
             let payload = self
                 .read_payload_shard_for_historical_inspection(target.source, &target.shard_key, ack)
                 .map_err(shard_io_error_to_store)?;
@@ -7828,6 +7858,7 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         locations: &[ShardLocation],
         read_mode: PlacedSegmentShardHealthReadMode,
+        historical_route: Option<&PgRouteSnapshot>,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
         let k = usize::from(req.ec.k);
@@ -7848,7 +7879,15 @@ impl StorageCluster {
                         locations.len()
                     ),
                 })?;
-            let validation = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
+            let ack_result = match historical_route {
+                Some(route) => self.load_payload_shard_ack_for_pg_route_snapshot(
+                    route,
+                    req.data_pg_id,
+                    &shard_key,
+                ),
+                None => self.load_payload_shard_ack(req.data_pg_id, &shard_key),
+            };
+            let validation = match ack_result {
                 Ok(ack) if ack.stored_size == shard_size as u64 => {
                     let read_result = match read_mode {
                         PlacedSegmentShardHealthReadMode::CurrentRoute => {
@@ -8124,6 +8163,7 @@ impl StorageCluster {
 
         for shard_index in 0..k {
             self.try_load_placed_segment_shard_for_historical_inspection(
+                route,
                 req.data_pg_id,
                 &req.segment_okh,
                 req.segment_vid,
@@ -8141,6 +8181,7 @@ impl StorageCluster {
                     break;
                 }
                 self.try_load_placed_segment_shard_for_historical_inspection(
+                    route,
                     req.data_pg_id,
                     &req.segment_okh,
                     req.segment_vid,
@@ -8470,6 +8511,7 @@ impl StorageCluster {
     #[allow(clippy::too_many_arguments)]
     fn try_load_placed_segment_shard_for_historical_inspection(
         &self,
+        route: &PgRouteSnapshot,
         data_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
@@ -8483,7 +8525,9 @@ impl StorageCluster {
             return Ok(());
         };
         let shard_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8);
-        let ack = match self.load_payload_shard_ack(data_pg_id, &shard_key) {
+        let ack = match self
+            .load_payload_shard_ack_for_pg_route_snapshot(route, data_pg_id, &shard_key)
+        {
             Ok(ack) => ack,
             Err(StoreError::NotFound) => return Ok(()),
             Err(error) => return Err(error),
@@ -8557,6 +8601,42 @@ impl StorageCluster {
         let pg_id = PgId::new(data_pg_id);
         let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
         shard_ack_client.load_written_shard_ack(pg_id, shard_key)
+    }
+
+    fn load_payload_shard_ack_for_pg_route_snapshot(
+        &self,
+        route: &PgRouteSnapshot,
+        data_pg_id: u32,
+        shard_key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        let pg_id = PgId::new(data_pg_id);
+        if route.pg_id() != pg_id {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "historical shard ack route PG {} does not match data PG {}",
+                    route.pg_id().get(),
+                    pg_id.get()
+                ),
+            });
+        }
+        let primary = route.primary_node_id();
+        if !route.acting_set().contains(&primary) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: primary.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+            });
+        }
+        let node = self
+            .local_map
+            .node(primary)
+            .ok_or(StoreError::NodeNotFound {
+                node_id: primary.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+            })?;
+        node.shard_ack_client()
+            .load_written_shard_ack_for_historical_inspection(pg_id, shard_key)
     }
 
     fn segment_payload_locations(

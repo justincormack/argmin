@@ -353,7 +353,6 @@ impl StorageNodeProcessConfig {
         let pg_routes: Vec<StorageNodePgRoute> = runtime_map
             .pg_routes()
             .iter()
-            .filter(|route| route.acting_set().contains(&node_id))
             .map(StorageNodePgRoute::from)
             .collect();
         let pg_ids: Vec<u32> = pg_routes.iter().map(|route| route.pg_id).collect();
@@ -454,6 +453,7 @@ impl StorageNodeProcessConfig {
             requested_lease_duration_ms,
             self.pg_routes
                 .iter()
+                .filter(|route| route.acting_set.contains(&self.node_id))
                 .map(|route| (PgId::new(route.pg_id), route.state)),
         )
         .map_err(StorageNodeServerError::from)
@@ -1033,8 +1033,15 @@ impl StorageNodeServer {
                             status.last_error = None;
                         }
                         Err(error) => {
+                            let error = error.to_string();
+                            if status.last_error.as_deref() != Some(error.as_str()) {
+                                eprintln!(
+                                    "storage-node {} control-plane refresh failed: {error}",
+                                    self.config_snapshot().node_id.as_u32()
+                                );
+                            }
                             status.failures += 1;
-                            status.last_error = Some(error.to_string());
+                            status.last_error = Some(error);
                         }
                     }
                 }
@@ -2204,6 +2211,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ShardAckLoad => {
                 match decode_shard_ack_item_request(&frame.payload) {
                     Ok(request) => self.shard_ack_load_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ShardAckHistoricalLoad => {
+                match decode_shard_ack_item_request(&frame.payload) {
+                    Ok(request) => self.shard_ack_historical_load_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6355,6 +6371,47 @@ impl StorageNodeConnectionHandler {
         Ok(response)
     }
 
+    fn shard_ack_historical_load_response(
+        &self,
+        request: StorageRpcShardAckItemRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if request.node_id != self.config.node_id {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    request.node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        if !self.config.pg_ids.contains(&request.pg_id.get()) {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!(
+                    "PG {} is not configured on this storage node",
+                    request.pg_id.get()
+                ),
+            });
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            let stat = pg.stat_shard(&request.shard_key)?;
+            Ok(WriteAck {
+                crc64: stat.crc64,
+                stored_size: stat.size,
+            })
+        }) {
+            Ok(ack) => encode_storage_rpc_success_response(&encode_shard_ack_item_response(
+                &StorageRpcShardAckItem {
+                    shard_key: request.shard_key,
+                    ack,
+                },
+            )),
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
     fn shard_ack_delete_response(
         &self,
         request: StorageRpcShardAckItemRequest,
@@ -9317,7 +9374,6 @@ fn validate_process_config_route_table(
 
 fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
     match (current, candidate) {
-        (None, Some(_)) => true,
         (Some(current), Some(candidate)) => candidate < current,
         _ => false,
     }
@@ -10007,6 +10063,25 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_runtime_config_install_accepts_bounded_authoritative_refresh() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_valid_until_ms = None;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut authoritative = config.clone();
+        authoritative.route_map_valid_until_ms = Some(5_000);
+
+        server
+            .install_control_plane_runtime_config(authoritative)
+            .unwrap();
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(5_000)
+        );
+    }
+
+    #[test]
     fn expired_route_map_rejects_new_work_but_allows_cleanup_route_validation() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -10163,6 +10238,116 @@ mod tests {
             heartbeat.pg_observations[0].metadata_proof.state_digest,
             metadata_state.state_digest
         );
+    }
+
+    #[test]
+    fn runtime_map_config_opens_non_acting_pgs_without_heartbeat_observation() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let acting_node_id = NodeId::new(8);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage-7.sock");
+        let acting_socket_path = tmp.path().join("sock").join("storage-8.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        for (heartbeat_node_id, heartbeat_socket_path) in [
+            (node_id, socket_path.clone()),
+            (acting_node_id, acting_socket_path),
+        ] {
+            authority
+                .set_node_membership(heartbeat_node_id, NodeMembershipState::Active)
+                .unwrap();
+            let first = authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        pg_observations: Vec::new(),
+                    },
+                    1_000,
+                )
+                .unwrap();
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: first.cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        pg_observations: Vec::new(),
+                    },
+                    1_001,
+                )
+                .unwrap();
+        }
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        authority
+            .set_pg_acting_set(pg_id, vec![acting_node_id])
+            .unwrap();
+        let observed_epoch = authority.snapshot().cluster_epoch();
+        for (heartbeat_node_id, heartbeat_socket_path) in [
+            (node_id, socket_path.clone()),
+            (
+                acting_node_id,
+                tmp.path().join("sock").join("storage-8.sock"),
+            ),
+        ] {
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch,
+                        requested_lease_duration_ms: 1_000,
+                        pg_observations: Vec::new(),
+                    },
+                    1_002,
+                )
+                .unwrap();
+        }
+
+        let runtime_map = authority.snapshot().runtime_map(1_003).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+
+        assert_eq!(config.pg_ids, vec![pg_id.get()]);
+        assert_eq!(config.pg_routes.len(), 1);
+        assert_eq!(config.pg_routes[0].acting_set, vec![acting_node_id]);
+
+        let server = StorageNodeServer::bind(config).unwrap();
+        let heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
+        assert!(heartbeat.pg_observations.is_empty());
+
+        let live_error = server
+            .connection_handler()
+            .validate_pg_route(node_id, runtime_map.cluster_epoch(), pg_id)
+            .unwrap_err();
+        assert!(matches!(
+            live_error.code,
+            StorageRpcErrorCode::InactivePgRoute | StorageRpcErrorCode::NonActingSetAccess
+        ));
+        server
+            .connection_handler()
+            .validate_shard_location_for_historical_inspection(ShardLocation::new(
+                runtime_map.cluster_epoch(),
+                DataPgId::new(pg_id),
+                ShardIndex::new(0),
+                node_id,
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -11953,6 +12138,18 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, StorageRpcErrorCode::NonActingSetAccess);
         }
+        let historical_load = send_frame(
+            &mut client,
+            5,
+            StorageRpcMessageKind::ShardAckHistoricalLoad,
+            encode_shard_ack_item_request(&existing_item),
+        );
+        let historical_payload = decode_storage_rpc_response_payload(&historical_load.payload)
+            .unwrap()
+            .unwrap();
+        let historical_item = decode_shard_ack_item_response(&historical_payload).unwrap();
+        assert_eq!(historical_item.shard_key, existing_key);
+        assert_eq!(historical_item.ack, ack);
         drop(client);
         join.join().unwrap();
 

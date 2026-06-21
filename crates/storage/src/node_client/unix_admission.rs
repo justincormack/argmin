@@ -451,6 +451,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ShardAckRecord
         | StorageRpcMessageKind::ShardAckValidate
         | StorageRpcMessageKind::ShardAckLoad
+        | StorageRpcMessageKind::ShardAckHistoricalLoad
         | StorageRpcMessageKind::PlacedSegmentShardRepairRecord
         | StorageRpcMessageKind::PlacedSegmentShardRepairClaimAcquire
         | StorageRpcMessageKind::PlacedSegmentShardRepairClaimComplete

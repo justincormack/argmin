@@ -33,8 +33,8 @@ use storage::storage_node_server::{
 };
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
-    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
-    StorageCluster, StorageClusterRuntimeMapHandle,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
+    PgState, StorageCluster, StorageClusterRuntimeMapHandle,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -199,6 +199,9 @@ fn control_plane_state_lock_path(state_path: &Path) -> Result<PathBuf, String> {
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    if let Some(exit_code) = maybe_run_control_plane_admin_command() {
+        std::process::exit(exit_code);
+    }
     let config = match ServerConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -240,6 +243,80 @@ async fn main() {
             run_legacy_local_frontend(config, host_id, ec_config).await;
         }
     }
+}
+
+fn maybe_run_control_plane_admin_command() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    let command = args.next()?;
+    if command != "control-plane-set-pg-acting-set" {
+        return None;
+    }
+
+    let Some(state_path) = args.next() else {
+        eprintln!(
+            "usage: argmin-s3 control-plane-set-pg-acting-set <state-path> <pg-id> <node-id>..."
+        );
+        return Some(2);
+    };
+    let Some(pg_id) = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(PgId::new)
+    else {
+        eprintln!(
+            "usage: argmin-s3 control-plane-set-pg-acting-set <state-path> <pg-id> <node-id>..."
+        );
+        return Some(2);
+    };
+    let mut acting_set = Vec::new();
+    for node_id in args {
+        let Some(node_id) = node_id
+            .into_string()
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(NodeId::new)
+        else {
+            eprintln!("node ids must be unsigned integers");
+            return Some(2);
+        };
+        acting_set.push(node_id);
+    }
+    if acting_set.is_empty() {
+        eprintln!("acting set must contain at least one node");
+        return Some(2);
+    }
+
+    match set_control_plane_pg_acting_set(Path::new(&state_path), pg_id, acting_set) {
+        Ok(epoch) => {
+            eprintln!(
+                "control-plane set PG {} acting set at epoch {}",
+                pg_id.get(),
+                epoch.get()
+            );
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            Some(1)
+        }
+    }
+}
+
+fn set_control_plane_pg_acting_set(
+    state_path: &Path,
+    pg_id: PgId,
+    acting_set: Vec<NodeId>,
+) -> Result<ClusterEpoch, String> {
+    let _state_lock = acquire_control_plane_state_lock(state_path)?;
+    let store = FileControlPlaneStore::new(state_path);
+    let mut authority = SingleAuthorityControlPlane::open(store)
+        .map_err(|error| format!("failed to open control-plane state: {error}"))?;
+    let snapshot = authority
+        .set_pg_acting_set(pg_id, acting_set)
+        .map_err(|error| format!("failed to set PG acting set: {error}"))?;
+    Ok(snapshot.cluster_epoch())
 }
 
 fn run_control_plane_process(config: &ServerConfig) -> ! {

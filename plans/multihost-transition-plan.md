@@ -7914,6 +7914,16 @@ PG backfill and migration design notes:
   allowing an already queued prefix of references to starve later candidates.
   Debug metrics and UAT now expose the already-queued and limit-reached counters
   alongside the existing scan outcome totals.
+- Added the first whole-lifetime UAT smoke for PG backfill migration. The
+  multihost harness now has a `pg-backfill-migration` smoke that runs a
+  file-backed control-plane topology, forces PG 0 from an old `1+1` acting set
+  to a new one while keeping the metadata primary stable, verifies historical
+  reads continue after the acting-set change, writes a new object on the desired
+  placement, and waits for scanner/backfill metrics to show candidate discovery,
+  durable enqueue, routine-backfill admission, shard writes, and durable
+  completion. The smoke is part of `scripts/ci`. Moving a metadata primary away
+  from replicas that hold the bucket/object metadata is intentionally left to
+  the metadata PG migration work; this smoke isolates data-shard backfill.
 
 Exit criteria:
 

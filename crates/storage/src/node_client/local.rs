@@ -174,6 +174,14 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
         })
     }
 
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        self.load_written_shard_ack(pg_id, key)
+    }
+
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.delete_shard_record(key)

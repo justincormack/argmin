@@ -169,6 +169,28 @@ impl UnixStorageNodeClient {
         Ok(item.ack)
     }
 
+    pub(crate) fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        let payload = self.encode_shard_ack_item(pg_id, key);
+        let response = self.rpc_request(StorageRpcMessageKind::ShardAckHistoricalLoad, payload)?;
+        let item = decode_shard_ack_item_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode historical shard ack load response",
+                error.to_string(),
+            )
+        })?;
+        if item.shard_key != *key {
+            return Err(self.rpc_payload_error(
+                "validate historical shard ack load response",
+                "shard key does not match request".to_string(),
+            ));
+        }
+        Ok(item.ack)
+    }
+
     pub(crate) fn delete_written_shard_ack(
         &self,
         pg_id: PgId,
@@ -891,6 +913,14 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
         UnixStorageNodeClient::load_written_shard_ack(self, pg_id, key)
+    }
+
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(self, pg_id, key)
     }
 
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {

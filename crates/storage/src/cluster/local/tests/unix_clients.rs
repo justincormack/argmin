@@ -177,6 +177,14 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         Err(StoreError::NotFound)
     }
 
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        self.load_written_shard_ack(pg_id, key)
+    }
+
     fn delete_written_shard_ack(&self, _pg_id: PgId, _key: &ShardKey) -> Result<(), StoreError> {
         Err(StoreError::NotFound)
     }

@@ -779,8 +779,7 @@ impl ShardScavengerSweeper {
         let handle = std::thread::Builder::new()
             .name("argmin-shard-scavenger".to_string())
             .spawn(move || {
-                let sweep_interval =
-                    Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS);
+                let sweep_interval = shard_scavenger_sweep_interval();
                 let pressure_sample_interval = BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL;
                 let mut next_sweep = Instant::now();
                 while !stop.load(Ordering::SeqCst) {
@@ -859,6 +858,16 @@ impl ShardScavengerSweeper {
             wake: Arc::new((Mutex::new(true), Condvar::new())),
             handle: Mutex::new(None),
         })
+    }
+}
+
+fn shard_scavenger_sweep_interval() -> Duration {
+    match std::env::var("ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) | Err(_) => Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
+            Ok(ms) => Duration::from_millis(ms),
+        },
+        Err(_) => Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
     }
 }
 
@@ -2421,7 +2430,8 @@ impl ReadRuntime {
 
         let mut buf = self.payload_buffer_pool.checkout(padded);
         self.storage_node
-            .read_segment_payload_stored_bytes_into(
+            .read_segment_payload_stored_bytes_at_placement_epoch_into(
+                segment.placement_cluster_epoch,
                 SegmentStoredBytesRequest {
                     data_pg_id: segment.data_pg_id,
                     segment_okh: segment.segment_okh,
@@ -2805,6 +2815,7 @@ mod tests {
             segment_okh: [61; 16],
             segment_vid: GenerationId::MIN,
             data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: ec_shape.k,
             ec_m: ec_shape.m,
             encryption: ObjectEncryption::None,
