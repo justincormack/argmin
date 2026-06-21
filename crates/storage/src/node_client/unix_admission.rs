@@ -426,7 +426,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ShardScavengerObservations
         | StorageRpcMessageKind::PlacedSegmentShardRepairs
         | StorageRpcMessageKind::PlacedSegmentShardBackfills
-        | StorageRpcMessageKind::PlacedSegmentShardBackfillCount => {
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillCount
+        | StorageRpcMessageKind::PlacedSegmentShardBackfillExists => {
             UnixStorageNodeRpcAdmissionClass::List
         }
 

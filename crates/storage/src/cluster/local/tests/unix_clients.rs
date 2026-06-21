@@ -254,6 +254,14 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         Ok(0)
     }
 
+    fn placed_segment_shard_backfill_exists(
+        &self,
+        _pg_id: PgId,
+        _work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
         _pg_id: PgId,

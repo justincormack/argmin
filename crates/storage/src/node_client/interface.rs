@@ -1020,6 +1020,12 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
     fn count_placed_segment_shard_backfills(&self, pg_id: PgId) -> Result<usize, StoreError>;
 
+    fn placed_segment_shard_backfill_exists(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError>;
+
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
         pg_id: PgId,

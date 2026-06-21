@@ -667,6 +667,7 @@ pub(crate) enum StorageRpcMessageKind {
     PlacedSegmentShardBackfillClaimError = 140,
     PlacedSegmentShardBackfillCount = 141,
     ShardHistoricalRead = 142,
+    PlacedSegmentShardBackfillExists = 143,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -893,6 +894,7 @@ impl StorageRpcMessageKind {
                 "placed segment shard backfill claim error"
             }
             Self::PlacedSegmentShardBackfillCount => "placed segment shard backfill count",
+            Self::PlacedSegmentShardBackfillExists => "placed segment shard backfill exists",
         }
     }
 
@@ -1040,6 +1042,7 @@ impl StorageRpcMessageKind {
             140 => Ok(Self::PlacedSegmentShardBackfillClaimError),
             141 => Ok(Self::PlacedSegmentShardBackfillCount),
             142 => Ok(Self::ShardHistoricalRead),
+            143 => Ok(Self::PlacedSegmentShardBackfillExists),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -3260,6 +3263,10 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::PlacedSegmentShardBackfillCount => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentShardBackfillExists => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+                + STORAGE_RPC_PLACED_SEGMENT_BACKFILL_WORK_ITEM_MAX_LEN
         }
         StorageRpcMessageKind::PlacedSegmentShardBackfillClaimAcquire => {
             STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_CLAIM_ACQUIRE_PAYLOAD_LEN

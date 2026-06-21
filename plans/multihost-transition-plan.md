@@ -7904,6 +7904,16 @@ PG backfill and migration design notes:
   verifications, plus separate hard scan errors. This keeps scanner discovery
   visible in the local debug metrics and UAT summary separately from durable
   worker claim/execution events.
+- Bounded the shard-backfill candidate verification pass. Each opportunistic
+  scanner sweep now spends a fixed budget on new historical-placement health
+  checks, reports when that budget is exhausted, and skips candidates that
+  already have durable backfill rows before consuming verification budget. The
+  already-queued check is an exact lookup by the candidate backfill work item's
+  data PG, not a bounded listing from the metadata PG being scanned. This keeps
+  scanner discovery compatible with the background-work admission model without
+  allowing an already queued prefix of references to starve later candidates.
+  Debug metrics and UAT now expose the already-queued and limit-reached counters
+  alongside the existing scan outcome totals.
 
 Exit criteria:
 

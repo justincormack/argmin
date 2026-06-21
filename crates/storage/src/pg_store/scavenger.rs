@@ -365,6 +365,39 @@ impl PgStore {
         })
     }
 
+    pub fn placed_segment_shard_backfill_exists(
+        &self,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError> {
+        validate_placed_segment_shard_backfill_work_item(work_item)?;
+        validate_placed_segment_shard_backfill_pg(self.pg_id(), work_item)?;
+        self.conn
+            .query_row(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM placed_segment_shard_backfills \
+                    WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
+                      AND stored_size = ?4 AND segment_crc64 = ?5 AND ec_k = ?6 AND ec_m = ?7 \
+                      AND source_cluster_epoch = ?8 AND desired_cluster_epoch = ?9 \
+                 )",
+                params![
+                    work_item.request.data_pg_id as i64,
+                    work_item.request.segment_okh.as_slice(),
+                    work_item.request.segment_vid.get() as i64,
+                    work_item.request.stored_size as i64,
+                    work_item.request.segment_crc64 as i64,
+                    work_item.request.ec.k as i64,
+                    work_item.request.ec.m as i64,
+                    work_item.source_cluster_epoch.get(),
+                    work_item.desired_cluster_epoch.get(),
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|source| StoreError::Db {
+                context: "check placed segment shard backfill exists",
+                source,
+            })
+    }
+
     pub fn resolve_placed_segment_shard_backfill(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
@@ -2397,6 +2430,9 @@ mod tests {
         store
             .record_placed_segment_shard_backfill(&work_item, work_item.request.ec.m, None)
             .unwrap();
+        assert!(store
+            .placed_segment_shard_backfill_exists(&work_item)
+            .unwrap());
 
         drop(store);
         let reopened = PgStore::open(tmp.path(), 7).unwrap();
@@ -2406,9 +2442,15 @@ mod tests {
         assert_eq!(backfills[0].remaining_tolerance, work_item.request.ec.m);
         assert_eq!(backfills[0].observation_count, 3);
         assert_eq!(backfills[0].last_error.as_deref(), Some("second"));
+        assert!(reopened
+            .placed_segment_shard_backfill_exists(&work_item)
+            .unwrap());
 
         assert!(reopened
             .resolve_placed_segment_shard_backfill(&work_item)
+            .unwrap());
+        assert!(!reopened
+            .placed_segment_shard_backfill_exists(&work_item)
             .unwrap());
         assert!(reopened
             .list_placed_segment_shard_backfills()

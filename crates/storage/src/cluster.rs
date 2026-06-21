@@ -88,6 +88,7 @@ pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs
 const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
+const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
 
 #[derive(Debug)]
 pub(super) struct RequestWorkBudget {
@@ -779,10 +780,12 @@ pub struct PlacedSegmentShardBackfillPlan {
 pub struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
     pub scanned: usize,
     pub current_epoch: usize,
+    pub already_queued: usize,
     pub already_complete: usize,
     pub enqueued: usize,
     pub unrecoverable: usize,
     pub failed: usize,
+    pub limit_reached: bool,
 }
 
 impl PlacedSegmentShardBackfillPlan {
@@ -7188,6 +7191,15 @@ impl StorageCluster {
             .list_placed_segment_shard_backfills(pg_id)
     }
 
+    pub fn placed_segment_shard_backfill_exists(
+        &self,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError> {
+        let pg_id = PgId::new(work_item.request.data_pg_id);
+        self.metadata_pg_primary_shard_ack_client(pg_id)?
+            .placed_segment_shard_backfill_exists(pg_id, work_item)
+    }
+
     pub fn placed_segment_shard_backfill_backlog_depth(&self) -> Result<usize, StoreError> {
         let mut depth = 0usize;
         for route in self.local_pg_routes() {
@@ -7206,9 +7218,19 @@ impl StorageCluster {
     pub fn enqueue_placed_segment_shard_backfills_from_scavenger_references(
         &self,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
+        self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
+            PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT,
+        )
+    }
+
+    fn enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
+        &self,
+        scan_limit: usize,
+    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
         let mut summary = PlacedSegmentShardBackfillCandidateEnqueueSummary::default();
         let desired_epoch = self.operation_epoch();
         let mut seen_candidates = HashSet::new();
+        let mut verified_candidates = 0usize;
         for route in self.local_pg_routes() {
             if route.state() != PgState::Active {
                 continue;
@@ -7233,6 +7255,27 @@ impl StorageCluster {
                     summary.current_epoch += 1;
                     continue;
                 }
+                let work_item = PlacedSegmentShardBackfillWorkItem {
+                    request,
+                    source_cluster_epoch: source_epoch,
+                    desired_cluster_epoch: desired_epoch,
+                };
+                match self.placed_segment_shard_backfill_exists(&work_item) {
+                    Ok(true) => {
+                        summary.already_queued += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                }
+                if verified_candidates >= scan_limit {
+                    summary.limit_reached = true;
+                    return Ok(summary);
+                }
+                verified_candidates += 1;
                 let pg_id = PgId::new(request.data_pg_id);
                 let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
                     Ok(route) => route,
@@ -7268,11 +7311,6 @@ impl StorageCluster {
                     summary.already_complete += 1;
                     continue;
                 }
-                let work_item = PlacedSegmentShardBackfillWorkItem {
-                    request,
-                    source_cluster_epoch: source_epoch,
-                    desired_cluster_epoch: desired_epoch,
-                };
                 if self
                     .record_placed_segment_shard_backfill_with_remaining_tolerance(
                         &work_item,

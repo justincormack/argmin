@@ -587,6 +587,36 @@ impl UnixStorageNodeClient {
         })
     }
 
+    pub(crate) fn placed_segment_shard_backfill_exists(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcPlacedSegmentShardBackfillItemRequest {
+            route: self.bucket_pg_request(pg_id),
+            work_item: *work_item,
+        };
+        let payload =
+            encode_placed_segment_shard_backfill_item_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment shard backfill exists request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentShardBackfillExists,
+            payload,
+        )?;
+        decode_metadata_command_bool_response(&response)
+            .map(|response| response.value)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode placed segment shard backfill exists response",
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) fn acquire_placed_segment_shard_backfill_claim(
         &self,
         pg_id: PgId,
@@ -987,6 +1017,14 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn count_placed_segment_shard_backfills(&self, pg_id: PgId) -> Result<usize, StoreError> {
         UnixStorageNodeClient::count_placed_segment_shard_backfills(self, pg_id)
+    }
+
+    fn placed_segment_shard_backfill_exists(
+        &self,
+        pg_id: PgId,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError> {
+        UnixStorageNodeClient::placed_segment_shard_backfill_exists(self, pg_id, work_item)
     }
 
     fn acquire_placed_segment_shard_backfill_claim(

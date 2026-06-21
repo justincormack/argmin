@@ -2356,6 +2356,15 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::PlacedSegmentShardBackfillExists => {
+                match decode_placed_segment_shard_backfill_item_request(&frame.payload) {
+                    Ok(request) => self.placed_segment_shard_backfill_exists_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::PlacedSegmentShardBackfillResolve => {
                 match decode_placed_segment_shard_backfill_item_request(&frame.payload) {
                     Ok(request) => self.placed_segment_shard_backfill_resolve_response(request),
@@ -6786,6 +6795,37 @@ impl StorageNodeConnectionHandler {
         match local_client.count_placed_segment_shard_backfills(request.pg_id) {
             Ok(count) => {
                 let payload = encode_placed_segment_shard_backfill_count_response(count)?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+        }
+    }
+
+    fn placed_segment_shard_backfill_exists_response(
+        &self,
+        request: StorageRpcPlacedSegmentShardBackfillItemRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.route.pg_id, "placed segment shard backfill exists")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match local_client
+            .placed_segment_shard_backfill_exists(request.route.pg_id, &request.work_item)
+        {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),

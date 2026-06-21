@@ -809,10 +809,12 @@ impl ShardScavengerSweeper {
                                         observability::ShardBackfillCandidateScanSummary {
                                             scanned: summary.scanned,
                                             current_epoch: summary.current_epoch,
+                                            already_queued: summary.already_queued,
                                             already_complete: summary.already_complete,
                                             enqueued: summary.enqueued,
                                             unrecoverable: summary.unrecoverable,
                                             failed: summary.failed,
+                                            limit_reached: summary.limit_reached,
                                         },
                                     );
                                 }

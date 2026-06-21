@@ -1085,10 +1085,12 @@ fn local_debug_metrics_body() -> String {
             "shard_backfill_candidate_scan_total {}\n",
             "shard_backfill_candidate_scanned_total {}\n",
             "shard_backfill_candidate_current_epoch_total {}\n",
+            "shard_backfill_candidate_already_queued_total {}\n",
             "shard_backfill_candidate_already_complete_total {}\n",
             "shard_backfill_candidate_enqueued_total {}\n",
             "shard_backfill_candidate_unrecoverable_total {}\n",
             "shard_backfill_candidate_failed_total {}\n",
+            "shard_backfill_candidate_limit_reached_total {}\n",
             "shard_backfill_candidate_scan_error_total {}\n",
             "background_work_admission_event_total {}\n",
             "background_work_active_total {}\n",
@@ -1167,10 +1169,12 @@ fn local_debug_metrics_body() -> String {
         snapshot.shard_backfill_candidate_scan_total,
         snapshot.shard_backfill_candidate_scanned_total,
         snapshot.shard_backfill_candidate_current_epoch_total,
+        snapshot.shard_backfill_candidate_already_queued_total,
         snapshot.shard_backfill_candidate_already_complete_total,
         snapshot.shard_backfill_candidate_enqueued_total,
         snapshot.shard_backfill_candidate_unrecoverable_total,
         snapshot.shard_backfill_candidate_failed_total,
+        snapshot.shard_backfill_candidate_limit_reached_total,
         snapshot.shard_backfill_candidate_scan_error_total,
         snapshot.background_work_admission_event_total,
         snapshot.background_work_active_total,
@@ -4640,10 +4644,12 @@ mod tests {
         assert!(response.contains("shard_backfill_candidate_scan_total "));
         assert!(response.contains("shard_backfill_candidate_scanned_total "));
         assert!(response.contains("shard_backfill_candidate_current_epoch_total "));
+        assert!(response.contains("shard_backfill_candidate_already_queued_total "));
         assert!(response.contains("shard_backfill_candidate_already_complete_total "));
         assert!(response.contains("shard_backfill_candidate_enqueued_total "));
         assert!(response.contains("shard_backfill_candidate_unrecoverable_total "));
         assert!(response.contains("shard_backfill_candidate_failed_total "));
+        assert!(response.contains("shard_backfill_candidate_limit_reached_total "));
         assert!(response.contains("shard_backfill_candidate_scan_error_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
