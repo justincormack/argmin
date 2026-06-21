@@ -2228,6 +2228,14 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         NodeId::new(5),
         NodeId::new(6),
     ];
+    let desired_node_ids = [
+        NodeId::new(0),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+        NodeId::new(6),
+    ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
         crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
@@ -2258,7 +2266,7 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         )
         .unwrap();
     authority
-        .set_pg_acting_set(PgId::new(0), all_node_ids[1..].to_vec())
+        .set_pg_acting_set(PgId::new(0), desired_node_ids.to_vec())
         .unwrap();
     let source_route = authority
         .snapshot()
@@ -2268,8 +2276,15 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         .snapshot()
         .reconstructed_pg_route_at_epoch(PgId::new(0), authority.snapshot().cluster_epoch())
         .unwrap();
+    let desired_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        desired_route.cluster_epoch(),
+        desired_route.pg_id(),
+        desired_route.primary_node_id(),
+        desired_route.acting_set().to_vec(),
+        PgState::Active,
+    );
     assert_eq!(source_route.acting_set(), &source_node_ids);
-    assert_eq!(desired_route.acting_set(), &all_node_ids[1..]);
+    assert_eq!(desired_route.acting_set(), &desired_node_ids);
 
     let configs: Vec<_> = all_node_ids
         .iter()
@@ -2302,16 +2317,17 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         segment_crc64: checksum::crc64::checksum(&segment.payload),
         ec: segment.written.ec,
     };
-    let desired_map = Arc::new(
-        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
-            NodeId::new(0),
-            configs,
-            &[0],
-            ec_shape,
-            desired_route.cluster_epoch(),
-        )
-        .unwrap(),
-    );
+    let mut desired_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &[0],
+        ec_shape,
+        desired_route.cluster_epoch(),
+        [LocalPgRoute::from(&desired_route)],
+    )
+    .unwrap();
+    desired_map.test_install_historical_pg_routes([source_route.clone()]);
+    let desired_map = Arc::new(desired_map);
     let desired_cluster = crate::StorageCluster::from_local_map(Arc::clone(&desired_map)).unwrap();
 
     BackfillRouteFixture {
@@ -2610,6 +2626,94 @@ fn placed_segment_payload_backfill_plan_record_derives_durable_priority() {
             .len(),
         1,
         "unrecoverable plan must not enqueue another durable backfill row"
+    );
+}
+
+#[test]
+fn shard_scavenger_backfill_candidate_scan_records_historical_payloads() {
+    let fixture = backfill_route_fixture(b"phase-eleven-scanner-backfill-candidate");
+    let bucket = crate::BucketName::try_from("backfill-scan-bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("backfill-scan-key".to_string()).unwrap();
+    let primary = fixture
+        .desired_cluster
+        .local_map
+        .metadata_pg_primary_node(
+            fixture.desired_cluster.operation_epoch(),
+            PgId::new(fixture.req.data_pg_id),
+        )
+        .unwrap();
+    assert_eq!(primary.node_id(), NodeId::new(0));
+    {
+        let pg = primary
+            .storage_node()
+            .get_pg(fixture.req.data_pg_id)
+            .unwrap();
+        crate::PgMetadataStore::put_object_with_segments(
+            &*pg,
+            &crate::PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: crate::VersionId::Null,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                generation_id: fixture.req.segment_vid,
+                size: fixture.req.stored_size as u64,
+                etag: crate::ObjectEtag::single_part(fixture.req.segment_crc64),
+                ec: fixture.req.ec,
+                layout: crate::ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            },
+            &[crate::ObjectSegmentRecord {
+                bucket,
+                key,
+                version_id: crate::VersionId::Null,
+                segment_index: 0,
+                size: fixture.req.stored_size as u64,
+                segment_crc64: fixture.req.segment_crc64,
+                segment_okh: fixture.req.segment_okh,
+                segment_vid: fixture.req.segment_vid,
+                data_pg_id: fixture.req.data_pg_id,
+                placement_cluster_epoch: fixture.source_route.cluster_epoch(),
+                ec_k: fixture.req.ec.k,
+                ec_m: fixture.req.ec.m,
+            }],
+        )
+        .unwrap();
+    }
+    let summary = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references()
+        .unwrap();
+    assert_eq!(
+        summary,
+        crate::cluster::PlacedSegmentShardBackfillCandidateEnqueueSummary {
+            scanned: 1,
+            current_epoch: 0,
+            already_complete: 0,
+            enqueued: 1,
+            unrecoverable: 0,
+            failed: 0,
+        }
+    );
+
+    let rows = fixture
+        .desired_cluster
+        .list_placed_segment_shard_backfills(fixture.req.data_pg_id)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].work_item.request, fixture.req);
+    assert_eq!(
+        rows[0].work_item.source_cluster_epoch,
+        fixture.source_route.cluster_epoch()
+    );
+    assert_eq!(
+        rows[0].work_item.desired_cluster_epoch,
+        fixture.desired_route.cluster_epoch()
     );
 }
 

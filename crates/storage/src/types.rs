@@ -2225,6 +2225,7 @@ pub(crate) struct ShardScavengerPlacedShardSetReference {
     pub data_pg_id: u32,
     pub okh: [u8; 16],
     pub generation_id: GenerationId,
+    pub placement_cluster_epoch: ClusterEpoch,
     pub stored_size: u64,
     pub crc64: u64,
     pub ec: EcShape,
@@ -2254,6 +2255,7 @@ pub(crate) struct ShardScavengerRoutedMultipartPartReference {
     pub crc64: u64,
     pub part_okh: [u8; 16],
     pub part_vid: GenerationId,
+    pub placement_cluster_epoch: ClusterEpoch,
     pub ec: EcShape,
 }
 

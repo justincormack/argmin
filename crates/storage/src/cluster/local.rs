@@ -1361,6 +1361,7 @@ impl LocalClusterMap {
             pg_ids,
             default_ec_shape,
             cluster_epoch,
+            None,
             true,
         )
     }
@@ -1378,6 +1379,27 @@ impl LocalClusterMap {
             pg_ids,
             default_ec_shape,
             cluster_epoch,
+            None,
+            false,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn open_frontend_with_configs_and_pg_routes(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+        pg_routes: impl IntoIterator<Item = LocalPgRoute>,
+    ) -> Result<Self, ClusterBuildError> {
+        Self::open_with_configs_inner(
+            metadata_primary_node_id,
+            configs,
+            pg_ids,
+            default_ec_shape,
+            cluster_epoch,
+            Some(pg_routes.into_iter().collect()),
             false,
         )
     }
@@ -1589,6 +1611,7 @@ impl LocalClusterMap {
         pg_ids: &[u32],
         default_ec_shape: EcShape,
         cluster_epoch: ClusterEpoch,
+        pg_routes: Option<Vec<LocalPgRoute>>,
         validate_local_metadata_command_replay: bool,
     ) -> Result<Self, ClusterBuildError> {
         let configs: Vec<LocalNodeStoreConfig> = configs.into_iter().collect();
@@ -1637,12 +1660,16 @@ impl LocalClusterMap {
                 reason: reason.to_string(),
             }
         })?;
-        let pg_routes = build_static_pg_routes(
-            cluster_epoch,
-            metadata_primary_node_id,
-            Arc::clone(&acting_set),
-            &pg_ids,
-        );
+        let pg_routes = if let Some(pg_routes) = pg_routes {
+            build_validated_pg_routes(cluster_epoch, &node_ids, &pg_ids, pg_routes)?
+        } else {
+            build_static_pg_routes(
+                cluster_epoch,
+                metadata_primary_node_id,
+                Arc::clone(&acting_set),
+                &pg_ids,
+            )
+        };
 
         let mut nodes = BTreeMap::new();
         for (node_id, canonical_data_dir) in validated_configs {
@@ -2460,6 +2487,14 @@ impl LocalClusterMap {
         self.historical_pg_routes = routes
             .into_iter()
             .map(|route| ((route.cluster_epoch(), route.pg_id()), route))
+            .collect();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_pg_routes(&mut self, routes: impl IntoIterator<Item = PgRouteSnapshot>) {
+        self.pg_routes = routes
+            .into_iter()
+            .map(|route| (route.pg_id(), LocalPgRoute::from(&route)))
             .collect();
     }
 

@@ -7863,6 +7863,19 @@ PG backfill and migration design notes:
   command replay and uniform metadata shape. Scanner/candidate integration can
   now consume direct part rows and segmented rows through the same historical
   placement reconstruction model.
+- Integrated shard-scavenger live-reference output with durable backfill
+  candidate production. Scavenger payload references now carry the placement
+  epoch for placed segment rows and routed multipart parts, and local
+  reference accounting reconstructs historical placement from that epoch rather
+  than treating all live payload as current-route payload. The opportunistic
+  shard-scavenger sweep now deduplicates live references by segment identity
+  and source epoch, verifies source and desired shard health through retained
+  route history, and records durable backfill rows with the derived EC-risk
+  tolerance. Reclaim-only references remain cleanup protection only and do not
+  create backfill candidates. Because scanner candidate production depends on
+  current route history, the coordinator shard-scavenger sweeper now resolves
+  the current storage runtime-map handle each iteration instead of holding the
+  initial storage cluster forever.
 
 Exit criteria:
 

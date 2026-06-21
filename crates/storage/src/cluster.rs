@@ -775,6 +775,16 @@ pub struct PlacedSegmentShardBackfillPlan {
     pub unrecoverable_targets: Vec<ShardIndex>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
+    pub scanned: usize,
+    pub current_epoch: usize,
+    pub already_complete: usize,
+    pub enqueued: usize,
+    pub unrecoverable: usize,
+    pub failed: usize,
+}
+
 impl PlacedSegmentShardBackfillPlan {
     #[must_use]
     pub fn is_complete(&self) -> bool {
@@ -6764,6 +6774,7 @@ impl StorageCluster {
                             data_pg_id,
                             okh: reference.part_okh,
                             generation_id: reference.part_vid,
+                            placement_cluster_epoch: reference.placement_cluster_epoch,
                             stored_size: reference.stored_size,
                             crc64: reference.crc64,
                             ec: reference.ec,
@@ -6787,6 +6798,7 @@ impl StorageCluster {
             reference.data_pg_id,
             reference.okh,
             reference.generation_id,
+            reference.placement_cluster_epoch,
             reference.ec,
         )?;
         let request = SegmentStoredBytesRequest {
@@ -6821,6 +6833,7 @@ impl StorageCluster {
             reference.data_pg_id,
             reference.okh,
             reference.generation_id,
+            self.operation_epoch(),
             reference.ec,
         )
     }
@@ -6831,12 +6844,15 @@ impl StorageCluster {
         data_pg_id: u32,
         okh: [u8; 16],
         generation_id: GenerationId,
+        placement_cluster_epoch: ClusterEpoch,
         ec: EcShape,
     ) -> Result<(), StoreError> {
         let data_pg = DataPgId::new(PgId::new(data_pg_id));
         let placement_key = segment_payload_placement_key(&okh, generation_id);
+        let route =
+            self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
         let locations = self
-            .place_payload_shards(data_pg, ec, &placement_key)
+            .place_payload_shards_for_pg_route_snapshot(&route, data_pg, ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
         for key in Self::payload_shard_set_keys(&okh, generation_id, ec) {
             let location = Self::placed_payload_shard_location(&locations, &key)?;
@@ -7185,6 +7201,135 @@ impl StorageCluster {
             );
         }
         Ok(depth)
+    }
+
+    pub fn enqueue_placed_segment_shard_backfills_from_scavenger_references(
+        &self,
+    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
+        let mut summary = PlacedSegmentShardBackfillCandidateEnqueueSummary::default();
+        let desired_epoch = self.operation_epoch();
+        let mut seen_candidates = HashSet::new();
+        for route in self.local_pg_routes() {
+            if route.state() != PgState::Active {
+                continue;
+            }
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            for reference in node
+                .shard_scavenger_client()
+                .list_shard_scavenger_payload_references(route.pg_id())?
+            {
+                let Some((request, source_epoch)) =
+                    self.backfill_candidate_from_scavenger_reference(reference)
+                else {
+                    continue;
+                };
+                if !seen_candidates.insert((request, source_epoch)) {
+                    continue;
+                }
+                summary.scanned += 1;
+                if source_epoch == desired_epoch {
+                    summary.current_epoch += 1;
+                    continue;
+                }
+                let pg_id = PgId::new(request.data_pg_id);
+                let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
+                    Ok(route) => route,
+                    Err(_) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
+                let desired_route = match self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch)
+                {
+                    Ok(route) => route,
+                    Err(_) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
+                let plan = match self.placed_segment_payload_shard_backfill_plan(
+                    &source_route,
+                    &desired_route,
+                    request,
+                ) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
+                if !plan.unrecoverable_targets.is_empty() {
+                    summary.unrecoverable += 1;
+                    continue;
+                }
+                if plan.is_complete() {
+                    summary.already_complete += 1;
+                    continue;
+                }
+                let work_item = PlacedSegmentShardBackfillWorkItem {
+                    request,
+                    source_cluster_epoch: source_epoch,
+                    desired_cluster_epoch: desired_epoch,
+                };
+                if self
+                    .record_placed_segment_shard_backfill_with_remaining_tolerance(
+                        &work_item,
+                        plan.source_remaining_tolerance(),
+                        None,
+                    )
+                    .is_err()
+                {
+                    summary.failed += 1;
+                    continue;
+                }
+                summary.enqueued += 1;
+            }
+        }
+        Ok(summary)
+    }
+
+    fn backfill_candidate_from_scavenger_reference(
+        &self,
+        reference: ShardScavengerPayloadReference,
+    ) -> Option<(SegmentStoredBytesRequest, ClusterEpoch)> {
+        match reference {
+            ShardScavengerPayloadReference::Placed(reference) => Some((
+                SegmentStoredBytesRequest {
+                    data_pg_id: reference.data_pg_id,
+                    segment_okh: reference.okh,
+                    segment_vid: reference.generation_id,
+                    stored_size: reference.stored_size as usize,
+                    segment_crc64: reference.crc64,
+                    ec: reference.ec,
+                },
+                reference.placement_cluster_epoch,
+            )),
+            ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
+                let data_pg_id = self
+                    .local_map
+                    .object_generation_multipart_part_data_pg(
+                        &reference.bucket,
+                        &reference.key,
+                        reference.object_generation_id,
+                        reference.part_number,
+                    )
+                    .get();
+                Some((
+                    SegmentStoredBytesRequest {
+                        data_pg_id,
+                        segment_okh: reference.part_okh,
+                        segment_vid: reference.part_vid,
+                        stored_size: reference.stored_size as usize,
+                        segment_crc64: reference.crc64,
+                        ec: reference.ec,
+                    },
+                    reference.placement_cluster_epoch,
+                ))
+            }
+            ShardScavengerPayloadReference::ReclaimOnly(_) => None,
+        }
     }
 
     pub fn acquire_placed_segment_shard_backfill_claim(

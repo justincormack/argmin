@@ -1116,25 +1116,25 @@ impl PgStore {
         let mut references = Vec::new();
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, placement_cluster_epoch, ec_k, ec_m \
              FROM object_segments",
             "list object segment shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, part_okh, part_vid, size, payload_crc64, ec_k, ec_m \
+            "SELECT data_pg_id, part_okh, part_vid, size, payload_crc64, placement_cluster_epoch, ec_k, ec_m \
              FROM object_parts WHERE part_okh != zeroblob(16)",
             "list object part shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, placement_cluster_epoch, ec_k, ec_m \
              FROM stream_upload_segments",
             "list stream upload segment shard scavenger references",
         )?;
         self.extend_scavenger_placed_references(
             &mut references,
-            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, ec_k, ec_m \
+            "SELECT data_pg_id, segment_okh, segment_vid, size, segment_crc64, placement_cluster_epoch, ec_k, ec_m \
              FROM multipart_part_segments",
             "list multipart part segment shard scavenger references",
         )?;
@@ -1294,14 +1294,17 @@ impl PgStore {
         for segment in segments {
             Self::push_placed_reference(
                 references,
-                segment.data_pg_id,
-                segment.segment_okh,
-                segment.segment_vid,
-                segment.size,
-                segment.segment_crc64,
-                EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
+                ShardScavengerPlacedShardSetReference {
+                    data_pg_id: segment.data_pg_id,
+                    okh: segment.segment_okh,
+                    generation_id: segment.segment_vid,
+                    placement_cluster_epoch: segment.placement_cluster_epoch,
+                    stored_size: segment.size,
+                    crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
                 },
             );
         }
@@ -1317,14 +1320,17 @@ impl PgStore {
             }
             Self::push_placed_reference(
                 references,
-                part.data_pg_id,
-                part.part_okh,
-                part.part_vid,
-                part.size,
-                part.payload_crc64,
-                EcShape {
-                    k: part.ec_k,
-                    m: part.ec_m,
+                ShardScavengerPlacedShardSetReference {
+                    data_pg_id: part.data_pg_id,
+                    okh: part.part_okh,
+                    generation_id: part.part_vid,
+                    placement_cluster_epoch: part.placement_cluster_epoch,
+                    stored_size: part.size,
+                    crc64: part.payload_crc64,
+                    ec: EcShape {
+                        k: part.ec_k,
+                        m: part.ec_m,
+                    },
                 },
             );
         }
@@ -1345,14 +1351,17 @@ impl PgStore {
     ) {
         Self::push_placed_reference(
             references,
-            segment.data_pg_id,
-            segment.segment_okh,
-            segment.segment_vid,
-            segment.size,
-            segment.segment_crc64,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
+            ShardScavengerPlacedShardSetReference {
+                data_pg_id: segment.data_pg_id,
+                okh: segment.segment_okh,
+                generation_id: segment.segment_vid,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                stored_size: segment.size,
+                crc64: segment.segment_crc64,
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
             },
         );
     }
@@ -1364,14 +1373,17 @@ impl PgStore {
         for segment in segments {
             Self::push_placed_reference(
                 references,
-                segment.data_pg_id,
-                segment.segment_okh,
-                segment.segment_vid,
-                segment.size,
-                segment.segment_crc64,
-                EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
+                ShardScavengerPlacedShardSetReference {
+                    data_pg_id: segment.data_pg_id,
+                    okh: segment.segment_okh,
+                    generation_id: segment.segment_vid,
+                    placement_cluster_epoch: segment.placement_cluster_epoch,
+                    stored_size: segment.size,
+                    crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
                 },
             );
         }
@@ -1398,6 +1410,7 @@ impl PgStore {
                     crc64: part.payload_crc64,
                     part_okh: part.part_okh,
                     part_vid: part.part_vid,
+                    placement_cluster_epoch: part.placement_cluster_epoch,
                     ec: EcShape {
                         k: part.ec_k,
                         m: part.ec_m,
@@ -1458,23 +1471,9 @@ impl PgStore {
 
     fn push_placed_reference(
         references: &mut Vec<ShardScavengerPayloadReference>,
-        data_pg_id: u32,
-        okh: [u8; 16],
-        generation_id: GenerationId,
-        stored_size: u64,
-        crc64: u64,
-        ec: EcShape,
+        reference: ShardScavengerPlacedShardSetReference,
     ) {
-        references.push(ShardScavengerPayloadReference::Placed(
-            ShardScavengerPlacedShardSetReference {
-                data_pg_id,
-                okh,
-                generation_id,
-                stored_size,
-                crc64,
-                ec,
-            },
-        ));
+        references.push(ShardScavengerPayloadReference::Placed(reference));
     }
 
     fn push_reclaim_reference(
@@ -1557,11 +1556,16 @@ impl PgStore {
                             2,
                             "shard scavenger reference generation",
                         )?,
+                        placement_cluster_epoch: PgStore::parse_cluster_epoch(
+                            row.get::<_, i64>(5)?,
+                            5,
+                            "placement_cluster_epoch",
+                        )?,
                         stored_size: row.get::<_, i64>(3)? as u64,
                         crc64: row.get::<_, i64>(4)? as u64,
                         ec: EcShape {
-                            k: row.get(5)?,
-                            m: row.get(6)?,
+                            k: row.get(6)?,
+                            m: row.get(7)?,
                         },
                     },
                 ))
@@ -1618,7 +1622,7 @@ impl PgStore {
             .conn
             .prepare_cached(
                 "SELECT u.bucket, u.key, u.object_generation_id, p.part_number, \
-                 p.size, p.payload_crc64, p.part_okh, p.part_vid, p.ec_k, p.ec_m \
+                 p.size, p.payload_crc64, p.part_okh, p.part_vid, p.placement_cluster_epoch, p.ec_k, p.ec_m \
                  FROM multipart_parts p \
                  JOIN multipart_uploads u ON u.upload_id = p.upload_id \
                  WHERE p.part_okh != zeroblob(16)",
@@ -1645,9 +1649,14 @@ impl PgStore {
                             7,
                             "multipart part payload generation",
                         )?,
+                        placement_cluster_epoch: PgStore::parse_cluster_epoch(
+                            row.get::<_, i64>(8)?,
+                            8,
+                            "placement_cluster_epoch",
+                        )?,
                         ec: EcShape {
-                            k: row.get(8)?,
-                            m: row.get(9)?,
+                            k: row.get(9)?,
+                            m: row.get(10)?,
                         },
                     },
                 ))
@@ -2514,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_scavenger_payload_references_include_part_size_and_crc() {
+    fn shard_scavenger_payload_references_include_part_size_crc_and_epoch() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
 
@@ -2537,7 +2546,7 @@ mod tests {
                     0i64,
                     [0x11u8; 16].as_slice(),
                     9i64,
-                    1i64,
+                    3i64,
                     4i64,
                     2i64,
                     7i64,
@@ -2586,7 +2595,7 @@ mod tests {
                     0i64,
                     [0x22u8; 16].as_slice(),
                     10i64,
-                    1i64,
+                    5i64,
                     4i64,
                     2i64,
                     11i64,
@@ -2623,6 +2632,10 @@ mod tests {
             .expect("object part placed reference should be listed");
         assert_eq!(object_part.stored_size, 1234);
         assert_eq!(object_part.crc64, 0xAABB);
+        assert_eq!(
+            object_part.placement_cluster_epoch,
+            ClusterEpoch::new(3).unwrap()
+        );
 
         let routed_part = references
             .iter()
@@ -2644,6 +2657,10 @@ mod tests {
         assert_eq!(routed_part.part_number, 2);
         assert_eq!(routed_part.stored_size, 5678);
         assert_eq!(routed_part.crc64, 0xCCDD);
+        assert_eq!(
+            routed_part.placement_cluster_epoch,
+            ClusterEpoch::new(5).unwrap()
+        );
 
         let reclaim = references
             .iter()

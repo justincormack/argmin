@@ -726,27 +726,27 @@ impl LifecycleSweeper {
 
 impl ShardScavengerSweeper {
     pub(super) fn acquire_shared(
-        storage_cluster: &Arc<StorageCluster>,
+        storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_SCAVENGER_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardScavengerSweeper>>> =
             lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
+        let storage_cluster = storage_handle.current();
         let key = storage_cluster.process_local_registry_key();
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }
 
-        let sweeper = Self::spawn(Arc::clone(storage_cluster))?;
+        let sweeper = Self::spawn(storage_handle.clone())?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
     }
 
-    fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
+    fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
-        let admission = background_work_admission_for(&storage_cluster);
         let sweeper = Arc::new(Self {
             stop: Arc::clone(&stop),
             wake: Arc::clone(&wake),
@@ -760,6 +760,8 @@ impl ShardScavengerSweeper {
                 let pressure_sample_interval = BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL;
                 let mut next_sweep = Instant::now();
                 while !stop.load(Ordering::SeqCst) {
+                    let storage_cluster = storage_handle.current();
+                    let admission = background_work_admission_for(&storage_cluster);
                     admission.observe_pressure();
                     let now = Instant::now();
                     if now >= next_sweep {
@@ -773,6 +775,32 @@ impl ShardScavengerSweeper {
                                     "shard_scavenger_audit_error",
                                     Some(format_args!("error={error}")),
                                 );
+                            }
+                            match storage_cluster
+                                .enqueue_placed_segment_shard_backfills_from_scavenger_references()
+                            {
+                                Ok(summary) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "shard_backfill_candidate_scan",
+                                        Some(format_args!(
+                                            "scanned={} current_epoch={} already_complete={} enqueued={} unrecoverable={} failed={}",
+                                            summary.scanned,
+                                            summary.current_epoch,
+                                            summary.already_complete,
+                                            summary.enqueued,
+                                            summary.unrecoverable,
+                                            summary.failed,
+                                        )),
+                                    );
+                                }
+                                Err(error) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "shard_backfill_candidate_scan_error",
+                                        Some(format_args!("error={error}")),
+                                    );
+                                }
                             }
                         }
                         next_sweep = Instant::now() + sweep_interval;

@@ -13660,6 +13660,7 @@ impl<'a> StorageRpcDecoder<'a> {
                     data_pg_id: self.read_u32()?,
                     okh: self.read_16_bytes()?,
                     generation_id: self.read_generation_id()?,
+                    placement_cluster_epoch: self.read_cluster_epoch()?,
                     stored_size: self.read_u64()?,
                     crc64: self.read_u64()?,
                     ec: self.read_ec_shape()?,
@@ -13675,6 +13676,7 @@ impl<'a> StorageRpcDecoder<'a> {
                     crc64: self.read_u64()?,
                     part_okh: self.read_16_bytes()?,
                     part_vid: self.read_generation_id()?,
+                    placement_cluster_epoch: self.read_cluster_epoch()?,
                     ec: self.read_ec_shape()?,
                 },
             )),
@@ -15327,6 +15329,7 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_u32(out, reference.data_pg_id);
             out.extend_from_slice(&reference.okh);
             put_u64(out, reference.generation_id.get());
+            put_u64(out, reference.placement_cluster_epoch.get());
             put_u64(out, reference.stored_size);
             put_u64(out, reference.crc64);
             put_ec_shape(out, reference.ec);
@@ -15341,6 +15344,7 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_u64(out, reference.crc64);
             out.extend_from_slice(&reference.part_okh);
             put_u64(out, reference.part_vid.get());
+            put_u64(out, reference.placement_cluster_epoch.get());
             put_ec_shape(out, reference.ec);
         }
         ShardScavengerPayloadReference::ReclaimOnly(reference) => {
@@ -17036,6 +17040,7 @@ mod tests {
                 data_pg_id: 3,
                 okh: [7; 16],
                 generation_id: GenerationId::new(5).unwrap(),
+                placement_cluster_epoch: ClusterEpoch::new(11).unwrap(),
                 stored_size: 4096,
                 crc64: 0xBEEF,
                 ec: EcShape { k: 2, m: 1 },
@@ -17056,6 +17061,7 @@ mod tests {
                     crc64: 0xCAFE,
                     part_okh: [8; 16],
                     part_vid: GenerationId::new(9).unwrap(),
+                    placement_cluster_epoch: ClusterEpoch::new(12).unwrap(),
                     ec: EcShape { k: 4, m: 2 },
                 },
             ),

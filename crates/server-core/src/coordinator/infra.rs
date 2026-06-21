@@ -378,9 +378,9 @@ impl Coordinator {
                     Ok(LifecycleSweeper::disabled())
                 }
             };
-        let shard_scavenger_sweeper_factory = |storage_cluster: &Arc<StorageCluster>| {
+        let shard_scavenger_sweeper_factory = |storage_handle: &StorageClusterRuntimeMapHandle| {
             if background_worker_mode.shard_scavenger {
-                ShardScavengerSweeper::acquire_shared(storage_cluster)
+                ShardScavengerSweeper::acquire_shared(storage_handle)
             } else {
                 Ok(ShardScavengerSweeper::disabled())
             }
@@ -455,7 +455,9 @@ impl Coordinator {
     ) -> Result<Self, ServerError>
     where
         F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
-        G: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
+        G: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
         H: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardRepairSweeper>, ServerError>,
         I: FnOnce(
             &StorageClusterRuntimeMapHandle,
@@ -513,7 +515,9 @@ impl Coordinator {
     ) -> Result<Self, ServerError>
     where
         F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
-        G: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
+        G: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
         H: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardRepairSweeper>, ServerError>,
         I: FnOnce(
             &StorageClusterRuntimeMapHandle,
@@ -550,7 +554,7 @@ impl Coordinator {
             ReclaimSweeper::disabled(Arc::clone(&storage_cluster))
         };
         let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
-        let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&storage_cluster)?;
+        let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&storage_handle)?;
         let shard_repair_sweeper = shard_repair_sweeper_factory(&storage_cluster)?;
         let shard_backfill_sweeper = shard_backfill_sweeper_factory(&storage_handle)?;
         let stream_session_sweeper = stream_session_sweeper_factory(&storage_cluster)?;
