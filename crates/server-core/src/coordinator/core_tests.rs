@@ -477,7 +477,10 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
     desired_cluster
         .record_placed_segment_shard_backfill(&work_item, None)
         .unwrap();
-    super::runtime::run_one_placed_segment_shard_backfill(&desired_cluster, "remote-backfill-test");
+    super::runtime::run_one_placed_segment_shard_backfill_for_test(
+        &desired_cluster,
+        "remote-backfill-test",
+    );
 
     let rows = desired_cluster
         .list_placed_segment_shard_backfills(written_segment.data_pg_id)

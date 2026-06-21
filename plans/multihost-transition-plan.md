@@ -7888,6 +7888,15 @@ PG backfill and migration design notes:
   current route history, the coordinator shard-scavenger sweeper now resolves
   the current storage runtime-map handle each iteration instead of holding the
   initial storage cluster forever.
+- Split shard-backfill worker admission by EC risk. Durable claim ordering
+  still prefers rows with lower `remaining_tolerance`, but the runtime now also
+  maps those claims onto different background-work classes: a source that has
+  already lost tolerance (`remaining_tolerance < ec_m`) runs as
+  known-damage repair, while a full-tolerance convergence row runs as routine
+  backfill. Routine backfill is denied under recent foreground pressure and
+  waits behind active known-damage repair, keeping low-risk PG convergence from
+  competing with foreground work while still allowing urgent EC-safety backfill
+  to progress.
 
 Exit criteria:
 

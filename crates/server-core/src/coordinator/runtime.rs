@@ -55,6 +55,7 @@ const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
+const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
 const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT: usize = 1;
@@ -68,6 +69,7 @@ type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundWorkClass {
     KnownDamageRepair,
+    RoutineBackfill,
     ReclaimCleanup,
     LifecycleCleanup,
     StreamSessionCleanup,
@@ -78,6 +80,7 @@ impl BackgroundWorkClass {
     fn name(self) -> &'static str {
         match self {
             Self::KnownDamageRepair => "known_damage_repair",
+            Self::RoutineBackfill => "routine_backfill",
             Self::ReclaimCleanup => "reclaim_cleanup",
             Self::LifecycleCleanup => "lifecycle_cleanup",
             Self::StreamSessionCleanup => "stream_session_cleanup",
@@ -89,6 +92,7 @@ impl BackgroundWorkClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundWorkAdmissionLimits {
     known_damage_repair: usize,
+    routine_backfill: usize,
     reclaim_cleanup: usize,
     lifecycle_cleanup: usize,
     stream_session_cleanup: usize,
@@ -99,6 +103,7 @@ impl Default for BackgroundWorkAdmissionLimits {
     fn default() -> Self {
         Self {
             known_damage_repair: BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT,
+            routine_backfill: BACKGROUND_ROUTINE_BACKFILL_LIMIT,
             reclaim_cleanup: BACKGROUND_RECLAIM_CLEANUP_LIMIT,
             lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
             stream_session_cleanup: BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT,
@@ -112,6 +117,7 @@ struct BackgroundWorkAdmission {
     limits: BackgroundWorkAdmissionLimits,
     pressure: Mutex<BackgroundWorkPressureState>,
     known_damage_repair_active: AtomicUsize,
+    routine_backfill_active: AtomicUsize,
     reclaim_cleanup_active: AtomicUsize,
     lifecycle_cleanup_active: AtomicUsize,
     stream_session_cleanup_active: AtomicUsize,
@@ -148,6 +154,7 @@ impl BackgroundWorkAdmission {
             limits,
             pressure: Mutex::new(BackgroundWorkPressureState::default()),
             known_damage_repair_active: AtomicUsize::new(0),
+            routine_backfill_active: AtomicUsize::new(0),
             reclaim_cleanup_active: AtomicUsize::new(0),
             lifecycle_cleanup_active: AtomicUsize::new(0),
             stream_session_cleanup_active: AtomicUsize::new(0),
@@ -188,17 +195,31 @@ impl BackgroundWorkAdmission {
     }
 
     fn policy_denial_event(&self, class: BackgroundWorkClass) -> Option<&'static str> {
-        if class != BackgroundWorkClass::OpportunisticScan {
-            return None;
-        }
-
-        let pressure = self.observe_pressure();
-        if pressure.foreground {
-            Some("denied_foreground_pressure")
-        } else if pressure.durable_backlog {
-            Some("denied_backlog_pressure")
-        } else {
-            None
+        match class {
+            BackgroundWorkClass::KnownDamageRepair
+            | BackgroundWorkClass::ReclaimCleanup
+            | BackgroundWorkClass::LifecycleCleanup
+            | BackgroundWorkClass::StreamSessionCleanup => None,
+            BackgroundWorkClass::RoutineBackfill => {
+                let pressure = self.observe_pressure();
+                if pressure.foreground {
+                    Some("denied_foreground_pressure")
+                } else if self.known_damage_repair_active.load(Ordering::Acquire) > 0 {
+                    Some("denied_known_damage_active")
+                } else {
+                    None
+                }
+            }
+            BackgroundWorkClass::OpportunisticScan => {
+                let pressure = self.observe_pressure();
+                if pressure.foreground {
+                    Some("denied_foreground_pressure")
+                } else if pressure.durable_backlog {
+                    Some("denied_backlog_pressure")
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -210,6 +231,7 @@ impl BackgroundWorkAdmission {
     fn counter_for(&self, class: BackgroundWorkClass) -> &AtomicUsize {
         match class {
             BackgroundWorkClass::KnownDamageRepair => &self.known_damage_repair_active,
+            BackgroundWorkClass::RoutineBackfill => &self.routine_backfill_active,
             BackgroundWorkClass::ReclaimCleanup => &self.reclaim_cleanup_active,
             BackgroundWorkClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
             BackgroundWorkClass::StreamSessionCleanup => &self.stream_session_cleanup_active,
@@ -220,6 +242,7 @@ impl BackgroundWorkAdmission {
     fn limit_for(&self, class: BackgroundWorkClass) -> usize {
         match class {
             BackgroundWorkClass::KnownDamageRepair => self.limits.known_damage_repair,
+            BackgroundWorkClass::RoutineBackfill => self.limits.routine_backfill,
             BackgroundWorkClass::ReclaimCleanup => self.limits.reclaim_cleanup,
             BackgroundWorkClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
             BackgroundWorkClass::StreamSessionCleanup => self.limits.stream_session_cleanup,
@@ -229,6 +252,7 @@ impl BackgroundWorkAdmission {
 
     fn active_total(&self) -> usize {
         self.known_damage_repair_active.load(Ordering::Acquire)
+            + self.routine_backfill_active.load(Ordering::Acquire)
             + self.reclaim_cleanup_active.load(Ordering::Acquire)
             + self.lifecycle_cleanup_active.load(Ordering::Acquire)
             + self.stream_session_cleanup_active.load(Ordering::Acquire)
@@ -1218,18 +1242,11 @@ impl ShardBackfillSweeper {
                         storage_cluster.process_local_registry_key()
                     );
                     admission.observe_pressure();
-                    if let Some(_permit) =
-                        admission.try_acquire(BackgroundWorkClass::KnownDamageRepair)
-                    {
-                        run_one_placed_segment_shard_backfill(&storage_cluster, &owner_token);
-                    } else {
-                        emit_shard_backfill_event(
-                            None,
-                            "admission_denied",
-                            shard_backfill_queue_depth(&storage_cluster),
-                            None,
-                        );
-                    }
+                    run_one_placed_segment_shard_backfill(
+                        &storage_cluster,
+                        &owner_token,
+                        &admission,
+                    );
 
                     let stop_guard = lock_mutex_unpoisoned(&wake.0);
                     if stop.load(Ordering::SeqCst) {
@@ -1261,9 +1278,10 @@ impl ShardBackfillSweeper {
     }
 }
 
-pub(super) fn run_one_placed_segment_shard_backfill(
+fn run_one_placed_segment_shard_backfill(
     storage_cluster: &StorageCluster,
     owner_token: &str,
+    admission: &Arc<BackgroundWorkAdmission>,
 ) {
     let now_ms = Coordinator::now_millis();
     let claim_id = format!(
@@ -1301,6 +1319,37 @@ pub(super) fn run_one_placed_segment_shard_backfill(
             );
             return;
         }
+    };
+
+    let admission_class =
+        shard_backfill_admission_class(claim.remaining_tolerance, claim.work_item.request.ec.m);
+    let Some(_permit) = admission.try_acquire(admission_class) else {
+        emit_shard_backfill_event(
+            Some(claim.work_item.request.data_pg_id),
+            "admission_denied",
+            shard_backfill_queue_depth(storage_cluster),
+            None,
+        );
+        let next_attempt_after =
+            Coordinator::now_millis().saturating_add(SHARD_BACKFILL_ERROR_BACKOFF_MILLIS);
+        if let Err(record_error) = storage_cluster.record_placed_segment_shard_backfill_claim_error(
+            &claim,
+            "background shard backfill admission denied",
+            next_attempt_after,
+        ) {
+            emit_shard_backfill_event(
+                Some(claim.work_item.request.data_pg_id),
+                "record_error_failed",
+                shard_backfill_queue_depth(storage_cluster),
+                None,
+            );
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_backfill_record_error_failed",
+                Some(format_args!("record_error={record_error}")),
+            );
+        }
+        return;
     };
 
     emit_shard_backfill_event(
@@ -1385,6 +1434,23 @@ pub(super) fn run_one_placed_segment_shard_backfill(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn run_one_placed_segment_shard_backfill_for_test(
+    storage_cluster: &StorageCluster,
+    owner_token: &str,
+) {
+    let admission = Arc::new(BackgroundWorkAdmission::new());
+    run_one_placed_segment_shard_backfill(storage_cluster, owner_token, &admission);
+}
+
+fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> BackgroundWorkClass {
+    if remaining_tolerance < ec_m {
+        BackgroundWorkClass::KnownDamageRepair
+    } else {
+        BackgroundWorkClass::RoutineBackfill
     }
 }
 
@@ -2467,6 +2533,7 @@ mod tests {
         let admission = Arc::new(BackgroundWorkAdmission::with_limits(
             BackgroundWorkAdmissionLimits {
                 known_damage_repair: 1,
+                routine_backfill: 1,
                 reclaim_cleanup: 1,
                 lifecycle_cleanup: 1,
                 stream_session_cleanup: 1,
@@ -2521,6 +2588,16 @@ mod tests {
 
         drop(repair_permit);
         assert_eq!(admission.active_total(), 3);
+        let routine_backfill_permit = admission
+            .try_acquire(BackgroundWorkClass::RoutineBackfill)
+            .expect("routine backfill should have its own class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::RoutineBackfill)
+                .is_none(),
+            "second routine backfill permit should be denied at limit"
+        );
+        assert_eq!(admission.active_total(), 4);
         let replacement = admission
             .try_acquire(BackgroundWorkClass::KnownDamageRepair)
             .expect("dropping a permit should release class capacity");
@@ -2528,7 +2605,57 @@ mod tests {
         drop(reclaim_permit);
         drop(lifecycle_permit);
         drop(stream_session_permit);
+        drop(routine_backfill_permit);
         assert_eq!(admission.active_total(), 0);
+    }
+
+    #[test]
+    fn background_work_admission_denies_routine_backfill_behind_known_damage() {
+        let admission = Arc::new(BackgroundWorkAdmission::with_limits(
+            BackgroundWorkAdmissionLimits {
+                known_damage_repair: 1,
+                routine_backfill: 1,
+                reclaim_cleanup: 0,
+                lifecycle_cleanup: 0,
+                stream_session_cleanup: 0,
+                opportunistic_scan: 0,
+            },
+        ));
+
+        let repair_permit = admission
+            .try_acquire(BackgroundWorkClass::KnownDamageRepair)
+            .expect("known damage should fit its class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::RoutineBackfill)
+                .is_none(),
+            "routine backfill should wait while known-damage work is active"
+        );
+        drop(repair_permit);
+        let routine_permit = admission
+            .try_acquire(BackgroundWorkClass::RoutineBackfill)
+            .expect("routine backfill should run once known-damage work is idle");
+        drop(routine_permit);
+    }
+
+    #[test]
+    fn shard_backfill_admission_class_uses_ec_risk_tolerance() {
+        assert_eq!(
+            shard_backfill_admission_class(2, 2),
+            BackgroundWorkClass::RoutineBackfill
+        );
+        assert_eq!(
+            shard_backfill_admission_class(1, 2),
+            BackgroundWorkClass::KnownDamageRepair
+        );
+        assert_eq!(
+            shard_backfill_admission_class(0, 2),
+            BackgroundWorkClass::KnownDamageRepair
+        );
+        assert_eq!(
+            shard_backfill_admission_class(0, 0),
+            BackgroundWorkClass::RoutineBackfill
+        );
     }
 
     #[test]
