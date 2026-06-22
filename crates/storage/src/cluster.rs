@@ -41,9 +41,10 @@ use crate::node_client::{
     ShardAckNodeClient, StorageNodeClient,
 };
 use crate::peering::{
+    build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
-    reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
-    PgPeeringReconstructionError, PgPeeringReconstructionFailure,
+    reconstruct_pg_peering_from_primary_retained_log, PgMetadataTransferArtifact,
+    PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
 use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
@@ -2213,6 +2214,89 @@ impl StorageCluster {
         }
 
         self.reconstruct_pg_peering_from_retained_metadata_log(pg_id, primary)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn export_pg_metadata_transfer_from_retained_log(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+    ) -> Result<PgMetadataTransferArtifact, PgPeeringReconstructionFailure> {
+        let route = self
+            .local_pg_route(pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+            })?;
+        if route.cluster_epoch() != self.operation_epoch() {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.operation_epoch(),
+            }
+            .into());
+        }
+        if route.state() != PgState::Peering {
+            return Err(PgPeeringReconstructionError::TransferSourceNotQuiesced {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                state: route.state(),
+            }
+            .into());
+        }
+        if route.primary_node_id() != source_node_id {
+            return Err(PgPeeringReconstructionError::TransferSourceNotPrimary {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                source_node: source_node_id,
+                primary: route.primary_node_id(),
+            }
+            .into());
+        }
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_inspection(self.operation_epoch(), pg_id)?;
+        let source_node = nodes
+            .iter()
+            .find(|node| node.node_id() == source_node_id)
+            .ok_or(PgPeeringReconstructionError::PrimaryMissing {
+                primary: source_node_id,
+            })?;
+        let metadata_client = source_node.metadata_command_client();
+        let state = metadata_client.metadata_command_replica_state(pg_id)?;
+        let has_pending_metadata_command = metadata_client
+            .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+            .is_some();
+
+        let mut retained_log_entries = Vec::new();
+        let mut batch_start = 1;
+        while batch_start <= state.applied_log_index {
+            let batch_end = state
+                .applied_log_index
+                .min(batch_start + STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES - 1);
+            let first_log_index = MetadataCommandLogIndex::new(batch_start)
+                .expect("metadata transfer retained entry range starts after zero");
+            let last_log_index = MetadataCommandLogIndex::new(batch_end)
+                .expect("metadata transfer retained entry range ends after zero");
+            retained_log_entries.extend(metadata_client.retained_metadata_command_log_entries(
+                pg_id,
+                self.operation_epoch(),
+                first_log_index,
+                last_log_index,
+            )?);
+            batch_start = batch_end + 1;
+        }
+
+        Ok(
+            build_pg_metadata_transfer_artifact_from_retained_log_entries(
+                self.operation_epoch(),
+                pg_id,
+                source_node_id,
+                state,
+                has_pending_metadata_command,
+                retained_log_entries,
+            )?,
+        )
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

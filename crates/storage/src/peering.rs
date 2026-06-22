@@ -4,7 +4,7 @@ use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandLogHashRangeEntry, MetadataCommandLogRangeEntry,
     MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState,
 };
-use crate::types::{ClusterEpoch, PgId};
+use crate::types::{ClusterEpoch, PgId, PgState};
 use placement::NodeId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,15 @@ pub(crate) struct PgPeeringReplicaReplayPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PgMetadataTransferArtifact {
+    pub(crate) pg_id: PgId,
+    pub(crate) source_node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) proof: PgMetadataProof,
+    pub(crate) retained_log_entries: Vec<MetadataCommandLogRangeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PgPeeringReconstructionDecision {
     AlreadyConverged {
         proof: PgMetadataProof,
@@ -45,6 +54,23 @@ pub(crate) enum PgPeeringReconstructionDecision {
 pub(crate) enum PgPeeringReconstructionError {
     #[error("PG peering selected primary {primary:?} is missing from reconstruction input")]
     PrimaryMissing { primary: NodeId },
+    #[error(
+        "PG metadata transfer source {source_node:?} is not the current primary {primary:?} for PG {pg_id} in cluster epoch {cluster_epoch}"
+    )]
+    TransferSourceNotPrimary {
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        source_node: NodeId,
+        primary: NodeId,
+    },
+    #[error(
+        "PG metadata transfer source route for PG {pg_id} in cluster epoch {cluster_epoch} is {state}, expected Peering"
+    )]
+    TransferSourceNotQuiesced {
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
     #[error("PG peering replay target {node_id:?} is missing from acting-set clients")]
     ReplayTargetMissing { node_id: NodeId },
     #[error(
@@ -285,6 +311,73 @@ pub(crate) fn build_pg_peering_replay_plan_from_retained_log_entries(
         });
     }
     Ok(plans)
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    source_node_id: NodeId,
+    state: MetadataCommandReplicaState,
+    has_pending_metadata_command: bool,
+    retained_log_entries: Vec<MetadataCommandLogRangeEntry>,
+) -> Result<PgMetadataTransferArtifact, PgPeeringReconstructionError> {
+    let source = PgPeeringReplicaReconstructionInput {
+        node_id: source_node_id,
+        state,
+        has_pending_metadata_command,
+        retained_log_hashes: Vec::new(),
+    };
+    validate_epoch_and_pending(&source, cluster_epoch)?;
+
+    let mut expected_previous_log_hash = 0;
+    for log_index in 1..=state.applied_log_index {
+        let retained = retained_log_entries
+            .iter()
+            .find(|entry| entry.log_index == log_index)
+            .ok_or(
+                PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                    node_id: source_node_id,
+                    log_index,
+                },
+            )?;
+        if retained.previous_log_hash != expected_previous_log_hash {
+            return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
+                node_id: source_node_id,
+                log_index,
+                expected_previous_log_hash,
+                actual_previous_log_hash: retained.previous_log_hash,
+            });
+        }
+        if matches!(
+            &retained.kind,
+            MetadataCommandLogRangeEntryKind::Abandoned { .. }
+        ) {
+            return Err(
+                PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                    node_id: source_node_id,
+                    log_index,
+                },
+            );
+        }
+        expected_previous_log_hash = retained.log_hash;
+    }
+    if expected_previous_log_hash != state.applied_log_hash {
+        return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
+            node_id: source_node_id,
+            log_index: state.applied_log_index,
+            expected_previous_log_hash,
+            actual_previous_log_hash: state.applied_log_hash,
+        });
+    }
+
+    Ok(PgMetadataTransferArtifact {
+        pg_id,
+        source_node_id,
+        cluster_epoch,
+        proof: proof_from_replica_state(state),
+        retained_log_entries,
+    })
 }
 
 fn proof_from_replica_state(state: MetadataCommandReplicaState) -> PgMetadataProof {

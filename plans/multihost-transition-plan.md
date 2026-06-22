@@ -7998,6 +7998,19 @@ Metadata PG migration and backfill design notes:
   if partial/stale/future, and cleared on activation. This still does not move
   metadata bytes or export/import checkpoint data; that remains the next
   storage-node transfer primitive.
+- Added the first storage-level metadata transfer export primitive. It packages
+  an authoritative source PG's metadata proof with a validated retained
+  command-log prefix and fails closed if the source has a pending metadata
+  command, a stale epoch, a missing retained prefix entry, a forked hash chain,
+  an abandoned entry that cannot be replayed from retained command payloads, or
+  a serving `Active` route. Until a metadata migration fence exists, export is
+  limited to quiesced `Peering` routes so no new metadata command can be
+  accepted between the proof and retained-log reads. This is intentionally
+  export-only and currently covers the replayable-log bootstrap case, not full
+  checkpoint import. The next slice is to define the import side: either replay
+  this artifact into an empty destination PG when it contains a complete applied
+  prefix, or import a real checkpoint plus retained suffix once checkpoint
+  materialization exists.
 
 Exit criteria:
 
