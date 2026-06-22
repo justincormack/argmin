@@ -7925,6 +7925,56 @@ PG backfill and migration design notes:
   from replicas that hold the bucket/object metadata is intentionally left to
   the metadata PG migration work; this smoke isolates data-shard backfill.
 
+Metadata PG migration and backfill design notes:
+
+- Metadata PG migration is different from payload-shard backfill. Payload data
+  can use independent source and desired routes as long as the historical source
+  route remains readable and the desired route can receive the full shard set.
+  Metadata PGs cannot activate an empty new acting set by reconstruction from
+  object payloads; the new acting set must derive its command-log/state proof
+  from an existing authoritative source or from an explicit transfer artifact.
+- The safety invariant is: a metadata PG may become `Active` on a new acting set
+  only from a proof derived from either an authoritative overlapping source in
+  the old acting set or a validated metadata transfer artifact. Mere membership
+  overlap is not enough: the overlapping source must be the active primary or a
+  replica whose metadata proof satisfies the active proof floor and whose
+  retained checkpoint/log suffix covers the cutover. If neither source exists,
+  the PG must remain `Peering` or enter an explicit
+  disaster-recovery/manual-restore path; it must not silently choose an empty or
+  divergent state.
+- The first implementation slice should be overlap-required. Automatic metadata
+  acting-set migration should handle changes such as `[A, B] -> [B, C]`, where
+  `B` is not just present in both sets but can prove current authoritative
+  metadata state and carry retained command-log/checkpoint state forward. The
+  normal peering catch-up path can then validate the destination acting set.
+  Direct non-overlap changes such as `[A, B] -> [C, D]` should be rejected,
+  deferred, or left in `Peering` until an explicit transfer primitive exists.
+- Non-overlap metadata migration is still a real requirement. Large node-add or
+  rebalancing events can legitimately choose desired acting sets with no common
+  member even when the old replicas are healthy and readable. This is not data
+  loss by itself, but it does require a transfer step before the new acting set
+  can serve metadata.
+- Prefer a checkpoint/log-transfer primitive for non-overlap metadata migration
+  rather than bridge generations. Bridge migration, for example
+  `[A, B] -> [B, C] -> [C, D]`, avoids a new transfer RPC but forces the control
+  plane to invent synthetic intermediate generations that were not the intended
+  durable placement. Those generations would still need durable recording,
+  retry, recovery, observability, and operator explanation.
+- A metadata transfer primitive should export a validated metadata checkpoint
+  plus the retained command-log suffix needed to prove the state, import it
+  into the desired acting set as bootstrap state, and let the destination
+  acting set report peering metadata proofs from that imported state. The
+  control plane should activate the PG only after the destination acting set
+  agrees on the imported proof and normal peering validation passes.
+- The same transfer primitive can later support manual disaster recovery. An
+  operator-provided or offline-restored metadata snapshot should enter through
+  the same import/proof path, with explicit operator intent and diagnostics,
+  instead of a special code path that bypasses peering invariants.
+- The next metadata-migration work should therefore start with focused tests
+  for overlap-required migration and fail-closed non-overlap behavior, then
+  define the checkpoint/log-transfer proof shape before wiring non-overlap
+  migration into live acting-set changes or UAT.
+
 Exit criteria:
 
 1. stale primaries cannot accept writes after an epoch change
