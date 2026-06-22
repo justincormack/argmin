@@ -7987,6 +7987,17 @@ Metadata PG migration and backfill design notes:
   transfer-required error until the checkpoint/log-transfer primitive exists.
   Focused control-plane regressions cover overlap migration, stale peering
   proof rejection, floor-preserving Peering changes, and non-overlap rejection.
+- Added the first explicit metadata-transfer proof shape at the control-plane
+  layer. A transfer proof records the source cluster epoch and imported
+  metadata proof separately from the normal peering proof floor, so later code
+  can distinguish overlap catch-up from an explicit checkpoint/log import.
+  The ordinary acting-set update remains fail-closed for non-overlap migration;
+  only the explicit transfer-backed API can move a PG to a non-overlapping
+  `Peering` acting set, and only when the imported proof satisfies the current
+  active/peering floor. The transfer marker is persisted while peering, rejected
+  if partial/stale/future, and cleared on activation. This still does not move
+  metadata bytes or export/import checkpoint data; that remains the next
+  storage-node transfer primitive.
 
 Exit criteria:
 
