@@ -1650,7 +1650,17 @@ run_metadata_pg_migration_smoke() {
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
     "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
 
-    echo "PASS: metadata PG migration UAT smoke transferred PG $target_metadata_pg from nodes 0,1 to nodes 2,3"
+    transfer_pg_metadata "return to original nodes 0,1 with suffix replay" "$target_metadata_pg" 0 1
+    wait_for_control_plane_pg_active "$target_metadata_pg" 20 "0:1"
+    wait_for_serving_runtime_installed 20 "$metrics_path"
+
+    echo "== argmin-s3 UAT metadata PG migration transfer-back reads =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+
+    echo "PASS: metadata PG migration UAT smoke transferred PG $target_metadata_pg from nodes 0,1 to nodes 2,3 and back"
 }
 
 cleanup_pg_backfill_migration_smoke() {

@@ -647,6 +647,8 @@ CREATE TABLE IF NOT EXISTS metadata_command_log (
     abandoned        INTEGER NOT NULL DEFAULT 0 CHECK (abandoned IN (0, 1)),
     previous_log_hash INTEGER,
     log_hash         INTEGER,
+    pre_state_digest INTEGER,
+    post_state_digest INTEGER,
     PRIMARY KEY (cluster_epoch, pg_id, log_index)
 )";
 

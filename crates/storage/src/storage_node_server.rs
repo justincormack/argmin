@@ -9773,8 +9773,8 @@ mod tests {
         BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
         DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
         MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload, PutBucketAclCommand, ReserveObjectGenerationCommand,
-        ReserveObjectVersionCommand,
+        MetadataCommandPayload, MetadataTransferCommand, PutBucketAclCommand,
+        ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
     use crate::storage_rpc::{
         decode_bucket_mark_deleting_command_build_response, decode_health_response,
@@ -12792,7 +12792,11 @@ mod tests {
                     cluster_epoch: destination_epoch,
                     pg_id: PgId::new(0),
                     expected_state_digest,
-                    commands: vec![rebased],
+                    commands: vec![MetadataTransferCommand {
+                        command: rebased,
+                        pre_state_digest: 0,
+                        post_state_digest: expected_state_digest,
+                    }],
                 },
             )
             .unwrap(),
@@ -12863,7 +12867,11 @@ mod tests {
                     cluster_epoch: destination_epoch,
                     pg_id: PgId::new(0),
                     expected_state_digest,
-                    commands: vec![rebased],
+                    commands: vec![MetadataTransferCommand {
+                        command: rebased,
+                        pre_state_digest: 0,
+                        post_state_digest: expected_state_digest,
+                    }],
                 },
             )
             .unwrap(),

@@ -8075,10 +8075,11 @@ Metadata PG migration and backfill design notes:
   places PGs initially on nodes `0:1`, creates bucket and object metadata on a
   selected PG while keeping payload data on a different PG, transfers that
   metadata PG to the non-overlapping acting set `2:3` through the retained-log
-  transfer admin path, and verifies old reads plus new metadata writes after
-  the transfer. This keeps metadata transfer coverage separate from the
-  existing `pg-backfill-migration` smoke, which continues to isolate payload
-  shard backfill.
+  transfer admin path, writes new metadata there, transfers the PG back to
+  `0:1`, and verifies both old and new reads after the round trip. This keeps
+  metadata transfer coverage separate from the existing
+  `pg-backfill-migration` smoke, which continues to isolate payload shard
+  backfill.
 - Tightened the fenced metadata-transfer source proof path for repeated
   migrations. A fenced `Peering` source may now authorize transfer with an
   epoch-local proof produced by writes after a prior transfer, while ordinary
@@ -8086,13 +8087,18 @@ Metadata PG migration and backfill design notes:
   also persist whether their active proof came from a metadata-transfer import,
   so lower-index destination-epoch proof acceptance remains scoped to
   transferred Active PGs; ordinary Active primary observations still use strict
-  rollback/fork detection. An attempted round-trip UAT (`0:1 -> 2:3 -> 0:1`)
-  exposed the next unsupported case: destination nodes can hold a compatible
-  older materialized PG state rather than being empty or already at the
-  imported proof. The current retained-log import correctly fails closed there.
-  General repeated reshuffle support needs an artifact/checkpoint shape that
-  proves the destination base state, or a transactional scratch validation
-  path, before replaying suffix commands over non-empty older destinations.
+  rollback/fork detection.
+- Added the first retained-log prefix/base-proof path for repeated metadata
+  reshuffles. Applied metadata command-log entries now persist the materialized
+  metadata digest before and after that command, retained-log transfer export
+  carries those pre/post state proofs, and import may replay only the retained
+  suffix over an empty destination or a same-epoch destination whose log
+  index/hash/digest exactly matches a rebased prefix proof. Digest-only matching
+  of either the state before the first retained command or an older
+  post-command prefix is not a proof and fails closed; supporting that
+  round-trip shape needs an explicit base proof, checkpoint, or state bootstrap
+  primitive. This keeps dirty or forked destination state fail-closed. Empty PG
+  transfer still needs the same explicit state/checkpoint bootstrap primitive.
 
 Exit criteria:
 

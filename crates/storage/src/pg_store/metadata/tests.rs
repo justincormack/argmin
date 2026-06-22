@@ -1,5 +1,7 @@
 use super::*;
-use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex};
+use crate::metadata_command::{
+    MetadataCommandId, MetadataCommandLogIndex, MetadataTransferCommand,
+};
 use crate::traits::PgMetadataStore;
 
 fn test_owner() -> OwnerIdentity {
@@ -50,6 +52,22 @@ fn rebase_probe_commands(
                 MetadataCommandId::new(cluster_epoch, pg_id, command.id().log_index()),
                 command.payload().clone(),
             )
+        })
+        .collect()
+}
+
+fn metadata_transfer_commands(
+    commands: Vec<MetadataCommandEnvelope>,
+    post_state_digests: &[u64],
+) -> Vec<MetadataTransferCommand> {
+    assert_eq!(commands.len(), post_state_digests.len());
+    commands
+        .into_iter()
+        .zip(post_state_digests.iter().copied())
+        .map(|(command, post_state_digest)| MetadataTransferCommand {
+            command,
+            pre_state_digest: 0,
+            post_state_digest,
         })
         .collect()
 }
@@ -2077,16 +2095,22 @@ fn adopt_metadata_transfer_state_installs_rebased_log_over_matching_materialized
         create_bucket_probe_command(1, 1, first_bucket.clone(), 1),
         create_bucket_probe_command(1, 2, second_bucket.clone(), 2),
     ];
+    let mut post_state_digests = Vec::new();
     for command in &commands {
-        store.apply_metadata_command_and_record(0, command).unwrap();
+        let state = store.apply_metadata_command_and_record(0, command).unwrap();
+        post_state_digests.push(state.state_digest);
     }
     let source_state = store.metadata_command_replica_state().unwrap();
     assert_eq!(source_state.cluster_epoch, ClusterEpoch::INITIAL);
 
     let destination_epoch = ClusterEpoch::new(7).unwrap();
-    let rebased = rebase_probe_commands(destination_epoch, PgId::new(1), &commands);
+    let rebased = metadata_transfer_commands(
+        rebase_probe_commands(destination_epoch, PgId::new(1), &commands),
+        &post_state_digests,
+    );
     let mut expected_log_hash = 0;
-    for command in &rebased {
+    for transfer_command in &rebased {
+        let command = &transfer_command.command;
         expected_log_hash = metadata_command_log_hash(
             destination_epoch,
             PgId::new(1),
@@ -2145,10 +2169,13 @@ fn adopt_metadata_transfer_state_rejects_dirty_materialized_state() {
     destination
         .apply_metadata_command_and_record(0, &dirty_command)
         .unwrap();
-    let rebased = rebase_probe_commands(
-        ClusterEpoch::new(8).unwrap(),
-        PgId::new(1),
-        &[source_command],
+    let rebased = metadata_transfer_commands(
+        rebase_probe_commands(
+            ClusterEpoch::new(8).unwrap(),
+            PgId::new(1),
+            std::slice::from_ref(&source_command),
+        ),
+        &[source_state.state_digest],
     );
 
     let err = destination
@@ -2223,7 +2250,14 @@ fn adopt_metadata_transfer_state_rejects_pending_command() {
         .unwrap();
 
     let destination_epoch = ClusterEpoch::new(9).unwrap();
-    let rebased = rebase_probe_commands(destination_epoch, PgId::new(1), &[command]);
+    let rebased = metadata_transfer_commands(
+        rebase_probe_commands(
+            destination_epoch,
+            PgId::new(1),
+            std::slice::from_ref(&command),
+        ),
+        &[source_state.state_digest],
+    );
     let err = store
         .adopt_metadata_transfer_state_from_rebased_commands(
             0,

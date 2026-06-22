@@ -863,7 +863,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        commands: &[MetadataCommandEnvelope],
+        commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         if cluster_epoch != self.cluster_epoch {

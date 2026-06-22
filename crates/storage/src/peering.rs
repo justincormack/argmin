@@ -3,7 +3,7 @@ use crate::error::{BucketSnapshotLoadError, PgMetadataTransferError, StoreError}
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogHashRangeEntry,
     MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
-    MetadataCommandReplicaState,
+    MetadataCommandReplicaState, MetadataTransferCommand,
 };
 use crate::types::{ClusterEpoch, PgId, PgState};
 use placement::NodeId;
@@ -98,6 +98,25 @@ pub(crate) enum PgPeeringReconstructionError {
         "PG metadata transfer artifact for PG {pg_id} has no retained commands; empty metadata import requires checkpoint/state bootstrap"
     )]
     EmptyTransferArtifact { pg_id: PgId },
+    #[error(
+        "PG metadata transfer source {node_id:?} retained command log entry {log_index} for PG {pg_id} is missing its post-state digest proof"
+    )]
+    MissingRetainedCommandStateProof {
+        node_id: NodeId,
+        pg_id: PgId,
+        log_index: u64,
+    },
+    #[error(
+        "PG metadata transfer source {node_id:?} retained command log entry {log_index} for PG {pg_id} has state digest fork: expected pre-state digest {expected_pre_state_digest:#018X}, actual pre-state digest {actual_pre_state_digest:#018X}, post-state digest {post_state_digest:#018X}"
+    )]
+    RetainedCommandStateDigestFork {
+        node_id: NodeId,
+        pg_id: PgId,
+        log_index: u64,
+        expected_pre_state_digest: u64,
+        actual_pre_state_digest: u64,
+        post_state_digest: u64,
+    },
     #[error(
         "PG metadata transfer destination node {node_id:?} for PG {pg_id} in cluster epoch {cluster_epoch} is not empty and does not contain the expected imported proof {expected:?}: found log index {applied_log_index}, log hash {applied_log_hash:#018X}, digest {state_digest:#018X}"
     )]
@@ -382,6 +401,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
     validate_epoch_and_pending(&source, cluster_epoch)?;
 
     let mut expected_previous_log_hash = 0;
+    let mut expected_pre_state_digest = None;
     for log_index in 1..=state.applied_log_index {
         let retained = retained_log_entries
             .iter()
@@ -411,6 +431,38 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
                 },
             );
         }
+        let Some(pre_state_digest) = retained.pre_state_digest else {
+            return Err(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: source_node_id,
+                    pg_id,
+                    log_index,
+                },
+            );
+        };
+        let Some(post_state_digest) = retained.post_state_digest else {
+            return Err(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: source_node_id,
+                    pg_id,
+                    log_index,
+                },
+            );
+        };
+        let expected = expected_pre_state_digest.unwrap_or(pre_state_digest);
+        if pre_state_digest != expected {
+            return Err(
+                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                    node_id: source_node_id,
+                    pg_id,
+                    log_index,
+                    expected_pre_state_digest: expected,
+                    actual_pre_state_digest: pre_state_digest,
+                    post_state_digest,
+                },
+            );
+        }
+        expected_pre_state_digest = Some(post_state_digest);
         expected_previous_log_hash = retained.log_hash;
     }
     if expected_previous_log_hash != state.applied_log_hash {
@@ -420,6 +472,20 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
             expected_previous_log_hash,
             actual_previous_log_hash: state.applied_log_hash,
         });
+    }
+    if let Some(final_state_digest) = expected_pre_state_digest {
+        if final_state_digest != state.state_digest {
+            return Err(
+                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                    node_id: source_node_id,
+                    pg_id,
+                    log_index: state.applied_log_index,
+                    expected_pre_state_digest: state.state_digest,
+                    actual_pre_state_digest: final_state_digest,
+                    post_state_digest: final_state_digest,
+                },
+            );
+        }
     }
 
     Ok(PgMetadataTransferArtifact {
@@ -435,7 +501,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
 pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
     artifact: &PgMetadataTransferArtifact,
     destination_cluster_epoch: ClusterEpoch,
-) -> Result<Vec<MetadataCommandEnvelope>, PgPeeringReconstructionError> {
+) -> Result<Vec<MetadataTransferCommand>, PgPeeringReconstructionError> {
     if artifact.proof.applied_log_index == 0 {
         return Err(PgPeeringReconstructionError::EmptyTransferArtifact {
             pg_id: artifact.pg_id,
@@ -476,12 +542,34 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
                 },
             );
         };
+        let Some(pre_state_digest) = retained.pre_state_digest else {
+            return Err(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index,
+                },
+            );
+        };
+        let Some(post_state_digest) = retained.post_state_digest else {
+            return Err(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index,
+                },
+            );
+        };
         let log_index = MetadataCommandLogIndex::new(log_index)
             .expect("metadata transfer import log index is non-zero");
-        commands.push(MetadataCommandEnvelope::new(
-            MetadataCommandId::new(destination_cluster_epoch, artifact.pg_id, log_index),
-            command.payload().clone(),
-        ));
+        commands.push(MetadataTransferCommand {
+            command: MetadataCommandEnvelope::new(
+                MetadataCommandId::new(destination_cluster_epoch, artifact.pg_id, log_index),
+                command.payload().clone(),
+            ),
+            pre_state_digest,
+            post_state_digest,
+        });
     }
     Ok(commands)
 }
@@ -588,6 +676,8 @@ mod tests {
             log_index,
             previous_log_hash,
             log_hash,
+            pre_state_digest: None,
+            post_state_digest: None,
             kind,
         }
     }

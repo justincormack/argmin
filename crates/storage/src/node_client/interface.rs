@@ -1182,7 +1182,7 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        commands: &[MetadataCommandEnvelope],
+        commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 

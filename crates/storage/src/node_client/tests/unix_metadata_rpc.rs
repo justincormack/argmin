@@ -207,7 +207,11 @@ fn unix_storage_node_client_adopts_metadata_transfer_state() {
         &client,
         PgId::new(0),
         destination_epoch,
-        &[rebased],
+        &[MetadataTransferCommand {
+            command: rebased,
+            pre_state_digest: 0,
+            post_state_digest: expected_state_digest,
+        }],
         expected_state_digest,
     )
     .unwrap();

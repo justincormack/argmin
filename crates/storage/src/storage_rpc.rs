@@ -3,9 +3,9 @@ use crate::{
     metadata_command::{
         decode_metadata_command_envelope, BucketPropertyMutation, BucketSubresourceMutation,
         BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandEnvelope,
-        MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex, MetadataCommandLogRangeEntry,
-        MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry,
+        MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
+        MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
         PutObjectMetadataMutation,
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow},
@@ -2666,7 +2666,7 @@ pub(crate) struct StorageRpcMetadataCommandTransferAdoptRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) expected_state_digest: u64,
-    pub(crate) commands: Vec<MetadataCommandEnvelope>,
+    pub(crate) commands: Vec<MetadataTransferCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7982,6 +7982,20 @@ pub(crate) fn encode_metadata_command_log_entry_range_response(
         put_u64(&mut out, entry.log_index);
         put_u64(&mut out, entry.previous_log_hash);
         put_u64(&mut out, entry.log_hash);
+        match entry.pre_state_digest {
+            Some(pre_state_digest) => {
+                put_u8(&mut out, 1);
+                put_u64(&mut out, pre_state_digest);
+            }
+            None => put_u8(&mut out, 0),
+        }
+        match entry.post_state_digest {
+            Some(post_state_digest) => {
+                put_u8(&mut out, 1);
+                put_u64(&mut out, post_state_digest);
+            }
+            None => put_u8(&mut out, 0),
+        }
         match &entry.kind {
             MetadataCommandLogRangeEntryKind::Applied(command) => {
                 if command.id().log_index().get() != entry.log_index {
@@ -8027,6 +8041,24 @@ pub(crate) fn decode_metadata_command_log_entry_range_response(
         }
         let previous_log_hash = decoder.read_u64()?;
         let log_hash = decoder.read_u64()?;
+        let pre_state_digest = match decoder.read_u8()? {
+            0 => None,
+            1 => Some(decoder.read_u64()?),
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                    "metadata command entry range pre-state digest flag is invalid",
+                ));
+            }
+        };
+        let post_state_digest = match decoder.read_u8()? {
+            0 => None,
+            1 => Some(decoder.read_u64()?),
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                    "metadata command entry range post-state digest flag is invalid",
+                ));
+            }
+        };
         let kind = match decoder.read_u8()? {
             0 => {
                 let item = decoder.read_metadata_command_item()?;
@@ -8051,6 +8083,8 @@ pub(crate) fn decode_metadata_command_log_entry_range_response(
             log_index,
             previous_log_hash,
             log_hash,
+            pre_state_digest,
+            post_state_digest,
             kind,
         });
     }
@@ -8497,8 +8531,11 @@ pub(crate) fn encode_metadata_command_transfer_adopt_request(
             )
         })?,
     );
-    for command in &request.commands {
+    for transfer_command in &request.commands {
+        let command = &transfer_command.command;
         validate_metadata_command_route(request.cluster_epoch, request.pg_id, command.id())?;
+        put_u64(&mut out, transfer_command.pre_state_digest);
+        put_u64(&mut out, transfer_command.post_state_digest);
         let item = StorageRpcMetadataCommandItem {
             command_checksum: command.checksum_crc64(),
             command_bytes: command.command_bytes(),
@@ -8519,10 +8556,16 @@ pub(crate) fn decode_metadata_command_transfer_adopt_request(
     let count = decoder.read_u32()?;
     let mut commands = Vec::new();
     for _ in 0..count {
+        let pre_state_digest = decoder.read_u64()?;
+        let post_state_digest = decoder.read_u64()?;
         let item = decoder.read_metadata_command_item()?;
         let command = metadata_command_envelope_from_item(&item)?;
         validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
-        commands.push(command);
+        commands.push(MetadataTransferCommand {
+            command,
+            pre_state_digest,
+            post_state_digest,
+        });
     }
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandTransferAdoptRequest {
@@ -16125,14 +16168,23 @@ mod tests {
             cluster_epoch: command.id().cluster_epoch(),
             pg_id: command.id().pg_id(),
             expected_state_digest: 1234,
-            commands: vec![command.clone()],
+            commands: vec![MetadataTransferCommand {
+                command: command.clone(),
+                pre_state_digest: 4321,
+                post_state_digest: 1234,
+            }],
         };
 
         let bytes = encode_metadata_command_transfer_adopt_request(&request).unwrap();
         let decoded = decode_metadata_command_transfer_adopt_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
-        assert_eq!(decoded.commands[0].command_bytes(), command.command_bytes());
+        assert_eq!(
+            decoded.commands[0].command.command_bytes(),
+            command.command_bytes()
+        );
+        assert_eq!(decoded.commands[0].pre_state_digest, 4321);
+        assert_eq!(decoded.commands[0].post_state_digest, 1234);
     }
 
     #[test]
@@ -16253,12 +16305,16 @@ mod tests {
                     log_index: command.id().log_index().get(),
                     previous_log_hash: 0x11,
                     log_hash: 0x22,
+                    pre_state_digest: Some(0x21),
+                    post_state_digest: Some(0x23),
                     kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command.clone())),
                 },
                 MetadataCommandLogRangeEntry {
                     log_index: 9,
                     previous_log_hash: 0x33,
                     log_hash: 0x44,
+                    pre_state_digest: None,
+                    post_state_digest: None,
                     kind: MetadataCommandLogRangeEntryKind::Abandoned {
                         original_command_checksum: 0x55,
                     },
@@ -16275,7 +16331,7 @@ mod tests {
     #[test]
     fn metadata_command_log_entry_range_worst_case_response_fits_frame_cap() {
         let worst_case_applied_entry_len =
-            8 + 8 + 8 + 1 + 8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
+            8 + 8 + 8 + 1 + 8 + 1 + 8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
         let response_payload_len =
             4 + usize::try_from(STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES).unwrap()
                 * worst_case_applied_entry_len;
@@ -16299,6 +16355,8 @@ mod tests {
         put_u64(&mut bytes, 1);
         put_u64(&mut bytes, 0x11);
         put_u64(&mut bytes, 0x22);
+        put_u8(&mut bytes, 0);
+        put_u8(&mut bytes, 0);
         put_u8(&mut bytes, 9);
 
         assert!(matches!(

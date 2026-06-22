@@ -1862,7 +1862,7 @@ impl UnixStorageNodeClient {
     pub(crate) fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         pg_id: PgId,
-        commands: &[MetadataCommandEnvelope],
+        commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let request = StorageRpcMetadataCommandTransferAdoptRequest {
@@ -2642,7 +2642,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        commands: &[MetadataCommandEnvelope],
+        commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         if cluster_epoch != self.cluster_epoch {

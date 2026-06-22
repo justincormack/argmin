@@ -1,4 +1,5 @@
 use super::*;
+use crate::metadata_command::MetadataTransferCommand;
 
 const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
@@ -545,6 +546,8 @@ struct MetadataCommandLogEntry {
     abandoned: bool,
     previous_log_hash: Option<u64>,
     log_hash: Option<u64>,
+    pre_state_digest: Option<u64>,
+    post_state_digest: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,7 +895,7 @@ impl PgStore {
         &self,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
-        commands: &[MetadataCommandEnvelope],
+        commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         if commands.is_empty() {
@@ -938,7 +941,8 @@ impl PgStore {
             let pg_id = PgId::new(self.pg_id);
             let mut previous_log_hash = 0;
             let mut applied_log_index: u64 = 0;
-            for command in commands {
+            for transfer_command in commands {
+                let command = &transfer_command.command;
                 if command.id().cluster_epoch() != cluster_epoch
                     || command.id().pg_id() != pg_id
                     || command.id().log_index().get()
@@ -964,8 +968,8 @@ impl PgStore {
                 );
                 let inserted = self.execute_cached(
                     "INSERT INTO metadata_command_log \
-                     (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7) \
+                     (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash, pre_state_digest, post_state_digest) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9) \
                      ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
                     params![
                         cluster_epoch.get() as i64,
@@ -975,6 +979,8 @@ impl PgStore {
                         command.command_bytes(),
                         previous_log_hash as i64,
                         log_hash as i64,
+                        transfer_command.pre_state_digest as i64,
+                        transfer_command.post_state_digest as i64,
                     ],
                     "install metadata transfer command log entry",
                 )?;
@@ -990,6 +996,8 @@ impl PgStore {
                     if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)?
                         || entry.previous_log_hash != Some(previous_log_hash)
                         || entry.log_hash != Some(log_hash)
+                        || entry.pre_state_digest != Some(transfer_command.pre_state_digest)
+                        || entry.post_state_digest != Some(transfer_command.post_state_digest)
                     {
                         return Err(StoreError::MetadataCommandLogConflict {
                             node_id,
@@ -1338,6 +1346,8 @@ impl PgStore {
                 log_index: raw_log_index,
                 previous_log_hash,
                 log_hash,
+                pre_state_digest: entry.pre_state_digest,
+                post_state_digest: entry.post_state_digest,
                 kind,
             });
         }
@@ -2042,7 +2052,7 @@ impl PgStore {
         log_index: MetadataCommandLogIndex,
     ) -> Result<Option<MetadataCommandLogEntry>, StoreError> {
         self.query_row_cached_optional(
-            "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+            "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash, pre_state_digest, post_state_digest \
              FROM metadata_command_log \
              WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
             params![
@@ -2058,6 +2068,8 @@ impl PgStore {
                     abandoned: row.get::<_, i64>(2)? != 0,
                     previous_log_hash: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
                     log_hash: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    pre_state_digest: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                    post_state_digest: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
                 })
             },
         )
@@ -2400,8 +2412,8 @@ impl PgStore {
         let command_bytes = command.command_bytes();
         let inserted = self.execute_cached(
             "INSERT INTO metadata_command_log \
-             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL) \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash, pre_state_digest, post_state_digest) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL, NULL, NULL) \
              ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
             params![
                 command.id().cluster_epoch().get() as i64,
@@ -2485,9 +2497,9 @@ impl PgStore {
         let command_bytes = command.abandoned_log_bytes();
         let command_checksum = command.abandoned_log_checksum_crc64();
         let inserted = self.execute_cached(
-            "INSERT INTO metadata_command_log \
-             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL) \
+                "INSERT INTO metadata_command_log \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash, pre_state_digest, post_state_digest) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL, NULL, NULL) \
              ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
             params![
                 command.id().cluster_epoch().get() as i64,
@@ -2682,12 +2694,13 @@ impl PgStore {
     ) -> Result<MetadataCommandRecordResult, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
+            let base_state_digest = state.state_digest;
             self.refresh_all_metadata_table_digests()?;
             state = MetadataCommandReplicaState {
                 cluster_epoch,
                 applied_log_index: 0,
                 applied_log_hash: 0,
-                state_digest: self.cached_metadata_state_digest()?,
+                state_digest: base_state_digest,
             };
         }
 
@@ -2711,12 +2724,13 @@ impl PgStore {
                 );
                 let updated = self.execute_cached(
                     "UPDATE metadata_command_log \
-                     SET previous_log_hash = ?1, log_hash = ?2 \
-                     WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
+                     SET previous_log_hash = ?1, log_hash = ?2, pre_state_digest = ?3 \
+                     WHERE cluster_epoch = ?4 AND pg_id = ?5 AND log_index = ?6 \
                        AND previous_log_hash IS NULL AND log_hash IS NULL",
                     params![
                         applied_log_hash as i64,
                         expected_log_hash as i64,
+                        state.state_digest as i64,
                         cluster_epoch.get() as i64,
                         self.pg_id as i64,
                         inserted_log_index.get() as i64,
@@ -2771,12 +2785,13 @@ impl PgStore {
                     );
                     let updated = self.execute_cached(
                         "UPDATE metadata_command_log \
-                     SET previous_log_hash = ?1, log_hash = ?2 \
-                     WHERE cluster_epoch = ?3 AND pg_id = ?4 AND log_index = ?5 \
+                     SET previous_log_hash = ?1, log_hash = ?2, pre_state_digest = ?3 \
+                     WHERE cluster_epoch = ?4 AND pg_id = ?5 AND log_index = ?6 \
                        AND previous_log_hash IS NULL AND log_hash IS NULL",
                         params![
                             applied_log_hash as i64,
                             expected_log_hash as i64,
+                            state.state_digest as i64,
                             cluster_epoch.get() as i64,
                             self.pg_id as i64,
                             next_log_index as i64,
@@ -2899,6 +2914,20 @@ impl PgStore {
             ],
             "update metadata command replica state",
         )?;
+        if applied_log_index > 0 {
+            self.execute_cached(
+                "UPDATE metadata_command_log \
+                 SET post_state_digest = ?1 \
+                 WHERE cluster_epoch = ?2 AND pg_id = ?3 AND log_index = ?4 AND abandoned = 0",
+                params![
+                    state_digest as i64,
+                    cluster_epoch.get() as i64,
+                    self.pg_id as i64,
+                    applied_log_index as i64,
+                ],
+                "update metadata command log post-state digest",
+            )?;
+        }
         Ok(MetadataCommandRecordResult {
             state: MetadataCommandReplicaState {
                 cluster_epoch,
@@ -2929,6 +2958,20 @@ impl PgStore {
             ],
             "update metadata command replica state preserving digest",
         )?;
+        if applied_log_index > 0 {
+            self.execute_cached(
+                "UPDATE metadata_command_log \
+                 SET post_state_digest = ?1 \
+                 WHERE cluster_epoch = ?2 AND pg_id = ?3 AND log_index = ?4 AND abandoned = 0",
+                params![
+                    state_digest as i64,
+                    cluster_epoch.get() as i64,
+                    self.pg_id as i64,
+                    applied_log_index as i64,
+                ],
+                "update metadata command log post-state digest preserving digest",
+            )?;
+        }
         Ok(MetadataCommandRecordResult {
             state: MetadataCommandReplicaState {
                 cluster_epoch,

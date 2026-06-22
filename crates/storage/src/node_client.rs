@@ -20,9 +20,9 @@ use crate::metadata_command::{
     MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
     MetadataCommandLogRangeEntry, MetadataCommandPayload, MetadataCommandReplicaState,
-    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
-    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    MetadataTransferCommand, ObjectPayloadReclaimCommand, PutBucketAclCommand,
+    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
+    PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};

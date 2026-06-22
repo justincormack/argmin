@@ -117,6 +117,8 @@ pub(crate) struct MetadataCommandLogRangeEntry {
     pub(crate) log_index: u64,
     pub(crate) previous_log_hash: u64,
     pub(crate) log_hash: u64,
+    pub(crate) pre_state_digest: Option<u64>,
+    pub(crate) post_state_digest: Option<u64>,
     pub(crate) kind: MetadataCommandLogRangeEntryKind,
 }
 
@@ -124,6 +126,13 @@ pub(crate) struct MetadataCommandLogRangeEntry {
 pub(crate) enum MetadataCommandLogRangeEntryKind {
     Applied(Box<MetadataCommandEnvelope>),
     Abandoned { original_command_checksum: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataTransferCommand {
+    pub(crate) command: MetadataCommandEnvelope,
+    pub(crate) pre_state_digest: u64,
+    pub(crate) post_state_digest: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

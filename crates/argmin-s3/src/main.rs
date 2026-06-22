@@ -692,15 +692,15 @@ fn import_pg_metadata_transfer_artifact_retrying_stale_route(
         match destination_cluster.import_pg_metadata_transfer_artifact_from_retained_log(artifact) {
             Ok(proof) => return Ok(proof),
             Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {
+                if control_plane_pg_active_with_acting_set(
+                    control_plane,
+                    pg_id,
+                    acting_set,
+                    destination_epoch,
+                )? {
+                    return Ok(imported_proof);
+                }
                 if Instant::now() >= deadline {
-                    if control_plane_pg_active_with_acting_set(
-                        control_plane,
-                        pg_id,
-                        acting_set,
-                        destination_epoch,
-                    )? {
-                        return Ok(imported_proof);
-                    }
                     return Err(format!(
                         "timed out importing PG metadata transfer artifact: {error}"
                     ));
@@ -722,9 +722,19 @@ fn control_plane_pg_active_with_acting_set(
     acting_set: &[NodeId],
     min_cluster_epoch: ClusterEpoch,
 ) -> Result<bool, String> {
-    let runtime_map = control_plane
-        .runtime_map_snapshot(storage::clock::current_time_millis())
-        .map_err(|error| format!("failed to verify live PG metadata transfer state: {error}"))?;
+    let runtime_map =
+        match control_plane.runtime_map_snapshot(storage::clock::current_time_millis()) {
+            Ok(runtime_map) => runtime_map,
+            Err(error) => {
+                let message = error.to_string();
+                if control_plane_runtime_map_not_ready_for_metadata_transfer(&message) {
+                    return Ok(false);
+                }
+                return Err(format!(
+                    "failed to verify live PG metadata transfer state: {error}"
+                ));
+            }
+        };
     if runtime_map.cluster_epoch() < min_cluster_epoch {
         return Ok(false);
     }
@@ -736,6 +746,14 @@ fn control_plane_pg_active_with_acting_set(
         return Ok(false);
     };
     Ok(route.state() == PgState::Active && route.acting_set() == acting_set)
+}
+
+fn control_plane_runtime_map_not_ready_for_metadata_transfer(message: &str) -> bool {
+    message.contains(" has no serving primary in cluster epoch ")
+        || (message.contains(" primary node ")
+            && message.contains(" has not reported active state in cluster epoch "))
+        || (message.contains(" reported unresolved pending metadata command for PG ")
+            && message.contains(" in cluster epoch "))
 }
 
 fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransferError) -> bool {
@@ -757,6 +775,8 @@ fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreErr
         StoreError::StaleShardLocation { .. } => true,
         StoreError::StorageRpc { message, .. } => {
             message.starts_with("StaleShardLocation: ")
+                || (message.starts_with("InactivePgRoute: historical peering inspection ")
+                    && message.contains(" requires Peering route, got active"))
                 || (message.starts_with("InactivePgRoute: historical metadata log read ")
                     && message.contains(" requires Peering route, got active"))
         }
@@ -1622,6 +1642,44 @@ mod tests {
         );
         assert_eq!(transfer.metadata_proof(), PgMetadataProof::new(20, 31, 40));
         assert_eq!(acting_set, vec![NodeId::new(2), NodeId::new(3)]);
+    }
+
+    #[test]
+    fn metadata_transfer_retry_treats_active_peering_inspection_as_transient() {
+        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
+            node_id: 0,
+            operation: "metadata command validate replay state preserving pending",
+            message: "InactivePgRoute: historical peering inspection for PG 0 at epoch 28 requires Peering route, got active".to_string(),
+        });
+
+        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_retry_does_not_treat_active_route_mismatch_as_transient() {
+        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
+            node_id: 0,
+            operation: "metadata command validate replay state preserving pending",
+            message: "InactivePgRoute: historical peering inspection for PG 0 at epoch 28 requires Peering route, got peering".to_string(),
+        });
+
+        assert!(!metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_active_check_treats_incomplete_runtime_map_as_retryable() {
+        assert!(control_plane_runtime_map_not_ready_for_metadata_transfer(
+            "control-plane RPC remote error: PG 1 has no serving primary in cluster epoch 26"
+        ));
+        assert!(control_plane_runtime_map_not_ready_for_metadata_transfer(
+            "control-plane RPC remote error: PG 0 primary node 2 has not reported active state in cluster epoch 31"
+        ));
+        assert!(control_plane_runtime_map_not_ready_for_metadata_transfer(
+            "control-plane RPC remote error: node 1 reported unresolved pending metadata command for PG 27 in cluster epoch 83"
+        ));
+        assert!(!control_plane_runtime_map_not_ready_for_metadata_transfer(
+            "control-plane RPC remote error: unknown PG 99"
+        ));
     }
 
     #[test]
