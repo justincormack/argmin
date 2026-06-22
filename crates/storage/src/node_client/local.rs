@@ -3956,6 +3956,15 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn metadata_command_replica_state_can_initialize(
+        &self,
+        pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_replica_state_can_initialize()
+    }
+
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,

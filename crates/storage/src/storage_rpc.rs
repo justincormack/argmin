@@ -549,6 +549,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPendingEnvelope = 22,
     MetadataCommandValidateReplayState = 23,
     MetadataCommandValidateReplayStatePreservingPending = 24,
+    MetadataCommandReplicaStateCanInitialize = 145,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -759,6 +760,9 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandValidateReplayStatePreservingPending => {
                 "metadata command validate replay state preserving pending"
             }
+            Self::MetadataCommandReplicaStateCanInitialize => {
+                "metadata command replica state can initialize"
+            }
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -926,6 +930,7 @@ impl StorageRpcMessageKind {
             22 => Ok(Self::MetadataCommandPendingEnvelope),
             23 => Ok(Self::MetadataCommandValidateReplayState),
             24 => Ok(Self::MetadataCommandValidateReplayStatePreservingPending),
+            145 => Ok(Self::MetadataCommandReplicaStateCanInitialize),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -3316,7 +3321,8 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::MetadataCommandMaxLogIndex
         | StorageRpcMessageKind::MetadataCommandPendingEnvelope
         | StorageRpcMessageKind::MetadataCommandValidateReplayState
-        | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending => {
+        | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
+        | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandNextId => {

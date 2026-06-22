@@ -8011,6 +8011,29 @@ Metadata PG migration and backfill design notes:
   this artifact into an empty destination PG when it contains a complete applied
   prefix, or import a real checkpoint plus retained suffix once checkpoint
   materialization exists.
+- Added the first storage-level metadata transfer import primitive for
+  complete retained-log artifacts. Import rebases each retained applied command
+  onto the current destination `Peering` epoch, replays it to every destination
+  acting-set node, and requires all destination replicas to converge on the
+  same destination-epoch metadata proof. Before replay, each destination
+  replica must either be a canonical empty metadata PG or already contain the
+  exact imported destination proof, so stale materialized metadata cannot be
+  overlaid by the transfer. This path is idempotent for retry after partial
+  import. It intentionally rejects empty artifacts for now because empty PG
+  migration needs a state/checkpoint bootstrap RPC rather than command-log
+  replay.
+- The retained-log import primitive is not the final general reshuffle path.
+  During a long-lived cluster reshuffle, destination nodes may already have a
+  materialized PG store from an older acting-set generation. That state should
+  not be treated as automatically dirty: a future migration path must validate
+  whether the existing local state is a safe base for the same PG, with no
+  pending commands, a proof at or below the transfer floor, and retained-log or
+  checkpoint coverage to reach the target proof. Depending on that validation,
+  migration can no-op, catch up from a retained suffix, or replace from an
+  authoritative checkpoint plus suffix. Only unrelated or forked metadata state
+  should fail closed as dirty. This keeps the current complete-prefix import
+  safe while leaving the checkpoint/suffix reconciliation work explicit for
+  high-volume PG reshuffles.
 
 Exit criteria:
 

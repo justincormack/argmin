@@ -77,7 +77,7 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     }
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || {
-        for _ in 0..9 {
+        for _ in 0..10 {
             server.accept_one().unwrap();
         }
     });
@@ -125,6 +125,12 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     let abandoned =
         MetadataCommandNodeClient::metadata_command_abandoned(&client, PgId::new(0), &first)
             .unwrap();
+    let can_initialize = MetadataCommandNodeClient::metadata_command_replica_state_can_initialize(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+    )
+    .unwrap();
     let next_conflict = MetadataCommandNodeClient::next_metadata_command_id_at_least(
         &client,
         PgId::new(0),
@@ -144,6 +150,7 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     assert_eq!(remote_hashes, Some(applied_hashes));
     assert!(matching);
     assert!(abandoned);
+    assert!(!can_initialize);
     assert!(matches!(
         next_conflict,
         StoreError::MetadataCommandLogConflict {

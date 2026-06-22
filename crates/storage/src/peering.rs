@@ -1,8 +1,9 @@
 use crate::control_plane::PgMetadataProof;
 use crate::error::{BucketSnapshotLoadError, StoreError};
 use crate::metadata_command::{
-    MetadataCommandEnvelope, MetadataCommandLogHashRangeEntry, MetadataCommandLogRangeEntry,
-    MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogHashRangeEntry,
+    MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
+    MetadataCommandReplicaState,
 };
 use crate::types::{ClusterEpoch, PgId, PgState};
 use placement::NodeId;
@@ -70,6 +71,22 @@ pub(crate) enum PgPeeringReconstructionError {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
         state: PgState,
+    },
+    #[error(
+        "PG metadata transfer artifact for PG {pg_id} has no retained commands; empty metadata import requires checkpoint/state bootstrap"
+    )]
+    EmptyTransferArtifact { pg_id: PgId },
+    #[error(
+        "PG metadata transfer destination node {node_id:?} for PG {pg_id} in cluster epoch {cluster_epoch} is not empty and does not contain the expected imported proof {expected:?}: found log index {applied_log_index}, log hash {applied_log_hash:#018X}, digest {state_digest:#018X}"
+    )]
+    DirtyMetadataTransferDestination {
+        node_id: NodeId,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        state_digest: u64,
+        expected: PgMetadataProof,
     },
     #[error("PG peering replay target {node_id:?} is missing from acting-set clients")]
     ReplayTargetMissing { node_id: NodeId },
@@ -378,6 +395,61 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
         proof: proof_from_replica_state(state),
         retained_log_entries,
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
+    artifact: &PgMetadataTransferArtifact,
+    destination_cluster_epoch: ClusterEpoch,
+) -> Result<Vec<MetadataCommandEnvelope>, PgPeeringReconstructionError> {
+    if artifact.proof.applied_log_index == 0 {
+        return Err(PgPeeringReconstructionError::EmptyTransferArtifact {
+            pg_id: artifact.pg_id,
+        });
+    }
+    let source_state = MetadataCommandReplicaState {
+        cluster_epoch: artifact.cluster_epoch,
+        applied_log_index: artifact.proof.applied_log_index,
+        applied_log_hash: artifact.proof.applied_log_hash,
+        state_digest: artifact.proof.state_digest,
+    };
+    build_pg_metadata_transfer_artifact_from_retained_log_entries(
+        artifact.cluster_epoch,
+        artifact.pg_id,
+        artifact.source_node_id,
+        source_state,
+        false,
+        artifact.retained_log_entries.clone(),
+    )?;
+
+    let mut commands = Vec::new();
+    for log_index in 1..=artifact.proof.applied_log_index {
+        let retained = artifact
+            .retained_log_entries
+            .iter()
+            .find(|entry| entry.log_index == log_index)
+            .ok_or(
+                PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                    node_id: artifact.source_node_id,
+                    log_index,
+                },
+            )?;
+        let MetadataCommandLogRangeEntryKind::Applied(command) = &retained.kind else {
+            return Err(
+                PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                    node_id: artifact.source_node_id,
+                    log_index,
+                },
+            );
+        };
+        let log_index = MetadataCommandLogIndex::new(log_index)
+            .expect("metadata transfer import log index is non-zero");
+        commands.push(MetadataCommandEnvelope::new(
+            MetadataCommandId::new(destination_cluster_epoch, artifact.pg_id, log_index),
+            command.payload().clone(),
+        ));
+    }
+    Ok(commands)
 }
 
 fn proof_from_replica_state(state: MetadataCommandReplicaState) -> PgMetadataProof {

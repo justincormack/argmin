@@ -2172,6 +2172,289 @@ fn metadata_transfer_export_fails_closed_on_abandoned_retained_entry() {
 }
 
 #[test]
+fn metadata_transfer_import_replays_rebased_artifact_to_peering_acting_set() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-import-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-import-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket.clone());
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    drop(source_pg);
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let proof = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+    let retried_proof = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+
+    assert_eq!(retried_proof, proof);
+    assert_eq!(proof.applied_log_index, artifact.proof.applied_log_index);
+    assert_eq!(proof.state_digest, artifact.proof.state_digest);
+    assert_ne!(
+        proof.applied_log_hash, artifact.proof.applied_log_hash,
+        "rebased destination epoch must produce a distinct metadata log hash"
+    );
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.cluster_epoch, destination_epoch);
+        assert_eq!(state.applied_log_index, proof.applied_log_index);
+        assert_eq!(state.applied_log_hash, proof.applied_log_hash);
+        assert_eq!(state.state_digest, proof.state_digest);
+        crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+    }
+}
+
+#[test]
+fn metadata_transfer_import_rejects_empty_artifact_until_state_bootstrap_exists() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-import-empty-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let mut artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    drop(cluster);
+    artifact.proof.applied_log_index = 0;
+    artifact.proof.applied_log_hash = 0;
+    artifact.retained_log_entries.clear();
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::EmptyTransferArtifact { pg_id }
+        ) if pg_id == PgId::new(1)
+    ));
+}
+
+fn create_bucket_metadata_command_at_epoch(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    log_index: u64,
+    bucket: crate::BucketName,
+) -> MetadataCommandEnvelope {
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    let config = crate::CreateBucketConfig {
+        name: bucket.as_str(),
+        owner_principal: "owner",
+        owner_canonical_id: &owner,
+        acl_grants: &acl_grants,
+        public_read: false,
+        public_write: false,
+        versioning: crate::BucketVersioningState::Disabled,
+        object_lock: crate::BucketObjectLockConfig::default(),
+        ownership_controls: crate::BucketOwnershipControls {
+            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster_epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::CreateBucket(
+            CreateBucketCommand::from_config(&config, 1_234, log_index).unwrap(),
+        ),
+    )
+}
+
+#[test]
+fn metadata_transfer_import_rejects_dirty_destination_replicas() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let source_bucket = bucket_for_pg(topology, 1, "metadata-transfer-import-source-");
+    let stale_bucket = bucket_for_pg(topology, 1, "metadata-transfer-import-stale-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let source = create_bucket_metadata_command(pg_id, 1, source_bucket);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .apply_metadata_command_and_record(0, &source)
+        .unwrap();
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let stale = create_bucket_metadata_command_at_epoch(destination_epoch, pg_id, 1, stale_bucket);
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &stale)
+            .unwrap();
+    }
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+                node_id,
+                pg_id: dirty_pg_id,
+                cluster_epoch,
+                ..
+            }
+        ) if node_id == NodeId::new(1)
+            && dirty_pg_id == pg_id
+            && cluster_epoch == destination_epoch
+    ));
+}
+
+#[test]
+fn metadata_transfer_import_rejects_active_destination_route() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-import-active-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Active;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Store(StoreError::PgNotActive {
+            pg_id: 1,
+            cluster_epoch,
+            state: PgState::Active,
+        }) if cluster_epoch == destination_epoch
+    ));
+}
+
+#[test]
 fn peering_replay_retries_after_partial_replica_catchup() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

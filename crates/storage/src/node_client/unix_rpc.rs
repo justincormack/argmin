@@ -1834,6 +1834,25 @@ impl UnixStorageNodeClient {
             })
     }
 
+    pub(crate) fn metadata_command_replica_state_can_initialize(
+        &self,
+        pg_id: PgId,
+    ) -> Result<bool, StoreError> {
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize,
+            payload,
+        )?;
+        decode_metadata_command_bool_response(&response)
+            .map(|response| response.value)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command replica state can initialize response",
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) fn applied_metadata_command_log_entry_hashes(
         &self,
         pg_id: PgId,
@@ -2565,6 +2584,21 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
             });
         }
         UnixStorageNodeClient::validate_metadata_command_replay_state(self, pg_id, true)
+    }
+
+    fn metadata_command_replica_state_can_initialize(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<bool, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        UnixStorageNodeClient::metadata_command_replica_state_can_initialize(self, pg_id)
     }
 
     fn metadata_command_acceptance(

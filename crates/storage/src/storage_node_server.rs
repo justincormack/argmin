@@ -2563,6 +2563,16 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => self
+                        .metadata_command_replica_state_can_initialize_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::MetadataCommandAppliedLogHashes => {
                 match decode_metadata_command_request(&frame.payload) {
                     Ok(request) => self.metadata_command_applied_hashes_response(session, request),
@@ -7359,6 +7369,34 @@ impl StorageNodeConnectionHandler {
                 let payload = encode_metadata_command_state_response(
                     &StorageRpcMetadataCommandStateResponse { state },
                 );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_replica_state_can_initialize_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let response = match self
+            .node
+            .get_pg(request.pg_id.get())
+            .and_then(|pg| pg.metadata_command_replica_state_can_initialize())
+        {
+            Ok(value) => {
+                let payload =
+                    encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
+                        value,
+                    });
                 encode_storage_rpc_success_response(&payload)
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,

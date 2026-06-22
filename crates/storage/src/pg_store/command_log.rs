@@ -830,7 +830,7 @@ impl PgStore {
         Ok(())
     }
 
-    fn metadata_command_replica_state_can_initialize(&self) -> Result<bool, StoreError> {
+    pub(crate) fn metadata_command_replica_state_can_initialize(&self) -> Result<bool, StoreError> {
         if self
             .query_row_cached_optional(
                 "SELECT 1 FROM metadata_command_log LIMIT 1",

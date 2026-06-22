@@ -21,17 +21,18 @@ pub use local::{
 use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 
 use crate::control_plane::{
-    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource, PgRouteSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource, PgMetadataProof,
+    PgRouteSnapshot,
 };
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::CommitDirectPutObjectCommand;
 use crate::metadata_command::{
-    AbortStreamUploadCommand, AppendStreamSegmentCommand, BucketWriteReservationProof,
-    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
+    BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
+    DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -43,6 +44,7 @@ use crate::node_client::{
 use crate::peering::{
     build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
+    rebase_pg_metadata_transfer_artifact_commands,
     reconstruct_pg_peering_from_primary_retained_log, PgMetadataTransferArtifact,
     PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
@@ -1366,6 +1368,82 @@ fn decide_reissued_pending_command(
     ReissuedPendingCommandDecision::ReloadCurrent
 }
 
+fn metadata_transfer_destination_proof(
+    artifact: &PgMetadataTransferArtifact,
+    commands: &[MetadataCommandEnvelope],
+    destination_cluster_epoch: ClusterEpoch,
+) -> PgMetadataProof {
+    let mut applied_log_hash = 0;
+    for command in commands {
+        applied_log_hash = metadata_command_log_hash(
+            destination_cluster_epoch,
+            artifact.pg_id,
+            command.id().log_index(),
+            applied_log_hash,
+            command.checksum_crc64(),
+        );
+    }
+    PgMetadataProof::new(
+        artifact.proof.applied_log_index,
+        applied_log_hash,
+        artifact.proof.state_digest,
+    )
+}
+
+fn validate_metadata_transfer_import_destination(
+    metadata_client: &dyn MetadataCommandNodeClient,
+    node_id: NodeId,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    expected_import_proof: PgMetadataProof,
+) -> Result<(), PgPeeringReconstructionFailure> {
+    if metadata_client
+        .pending_metadata_command_envelope(pg_id, cluster_epoch)?
+        .is_some()
+    {
+        return Err(PgPeeringReconstructionError::PendingMetadataCommand { node_id }.into());
+    }
+
+    let state = metadata_client.metadata_command_replica_state(pg_id)?;
+    let proof = PgMetadataProof::new(
+        state.applied_log_index,
+        state.applied_log_hash,
+        state.state_digest,
+    );
+    if state.cluster_epoch == cluster_epoch && proof == expected_import_proof {
+        let validated = metadata_client
+            .validate_metadata_command_replay_state_preserving_pending_slot(pg_id, cluster_epoch)?;
+        let validated_proof = PgMetadataProof::new(
+            validated.applied_log_index,
+            validated.applied_log_hash,
+            validated.state_digest,
+        );
+        if validated_proof == expected_import_proof {
+            return Ok(());
+        }
+    }
+
+    if state.applied_log_index == 0
+        && state.applied_log_hash == 0
+        && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
+    {
+        return Ok(());
+    }
+
+    Err(
+        PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+            expected: expected_import_proof,
+        }
+        .into(),
+    )
+}
+
 impl StorageCluster {
     fn emit_metadata_command_conflict(
         &self,
@@ -2297,6 +2375,69 @@ impl StorageCluster {
                 retained_log_entries,
             )?,
         )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn import_pg_metadata_transfer_from_retained_log(
+        &self,
+        artifact: &PgMetadataTransferArtifact,
+    ) -> Result<PgMetadataProof, PgPeeringReconstructionFailure> {
+        let pg_id = artifact.pg_id;
+        let commands =
+            rebase_pg_metadata_transfer_artifact_commands(artifact, self.operation_epoch())?;
+        let expected_import_proof =
+            metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
+
+        let mut reference: Option<(NodeId, PgMetadataProof)> = None;
+        for node in nodes {
+            let metadata_client = node.metadata_command_client();
+            validate_metadata_transfer_import_destination(
+                metadata_client.as_ref(),
+                node.node_id(),
+                pg_id,
+                self.operation_epoch(),
+                expected_import_proof,
+            )?;
+            let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
+            for command in &commands {
+                state = metadata_client.replay_metadata_command_for_peering(pg_id, command)?;
+            }
+            if state.cluster_epoch != self.operation_epoch() {
+                return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
+                    node_id: node.node_id(),
+                    replica_epoch: state.cluster_epoch,
+                    cluster_epoch: self.operation_epoch(),
+                }
+                .into());
+            }
+            let proof = PgMetadataProof::new(
+                state.applied_log_index,
+                state.applied_log_hash,
+                state.state_digest,
+            );
+            if let Some((reference_node_id, reference_proof)) = reference {
+                if proof != reference_proof {
+                    return Err(PgPeeringReconstructionError::MetadataFork {
+                        node_id: node.node_id(),
+                        reference_node_id,
+                        replica: proof,
+                        reference: reference_proof,
+                    }
+                    .into());
+                }
+            } else {
+                reference = Some((node.node_id(), proof));
+            }
+        }
+
+        let (_reference_node_id, proof) =
+            reference.ok_or(PgPeeringReconstructionError::PrimaryMissing {
+                primary: artifact.source_node_id,
+            })?;
+        Ok(proof)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
