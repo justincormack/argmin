@@ -164,6 +164,137 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
 }
 
 #[test]
+fn unix_storage_node_client_adopts_metadata_transfer_state() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let command = test_metadata_command(0, 1);
+    let expected_state_digest;
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        pg.apply_metadata_command_and_record(7, &command).unwrap();
+        expected_state_digest = pg.metadata_command_replica_state().unwrap().state_digest;
+    }
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    config.cluster_epoch = destination_epoch;
+    config.pg_routes[0].cluster_epoch = destination_epoch;
+    let rebased = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            destination_epoch,
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        command.payload().clone(),
+    );
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        server.accept_one().unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let state = MetadataCommandNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
+        &client,
+        PgId::new(0),
+        destination_epoch,
+        &[rebased],
+        expected_state_digest,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.cluster_epoch, destination_epoch);
+    assert_eq!(state.applied_log_index, 1);
+    assert_eq!(state.state_digest, expected_state_digest);
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let persisted = reopened
+        .get_pg(0)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    assert_eq!(persisted, state);
+}
+
+#[test]
+fn unix_storage_node_client_rejects_empty_metadata_transfer_adoption() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let command = test_metadata_command(0, 1);
+    let before;
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        pg.apply_metadata_command_and_record(7, &command).unwrap();
+        before = pg.metadata_command_replica_state().unwrap();
+    }
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    config.cluster_epoch = destination_epoch;
+    config.pg_routes[0].cluster_epoch = destination_epoch;
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        server.accept_one().unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let err = MetadataCommandNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
+        &client,
+        PgId::new(0),
+        destination_epoch,
+        &[],
+        before.state_digest,
+    )
+    .unwrap_err();
+    server_thread.join().unwrap();
+
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            operation: "metadata command transfer state adopt",
+            message,
+            ..
+        } if message.contains("requires at least one retained command")
+    ));
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let after = reopened
+        .get_pg(0)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn unix_storage_node_client_applies_metadata_command_idempotently() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

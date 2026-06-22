@@ -38,6 +38,22 @@ fn create_bucket_probe_command(
     )
 }
 
+fn rebase_probe_commands(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    commands: &[MetadataCommandEnvelope],
+) -> Vec<MetadataCommandEnvelope> {
+    commands
+        .iter()
+        .map(|command| {
+            MetadataCommandEnvelope::new(
+                MetadataCommandId::new(cluster_epoch, pg_id, command.id().log_index()),
+                command.payload().clone(),
+            )
+        })
+        .collect()
+}
+
 fn test_bucket_write_reservation_proof(
     bucket: &BucketName,
     key: &ObjectKey,
@@ -2049,6 +2065,186 @@ fn retained_metadata_command_log_entries_returns_applied_payloads() {
         }
         other => panic!("expected applied command entry, got {other:?}"),
     }
+}
+
+#[test]
+fn adopt_metadata_transfer_state_installs_rebased_log_over_matching_materialized_state() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first_bucket = trusted_bucket_name("adopt-transfer-first");
+    let second_bucket = trusted_bucket_name("adopt-transfer-second");
+    let commands = vec![
+        create_bucket_probe_command(1, 1, first_bucket.clone(), 1),
+        create_bucket_probe_command(1, 2, second_bucket.clone(), 2),
+    ];
+    for command in &commands {
+        store.apply_metadata_command_and_record(0, command).unwrap();
+    }
+    let source_state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(source_state.cluster_epoch, ClusterEpoch::INITIAL);
+
+    let destination_epoch = ClusterEpoch::new(7).unwrap();
+    let rebased = rebase_probe_commands(destination_epoch, PgId::new(1), &commands);
+    let mut expected_log_hash = 0;
+    for command in &rebased {
+        expected_log_hash = metadata_command_log_hash(
+            destination_epoch,
+            PgId::new(1),
+            command.id().log_index(),
+            expected_log_hash,
+            command.checksum_crc64(),
+        );
+    }
+
+    let adopted = store
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            0,
+            destination_epoch,
+            &rebased,
+            source_state.state_digest,
+        )
+        .unwrap();
+    assert_eq!(adopted.cluster_epoch, destination_epoch);
+    assert_eq!(adopted.applied_log_index, 2);
+    assert_eq!(adopted.applied_log_hash, expected_log_hash);
+    assert_eq!(adopted.state_digest, source_state.state_digest);
+    assert!(store.head_bucket_raw(&first_bucket).is_ok());
+    assert!(store.head_bucket_raw(&second_bucket).is_ok());
+
+    let stats = store.metadata_command_log_stats(destination_epoch).unwrap();
+    assert_eq!(stats.retained_entries, 2);
+    assert_eq!(stats.applied_log_index, 2);
+    assert_eq!(stats.missing_applied_prefix_entries, 0);
+    assert_eq!(stats.pending_tail_entries, 0);
+
+    let retried = store
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            0,
+            destination_epoch,
+            &rebased,
+            source_state.state_digest,
+        )
+        .unwrap();
+    assert_eq!(retried, adopted);
+}
+
+#[test]
+fn adopt_metadata_transfer_state_rejects_dirty_materialized_state() {
+    let tmp = test_util::tempdir();
+    let source = PgStore::open(&tmp.path().join("source"), 1).unwrap();
+    let source_bucket = trusted_bucket_name("adopt-transfer-source");
+    let source_command = create_bucket_probe_command(1, 1, source_bucket, 1);
+    source
+        .apply_metadata_command_and_record(0, &source_command)
+        .unwrap();
+    let source_state = source.metadata_command_replica_state().unwrap();
+
+    let destination = PgStore::open(&tmp.path().join("destination"), 1).unwrap();
+    let dirty_bucket = trusted_bucket_name("adopt-transfer-dirty");
+    let dirty_command = create_bucket_probe_command(1, 1, dirty_bucket, 1);
+    destination
+        .apply_metadata_command_and_record(0, &dirty_command)
+        .unwrap();
+    let rebased = rebase_probe_commands(
+        ClusterEpoch::new(8).unwrap(),
+        PgId::new(1),
+        &[source_command],
+    );
+
+    let err = destination
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            0,
+            ClusterEpoch::new(8).unwrap(),
+            &rebased,
+            source_state.state_digest,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
+    ));
+    assert_eq!(
+        destination
+            .metadata_command_replica_state()
+            .unwrap()
+            .cluster_epoch,
+        ClusterEpoch::INITIAL
+    );
+}
+
+#[test]
+fn adopt_metadata_transfer_state_rejects_empty_command_list() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("adopt-transfer-empty");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let source_state = store.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(10).unwrap();
+
+    let err = store
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            0,
+            destination_epoch,
+            &[],
+            source_state.state_digest,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataTransferEmpty {
+            pg_id: 1,
+            cluster_epoch,
+        } if cluster_epoch == destination_epoch
+    ));
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        source_state,
+        "empty adoption must not move the replica to a new epoch"
+    );
+}
+
+#[test]
+fn adopt_metadata_transfer_state_rejects_pending_command() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("adopt-transfer-pending");
+    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let source_state = store.metadata_command_replica_state().unwrap();
+    let pending_bucket = trusted_bucket_name("adopt-transfer-pending-next");
+    let pending = create_bucket_probe_command(1, 2, pending_bucket.clone(), 2);
+    store
+        .try_insert_pending_metadata_command_slot(0, &pending, Some(&pending_bucket))
+        .unwrap();
+
+    let destination_epoch = ClusterEpoch::new(9).unwrap();
+    let rebased = rebase_probe_commands(destination_epoch, PgId::new(1), &[command]);
+    let err = store
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            0,
+            destination_epoch,
+            &rebased,
+            source_state.state_digest,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCommandContention {
+            context: "adopt metadata transfer state with pending command"
+        }
+    ));
+    assert_eq!(
+        store
+            .metadata_command_replica_state()
+            .unwrap()
+            .cluster_epoch,
+        ClusterEpoch::INITIAL
+    );
 }
 
 #[test]

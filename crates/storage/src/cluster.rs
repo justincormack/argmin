@@ -1390,13 +1390,19 @@ fn metadata_transfer_destination_proof(
     )
 }
 
-fn validate_metadata_transfer_import_destination(
+enum MetadataTransferImportDestination {
+    AlreadyImported(MetadataCommandReplicaState),
+    Empty,
+    AdoptExisting,
+}
+
+fn classify_metadata_transfer_import_destination(
     metadata_client: &dyn MetadataCommandNodeClient,
     node_id: NodeId,
     pg_id: PgId,
     cluster_epoch: ClusterEpoch,
     expected_import_proof: PgMetadataProof,
-) -> Result<(), PgPeeringReconstructionFailure> {
+) -> Result<MetadataTransferImportDestination, PgPeeringReconstructionFailure> {
     if metadata_client
         .pending_metadata_command_envelope(pg_id, cluster_epoch)?
         .is_some()
@@ -1419,7 +1425,9 @@ fn validate_metadata_transfer_import_destination(
             validated.state_digest,
         );
         if validated_proof == expected_import_proof {
-            return Ok(());
+            return Ok(MetadataTransferImportDestination::AlreadyImported(
+                validated,
+            ));
         }
     }
 
@@ -1427,21 +1435,25 @@ fn validate_metadata_transfer_import_destination(
         && state.applied_log_hash == 0
         && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
     {
-        return Ok(());
+        return Ok(MetadataTransferImportDestination::Empty);
     }
 
-    Err(
-        PgPeeringReconstructionError::DirtyMetadataTransferDestination {
-            node_id,
-            pg_id,
-            cluster_epoch,
-            applied_log_index: state.applied_log_index,
-            applied_log_hash: state.applied_log_hash,
-            state_digest: state.state_digest,
-            expected: expected_import_proof,
-        }
-        .into(),
-    )
+    if state.state_digest != expected_import_proof.state_digest {
+        return Err(
+            PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                applied_log_index: state.applied_log_index,
+                applied_log_hash: state.applied_log_hash,
+                state_digest: state.state_digest,
+                expected: expected_import_proof,
+            }
+            .into(),
+        );
+    }
+
+    Ok(MetadataTransferImportDestination::AdoptExisting)
 }
 
 impl StorageCluster {
@@ -2394,17 +2406,30 @@ impl StorageCluster {
         let mut reference: Option<(NodeId, PgMetadataProof)> = None;
         for node in nodes {
             let metadata_client = node.metadata_command_client();
-            validate_metadata_transfer_import_destination(
+            let state = match classify_metadata_transfer_import_destination(
                 metadata_client.as_ref(),
                 node.node_id(),
                 pg_id,
                 self.operation_epoch(),
                 expected_import_proof,
-            )?;
-            let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
-            for command in &commands {
-                state = metadata_client.replay_metadata_command_for_peering(pg_id, command)?;
-            }
+            )? {
+                MetadataTransferImportDestination::AlreadyImported(state) => state,
+                MetadataTransferImportDestination::Empty => {
+                    let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
+                    for command in &commands {
+                        state =
+                            metadata_client.replay_metadata_command_for_peering(pg_id, command)?;
+                    }
+                    state
+                }
+                MetadataTransferImportDestination::AdoptExisting => metadata_client
+                    .adopt_metadata_transfer_state_from_rebased_commands(
+                        pg_id,
+                        self.operation_epoch(),
+                        &commands,
+                        artifact.proof.state_digest,
+                    )?,
+            };
             if state.cluster_epoch != self.operation_epoch() {
                 return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
                     node_id: node.node_id(),

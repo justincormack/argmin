@@ -1178,6 +1178,14 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<bool, StoreError>;
 
+    fn adopt_metadata_transfer_state_from_rebased_commands(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        commands: &[MetadataCommandEnvelope],
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,

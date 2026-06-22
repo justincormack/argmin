@@ -3,9 +3,10 @@ use crate::{
     metadata_command::{
         decode_metadata_command_envelope, BucketPropertyMutation, BucketSubresourceMutation,
         BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry,
-        MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
-        MetadataCommandReplicaState, ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
+        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandEnvelope,
+        MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex, MetadataCommandLogRangeEntry,
+        MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
+        PutObjectMetadataMutation,
     },
     pg_store::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow},
     types::{
@@ -550,6 +551,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandValidateReplayState = 23,
     MetadataCommandValidateReplayStatePreservingPending = 24,
     MetadataCommandReplicaStateCanInitialize = 145,
+    MetadataCommandTransferStateAdopt = 146,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -763,6 +765,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandReplicaStateCanInitialize => {
                 "metadata command replica state can initialize"
             }
+            Self::MetadataCommandTransferStateAdopt => "metadata command transfer state adopt",
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -931,6 +934,7 @@ impl StorageRpcMessageKind {
             23 => Ok(Self::MetadataCommandValidateReplayState),
             24 => Ok(Self::MetadataCommandValidateReplayStatePreservingPending),
             145 => Ok(Self::MetadataCommandReplicaStateCanInitialize),
+            146 => Ok(Self::MetadataCommandTransferStateAdopt),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -2657,6 +2661,15 @@ pub(crate) struct StorageRpcMetadataCommandStateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandTransferAdoptRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) expected_state_digest: u64,
+    pub(crate) commands: Vec<MetadataCommandEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3325,6 +3338,7 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::MetadataCommandTransferStateAdopt => STORAGE_RPC_MAX_PAYLOAD_LEN,
         StorageRpcMessageKind::MetadataCommandNextId => {
             STORAGE_RPC_MAX_METADATA_COMMAND_NEXT_ID_PAYLOAD_LEN
         }
@@ -8463,6 +8477,60 @@ pub(crate) fn decode_metadata_command_state_request(
         node_id,
         cluster_epoch,
         pg_id,
+    })
+}
+
+pub(crate) fn encode_metadata_command_transfer_adopt_request(
+    request: &StorageRpcMetadataCommandTransferAdoptRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    put_u64(&mut out, request.expected_state_digest);
+    put_u32(
+        &mut out,
+        u32::try_from(request.commands.len()).map_err(|_| {
+            StorageRpcPayloadError::InvalidResponseEnvelope(
+                "metadata command transfer adopt request command count exceeds u32",
+            )
+        })?,
+    );
+    for command in &request.commands {
+        validate_metadata_command_route(request.cluster_epoch, request.pg_id, command.id())?;
+        let item = StorageRpcMetadataCommandItem {
+            command_checksum: command.checksum_crc64(),
+            command_bytes: command.command_bytes(),
+        };
+        out.extend_from_slice(&encode_metadata_command_item(&item)?);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_transfer_adopt_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandTransferAdoptRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let expected_state_digest = decoder.read_u64()?;
+    let count = decoder.read_u32()?;
+    let mut commands = Vec::new();
+    for _ in 0..count {
+        let item = decoder.read_metadata_command_item()?;
+        let command = metadata_command_envelope_from_item(&item)?;
+        validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
+        commands.push(command);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandTransferAdoptRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        expected_state_digest,
+        commands,
     })
 }
 
@@ -16047,6 +16115,24 @@ mod tests {
         let decoded = decode_metadata_command_next_id_response(&bytes).unwrap();
 
         assert_eq!(decoded, conflict);
+    }
+
+    #[test]
+    fn metadata_command_transfer_adopt_request_round_trips() {
+        let command = test_metadata_command();
+        let request = StorageRpcMetadataCommandTransferAdoptRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            expected_state_digest: 1234,
+            commands: vec![command.clone()],
+        };
+
+        let bytes = encode_metadata_command_transfer_adopt_request(&request).unwrap();
+        let decoded = decode_metadata_command_transfer_adopt_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.commands[0].command_bytes(), command.command_bytes());
     }
 
     #[test]

@@ -64,10 +64,11 @@ use crate::storage_rpc::{
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
-    decode_metadata_command_state_request, decode_multipart_completion_preflight_request,
-    decode_multipart_completion_snapshot_request, decode_multipart_parts_list_request,
-    decode_multipart_upload_load_request, decode_multipart_upload_match_request,
-    decode_object_delete_snapshot_request, decode_object_generation_reservation_request,
+    decode_metadata_command_state_request, decode_metadata_command_transfer_adopt_request,
+    decode_multipart_completion_preflight_request, decode_multipart_completion_snapshot_request,
+    decode_multipart_parts_list_request, decode_multipart_upload_load_request,
+    decode_multipart_upload_match_request, decode_object_delete_snapshot_request,
+    decode_object_generation_reservation_request,
     decode_object_payload_reclaim_claim_acquire_request,
     decode_object_payload_reclaim_claim_record_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
@@ -207,9 +208,10 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
-    StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
-    StorageRpcMultipartCompletionPreflightResponse, StorageRpcMultipartCompletionSnapshotOutcome,
-    StorageRpcMultipartCompletionSnapshotRequest, StorageRpcMultipartCompletionSnapshotResponse,
+    StorageRpcMetadataCommandTransferAdoptRequest, StorageRpcMultipartCompletionPreflightOutcome,
+    StorageRpcMultipartCompletionPreflightRequest, StorageRpcMultipartCompletionPreflightResponse,
+    StorageRpcMultipartCompletionSnapshotOutcome, StorageRpcMultipartCompletionSnapshotRequest,
+    StorageRpcMultipartCompletionSnapshotResponse,
     StorageRpcMultipartCompletionStaleSourceResponse, StorageRpcMultipartManagementLookupResponse,
     StorageRpcMultipartPartsListOutcome, StorageRpcMultipartPartsListRequest,
     StorageRpcMultipartPartsListResponse, StorageRpcMultipartUploadLoadOutcome,
@@ -2567,6 +2569,17 @@ impl StorageNodeConnectionHandler {
                 match decode_metadata_command_state_request(&frame.payload) {
                     Ok(request) => self
                         .metadata_command_replica_state_can_initialize_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandTransferStateAdopt => {
+                match decode_metadata_command_transfer_adopt_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_command_transfer_state_adopt_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7397,6 +7410,36 @@ impl StorageNodeConnectionHandler {
                     encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
                         value,
                     });
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_transfer_state_adopt_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandTransferAdoptRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.adopt_metadata_transfer_state_from_rebased_commands(
+                request.node_id.as_u32(),
+                request.cluster_epoch,
+                &request.commands,
+                request.expected_state_digest,
+            )
+        }) {
+            Ok(state) => {
+                let payload = encode_metadata_command_state_response(
+                    &StorageRpcMetadataCommandStateResponse { state },
+                );
                 encode_storage_rpc_success_response(&payload)
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,

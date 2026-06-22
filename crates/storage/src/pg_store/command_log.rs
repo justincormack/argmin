@@ -888,6 +888,149 @@ impl PgStore {
         Ok(true)
     }
 
+    pub(crate) fn adopt_metadata_transfer_state_from_rebased_commands(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        commands: &[MetadataCommandEnvelope],
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if commands.is_empty() {
+            return Err(StoreError::MetadataTransferEmpty {
+                pg_id: self.pg_id,
+                cluster_epoch,
+            });
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StoreError::Db {
+                context: "begin metadata transfer state adoption",
+                source: e,
+            })?;
+
+        let result = (|| {
+            if self
+                .query_row_cached_optional(
+                    "SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0",
+                    [],
+                    "check metadata transfer destination pending slot",
+                    |_| Ok(()),
+                )?
+                .is_some()
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "adopt metadata transfer state with pending command",
+                });
+            }
+
+            let actual_digest = self.metadata_state_digest()?;
+            if actual_digest != expected_state_digest {
+                return Err(StoreError::MetadataStateDigestMismatch {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    expected_digest: expected_state_digest,
+                    actual_digest,
+                });
+            }
+
+            let pg_id = PgId::new(self.pg_id);
+            let mut previous_log_hash = 0;
+            let mut applied_log_index: u64 = 0;
+            for command in commands {
+                if command.id().cluster_epoch() != cluster_epoch
+                    || command.id().pg_id() != pg_id
+                    || command.id().log_index().get()
+                        != applied_log_index
+                            .checked_add(1)
+                            .expect("metadata transfer log index overflow")
+                {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: command.id().log_index().get(),
+                    });
+                }
+
+                let command_checksum = command.checksum_crc64();
+                let log_hash = metadata_command_log_hash(
+                    cluster_epoch,
+                    pg_id,
+                    command.id().log_index(),
+                    previous_log_hash,
+                    command_checksum,
+                );
+                let inserted = self.execute_cached(
+                    "INSERT INTO metadata_command_log \
+                     (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7) \
+                     ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
+                    params![
+                        cluster_epoch.get() as i64,
+                        self.pg_id as i64,
+                        command.id().log_index().get() as i64,
+                        command_checksum as i64,
+                        command.command_bytes(),
+                        previous_log_hash as i64,
+                        log_hash as i64,
+                    ],
+                    "install metadata transfer command log entry",
+                )?;
+                if inserted == 0 {
+                    let entry = self
+                        .load_metadata_command_log_entry(
+                            "load existing metadata transfer command log entry",
+                            cluster_epoch,
+                            pg_id,
+                            command.id().log_index(),
+                        )?
+                        .expect("metadata command log conflict must leave an entry");
+                    if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)?
+                        || entry.previous_log_hash != Some(previous_log_hash)
+                        || entry.log_hash != Some(log_hash)
+                    {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id,
+                            pg_id: self.pg_id,
+                            cluster_epoch,
+                            log_index: command.id().log_index().get(),
+                        });
+                    }
+                }
+                applied_log_index = command.id().log_index().get();
+                previous_log_hash = log_hash;
+            }
+
+            self.update_metadata_command_replica_state_preserving_digest(
+                cluster_epoch,
+                applied_log_index,
+                previous_log_hash,
+                expected_state_digest,
+            )
+            .map(|record| record.state)
+        })();
+
+        match result {
+            Ok(state) => {
+                self.conn.execute_batch("COMMIT").map_err(|e| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    StoreError::Db {
+                        context: "commit metadata transfer state adoption",
+                        source: e,
+                    }
+                })?;
+                self.mark_metadata_state_digest_clean()?;
+                Ok(state)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn metadata_command_replica_state(
         &self,
     ) -> Result<MetadataCommandReplicaState, StoreError> {

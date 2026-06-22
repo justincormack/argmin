@@ -191,6 +191,14 @@ pub enum StoreError {
     MetadataCommandContention { context: &'static str },
 
     #[error(
+        "metadata transfer adoption for PG {pg_id} epoch {cluster_epoch} requires at least one retained command"
+    )]
+    MetadataTransferEmpty {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "metadata command pending slot for PG {pg_id} epoch {cluster_epoch} exists on local node {node_id}, expected primary node {primary_node_id}"
     )]
     MetadataCommandPendingOnNonPrimary {
