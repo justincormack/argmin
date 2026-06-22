@@ -25,6 +25,11 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         {
             Ok(_) => return,
             Err(err) => {
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchBucket")
+                {
+                    return;
+                }
                 let raw = format!("{err:?}");
                 if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(Duration::from_millis(200)).await;
