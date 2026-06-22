@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use s3_tests::{
     aws_sdk_s3::error::ProvideErrorMetadata, build_client_with_ca,
@@ -10,7 +10,7 @@ use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
     );
     std::process::exit(2);
 }
@@ -97,14 +97,34 @@ fn pg_topology_from_env() -> PgTopology {
     PgTopology::new(&pg_ids).expect("UAT PG topology must be valid")
 }
 
+fn parse_pg_csv(value: Option<String>) -> BTreeSet<u32> {
+    let Some(value) = value else {
+        return BTreeSet::new();
+    };
+    if value.trim().is_empty() {
+        return BTreeSet::new();
+    }
+    value
+        .split(',')
+        .map(|part| {
+            part.parse::<u32>()
+                .unwrap_or_else(|_| panic!("invalid PG id in excluded metadata PG list: {part}"))
+        })
+        .collect()
+}
+
 fn find_key_with_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
     target_data_pg: Option<u32>,
+    excluded_metadata_pgs: &BTreeSet<u32>,
 ) -> Option<(String, u32)> {
     let topology = pg_topology_from_env();
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
     let bucket_pg = topology.bucket_metadata_pg_for(&bucket_name).get();
+    if excluded_metadata_pgs.contains(&bucket_pg) {
+        return None;
+    }
     let generation_id = GenerationId::new(1).expect("first object generation id is valid");
 
     for suffix in 0..10_000u32 {
@@ -118,6 +138,7 @@ fn find_key_with_distinct_data_pg(
             .get();
         if data_pg != bucket_pg
             && data_pg != object_pg
+            && !excluded_metadata_pgs.contains(&object_pg)
             && target_data_pg.is_none_or(|target| data_pg == target)
         {
             return Some((key, data_pg));
@@ -130,8 +151,11 @@ fn choose_key_with_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
     target_data_pg: Option<u32>,
+    excluded_metadata_pgs: &BTreeSet<u32>,
 ) -> (String, u32) {
-    if let Some(key) = find_key_with_distinct_data_pg(bucket, key_prefix, target_data_pg) {
+    if let Some(key) =
+        find_key_with_distinct_data_pg(bucket, key_prefix, target_data_pg, excluded_metadata_pgs)
+    {
         return key;
     }
     panic!("could not find UAT key with distinct bucket/object metadata PG and data PG");
@@ -190,6 +214,8 @@ fn main() {
                     .and_then(|value| value.parse::<u32>().ok())
                     .unwrap_or_else(|| usage())
             });
+            let excluded_metadata_pgs =
+                parse_pg_csv(args.next().and_then(|arg| arg.into_string().ok()));
             if args.next().is_some() {
                 usage();
             }
@@ -199,8 +225,13 @@ fn main() {
                     let (bucket, key, data_pg) = (0..100)
                         .find_map(|_| {
                             let bucket = unique_bucket();
-                            find_key_with_distinct_data_pg(&bucket, &key_prefix, target_data_pg)
-                                .map(|(key, data_pg)| (bucket, key, data_pg))
+                            find_key_with_distinct_data_pg(
+                                &bucket,
+                                &key_prefix,
+                                target_data_pg,
+                                &excluded_metadata_pgs,
+                            )
+                            .map(|(key, data_pg)| (bucket, key, data_pg))
                         })
                         .unwrap_or_else(|| {
                             panic!(
@@ -212,8 +243,12 @@ fn main() {
                 } else {
                     let bucket = unique_bucket();
                     create_bucket(&client, &bucket).await;
-                    let (key, data_pg) =
-                        choose_key_with_distinct_data_pg(&bucket, &key_prefix, None);
+                    let (key, data_pg) = choose_key_with_distinct_data_pg(
+                        &bucket,
+                        &key_prefix,
+                        None,
+                        &excluded_metadata_pgs,
+                    );
                     (bucket, key, data_pg)
                 };
                 let body = read_body(Path::new(&body_file));
@@ -249,14 +284,20 @@ fn main() {
             else {
                 usage();
             };
+            let excluded_metadata_pgs =
+                parse_pg_csv(args.next().and_then(|arg| arg.into_string().ok()));
             if args.next().is_some() {
                 usage();
             }
             run(async {
                 let client = client_from_env();
                 let bucket = read_bucket(Path::new(&bucket_file));
-                let (key, actual_data_pg) =
-                    choose_key_with_distinct_data_pg(&bucket, &key_prefix, Some(data_pg));
+                let (key, actual_data_pg) = choose_key_with_distinct_data_pg(
+                    &bucket,
+                    &key_prefix,
+                    Some(data_pg),
+                    &excluded_metadata_pgs,
+                );
                 assert_eq!(actual_data_pg, data_pg);
                 let body = read_body(Path::new(&body_file));
                 put_object(&client, &bucket, &key, body).await;

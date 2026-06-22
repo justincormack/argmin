@@ -183,18 +183,27 @@ if [[ "$smoke" == "pg-backfill-migration" ]]; then
     export ARGMIN_EC_K=1
     export ARGMIN_EC_M=1
     export ARGMIN_LOCAL_NODE_COUNT=3
-    pg_backfill_default_pg_count="$repeat_count"
-    if ((pg_backfill_default_pg_count < 3)); then
-        pg_backfill_default_pg_count=3
-    fi
+    pg_backfill_metadata_pg_slack=16
+    pg_backfill_default_pg_count=$((repeat_count + pg_backfill_metadata_pg_slack))
+    ((pg_backfill_default_pg_count >= 16)) || pg_backfill_default_pg_count=16
     export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$pg_backfill_default_pg_count}"
     export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
-    if ((repeat_count > ARGMIN_PG_COUNT)); then
-        die "pg-backfill-migration --repeat requires ARGMIN_PG_COUNT >= repeat count"
+    pg_backfill_required_pg_count=$((repeat_count + pg_backfill_metadata_pg_slack))
+    if ((pg_backfill_required_pg_count > ARGMIN_PG_COUNT)); then
+        die "pg-backfill-migration --repeat requires ARGMIN_PG_COUNT >= $pg_backfill_required_pg_count"
     fi
+    pg_backfill_target_pgs=()
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        pg_backfill_target_pgs+=("$((iteration - 1))")
+    done
+    ARGMIN_PG_BACKFILL_TARGET_PGS="$(
+        IFS=,
+        echo "${pg_backfill_target_pgs[*]}"
+    )"
+    export ARGMIN_PG_BACKFILL_TARGET_PGS
 fi
 if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
@@ -1465,8 +1474,8 @@ run_pg_backfill_migration_smoke() {
         "$reset_max_record_error_failed"
 
     echo "== argmin-s3 UAT PG backfill old-placement put =="
-    print_command "${pg_backfill_smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" "uat-pg-backfill-old-object-$iteration" "$old_body_file" "$target_data_pg"
-    "${pg_backfill_smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" "uat-pg-backfill-old-object-$iteration" "$old_body_file" "$target_data_pg"
+    print_command "${pg_backfill_smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" "uat-pg-backfill-old-object-$iteration" "$old_body_file" "$target_data_pg" "$ARGMIN_PG_BACKFILL_TARGET_PGS"
+    "${pg_backfill_smoke_cmd[@]}" create-put-distinct-data-pg "$bucket_file" "$old_key_file" "$data_pg_file" "uat-pg-backfill-old-object-$iteration" "$old_body_file" "$target_data_pg" "$ARGMIN_PG_BACKFILL_TARGET_PGS"
     local old_key
     old_key="$(tr -d '[:space:]' <"$old_key_file")"
     local data_pg
@@ -1515,8 +1524,8 @@ run_pg_backfill_migration_smoke() {
     "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
 
     echo "== argmin-s3 UAT PG backfill new-placement put =="
-    print_command "${pg_backfill_smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" "uat-pg-backfill-new-object-$iteration" "$new_body_file" "$data_pg"
-    "${pg_backfill_smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" "uat-pg-backfill-new-object-$iteration" "$new_body_file" "$data_pg"
+    print_command "${pg_backfill_smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" "uat-pg-backfill-new-object-$iteration" "$new_body_file" "$data_pg" "$ARGMIN_PG_BACKFILL_TARGET_PGS"
+    "${pg_backfill_smoke_cmd[@]}" put-for-data-pg "$bucket_file" "$new_key_file" "uat-pg-backfill-new-object-$iteration" "$new_body_file" "$data_pg" "$ARGMIN_PG_BACKFILL_TARGET_PGS"
     local new_key
     new_key="$(tr -d '[:space:]' <"$new_key_file")"
 

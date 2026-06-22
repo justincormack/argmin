@@ -7974,6 +7974,19 @@ Metadata PG migration and backfill design notes:
   for overlap-required migration and fail-closed non-overlap behavior, then
   define the checkpoint/log-transfer proof shape before wiring non-overlap
   migration into live acting-set changes or UAT.
+- Started the overlap-required metadata migration slice. The control-plane PG
+  record now carries a peering metadata proof floor whenever a previously
+  active PG moves back to `Peering` due to acting-set migration, restart, or
+  availability/membership change. Peering completion must satisfy that floor
+  before the PG can become `Active` again, and later `Peering` acting-set
+  changes preserve the floor and require an overlapping current `Peering`
+  source whose proof satisfies it. Active acting-set migration now requires an
+  authoritative overlapping source: an overlapping node must have a current
+  `Active` observation whose metadata proof satisfies the accepted active proof
+  floor. Direct non-overlap metadata migration fails closed with an explicit
+  transfer-required error until the checkpoint/log-transfer primitive exists.
+  Focused control-plane regressions cover overlap migration, stale peering
+  proof rejection, floor-preserving Peering changes, and non-overlap rejection.
 
 Exit criteria:
 
