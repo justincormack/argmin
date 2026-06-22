@@ -7998,6 +7998,13 @@ Metadata PG migration and backfill design notes:
   if partial/stale/future, and cleared on activation. This still does not move
   metadata bytes or export/import checkpoint data; that remains the next
   storage-node transfer primitive.
+- Wired transfer-backed acting-set changes through the live control-plane Unix
+  RPC/admin boundary. The normal live `set-pg-acting-set` command remains the
+  overlap/fail-closed path, while the explicit transfer-backed request carries
+  the source epoch and imported metadata proof to the authority and persists
+  the same peering transfer marker as the in-process API. This makes the proof
+  path usable by later migration drivers and UAT without weakening ordinary
+  non-overlap rejection.
 - Added the first storage-level metadata transfer export primitive. It packages
   an authoritative source PG's metadata proof with a validated retained
   command-log prefix and fails closed if the source has a pending metadata

@@ -1147,6 +1147,13 @@ pub trait ControlPlaneAdmin {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+
+    fn set_pg_acting_set_with_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2343,6 +2350,17 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         SingleAuthorityControlPlane::set_pg_acting_set(self, pg_id, acting_set)
     }
+
+    fn set_pg_acting_set_with_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::set_pg_acting_set_with_metadata_transfer(
+            self, pg_id, acting_set, transfer,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2406,6 +2424,33 @@ impl UnixControlPlaneClient {
         let mut payload = Vec::new();
         write_pg_acting_set_request(&mut payload, pg_id, &acting_set)?;
         let payload = self.send_request(ControlPlaneRpcKind::SetPgActingSet, &payload)?;
+        let mut reader = PayloadReader::new(&payload);
+        let raw_cluster_epoch = reader.read_u64()?;
+        let cluster_epoch =
+            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
+            })?;
+        reader.finish()?;
+        Ok(cluster_epoch)
+    }
+
+    pub fn set_pg_acting_set_with_metadata_transfer(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_acting_set_with_metadata_transfer_request(
+            &mut payload,
+            pg_id,
+            &acting_set,
+            transfer,
+        )?;
+        let payload = self.send_request(
+            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer,
+            &payload,
+        )?;
         let mut reader = PayloadReader::new(&payload);
         let raw_cluster_epoch = reader.read_u64()?;
         let cluster_epoch =
@@ -2528,6 +2573,22 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
+            let mut reader = PayloadReader::new(&payload);
+            let (pg_id, acting_set, transfer) =
+                read_pg_acting_set_with_metadata_transfer_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+            {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_u64(&mut response, snapshot.cluster_epoch().get());
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
     };
     let payload = encode_control_plane_rpc_response(response)?;
     Ok(ControlPlaneRpcResponse { kind, payload })
@@ -2558,6 +2619,7 @@ enum ControlPlaneRpcKind {
     RuntimeMapSnapshot = 1,
     RefreshNodeHeartbeat = 2,
     SetPgActingSet = 3,
+    SetPgActingSetWithMetadataTransfer = 4,
 }
 
 impl ControlPlaneRpcKind {
@@ -2566,6 +2628,7 @@ impl ControlPlaneRpcKind {
             1 => Ok(Self::RuntimeMapSnapshot),
             2 => Ok(Self::RefreshNodeHeartbeat),
             3 => Ok(Self::SetPgActingSet),
+            4 => Ok(Self::SetPgActingSetWithMetadataTransfer),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -2791,6 +2854,31 @@ fn read_pg_acting_set_request(
         acting_set.push(NodeId::new(reader.read_u32()?));
     }
     Ok((pg_id, acting_set))
+}
+
+fn write_pg_acting_set_with_metadata_transfer_request(
+    out: &mut Vec<u8>,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    transfer: PgMetadataTransferProof,
+) -> Result<(), ControlPlaneError> {
+    write_pg_acting_set_request(out, pg_id, acting_set)?;
+    write_u64(out, transfer.source_epoch().get());
+    write_pg_metadata_proof(out, transfer.metadata_proof());
+    Ok(())
+}
+
+fn read_pg_acting_set_with_metadata_transfer_request(
+    reader: &mut PayloadReader<'_>,
+) -> Result<(PgId, Vec<NodeId>, PgMetadataTransferProof), ControlPlaneError> {
+    let (pg_id, acting_set) = read_pg_acting_set_request(reader)?;
+    let source_epoch = read_cluster_epoch(reader, "metadata transfer source epoch")?;
+    let metadata_proof = read_pg_metadata_proof(reader)?;
+    Ok((
+        pg_id,
+        acting_set,
+        PgMetadataTransferProof::new(source_epoch, metadata_proof),
+    ))
 }
 
 fn write_heartbeat_lease(
@@ -5136,6 +5224,76 @@ mod tests {
         assert_eq!(
             authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
             &[NodeId::new(1), NodeId::new(2)]
+        );
+    }
+
+    #[test]
+    fn unix_control_plane_client_sets_pg_acting_set_with_metadata_transfer_live() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(43),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let transfer = PgMetadataTransferProof::new(active_epoch, PgMetadataProof::new(10, 12, 13));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_003).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let cluster_epoch = client
+            .set_pg_acting_set_with_metadata_transfer(PgId::new(43), vec![NodeId::new(2)], transfer)
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch > active_epoch);
+        let authority =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
+        let pg = authority.snapshot().pg(PgId::new(43)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        assert_eq!(
+            pg.peering_metadata_proof_floor(),
+            Some(transfer.metadata_proof())
         );
     }
 

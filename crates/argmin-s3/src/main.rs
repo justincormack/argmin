@@ -25,7 +25,7 @@ use server_core::sse::{
 use storage::control_plane::{
     build_control_plane_unix_response, read_control_plane_unix_request,
     write_control_plane_unix_response, ControlPlaneRuntimeMapSource, FileControlPlaneStore,
-    SingleAuthorityControlPlane, UnixControlPlaneClient,
+    PgMetadataProof, PgMetadataTransferProof, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use storage::storage_node_server::{
     StorageNodeControlPlaneRefreshLoop, StorageNodePgRoute, StorageNodeProcessConfig,
@@ -276,6 +276,44 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
     }
 
+    if command == "control-plane-set-pg-acting-set-with-metadata-transfer-live" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id> <source-epoch> <applied-log-index> <applied-log-hash> <state-digest> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some((pg_id, transfer, acting_set)) =
+            parse_control_plane_pg_acting_set_with_metadata_transfer_args(args)
+        else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id> <source-epoch> <applied-log-index> <applied-log-hash> <state-digest> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        return match set_control_plane_pg_acting_set_with_metadata_transfer_live(
+            Path::new(&path),
+            pg_id,
+            acting_set,
+            transfer,
+        ) {
+            Ok(epoch) => {
+                eprintln!(
+                    "control-plane set PG {} acting set with metadata transfer at epoch {}",
+                    pg_id.get(),
+                    epoch.get()
+                );
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     let live = if command == "control-plane-set-pg-acting-set" {
         false
     } else if command == "control-plane-set-pg-acting-set-live" {
@@ -346,6 +384,48 @@ fn parse_control_plane_pg_acting_set_args(
     Some((pg_id, acting_set))
 }
 
+fn parse_control_plane_pg_acting_set_with_metadata_transfer_args(
+    mut args: impl Iterator<Item = OsString>,
+) -> Option<(PgId, PgMetadataTransferProof, Vec<NodeId>)> {
+    let pg_id = parse_next_u32(&mut args).map(PgId::new)?;
+    let source_epoch = parse_next_u64(&mut args).and_then(ClusterEpoch::new)?;
+    let applied_log_index = parse_next_u64(&mut args)?;
+    let applied_log_hash = parse_next_u64(&mut args)?;
+    let state_digest = parse_next_u64(&mut args)?;
+    let mut acting_set = Vec::new();
+    for node_id in args {
+        let node_id = node_id
+            .into_string()
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(NodeId::new)?;
+        acting_set.push(node_id);
+    }
+    if acting_set.is_empty() {
+        return None;
+    }
+    Some((
+        pg_id,
+        PgMetadataTransferProof::new(
+            source_epoch,
+            PgMetadataProof {
+                applied_log_index,
+                applied_log_hash,
+                state_digest,
+            },
+        ),
+        acting_set,
+    ))
+}
+
+fn parse_next_u32(args: &mut impl Iterator<Item = OsString>) -> Option<u32> {
+    args.next()?.into_string().ok()?.parse().ok()
+}
+
+fn parse_next_u64(args: &mut impl Iterator<Item = OsString>) -> Option<u64> {
+    args.next()?.into_string().ok()?.parse().ok()
+}
+
 fn set_control_plane_pg_acting_set(
     state_path: &Path,
     pg_id: PgId,
@@ -369,6 +449,19 @@ fn set_control_plane_pg_acting_set_live(
     UnixControlPlaneClient::new(socket_path)
         .set_pg_acting_set(pg_id, acting_set)
         .map_err(|error| format!("failed to set live PG acting set: {error}"))
+}
+
+fn set_control_plane_pg_acting_set_with_metadata_transfer_live(
+    socket_path: &Path,
+    pg_id: PgId,
+    acting_set: Vec<NodeId>,
+    transfer: PgMetadataTransferProof,
+) -> Result<ClusterEpoch, String> {
+    UnixControlPlaneClient::new(socket_path)
+        .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+        .map_err(|error| {
+            format!("failed to set live PG acting set with metadata transfer: {error}")
+        })
 }
 
 fn control_plane_runtime_map_ready(
