@@ -1,0 +1,183 @@
+Metadata transfer import rejects remote peering routes
+Link: https://chatgpt.com/codex/cloud/security/findings/49d3fbec5a2c8191bfb79f00577762fd?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Resolution
+Fixed in commit [`9123ccc6`](https://github.com/justincormack/argmin/commit/9123ccc6) (`Add metadata PG transfer and backfill UAT coverage`).
+
+The finding was valid for the reported commit `78b6e3a`: remote metadata-transfer destination validation selected Peering PG routes, but the Unix/RPC server handlers for `MetadataCommandReplicaStateCanInitialize` and replay-state validation still used the Active-only `validate_pg_route` helper.
+
+The fix changed those metadata peering inspection RPC handlers to use `validate_pg_route_for_peering_inspection`, which permits current-epoch `Active` and `Peering` routes and supports retained historical Peering route inspection where required. The current code therefore allows remote/multihost metadata transfer import to validate empty and already-imported Peering destinations instead of failing with `InactivePgRoute`.
+
+Regression coverage now includes `storage_node_server_allows_peering_metadata_transfer_destination_checks`, which exercises `MetadataCommandReplicaStateCanInitialize` against a Peering route, and `storage_node_server_allows_peering_metadata_transfer_adopt_and_validate`, which validates the replay-state path under a Peering destination route.
+
+Verification for the resolution:
+- `cargo test -p storage metadata_transfer_destination_checks -- --nocapture`
+- `cargo nextest run` on commit `867d9813` passed 5576 tests.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 78b6e3a
+Fixed Commit: 9123ccc6
+Author: justin@specialbusservice.com
+Created: 22/06/2026, 14:41:41
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced bug: remote/multihost metadata transfer import is blocked by inconsistent route-state validation. This is primarily an availability/operational bug rather than a direct security vulnerability.
+The import path obtains destination nodes through metadata_pg_acting_nodes_for_peering_replay, which requires the PG route to be in Peering state. Before replaying metadata, it calls metadata_command_replica_state_can_initialize on empty destinations, and validate_metadata_command_replay_state_preserving_pending_slot on already-imported destinations. For Unix/RPC-backed storage nodes, the newly added MetadataCommandReplicaStateCanInitialize server handler calls validate_pg_route, whose allowed state list is only PgState::Active. The existing replay-state validation handler has the same Active-only validation. As a result, a remote destination PG in the required Peering state returns InactivePgRoute and the import cannot proceed. Local tests pass because LocalStorageNodeClient bypasses the storage RPC route validation.
+
+# Validation
+## Rubric
+- [x] Confirm the import path obtains destination nodes in Peering state, not Active state. - [x] Confirm destination validation calls the new can-initialize RPC for empty replicas and replay-state validation for already-imported replicas. - [x] Confirm Unix/RPC server handlers use `validate_pg_route`, whose allowed state list is Active-only. - [x] Dynamically reproduce the remote failure over `UnixStorageNodeClient`/`StorageNodeServer`, with an Active-route control showing the underlying operation can succeed. - [x] Use a debugger trace to verify the runtime rejection occurs at `validate_pg_route_with_allowed_states` with `route.state = Peering` and an Active-only allowed-state slice.
+## Report
+Validated the finding as a real availability/operational bug in the Unix/RPC-backed metadata import path. Code review showed the import selects destination nodes via `metadata_pg_acting_nodes_for_peering_replay` in `crates/storage/src/cluster.rs:2390-2403`; that helper only permits `PgState::Peering` in `crates/storage/src/cluster/local.rs:2869-2878`. Before replay, destination validation calls `validate_metadata_command_replay_state_preserving_pending_slot` for already-imported replicas and `metadata_command_replica_state_can_initialize` for empty replicas in `crates/storage/src/cluster.rs:1413-1428`. The Unix server handlers for those calls both invoke `validate_pg_route` first (`crates/storage/src/storage_node_server.rs:7349-7353` and `7379-7388`), but `validate_pg_route` delegates to `validate_pg_route_with_allowed_states(..., &[PgState::Active])` at `crates/storage/src/storage_node_server.rs:8265-8276`; non-allowed states return `InactivePgRoute` at `8354-8358`. I added targeted PoC unit tests that run through the actual UnixStorageNodeClient/StorageNodeServer RPC path. `cargo test -p storage poc_metadata_import_ -- --nocapture` produced: Active route control: `PoC active-route can_initialize result: true`; Peering empty-destination path: `StorageRpc { node_id: 7, operation: "metadata command replica state can initialize", message: "InactivePgRoute: PG 0 route is peering" }`; Peering already-imported/idempotence path: `StorageRpc { node_id: 7, operation: "metadata command validate replay state preserving pending", message: "InactivePgRoute: PG 0 route is peering" }`. I attempted a crash-style run; no process crash occurs because this is a logic/availability failure expressed as an RPC error. Valgrind was attempted but is not installed in the container. LLDB was used non-interactively and stopped at `storage_node_server.rs:8355`; it showed `route->state = Peering`, `allowed_states.length = 1`, and the backtrace `validate_pg_route_with_allowed_states -> validate_pg_route -> metadata_command_replica_state_can_initialize_response -> dispatch_frame`, confirming the exact rejection chain.
+
+# Evidence
+crates/storage/src/cluster.rs (L1413 to 1428)
+  Note: Destination validation calls the replay-state check for already-imported replicas and the new can-initialize check for empty replicas.
+```
+    if state.cluster_epoch == cluster_epoch && proof == expected_import_proof {
+        let validated = metadata_client
+            .validate_metadata_command_replay_state_preserving_pending_slot(pg_id, cluster_epoch)?;
+        let validated_proof = PgMetadataProof::new(
+            validated.applied_log_index,
+            validated.applied_log_hash,
+            validated.state_digest,
+        );
+        if validated_proof == expected_import_proof {
+            return Ok(());
+        }
+    }
+
+    if state.applied_log_index == 0
+        && state.applied_log_hash == 0
+        && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
+```
+
+crates/storage/src/cluster.rs (L2390 to 2403)
+  Note: The new import path selects destination nodes via the peering replay acting set and then validates each destination before replay.
+```
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
+
+        let mut reference: Option<(NodeId, PgMetadataProof)> = None;
+        for node in nodes {
+            let metadata_client = node.metadata_command_client();
+            validate_metadata_transfer_import_destination(
+                metadata_client.as_ref(),
+                node.node_id(),
+                pg_id,
+                self.operation_epoch(),
+                expected_import_proof,
+            )?;
+```
+
+crates/storage/src/cluster/local.rs (L2869 to 2878)
+  Note: The acting-set helper used by import only permits PgState::Peering, establishing that import destinations are expected to be in Peering state.
+```
+    pub(crate) fn metadata_pg_acting_nodes_for_peering_replay(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        self.metadata_pg_acting_nodes_with_allowed_states(
+            operation_epoch,
+            pg_id,
+            &[PgState::Peering],
+        )
+```
+
+crates/storage/src/storage_node_server.rs (L7349 to 7353)
+  Note: The retry/idempotence path for already-imported destinations also uses the same Active-only route validation, so remote retries in Peering state are rejected as well.
+```
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+```
+
+crates/storage/src/storage_node_server.rs (L7379 to 7388)
+  Note: The newly added can-initialize RPC handler validates the request with validate_pg_route before checking whether the replica state can initialize.
+```
+    fn metadata_command_replica_state_can_initialize_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+```
+
+crates/storage/src/storage_node_server.rs (L8265 to 8276)
+  Note: validate_pg_route allows only PgState::Active, so it rejects the Peering routes required by metadata transfer import.
+```
+    fn validate_pg_route(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_with_allowed_states(
+            node_id,
+            cluster_epoch,
+            pg_id,
+            &[PgState::Active],
+        )
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The original low rating is appropriate for an operational availability bug, but for security triage it should be ignored. The code evidence confirms the route-state mismatch, yet the path is internal: import_pg_metadata_transfer_from_retained_log is pub(crate) storage code, repository search showed no external argmin-s3/server-http/server-core entrypoint invoking it, and StorageNodeServer binds a Unix domain socket whose parent directory must be private. The validation PoC demonstrates an InactivePgRoute error, not a crash or security impact. There is no realistic in-scope attacker-controlled input, no public exposure, and no major confidentiality, integrity, identity, or execution consequence.
+## Likelihood
+ignore - Exploitation by an in-scope attacker is unlikely to unachievable because no public HTTP route or product CLI path was found for the import method, and the involved RPC surface is an internal Unix socket protected by private directory requirements. Triggering requires internal cluster peering conditions and operational control.
+## Impact
+ignore - The proven impact is failure of multihost/Unix-RPC metadata transfer import during Peering. This can affect recovery/migration availability for an operator, but it does not expose object data, bypass authentication/authorization, corrupt data, execute code, or cross a tenant boundary.
+## Assumptions
+- Analysis is limited to repository artifacts in /workspace/argmin; no cloud APIs or live deployment state were queried.
+- The provided threat model treats the main externally relevant surface as the S3-compatible HTTP frontend; storage-node/control-plane Unix sockets are internal deployment surfaces.
+- No deployment manifests were present to prove public exposure of internal Unix sockets.
+- Operator deploys the multihost/Unix-RPC storage-node mode rather than the default legacy-local mode
+- A placement group is in Peering state during metadata transfer import/replay
+- The internal metadata transfer import path is invoked against a remote Unix/RPC-backed storage node
+- An actor already has the ability to affect internal cluster topology/peering operations or local Unix socket access
+## Path
+Internal peering import
+  -> Peering acting-set destinations
+  -> Unix storage-node validation RPC
+  -> Active-only validate_pg_route
+  -> InactivePgRoute / metadata import blocked
+## Path evidence
+- `crates/storage/src/cluster.rs:2381-2403` - Metadata transfer import is an internal pub(crate) storage-cluster method and validates each selected destination before replay.
+- `crates/storage/src/cluster/local.rs:2869-2878` - The destination acting-set helper used by import allows only PgState::Peering.
+- `crates/storage/src/cluster.rs:1413-1428` - Destination validation calls replay-state validation for already-imported destinations and can-initialize validation for empty destinations.
+- `crates/storage/src/storage_node_server.rs:7349-7353` - The replay-state validation RPC handler calls validate_pg_route before performing the validation.
+- `crates/storage/src/storage_node_server.rs:7379-7388` - The can-initialize RPC handler also calls validate_pg_route before checking replica state.
+- `crates/storage/src/storage_node_server.rs:8265-8276` - validate_pg_route delegates with an allowed-state slice containing only PgState::Active.
+- `crates/storage/src/storage_node_server.rs:8354-8358` - Non-allowed route states return InactivePgRoute, which explains Peering rejection.
+- `crates/argmin-s3/src/main.rs:232-243` - The product has distinct control-plane, storage-node, combined, frontend, and legacy-local modes; the affected code is in internal storage-node/multihost operation, not the public S3 HTTP handler.
+- `crates/argmin-s3/src/main.rs:919-939` - Remote frontend routing installs Unix storage-node clients from configured socket paths, showing internal IPC rather than public network exposure.
+- `crates/storage/src/storage_node_server.rs:863-879` - StorageNodeServer binds a UnixListener at a configured socket path, not a TCP listener.
+- `crates/storage/src/storage_node_server.rs:9420-9444` - Storage-node socket parent directory must be private, reducing direct attacker reachability.
+- `crates/argmin-s3/src/config.rs:101-112` - Configuration documents default HTTP listen address and internal storage-node socket configuration.
+## Narrative
+The finding is a confirmed logic bug: metadata transfer import selects Peering PG destinations, but the Unix/RPC server handlers used to validate those destinations call validate_pg_route, which allows only Active routes and returns InactivePgRoute for Peering. This can block remote/multihost metadata import. However, static reachability does not show an attacker-facing security path: the operation is internal storage-cluster code, the normal public service is the S3 HTTP frontend, and storage-node RPC binds to Unix domain sockets with private directory validation. The demonstrated effect is availability of an operational migration/recovery primitive, not compromise of data, identity, or code execution.
+## Controls
+- Public S3 API uses SigV4 authentication per project threat model
+- Default frontend listen address is 127.0.0.1:9000 unless configured otherwise
+- Storage-node RPC uses Unix domain sockets
+- Storage-node socket directory must be private; group/other permissions are rejected
+- Storage-node RPC admission limits are configurable
+- No executable sink, auth bypass, or data disclosure sink identified in this path
+## Blindspots
+- Static-only review cannot prove how operators deploy socket directories or whether any out-of-repository wrapper exposes storage-node/control-plane sockets.
+- No deployment manifests, systemd units, container configs, or network proxy configs were present to validate production exposure.
+- The multihost metadata-transfer feature appears partly internal/test-driven in this checkout; future admin APIs could change reachability.
