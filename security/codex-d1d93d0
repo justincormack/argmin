@@ -1,0 +1,583 @@
+Raw copy-source policy checks permit encoded bypasses
+Link: https://chatgpt.com/codex/cloud/security/findings/c76230ae09848191add6a612100897bb?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: high (attack path: high)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d1d93d0
+Author: justin@specialbusservice.com
+Created: 20/06/2026, 17:26:06
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Resolution
+
+Invalid for the AWS-compatibility target. The reported behavior is real, but
+AWS S3 evaluates `s3:x-amz-copy-source` against the request header spelling
+rather than a canonical decoded source object value.
+
+AWS validation confirmed both relevant properties:
+
+- A leading-slash and percent-encoded copy source header can satisfy a policy
+  condition that expects that exact raw header value:
+  `./scripts/aws-tests --region us-east-1 --test bucket_policy test_bucket_policy_copy_source_condition_uses_leading_slash_encoded_header_value`
+- An unreserved percent-encoded spelling such as `%70rivate/foo` copies the
+  underlying `private/foo` object, while a destination policy deny matching the
+  canonical `private/*` spelling does not apply:
+  `./scripts/aws-tests --region us-east-1 --test bucket_policy test_bucket_policy_copy_source_condition_percent_encoded_unreserved_bypasses_canonical_deny`
+
+The proposed canonicalization patch would make policy evaluation more robust,
+but it would diverge from observed AWS behavior. Commit/test coverage should
+therefore preserve raw-header policy semantics for `s3:x-amz-copy-source`,
+including the non-unique encoding behavior.
+
+The safe policy shape is an allowlist: deny when `s3:x-amz-copy-source` does
+not match the permitted source prefix, for example a `StringNotLike` deny for
+everything outside `<bucket>/public/*`. This is the framing used by the AWS S3
+policy-key examples and it remains safe under raw-header evaluation because an
+alternate encoding of a disallowed prefix still does not match the allowed
+literal prefix. The unsafe shape is a blacklist: deny when
+`s3:x-amz-copy-source` matches a sensitive source prefix such as
+`<bucket>/private/*`. That can be bypassed by an equivalent non-canonical raw
+header spelling such as `<bucket>/%70rivate/foo`, which does not match the
+blacklist but still copies the decoded `private/foo` object.
+
+# Summary
+Introduced: the commit removed the coordinator-derived canonical copy-source policy value and replaced it with a caller-supplied/raw header value from the HTTP layer. Because the HTTP parser accepts non-canonical but equivalent copy-source spellings, bucket policy deny rules on s3:x-amz-copy-source can be bypassed by alternate encoding or a leading slash.
+CopyObject and UploadPartCopy now pass the raw x-amz-copy-source header into PutObjectPolicyContext, and the coordinator uses that value for bucket-policy condition key s3:x-amz-copy-source. However, the actual source object is parsed by stripping an optional leading slash and percent-decoding the bucket/key. Therefore multiple raw header strings can refer to the same source object but evaluate differently in bucket policy. For example, a destination bucket policy that broadly allows PutObject but denies copies when StringLike s3:x-amz-copy-source matches src/private/* can be bypassed with a header such as /src/private/foo or src/%70rivate/foo. The parser still copies src/private/foo, but the raw policy value does not match src/private/*, so the explicit deny is skipped. The same issue applies to multipart UploadPartCopy. Policies that use the AWS-documented allowlist shape, denying copies whose raw copy-source value does not match an allowed prefix such as public/*, are not bypassed by this encoding behavior.
+
+# Validation
+## Rubric
+- [x] Confirm the HTTP copy-source parser accepts multiple raw spellings for the same logical source object, especially optional leading slash and percent decoding.
+- [x] Confirm CopyObject and UploadPartCopy parse the source separately from the value used in PutObjectPolicyContext.
+- [x] Confirm bucket-policy condition key `s3:x-amz-copy-source` is evaluated from the raw `policy_context.copy_source` without canonicalization.
+- [x] Dynamically demonstrate a destination policy where canonical `src/private/*` is denied but equivalent raw spellings bypass the deny and copy the private object.
+- [x] Cover both CopyObject and UploadPartCopy, and attempt direct crash/valgrind/debugger methods before finalizing.
+## Report
+Validated the authorization-bypass finding. Static path review showed the mismatch: `parse_copy_source` strips an optional leading slash and percent-decodes bucket/key (`crates/server-http/src/http/request.rs:394-413`); CopyObject parses the source at `crates/server-http/src/http/mod.rs:1449-1452` but passes the raw header into the policy context at `mod.rs:1533-1540`; UploadPartCopy does the same at `mod.rs:2763` and `mod.rs:2794`; the policy engine evaluates `s3:x-amz-copy-source` directly from `input.policy_context.copy_source` at `crates/server-core/src/coordinator/authz/policy.rs:122-123`. I added targeted PoC tests. The HTTP parser test proves `src/private/foo`, `/src/private/foo`, and `src/%70rivate/foo` all parse to bucket `src`, key `private/foo`. The core CopyObject PoC creates a destination policy with broad Allow plus explicit Deny on `StringLike s3:x-amz-copy-source = src/private/*`; canonical policy context `src/private/foo` is denied, while the same parsed source object succeeds when policy context contains `/src/private/foo` or `src/%70rivate/foo`, and the copied body equals the private source. The UploadPartCopy PoC shows the same canonical-denied/raw-alternate-allowed behavior for multipart copy. Command evidence: `cargo test -p server-http raw_copy_source_spellings_parse_to_same_source_object -- --nocapture` passed 1/1; `cargo test -p server-core autovalidator_ -- --nocapture` passed 2/2. Direct crash was not applicable for this auth-bypass class and the debug tests exited normally. Valgrind and gdb were unavailable; no nightly toolchain was installed for ASan. I used lldb non-interactively on the CopyObject PoC test and broke at the raw policy-context construction, observing `raw_header` values `/src/private/foo` and `src/%70rivate/foo`; the test then exited status 0.
+
+# Evidence
+crates/server-core/src/coordinator/authz/acl.rs (L438 to 440)
+  Note: Destination CopyObject authorization now uses the request-supplied copy_source policy value rather than reconstructing it from the parsed bucket/key/version.
+```
+        let copy_policy_context = PutObjectPolicyContext::new(
+            req.policy_context.copy_source,
+            metadata_directive,
+```
+
+crates/server-core/src/coordinator/authz/policy.rs (L122 to 123)
+  Note: The policy engine directly evaluates s3:x-amz-copy-source from policy_context.copy_source, so raw non-canonical values affect authorization decisions.
+```
+    .with_request_object_tags(input.request_object_tags)
+    .with_copy_source(input.policy_context.copy_source)
+```
+
+crates/server-http/src/http/mod.rs (L1533 to 1540)
+  Note: CopyObject passes the raw x-amz-copy-source header value into the policy context instead of a canonical value derived from the parsed source.
+```
+                    let policy_context = put_object_policy_context_from_request(
+                        req,
+                        replace_tags_xml.as_deref(),
+                        Some(copy_source),
+                        directive.policy_condition_value(),
+                        acl.policy_condition_value(),
+                        destination_managed_encryption,
+                    );
+```
+
+crates/server-http/src/http/mod.rs (L2763 to 2794)
+  Note: UploadPartCopy parses the source for the actual copy but stores the raw header in the policy context, creating the same mismatch for multipart copy policy checks.
+```
+                let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
+                let requester = Self::requester_from_auth(auth);
+                let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
+                let sse_customer = parse_sse_customer_request(req)?;
+                reject_managed_encryption_read_headers(req)?;
+                let src_cond = copy_source_condition_from_headers(req);
+                let copy_source_range =
+                    if let Some(range_header) = req.header("x-amz-copy-source-range") {
+                        Some(crate::range::parse_copy_source_range(range_header)?)
+                    } else {
+                        None
+                    };
+                let result = self
+                    .coordinator
+                    .upload_part_copy(&UploadPartCopyRequest {
+                        source: CopySource::new(
+                            src_bucket,
+                            src_key,
+                            src_version_id,
+                            &src_cond,
+                            expected_source_bucket_owner(req),
+                        ),
+                        upload: multipart_object_request(
+                            &bucket,
+                            &key,
+                            upload_id,
+                            requester,
+                            expected_bucket_owner,
+                        )?,
+                        part_number,
+                        copy_source_range,
+                        policy_context: PutObjectPolicyContext::new(Some(copy_source), None, None),
+```
+
+crates/server-http/src/http/request.rs (L394 to 413)
+  Note: The actual copy source accepts an optional leading slash and percent-decodes the bucket/key, so multiple raw header values can refer to the same logical source object.
+```
+    // Strip optional leading slash
+    let s = header.strip_prefix('/').unwrap_or(header);
+
+    // Extract ?versionId=... query string
+    let (s, version_id) = match s.find('?') {
+        Some(pos) => {
+            let query = &s[pos + 1..];
+            let vid = query_param_raw(query, "versionId").map(std::string::ToString::to_string);
+            (&s[..pos], vid)
+        }
+        None => (s, None),
+    };
+
+    // Split into bucket/key at first '/'
+    let slash_pos = s.find('/').ok_or_else(invalid_copy_source)?;
+
+    let bucket = percent_decode_strict(&s[..slash_pos]).map_err(|_| invalid_copy_source())?;
+    let key = percent_decode_strict(&s[slash_pos + 1..]).map_err(|_| invalid_copy_source())?;
+
+    let key = ObjectKey::try_from(key).map_err(|_| invalid_copy_source())?;
+```
+
+Proposed patch:
+diff --git a/crates/s3-tests/tests/bucket_policy.rs b/crates/s3-tests/tests/bucket_policy.rs
+index 406e7d444e4ef7e8564493d4fd5ec89897627e76..f59334e80ee7612ecc1b7b51e9c0a6a13f43b23a 100644
+--- a/crates/s3-tests/tests/bucket_policy.rs
++++ b/crates/s3-tests/tests/bucket_policy.rs
+@@ -11806,114 +11806,115 @@ fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
+             .key("copied-denied")
+             .upload_id(&denied_upload_id)
+             .part_number(1)
+             .copy_source(format!("{src_bucket}/private/foo"))
+             .send()
+             .await;
+         assert_eq!(err_status(&denied), 403);
+         assert_s3_err_code(&denied, "AccessDenied");
+ 
+         let body = s3_tests::get_object_body_retrying_operation_aborted(
+             client,
+             &dst_bucket,
+             "copied",
+             None,
+             "get copy-source-conditioned copied object",
+         )
+         .await;
+         assert_eq!(body.as_slice(), b"public/foo");
+ 
+         cleanup_with_client(client, &dst_bucket, &["copied", "copied-denied"]).await;
+         cleanup(&src_bucket, &["public/foo", "private/foo"]).await;
+     });
+ }
+ 
+ #[test]
+-fn test_bucket_policy_copy_source_condition_uses_leading_slash_encoded_header_value() {
++fn test_bucket_policy_copy_source_condition_uses_canonical_parsed_source_value() {
+     s3_tests::run(async {
+         let client = CTX.client();
+         let src_bucket = unique_bucket();
+         let dst_bucket = unique_bucket();
+         s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+         s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+ 
+         let src_key = "public/space key+plus#hash";
+         let encoded_src_key = "public/space%20key%2Bplus%23hash";
+         let dst_key = "copied";
+         let copy_source = format!("/{src_bucket}/{encoded_src_key}");
++        let policy_copy_source = format!("{src_bucket}/{src_key}");
+ 
+         s3_tests::put_object_retrying_operation_aborted(
+             client,
+             &src_bucket,
+             src_key,
+             b"copy-source-normalization".to_vec(),
+         )
+         .await;
+ 
+         client
+             .put_bucket_policy()
+             .bucket(&dst_bucket)
+             .policy(
+                 json!({
+                     "Version": "2012-10-17",
+                     "Statement": [{
+                         "Effect": "Deny",
+                         "Principal": "*",
+                         "Action": "s3:PutObject",
+                         "Resource": bucket_wildcard_resource(&dst_bucket),
+                         "Condition": {
+                             "StringNotEquals": {
+-                                "s3:x-amz-copy-source": copy_source
++                                "s3:x-amz-copy-source": policy_copy_source
+                             }
+                         }
+                     }]
+                 })
+                 .to_string(),
+             )
+             .send_retrying_operation_aborted("put copy-source normalization bucket policy")
+             .await
+             .unwrap();
+ 
+         let dst_url = object_url(CTX.endpoint(), &dst_bucket, dst_key, None);
+         let response = send_signed_request(
+             "PUT",
+             &dst_url,
+             b"",
+             [("x-amz-copy-source", copy_source.as_str())],
+         );
+         assert_eq!(
+             response.status, 200,
+-            "expected copy with leading-slash encoded copy-source to match policy, got {} body={}",
++            "expected copy-source policy to match canonical parsed source, got {} body={}",
+             response.status, response.body
+         );
+ 
+         let copied = s3_tests::get_object_body_retrying_operation_aborted(
+             client,
+             &dst_bucket,
+             dst_key,
+             None,
+-            "get copied object after copy-source normalization policy",
++            "get copied object after copy-source canonicalization policy",
+         )
+         .await;
+         assert_eq!(copied.as_slice(), b"copy-source-normalization");
+ 
+         cleanup_with_client(client, &dst_bucket, &[dst_key]).await;
+         cleanup_with_client(client, &src_bucket, &[src_key]).await;
+     });
+ }
+ 
+ #[test]
+ fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition() {
+     s3_tests::run(async {
+         let principal = same_account_exact_principal().await;
+         let client = CTX.client();
+         let second_client = CTX.require_second_client();
+ 
+         let src_bucket = unique_bucket();
+         let dst_bucket = unique_bucket();
+         s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+         s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+ 
+         s3_tests::put_object_retrying_operation_aborted(
+             client,
+             &src_bucket,
+             "src",
+
+
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index e736b6fa7e01b343301b97f8d17f45eb7762a652..fb79fc58813f0c880a5dc75e77de230b8a6507a9 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -218,50 +218,63 @@ fn validate_untag_resource_tag_keys(tag_keys: &[String]) -> Result<(), ServerErr
+         return Err(ServerError::InvalidTag {
+             reason: "too many tagKeys in UntagResource request".to_string(),
+         });
+     }
+     Ok(())
+ }
+ 
+ fn parse_object_key(key: &str) -> Result<ObjectKey, ServerError> {
+     ObjectKey::try_from(key.to_string()).map_err(|error| ServerError::InvalidRequest {
+         reason: error.to_string(),
+     })
+ }
+ 
+ fn parse_copy_source_header(
+     copy_source: &str,
+ ) -> Result<(BucketName, ObjectKey, Option<VersionId>), ServerError> {
+     let (src_bucket_raw, src_key, src_version_id_str) = request::parse_copy_source(copy_source)?;
+     let src_bucket =
+         BucketName::try_from(src_bucket_raw.clone()).map_err(|_| ServerError::BucketNotFound {
+             name: src_bucket_raw,
+         })?;
+     let src_version_id = parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
+     Ok((src_bucket, src_key, src_version_id))
+ }
+ 
++fn canonical_copy_source_policy_value(
++    src_bucket: &BucketName,
++    src_key: &ObjectKey,
++    src_version_id: Option<VersionId>,
++) -> String {
++    let mut value = format!("{src_bucket}/{src_key}");
++    if let Some(version_id) = src_version_id {
++        value.push_str("?versionId=");
++        value.push_str(&version_id.to_string());
++    }
++    value
++}
++
+ fn bucket_request<'a>(
+     bucket: &BucketName,
+     requester: crate::coordinator::Requester,
+     expected_bucket_owner: Option<&'a str>,
+ ) -> Result<BucketRequest<'a>, ServerError> {
+     Ok(BucketRequest::new(
+         bucket.clone(),
+         requester,
+         expected_bucket_owner,
+     ))
+ }
+ 
+ fn object_request<'a>(
+     bucket: &BucketName,
+     key: &str,
+     requester: crate::coordinator::Requester,
+     expected_bucket_owner: Option<&'a str>,
+ ) -> Result<ObjectRequest<'a>, ServerError> {
+     Ok(ObjectRequest::new(
+         bucket.clone(),
+         parse_object_key(key)?,
+         requester,
+         expected_bucket_owner,
+     ))
+ }
+@@ -1508,54 +1521,56 @@ impl HttpFrontend {
+                     let replace_tags_xml = if req
+                         .header("x-amz-tagging-directive")
+                         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
+                     {
+                         if let Some(tagging_header) = req.header("x-amz-tagging") {
+                             let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                             if tags.is_empty() {
+                                 None
+                             } else {
+                                 Some(xml::get_tagging_xml(&tags))
+                             }
+                         } else {
+                             None
+                         }
+                     } else {
+                         None
+                     };
+                     let tagging = if req
+                         .header("x-amz-tagging-directive")
+                         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
+                     {
+                         TaggingDirective::Replace(replace_tags_xml.as_deref())
+                     } else {
+                         TaggingDirective::Copy
+                     };
++                    let canonical_copy_source =
++                        canonical_copy_source_policy_value(&src_bucket, &src_key, src_version_id);
+                     let policy_context = put_object_policy_context_from_request(
+                         req,
+                         replace_tags_xml.as_deref(),
+-                        Some(copy_source),
++                        Some(canonical_copy_source.as_str()),
+                         directive.policy_condition_value(),
+                         acl.policy_condition_value(),
+                         destination_managed_encryption,
+                     );
+                     let result = self.coordinator.copy_object(&CopyObjectRequest {
+                         source: CopySource::new(
+                             src_bucket,
+                             src_key,
+                             src_version_id,
+                             &src_cond,
+                             expected_source_bucket_owner(req),
+                         ),
+                         destination: object_request(
+                             &bucket,
+                             &key,
+                             requester,
+                             expected_bucket_owner,
+                         )?,
+                         dst_condition: &dst_cond,
+                         directive,
+                         website_redirect_location,
+                         tagging,
+                         acl,
+                         policy_context,
+                         source_sse_customer: source_sse_customer.as_ref(),
+@@ -2750,70 +2765,76 @@ impl HttpFrontend {
+             S3Operation::UploadPart { bucket, key } => {
+                 let (upload_id_raw, part_number) =
+                     request::parse_upload_part_query(req.query_string())?;
+                 let upload_id = parse_present_upload_id(upload_id_raw.as_str())?;
+                 // Normal UploadPart requests are intercepted in serve.rs and
+                 // streamed before they reach dispatch_routed(). Only copy-source
+                 // variants should remain on this buffered path.
+                 let Some(copy_source) = req.header("x-amz-copy-source") else {
+                     return Err(ServerError::InternalError {
+                         reason: "buffered dispatcher reached non-copy UploadPart".to_string(),
+                     });
+                 };
+ 
+                 let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
+                 let requester = Self::requester_from_auth(auth);
+                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
+                 let sse_customer = parse_sse_customer_request(req)?;
+                 reject_managed_encryption_read_headers(req)?;
+                 let src_cond = copy_source_condition_from_headers(req);
+                 let copy_source_range =
+                     if let Some(range_header) = req.header("x-amz-copy-source-range") {
+                         Some(crate::range::parse_copy_source_range(range_header)?)
+                     } else {
+                         None
+                     };
++                let canonical_copy_source =
++                    canonical_copy_source_policy_value(&src_bucket, &src_key, src_version_id);
+                 let result = self
+                     .coordinator
+                     .upload_part_copy(&UploadPartCopyRequest {
+                         source: CopySource::new(
+                             src_bucket,
+                             src_key,
+                             src_version_id,
+                             &src_cond,
+                             expected_source_bucket_owner(req),
+                         ),
+                         upload: multipart_object_request(
+                             &bucket,
+                             &key,
+                             upload_id,
+                             requester,
+                             expected_bucket_owner,
+                         )?,
+                         part_number,
+                         copy_source_range,
+-                        policy_context: PutObjectPolicyContext::new(Some(copy_source), None, None),
++                        policy_context: PutObjectPolicyContext::new(
++                            Some(canonical_copy_source.as_str()),
++                            None,
++                            None,
++                        ),
+                         source_sse_customer: source_sse_customer.as_ref(),
+                         sse_customer: sse_customer.as_ref(),
+                     })
+                     .map_err(|err| match err {
+                         ServerError::PreconditionFailed => {
+                             let condition = if req.header("x-amz-copy-source-if-match").is_some() {
+                                 "x-amz-copy-source-If-Match"
+                             } else if req.header("x-amz-copy-source-if-none-match").is_some() {
+                                 "x-amz-copy-source-If-None-Match"
+                             } else if req.header("x-amz-copy-source-if-modified-since").is_some() {
+                                 "x-amz-copy-source-If-Modified-Since"
+                             } else if req
+                                 .header("x-amz-copy-source-if-unmodified-since")
+                                 .is_some()
+                             {
+                                 "x-amz-copy-source-If-Unmodified-Since"
+                             } else {
+                                 return ServerError::PreconditionFailed;
+                             };
+                             ServerError::UploadPartCopyPreconditionFailed {
+                                 condition: condition.to_string(),
+                             }
+                         }
+                         other => other,
+                     })?;
+@@ -6414,50 +6435,61 @@ mod tests {
+         let err =
+             parse_request_metadata([(WEBSITE_REDIRECT_LOCATION_HEADER_NAME, "docs/landing.html")])
+                 .unwrap_err();
+         assert!(matches!(err, ServerError::InvalidRedirectLocation { .. }));
+     }
+ 
+     #[test]
+     fn parse_request_metadata_rejects_redirect_with_unsupported_scheme() {
+         let err = parse_request_metadata([(
+             WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
+             "ftp://example.com/out",
+         )])
+         .unwrap_err();
+         assert!(matches!(err, ServerError::InvalidRedirectLocation { .. }));
+     }
+ 
+     #[test]
+     fn parse_copy_source_header_parses_typed_source() {
+         let (bucket, key, version_id) =
+             parse_copy_source_header("/source-bucket/path/to/key?versionId=42").unwrap();
+         assert_eq!(bucket.as_str(), "source-bucket");
+         assert_eq!(key.as_str(), "path/to/key");
+         assert_eq!(version_id, Some(VersionId::from_u64(42)));
+     }
+ 
++    #[test]
++    fn canonical_copy_source_policy_value_uses_parsed_source() {
++        let (bucket, key, version_id) =
++            parse_copy_source_header("/source-bucket/%70rivate/foo?versionId=42").unwrap();
++
++        assert_eq!(
++            canonical_copy_source_policy_value(&bucket, &key, version_id),
++            "source-bucket/private/foo?versionId=42"
++        );
++    }
++
+     #[test]
+     fn parse_copy_source_header_maps_invalid_source_bucket_to_bucket_not_found() {
+         match parse_copy_source_header("/BadBucket/key") {
+             Err(ServerError::BucketNotFound { name }) => assert_eq!(name, "BadBucket"),
+             other => panic!("expected BucketNotFound, got {other:?}"),
+         }
+     }
+ 
+     #[test]
+     fn parse_copy_source_header_maps_oversized_source_bucket_to_bucket_not_found() {
+         let oversized_bucket = "a".repeat(64);
+         match parse_copy_source_header(&format!("/{oversized_bucket}/key")) {
+             Err(ServerError::BucketNotFound { name }) => assert_eq!(name, oversized_bucket),
+             other => panic!("expected BucketNotFound, got {other:?}"),
+         }
+     }
+ 
+     #[test]
+     fn unsupported_sigv2_error_returns_sigv4_required_message_in_eu_central_1() {
+         let err = HttpFrontend::unsupported_sigv2_error(Some("AWS AKIA:signature"), "eu-central-1")
+             .expect("expected eu-central-1 SigV2 to be rejected");
+         match err {
+             ServerError::InvalidRequest { reason } => assert_eq!(
+                 reason,
+                 "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256."
+
+# Attack-path analysis
+Final: high | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Kept as high. The finding is in the main runtime HTTP and authorization path and has concrete evidence: request.rs normalizes the actual copy source, mod.rs passes the raw header into policy context for both CopyObject and UploadPartCopy, and policy.rs evaluates that raw value as s3:x-amz-copy-source. Executable validation demonstrated canonical values being denied while equivalent leading-slash and percent-encoded values succeeded. The impact is a real authorization-control bypass over object data movement, but it is not critical because exploitation requires an authenticated requester with source read and destination write paths plus a relevant bucket-policy configuration, and it does not grant unauthenticated arbitrary object access.
+## Likelihood
+high - Once the required policy shape and permissions exist, exploitation is simple: send a normal S3 CopyObject or UploadPartCopy request with a leading slash or percent-encoded source component. However, it requires authentication, source read access, destination write access, and a bucket policy that depends on deny matching for s3:x-amz-copy-source; default repository exposure is loopback with no public ingress artifacts. | Remote network vector
+## Impact
+high - The bug bypasses an explicit bucket-policy deny condition and can allow object copies or multipart copy parts that policy authors intended to forbid. It affects object data integrity and controlled data movement, and can become confidentiality-impacting if the destination exposes copied data more broadly. It does not by itself bypass SigV4 authentication or source-object read authorization, so it is high rather than critical.
+## Assumptions
+- No Kubernetes, Terraform, or other deployment manifests were identified in the provided scope, so exposure is inferred from product code and defaults.
+- The attacker is an authenticated S3 client with source read permission and some destination PutObject or multipart-upload write path, but is intended to be constrained by a destination bucket policy using s3:x-amz-copy-source deny conditions.
+- Operators may bind the S3 HTTP listener beyond the default loopback address via ARGMIN_LISTEN_ADDR; the repository default is 127.0.0.1:9000.
+- Argmin S3 HTTP frontend is reachable by the attacker
+- Attacker can authenticate or otherwise obtain an allowed requester identity
+- A destination bucket policy relies on s3:x-amz-copy-source to deny copies from sensitive source prefixes
+- Attacker has whatever source read authorization the CopyObject or UploadPartCopy path requires
+## Path
+Client -> argmin-s3 HTTP -> parse_copy_source(decodes / strips slash) -> source object selected
+       \-> raw x-amz-copy-source -> PutObjectPolicyContext -> bucket policy condition miss -> copy succeeds
+## Path evidence
+- `crates/server-http/src/http/request.rs:382-416` - parse_copy_source documents and implements optional leading slash stripping plus percent-decoding of bucket and key, so raw strings can normalize to the same source object.
+- `crates/server-http/src/http/mod.rs:1449-1540` - CopyObject parses the source for the actual operation, but passes Some(copy_source), the raw request header, into the put-object policy context.
+- `crates/server-http/src/http/mod.rs:2757-2794` - UploadPartCopy has the same split: parsed source bucket/key/version are used for the copy, while PutObjectPolicyContext stores Some(copy_source) from the raw header.
+- `crates/server-core/src/coordinator/authz/policy.rs:122-123` - The policy engine evaluates the s3:x-amz-copy-source condition from input.policy_context.copy_source without canonicalization.
+- `crates/argmin-s3/src/main.rs:888-919` - The affected frontend is a real runtime TCP listener for argmin-s3, not a test-only path.
+- `crates/argmin-s3/src/config.rs:101-106` - Configuration shows the default listener address is 127.0.0.1:9000 and can be changed with ARGMIN_LISTEN_ADDR.
+## Narrative
+This is a real, in-scope authorization bypass in the main S3-compatible runtime. The HTTP parser accepts multiple raw x-amz-copy-source spellings for the same logical source by stripping an optional leading slash and percent-decoding bucket/key. CopyObject and UploadPartCopy then pass the original raw header value into PutObjectPolicyContext, and the policy engine evaluates s3:x-amz-copy-source directly from that raw value. A policy deny such as StringLike s3:x-amz-copy-source = src/private/* can therefore miss /src/private/foo or src/%70rivate/foo even though the actual copied object is src/private/foo. Earlier validation included executable tests proving both CopyObject and UploadPartCopy bypass behavior.
+## Controls
+- SigV4 request authentication
+- anonymous access only if policy/ACL allows it
+- bucket policy authorization
+- ACL/object ownership authorization
+- connection and inflight request limits
+- header and request parsing validation
+## Blindspots
+- Static repository review found no deployment manifests, so real-world public exposure, TLS termination, and network controls are unknown.
+- The assessment relies on provided validation evidence for dynamic PoC execution; this attack-path stage did not rerun the full cargo test suite.
+- Exact production use of s3:x-amz-copy-source deny policies is deployment-dependent, so likelihood varies by operator policy design.
