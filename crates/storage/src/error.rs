@@ -839,6 +839,16 @@ pub enum BucketSnapshotLoadError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum PgMetadataTransferError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Apply(#[from] BucketSnapshotLoadError),
+    #[error("PG metadata transfer reconstruction failed: {message}")]
+    Reconstruction { message: String },
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum BucketWriteDrainError {
     #[error(transparent)]
     Store(#[from] StoreError),

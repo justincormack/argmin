@@ -47,11 +47,12 @@ pub use cluster::{
     BucketWriteSnapshotAction, LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
-    ObjectPayloadLease, PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan,
-    PlacedSegmentShardHealth, PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk,
-    PlacedSegmentShardValidation, ReleasedObjectPayloadLease, ShardLocation, StorageCluster,
-    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopSuccess,
+    ObjectPayloadLease, PgMetadataTransferArtifact, PlacedSegmentShardBackfillCopyTarget,
+    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
+    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ReleasedObjectPayloadLease,
+    ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopStatus,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
@@ -60,7 +61,7 @@ pub use cluster::{
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
-    ObjectPgActionError, ShardIoError, StoreError,
+    ObjectPgActionError, PgMetadataTransferError, ShardIoError, StoreError,
 };
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(feature = "test-hooks")]

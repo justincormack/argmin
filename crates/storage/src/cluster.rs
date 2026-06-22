@@ -24,7 +24,7 @@ use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource, PgMetadataProof,
     PgRouteSnapshot,
 };
-use crate::error::{ClusterBuildError, ShardIoError, StoreError};
+use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::CommitDirectPutObjectCommand;
 use crate::metadata_command::{
@@ -41,12 +41,13 @@ use crate::node_client::{
     CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
     ShardAckNodeClient, StorageNodeClient,
 };
+pub use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
     build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
     rebase_pg_metadata_transfer_artifact_commands,
-    reconstruct_pg_peering_from_primary_retained_log, PgMetadataTransferArtifact,
-    PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
+    reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
+    PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
 use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
@@ -1390,6 +1391,23 @@ fn metadata_transfer_destination_proof(
     )
 }
 
+impl StorageCluster {
+    pub fn metadata_transfer_imported_proof_at_epoch(
+        artifact: &PgMetadataTransferArtifact,
+        destination_epoch: ClusterEpoch,
+    ) -> Result<PgMetadataProof, PgMetadataTransferError> {
+        let commands = rebase_pg_metadata_transfer_artifact_commands(artifact, destination_epoch)
+            .map_err(|error| PgMetadataTransferError::Reconstruction {
+            message: error.to_string(),
+        })?;
+        Ok(metadata_transfer_destination_proof(
+            artifact,
+            &commands,
+            destination_epoch,
+        ))
+    }
+}
+
 enum MetadataTransferImportDestination {
     AlreadyImported(MetadataCommandReplicaState),
     Empty,
@@ -2389,6 +2407,15 @@ impl StorageCluster {
         )
     }
 
+    pub fn export_pg_metadata_transfer_artifact_from_retained_log(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
+        self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id)
+            .map_err(Into::into)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn import_pg_metadata_transfer_from_retained_log(
         &self,
@@ -2463,6 +2490,14 @@ impl StorageCluster {
                 primary: artifact.source_node_id,
             })?;
         Ok(proof)
+    }
+
+    pub fn import_pg_metadata_transfer_artifact_from_retained_log(
+        &self,
+        artifact: &PgMetadataTransferArtifact,
+    ) -> Result<PgMetadataProof, PgMetadataTransferError> {
+        self.import_pg_metadata_transfer_from_retained_log(artifact)
+            .map_err(Into::into)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

@@ -7993,11 +7993,12 @@ Metadata PG migration and backfill design notes:
   can distinguish overlap catch-up from an explicit checkpoint/log import.
   The ordinary acting-set update remains fail-closed for non-overlap migration;
   only the explicit transfer-backed API can move a PG to a non-overlapping
-  `Peering` acting set, and only when the imported proof satisfies the current
-  active/peering floor. The transfer marker is persisted while peering, rejected
-  if partial/stale/future, and cleared on activation. This still does not move
-  metadata bytes or export/import checkpoint data; that remains the next
-  storage-node transfer primitive.
+  `Peering` acting set, and only when the source proof satisfies the current
+  active/peering floor. The imported proof is then stored as the destination
+  Peering activation floor. The transfer marker is persisted while peering,
+  rejected if partial/stale/future, and cleared on activation. This still does
+  not move metadata bytes or export/import checkpoint data; that remains the
+  next storage-node transfer primitive.
 - Wired transfer-backed acting-set changes through the live control-plane Unix
   RPC/admin boundary. The normal live `set-pg-acting-set` command remains the
   overlap/fail-closed path, while the explicit transfer-backed request carries
@@ -8005,6 +8006,21 @@ Metadata PG migration and backfill design notes:
   the same peering transfer marker as the in-process API. This makes the proof
   path usable by later migration drivers and UAT without weakening ordinary
   non-overlap rejection.
+- Added an explicit live control-plane fencing step for metadata transfer.
+  `control-plane-fence-pg-for-metadata-transfer-live` moves an `Active` PG to
+  `Peering` without changing its acting set, preserves the accepted metadata
+  proof as the peering floor, and is idempotent once the PG is already
+  `Peering`. This gives the storage export primitive a quiesced authoritative
+  source route instead of requiring migration code to abuse a broad PG-state
+  setter or race an active route.
+- Split explicit metadata-transfer proof into source and imported proofs. A
+  retained-log transfer may rebase command-log hashes onto the destination
+  cluster epoch, so the proof that authorizes the transfer from the old acting
+  set is not necessarily the same proof the destination Peering replicas will
+  report. The control plane now validates the source proof against the old
+  floor, stores the imported proof as the Peering activation floor, and persists
+  both values in the transfer marker. Older single-proof records are still read
+  as source/imported-same for focused tests.
 - Added the first storage-level metadata transfer export primitive. It packages
   an authoritative source PG's metadata proof with a validated retained
   command-log prefix and fails closed if the source has a pending metadata
@@ -8043,6 +8059,17 @@ Metadata PG migration and backfill design notes:
   forked metadata state should fail closed as dirty. This keeps the current
   complete-prefix import safe while leaving the checkpoint/suffix
   reconciliation work explicit for high-volume PG reshuffles.
+- Added a first live retained-log transfer admin path:
+  `control-plane-transfer-pg-metadata-live` fences the source PG, exports the
+  retained-log artifact from the fenced Peering primary, computes the expected
+  imported proof for the next destination epoch, installs the transfer-backed
+  acting set through the control plane, and imports the artifact into the
+  destination Peering acting set using the exact destination runtime map
+  returned by the transfer-install RPC. This is still an operator/UAT primitive
+  rather than an autonomous migration scheduler. The authority rejects stale
+  transfer source epochs before persisting the transfer marker, and the command
+  no longer refetches an arbitrary later control-plane map between install and
+  import.
 
 Exit criteria:
 

@@ -917,15 +917,26 @@ impl PgControlRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PgMetadataTransferProof {
     source_epoch: ClusterEpoch,
-    metadata_proof: PgMetadataProof,
+    source_metadata_proof: PgMetadataProof,
+    imported_metadata_proof: PgMetadataProof,
 }
 
 impl PgMetadataTransferProof {
     #[must_use]
     pub fn new(source_epoch: ClusterEpoch, metadata_proof: PgMetadataProof) -> Self {
+        Self::new_with_imported_metadata_proof(source_epoch, metadata_proof, metadata_proof)
+    }
+
+    #[must_use]
+    pub fn new_with_imported_metadata_proof(
+        source_epoch: ClusterEpoch,
+        source_metadata_proof: PgMetadataProof,
+        imported_metadata_proof: PgMetadataProof,
+    ) -> Self {
         Self {
             source_epoch,
-            metadata_proof,
+            source_metadata_proof,
+            imported_metadata_proof,
         }
     }
 
@@ -935,8 +946,13 @@ impl PgMetadataTransferProof {
     }
 
     #[must_use]
+    pub fn source_metadata_proof(self) -> PgMetadataProof {
+        self.source_metadata_proof
+    }
+
+    #[must_use]
     pub fn metadata_proof(self) -> PgMetadataProof {
-        self.metadata_proof
+        self.imported_metadata_proof
     }
 }
 
@@ -1146,6 +1162,11 @@ pub trait ControlPlaneAdmin {
         &mut self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+
+    fn fence_pg_for_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
 
     fn set_pg_acting_set_with_metadata_transfer(
@@ -1644,6 +1665,34 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
+    }
+
+    pub fn fence_pg_for_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let record = self
+            .snapshot
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        match record.state {
+            PgState::Peering => return Ok(self.snapshot.clone()),
+            PgState::Active => {
+                if record.active_metadata_proof.is_none() {
+                    return Err(ControlPlaneError::ActivePgMissingMetadataProof {
+                        pg_id: pg_id.get(),
+                    });
+                }
+            }
+            state => {
+                return Err(ControlPlaneError::PgNotActive {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.snapshot.cluster_epoch(),
+                    state,
+                });
+            }
+        }
+        self.set_pg_state(pg_id, PgState::Peering)
     }
 
     pub fn set_pg_state(
@@ -2351,6 +2400,13 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         SingleAuthorityControlPlane::set_pg_acting_set(self, pg_id, acting_set)
     }
 
+    fn fence_pg_for_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::fence_pg_for_metadata_transfer(self, pg_id)
+    }
+
     fn set_pg_acting_set_with_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -2434,6 +2490,24 @@ impl UnixControlPlaneClient {
         Ok(cluster_epoch)
     }
 
+    pub fn fence_pg_for_metadata_transfer(
+        &self,
+        pg_id: PgId,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload =
+            self.send_request(ControlPlaneRpcKind::FencePgForMetadataTransfer, &payload)?;
+        let mut reader = PayloadReader::new(&payload);
+        let raw_cluster_epoch = reader.read_u64()?;
+        let cluster_epoch =
+            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
+            })?;
+        reader.finish()?;
+        Ok(cluster_epoch)
+    }
+
     pub fn set_pg_acting_set_with_metadata_transfer(
         &self,
         pg_id: PgId,
@@ -2459,6 +2533,29 @@ impl UnixControlPlaneClient {
             })?;
         reader.finish()?;
         Ok(cluster_epoch)
+    }
+
+    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_acting_set_with_metadata_transfer_request(
+            &mut payload,
+            pg_id,
+            &acting_set,
+            transfer,
+        )?;
+        let payload = self.send_request(
+            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
+            &payload,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
     }
 }
 
@@ -2573,6 +2670,19 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::FencePgForMetadataTransfer => {
+            let mut reader = PayloadReader::new(&payload);
+            let pg_id = read_pg_id_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane.fence_pg_for_metadata_transfer(pg_id) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_u64(&mut response, snapshot.cluster_epoch().get());
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
             let mut reader = PayloadReader::new(&payload);
             let (pg_id, acting_set, transfer) =
@@ -2584,6 +2694,23 @@ where
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_u64(&mut response, snapshot.cluster_epoch().get());
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap => {
+            let mut reader = PayloadReader::new(&payload);
+            let (pg_id, acting_set, transfer) =
+                read_pg_acting_set_with_metadata_transfer_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+                .and_then(|snapshot| snapshot.runtime_map(authority_now_ms))
+            {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
                     Ok(response)
                 }
                 Err(error) => Err(error),
@@ -2620,6 +2747,8 @@ enum ControlPlaneRpcKind {
     RefreshNodeHeartbeat = 2,
     SetPgActingSet = 3,
     SetPgActingSetWithMetadataTransfer = 4,
+    FencePgForMetadataTransfer = 5,
+    SetPgActingSetWithMetadataTransferRuntimeMap = 6,
 }
 
 impl ControlPlaneRpcKind {
@@ -2629,6 +2758,8 @@ impl ControlPlaneRpcKind {
             2 => Ok(Self::RefreshNodeHeartbeat),
             3 => Ok(Self::SetPgActingSet),
             4 => Ok(Self::SetPgActingSetWithMetadataTransfer),
+            5 => Ok(Self::FencePgForMetadataTransfer),
+            6 => Ok(Self::SetPgActingSetWithMetadataTransferRuntimeMap),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -2856,6 +2987,14 @@ fn read_pg_acting_set_request(
     Ok((pg_id, acting_set))
 }
 
+fn write_pg_id_request(out: &mut Vec<u8>, pg_id: PgId) {
+    write_u32(out, pg_id.get());
+}
+
+fn read_pg_id_request(reader: &mut PayloadReader<'_>) -> Result<PgId, ControlPlaneError> {
+    Ok(PgId::new(reader.read_u32()?))
+}
+
 fn write_pg_acting_set_with_metadata_transfer_request(
     out: &mut Vec<u8>,
     pg_id: PgId,
@@ -2864,6 +3003,7 @@ fn write_pg_acting_set_with_metadata_transfer_request(
 ) -> Result<(), ControlPlaneError> {
     write_pg_acting_set_request(out, pg_id, acting_set)?;
     write_u64(out, transfer.source_epoch().get());
+    write_pg_metadata_proof(out, transfer.source_metadata_proof());
     write_pg_metadata_proof(out, transfer.metadata_proof());
     Ok(())
 }
@@ -2873,11 +3013,16 @@ fn read_pg_acting_set_with_metadata_transfer_request(
 ) -> Result<(PgId, Vec<NodeId>, PgMetadataTransferProof), ControlPlaneError> {
     let (pg_id, acting_set) = read_pg_acting_set_request(reader)?;
     let source_epoch = read_cluster_epoch(reader, "metadata transfer source epoch")?;
-    let metadata_proof = read_pg_metadata_proof(reader)?;
+    let source_metadata_proof = read_pg_metadata_proof(reader)?;
+    let imported_metadata_proof = read_pg_metadata_proof(reader)?;
     Ok((
         pg_id,
         acting_set,
-        PgMetadataTransferProof::new(source_epoch, metadata_proof),
+        PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            source_metadata_proof,
+            imported_metadata_proof,
+        ),
     ))
 }
 
@@ -3279,6 +3424,15 @@ pub enum ControlPlaneError {
     },
 
     #[error(
+        "PG {pg_id} metadata transfer source epoch {source_epoch} is stale for current cluster epoch {cluster_epoch}"
+    )]
+    PgMetadataTransferSourceEpochStale {
+        pg_id: u32,
+        source_epoch: ClusterEpoch,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "PG {pg_id} metadata transfer proof {actual:?} does not satisfy required floor {expected:?}"
     )]
     PgMetadataTransferProofBelowFloor {
@@ -3608,23 +3762,36 @@ fn format_pg_record(record: &PgControlRecord) -> String {
             ),
             None => (option_u64(None), option_u64(None), option_u64(None)),
         };
-    let (transfer_source_epoch, transfer_log_index, transfer_log_hash, transfer_state_digest) =
-        match record.peering_metadata_transfer {
-            Some(transfer) => (
-                option_u64(Some(transfer.source_epoch().get())),
-                option_u64(Some(transfer.metadata_proof().applied_log_index)),
-                option_u64(Some(transfer.metadata_proof().applied_log_hash)),
-                option_u64(Some(transfer.metadata_proof().state_digest)),
-            ),
-            None => (
-                option_u64(None),
-                option_u64(None),
-                option_u64(None),
-                option_u64(None),
-            ),
-        };
+    let (
+        transfer_source_epoch,
+        transfer_source_log_index,
+        transfer_source_log_hash,
+        transfer_source_state_digest,
+        transfer_imported_log_index,
+        transfer_imported_log_hash,
+        transfer_imported_state_digest,
+    ) = match record.peering_metadata_transfer {
+        Some(transfer) => (
+            option_u64(Some(transfer.source_epoch().get())),
+            option_u64(Some(transfer.source_metadata_proof().applied_log_index)),
+            option_u64(Some(transfer.source_metadata_proof().applied_log_hash)),
+            option_u64(Some(transfer.source_metadata_proof().state_digest)),
+            option_u64(Some(transfer.metadata_proof().applied_log_index)),
+            option_u64(Some(transfer.metadata_proof().applied_log_hash)),
+            option_u64(Some(transfer.metadata_proof().state_digest)),
+        ),
+        None => (
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+        ),
+    };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -3636,9 +3803,12 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         peering_floor_log_hash,
         peering_floor_state_digest,
         transfer_source_epoch,
-        transfer_log_index,
-        transfer_log_hash,
-        transfer_state_digest
+        transfer_source_log_index,
+        transfer_source_log_hash,
+        transfer_source_state_digest,
+        transfer_imported_log_index,
+        transfer_imported_log_hash,
+        transfer_imported_state_digest
     )
 }
 
@@ -3829,7 +3999,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if version < 8 || version > 9 {
+    if !(8..=9).contains(&version) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -4143,10 +4313,10 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
 
 fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 7 && fields.len() != 10 && fields.len() != 14 {
+    if fields.len() != 7 && fields.len() != 10 && fields.len() != 14 && fields.len() != 17 {
         return Err(parse_error(
             line,
-            "PG record must have seven, ten, or fourteen fields",
+            "PG record must have seven, ten, fourteen, or seventeen fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
@@ -4202,39 +4372,88 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
     } else {
         None
     };
-    let peering_metadata_transfer = if fields.len() == 14 {
+    let peering_metadata_transfer = if fields.len() == 14 || fields.len() == 17 {
         let transfer_source_epoch =
             parse_option_cluster_epoch(line, fields[10], "metadata transfer source epoch")?;
-        let transfer_log_index =
-            parse_option_u64(line, fields[11], "metadata transfer applied log index")?;
-        let transfer_log_hash =
-            parse_option_u64(line, fields[12], "metadata transfer applied log hash")?;
-        let transfer_state_digest =
-            parse_option_u64(line, fields[13], "metadata transfer state digest")?;
+        let transfer_source_log_index = parse_option_u64(
+            line,
+            fields[11],
+            "metadata transfer source applied log index",
+        )?;
+        let transfer_source_log_hash = parse_option_u64(
+            line,
+            fields[12],
+            "metadata transfer source applied log hash",
+        )?;
+        let transfer_source_state_digest =
+            parse_option_u64(line, fields[13], "metadata transfer source state digest")?;
+        let transfer_imported = if fields.len() == 17 {
+            let transfer_imported_log_index = parse_option_u64(
+                line,
+                fields[14],
+                "metadata transfer imported applied log index",
+            )?;
+            let transfer_imported_log_hash = parse_option_u64(
+                line,
+                fields[15],
+                "metadata transfer imported applied log hash",
+            )?;
+            let transfer_imported_state_digest =
+                parse_option_u64(line, fields[16], "metadata transfer imported state digest")?;
+            match (
+                transfer_imported_log_index,
+                transfer_imported_log_hash,
+                transfer_imported_state_digest,
+            ) {
+                (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
+                    Some(PgMetadataProof {
+                        applied_log_index,
+                        applied_log_hash,
+                        state_digest,
+                    })
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(parse_error(
+                        line,
+                        "metadata transfer imported proof fields must be all present or all absent",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         match (
             transfer_source_epoch,
-            transfer_log_index,
-            transfer_log_hash,
-            transfer_state_digest,
+            transfer_source_log_index,
+            transfer_source_log_hash,
+            transfer_source_state_digest,
+            transfer_imported,
         ) {
             (
                 Some(source_epoch),
                 Some(applied_log_index),
                 Some(applied_log_hash),
                 Some(state_digest),
+                imported_metadata_proof,
             ) => Some(PgMetadataTransferProof {
                 source_epoch,
-                metadata_proof: PgMetadataProof {
+                source_metadata_proof: PgMetadataProof {
                     applied_log_index,
                     applied_log_hash,
                     state_digest,
                 },
+                imported_metadata_proof: imported_metadata_proof.unwrap_or(PgMetadataProof {
+                    applied_log_index,
+                    applied_log_hash,
+                    state_digest,
+                }),
             }),
-            (None, None, None, None) => None,
+            (None, None, None, None, None) => None,
             _ => {
                 return Err(parse_error(
                     line,
-                    "metadata transfer proof fields must be all present or all absent",
+                    "metadata transfer source proof fields must be all present or all absent",
                 ));
             }
         }
@@ -4560,11 +4779,18 @@ fn validate_metadata_transfer_proof(
             cluster_epoch: snapshot.cluster_epoch,
         });
     }
-    if !metadata_proof_satisfies_active_floor(required_floor, transfer.metadata_proof()) {
+    if transfer.source_epoch() < snapshot.cluster_epoch {
+        return Err(ControlPlaneError::PgMetadataTransferSourceEpochStale {
+            pg_id: pg_id.get(),
+            source_epoch: transfer.source_epoch(),
+            cluster_epoch: snapshot.cluster_epoch,
+        });
+    }
+    if !metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof()) {
         return Err(ControlPlaneError::PgMetadataTransferProofBelowFloor {
             pg_id: pg_id.get(),
             expected: required_floor,
-            actual: transfer.metadata_proof(),
+            actual: transfer.source_metadata_proof(),
         });
     }
     Ok(())
@@ -5228,6 +5454,77 @@ mod tests {
     }
 
     #[test]
+    fn unix_control_plane_client_fences_pg_for_metadata_transfer_live() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            44,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(44),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            44,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_003).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let peering_epoch = client
+            .fence_pg_for_metadata_transfer(PgId::new(44))
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(peering_epoch > active_epoch);
+        let mut authority =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
+        let pg = authority.snapshot().pg(PgId::new(44)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(pg.peering_metadata_proof_floor(), Some(active_proof));
+        assert_eq!(pg.peering_metadata_transfer(), None);
+
+        let reopened_epoch = authority.snapshot().cluster_epoch();
+        let same_epoch = authority
+            .fence_pg_for_metadata_transfer(PgId::new(44))
+            .unwrap()
+            .cluster_epoch();
+        assert_eq!(same_epoch, reopened_epoch);
+    }
+
+    #[test]
     fn unix_control_plane_client_sets_pg_acting_set_with_metadata_transfer_live() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -5295,6 +5592,89 @@ mod tests {
             pg.peering_metadata_proof_floor(),
             Some(transfer.metadata_proof())
         );
+    }
+
+    #[test]
+    fn unix_control_plane_client_sets_transfer_and_returns_exact_runtime_map() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(43),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let imported_proof = PgMetadataProof::new(9, 12, 11);
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            active_proof,
+            imported_proof,
+        );
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_003).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client
+            .set_pg_acting_set_with_metadata_transfer_runtime_map(
+                PgId::new(43),
+                vec![NodeId::new(2)],
+                transfer,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(runtime_map.cluster_epoch() > active_epoch);
+        let route = runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(43))
+            .unwrap();
+        assert_eq!(route.cluster_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.acting_set(), &[NodeId::new(2)]);
+
+        let authority =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
+        let pg = authority.snapshot().pg(PgId::new(43)).unwrap();
+        assert_eq!(pg.peering_metadata_proof_floor(), Some(imported_proof));
+        assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
     }
 
     #[test]
@@ -10962,11 +11342,16 @@ mod tests {
             Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer { pg_id: 42 })
         ));
 
-        let stale_transfer = PgMetadataTransferProof::new(
+        let stale_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             PgMetadataProof::new(
                 active_proof.applied_log_index,
                 active_proof.applied_log_hash + 1,
+                active_proof.state_digest,
+            ),
+            PgMetadataProof::new(
+                active_proof.applied_log_index,
+                active_proof.applied_log_hash + 10,
                 active_proof.state_digest,
             ),
         );
@@ -10990,8 +11375,27 @@ mod tests {
             Err(ControlPlaneError::PgMetadataTransferSourceEpochInFuture { pg_id: 42, .. })
         ));
 
-        let transferred_proof = PgMetadataProof::new(10, 12, 13);
-        let transfer = PgMetadataTransferProof::new(active_epoch, transferred_proof);
+        let stale_epoch = ClusterEpoch::new(active_epoch.get() - 1).unwrap();
+        let stale_epoch_transfer = PgMetadataTransferProof::new(stale_epoch, active_proof);
+        assert!(matches!(
+            authority.set_pg_acting_set_with_metadata_transfer(
+                PgId::new(42),
+                vec![NodeId::new(2)],
+                stale_epoch_transfer,
+            ),
+            Err(ControlPlaneError::PgMetadataTransferSourceEpochStale { pg_id: 42, .. })
+        ));
+
+        let imported_proof = PgMetadataProof::new(
+            active_proof.applied_log_index,
+            active_proof.applied_log_hash + 100,
+            active_proof.state_digest,
+        );
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            active_proof,
+            imported_proof,
+        );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
             .unwrap();
@@ -10999,14 +11403,14 @@ mod tests {
         let pg = authority.snapshot().pg(PgId::new(42)).unwrap();
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
-        assert_eq!(pg.peering_metadata_proof_floor(), Some(transferred_proof));
+        assert_eq!(pg.peering_metadata_proof_floor(), Some(imported_proof));
         assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
 
         let restarted = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         let restarted_pg = restarted.snapshot().pg(PgId::new(42)).unwrap();
         assert_eq!(
             restarted_pg.peering_metadata_proof_floor(),
-            Some(transferred_proof)
+            Some(imported_proof)
         );
         assert_eq!(restarted_pg.peering_metadata_transfer(), Some(transfer));
 
@@ -11038,7 +11442,7 @@ mod tests {
             2,
             42,
             PgState::Peering,
-            transferred_proof,
+            imported_proof,
             false,
             2_005,
         );
@@ -11053,7 +11457,7 @@ mod tests {
         let active_pg = authority.snapshot().pg(PgId::new(42)).unwrap();
         assert_eq!(active_pg.state(), PgState::Active);
         assert_eq!(active_pg.active_primary(), Some(NodeId::new(2)));
-        assert_eq!(active_pg.active_metadata_proof(), Some(transferred_proof));
+        assert_eq!(active_pg.active_metadata_proof(), Some(imported_proof));
         assert_eq!(active_pg.peering_metadata_proof_floor(), None);
         assert_eq!(active_pg.peering_metadata_transfer(), None);
     }

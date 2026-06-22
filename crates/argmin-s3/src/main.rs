@@ -24,8 +24,9 @@ use server_core::sse::{
 };
 use storage::control_plane::{
     build_control_plane_unix_response, read_control_plane_unix_request,
-    write_control_plane_unix_response, ControlPlaneRuntimeMapSource, FileControlPlaneStore,
-    PgMetadataProof, PgMetadataTransferProof, SingleAuthorityControlPlane, UnixControlPlaneClient,
+    write_control_plane_unix_response, ClusterRuntimeMapSnapshot, ControlPlaneRuntimeMapSource,
+    FileControlPlaneStore, PgMetadataProof, PgMetadataTransferProof, SingleAuthorityControlPlane,
+    UnixControlPlaneClient,
 };
 use storage::storage_node_server::{
     StorageNodeControlPlaneRefreshLoop, StorageNodePgRoute, StorageNodeProcessConfig,
@@ -279,7 +280,7 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
     if command == "control-plane-set-pg-acting-set-with-metadata-transfer-live" {
         let Some(path) = args.next() else {
             eprintln!(
-                "usage: argmin-s3 {} <socket-path> <pg-id> <source-epoch> <applied-log-index> <applied-log-hash> <state-digest> <node-id>...",
+                "usage: argmin-s3 {} <socket-path> <pg-id> <source-epoch> <source-applied-log-index> <source-applied-log-hash> <source-state-digest> <imported-applied-log-index> <imported-applied-log-hash> <imported-state-digest> <node-id>...",
                 command.to_string_lossy()
             );
             return Some(2);
@@ -288,7 +289,7 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             parse_control_plane_pg_acting_set_with_metadata_transfer_args(args)
         else {
             eprintln!(
-                "usage: argmin-s3 {} <socket-path> <pg-id> <source-epoch> <applied-log-index> <applied-log-hash> <state-digest> <node-id>...",
+                "usage: argmin-s3 {} <socket-path> <pg-id> <source-epoch> <source-applied-log-index> <source-applied-log-hash> <source-state-digest> <imported-applied-log-index> <imported-applied-log-hash> <imported-state-digest> <node-id>...",
                 command.to_string_lossy()
             );
             return Some(2);
@@ -304,6 +305,80 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
                     "control-plane set PG {} acting set with metadata transfer at epoch {}",
                     pg_id.get(),
                     epoch.get()
+                );
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
+    if command == "control-plane-fence-pg-for-metadata-transfer-live" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(pg_id) = args.next().and_then(parse_pg_id_arg) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match fence_control_plane_pg_for_metadata_transfer_live(Path::new(&path), pg_id) {
+            Ok(epoch) => {
+                eprintln!(
+                    "control-plane fenced PG {} for metadata transfer at epoch {}",
+                    pg_id.get(),
+                    epoch.get()
+                );
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
+    if command == "control-plane-transfer-pg-metadata-live" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some((pg_id, acting_set)) = parse_control_plane_pg_acting_set_args(args) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        return match transfer_control_plane_pg_metadata_live(Path::new(&path), pg_id, acting_set) {
+            Ok(summary) => {
+                eprintln!(
+                    "control-plane transferred PG {} metadata from node {} epoch {} to epoch {} with imported proof {}:{}:{}",
+                    pg_id.get(),
+                    summary.source_node_id.as_u32(),
+                    summary.source_epoch.get(),
+                    summary.destination_epoch.get(),
+                    summary.imported_proof.applied_log_index,
+                    summary.imported_proof.applied_log_hash,
+                    summary.imported_proof.state_digest
                 );
                 Some(0)
             }
@@ -384,14 +459,25 @@ fn parse_control_plane_pg_acting_set_args(
     Some((pg_id, acting_set))
 }
 
+fn parse_pg_id_arg(value: OsString) -> Option<PgId> {
+    value
+        .into_string()
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(PgId::new)
+}
+
 fn parse_control_plane_pg_acting_set_with_metadata_transfer_args(
     mut args: impl Iterator<Item = OsString>,
 ) -> Option<(PgId, PgMetadataTransferProof, Vec<NodeId>)> {
     let pg_id = parse_next_u32(&mut args).map(PgId::new)?;
     let source_epoch = parse_next_u64(&mut args).and_then(ClusterEpoch::new)?;
-    let applied_log_index = parse_next_u64(&mut args)?;
-    let applied_log_hash = parse_next_u64(&mut args)?;
-    let state_digest = parse_next_u64(&mut args)?;
+    let source_applied_log_index = parse_next_u64(&mut args)?;
+    let source_applied_log_hash = parse_next_u64(&mut args)?;
+    let source_state_digest = parse_next_u64(&mut args)?;
+    let imported_applied_log_index = parse_next_u64(&mut args)?;
+    let imported_applied_log_hash = parse_next_u64(&mut args)?;
+    let imported_state_digest = parse_next_u64(&mut args)?;
     let mut acting_set = Vec::new();
     for node_id in args {
         let node_id = node_id
@@ -406,12 +492,17 @@ fn parse_control_plane_pg_acting_set_with_metadata_transfer_args(
     }
     Some((
         pg_id,
-        PgMetadataTransferProof::new(
+        PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             PgMetadataProof {
-                applied_log_index,
-                applied_log_hash,
-                state_digest,
+                applied_log_index: source_applied_log_index,
+                applied_log_hash: source_applied_log_hash,
+                state_digest: source_state_digest,
+            },
+            PgMetadataProof {
+                applied_log_index: imported_applied_log_index,
+                applied_log_hash: imported_applied_log_hash,
+                state_digest: imported_state_digest,
             },
         ),
         acting_set,
@@ -451,6 +542,15 @@ fn set_control_plane_pg_acting_set_live(
         .map_err(|error| format!("failed to set live PG acting set: {error}"))
 }
 
+fn fence_control_plane_pg_for_metadata_transfer_live(
+    socket_path: &Path,
+    pg_id: PgId,
+) -> Result<ClusterEpoch, String> {
+    UnixControlPlaneClient::new(socket_path)
+        .fence_pg_for_metadata_transfer(pg_id)
+        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))
+}
+
 fn set_control_plane_pg_acting_set_with_metadata_transfer_live(
     socket_path: &Path,
     pg_id: PgId,
@@ -462,6 +562,86 @@ fn set_control_plane_pg_acting_set_with_metadata_transfer_live(
         .map_err(|error| {
             format!("failed to set live PG acting set with metadata transfer: {error}")
         })
+}
+
+struct MetadataTransferLiveSummary {
+    source_node_id: NodeId,
+    source_epoch: ClusterEpoch,
+    destination_epoch: ClusterEpoch,
+    imported_proof: PgMetadataProof,
+}
+
+fn transfer_control_plane_pg_metadata_live(
+    socket_path: &Path,
+    pg_id: PgId,
+    acting_set: Vec<NodeId>,
+) -> Result<MetadataTransferLiveSummary, String> {
+    let config =
+        ServerConfig::from_env().map_err(|error| format!("configuration error: {error}"))?;
+    let ec_config = EcConfig::new(config.ec_k, config.ec_m)
+        .map_err(|error| format!("invalid EC config: {error}"))?;
+    let control_plane = UnixControlPlaneClient::new(socket_path);
+    control_plane
+        .fence_pg_for_metadata_transfer(pg_id)
+        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
+    let source_runtime = control_plane
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| format!("failed to fetch fenced control-plane runtime map: {error}"))?;
+    let source_route = source_runtime
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .ok_or_else(|| format!("control-plane runtime map has no PG {}", pg_id.get()))?;
+    let source_node_id = source_route.primary_node_id();
+    let source_cluster =
+        build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &source_runtime)?;
+    let artifact = source_cluster
+        .export_pg_metadata_transfer_artifact_from_retained_log(pg_id, source_node_id)
+        .map_err(|error| format!("failed to export PG metadata transfer artifact: {error}"))?;
+    let destination_epoch = source_runtime
+        .cluster_epoch()
+        .get()
+        .checked_add(1)
+        .and_then(ClusterEpoch::new)
+        .ok_or_else(|| "destination cluster epoch overflowed".to_string())?;
+    let imported_proof =
+        StorageCluster::metadata_transfer_imported_proof_at_epoch(&artifact, destination_epoch)
+            .map_err(|error| format!("failed to compute imported PG metadata proof: {error}"))?;
+    let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+        artifact.cluster_epoch(),
+        artifact.source_metadata_proof(),
+        imported_proof,
+    );
+    let destination_runtime = control_plane
+        .set_pg_acting_set_with_metadata_transfer_runtime_map(pg_id, acting_set, transfer)
+        .map_err(|error| {
+            format!("failed to install transfer-backed live PG acting set: {error}")
+        })?;
+    let actual_destination_epoch = destination_runtime.cluster_epoch();
+    if actual_destination_epoch != destination_epoch {
+        return Err(format!(
+            "control-plane installed transfer at epoch {}, expected {}",
+            actual_destination_epoch.get(),
+            destination_epoch.get()
+        ));
+    }
+    let destination_cluster =
+        build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &destination_runtime)?;
+    let actual_imported_proof = destination_cluster
+        .import_pg_metadata_transfer_artifact_from_retained_log(&artifact)
+        .map_err(|error| format!("failed to import PG metadata transfer artifact: {error}"))?;
+    if actual_imported_proof != imported_proof {
+        return Err(format!(
+            "imported PG metadata proof {:?} did not match expected {:?}",
+            actual_imported_proof, imported_proof
+        ));
+    }
+    Ok(MetadataTransferLiveSummary {
+        source_node_id,
+        source_epoch: artifact.cluster_epoch(),
+        destination_epoch,
+        imported_proof,
+    })
 }
 
 fn control_plane_runtime_map_ready(
@@ -1045,18 +1225,22 @@ fn build_control_plane_frontend_storage_cluster(
                     "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
                 )
             })?;
+    build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
+}
+
+fn build_frontend_storage_cluster_from_runtime_map(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+    runtime_map: &ClusterRuntimeMapSnapshot,
+) -> Result<Arc<StorageCluster>, String> {
     let metadata_primary_node_id = runtime_map
         .nodes()
         .first()
         .map(|node| node.node_id())
-        .ok_or_else(|| {
-            format!(
-                "control-plane runtime map from {control_plane_socket_path} has no routed nodes"
-            )
-        })?;
+        .ok_or_else(|| "control-plane runtime map has no routed nodes".to_string())?;
     StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
         metadata_primary_node_id,
-        &runtime_map,
+        runtime_map,
         EcShape {
             k: ec_config.data_shards,
             m: ec_config.parity_shards,
@@ -1296,6 +1480,25 @@ mod tests {
             abort_on_500: false,
             local_debug_endpoint: false,
         }
+    }
+
+    #[test]
+    fn metadata_transfer_admin_args_parse_source_and_imported_proofs() {
+        let args = ["7", "12", "20", "30", "40", "20", "31", "40", "2", "3"]
+            .into_iter()
+            .map(OsString::from);
+
+        let (pg_id, transfer, acting_set) =
+            parse_control_plane_pg_acting_set_with_metadata_transfer_args(args).unwrap();
+
+        assert_eq!(pg_id, PgId::new(7));
+        assert_eq!(transfer.source_epoch(), ClusterEpoch::new(12).unwrap());
+        assert_eq!(
+            transfer.source_metadata_proof(),
+            PgMetadataProof::new(20, 30, 40)
+        );
+        assert_eq!(transfer.metadata_proof(), PgMetadataProof::new(20, 31, 40));
+        assert_eq!(acting_set, vec![NodeId::new(2), NodeId::new(3)]);
     }
 
     #[test]

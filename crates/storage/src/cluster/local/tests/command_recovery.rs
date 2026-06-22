@@ -2205,8 +2205,12 @@ fn metadata_transfer_import_replays_rebased_artifact_to_peering_acting_set() {
         .unwrap();
     drop(source_pg);
     let artifact = cluster
-        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .export_pg_metadata_transfer_artifact_from_retained_log(pg_id, NodeId::new(0))
         .unwrap();
+    assert_eq!(artifact.pg_id(), pg_id);
+    assert_eq!(artifact.source_node_id(), NodeId::new(0));
+    assert_eq!(artifact.cluster_epoch(), cluster.operation_epoch());
+    assert_eq!(artifact.source_metadata_proof(), artifact.proof);
     drop(cluster);
 
     let destination_epoch = ClusterEpoch::new(2).unwrap();
@@ -2218,14 +2222,20 @@ fn metadata_transfer_import_replays_rebased_artifact_to_peering_acting_set() {
     route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
     route.state = PgState::Peering;
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let expected_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        &artifact,
+        destination_epoch,
+    )
+    .unwrap();
 
     let proof = cluster
-        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .import_pg_metadata_transfer_artifact_from_retained_log(&artifact)
         .unwrap();
     let retried_proof = cluster
-        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .import_pg_metadata_transfer_artifact_from_retained_log(&artifact)
         .unwrap();
 
+    assert_eq!(proof, expected_proof);
     assert_eq!(retried_proof, proof);
     assert_eq!(proof.applied_log_index, artifact.proof.applied_log_index);
     assert_eq!(proof.state_digest, artifact.proof.state_digest);

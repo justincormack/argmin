@@ -1,5 +1,5 @@
 use crate::control_plane::PgMetadataProof;
-use crate::error::{BucketSnapshotLoadError, StoreError};
+use crate::error::{BucketSnapshotLoadError, PgMetadataTransferError, StoreError};
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogHashRangeEntry,
     MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
@@ -32,12 +32,34 @@ pub(crate) struct PgPeeringReplicaReplayPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PgMetadataTransferArtifact {
+pub struct PgMetadataTransferArtifact {
     pub(crate) pg_id: PgId,
     pub(crate) source_node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) proof: PgMetadataProof,
     pub(crate) retained_log_entries: Vec<MetadataCommandLogRangeEntry>,
+}
+
+impl PgMetadataTransferArtifact {
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn source_node_id(&self) -> NodeId {
+        self.source_node_id
+    }
+
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn source_metadata_proof(&self) -> PgMetadataProof {
+        self.proof
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +162,18 @@ pub(crate) enum PgPeeringReconstructionFailure {
     Apply(#[from] BucketSnapshotLoadError),
     #[error(transparent)]
     Reconstruction(#[from] PgPeeringReconstructionError),
+}
+
+impl From<PgPeeringReconstructionFailure> for PgMetadataTransferError {
+    fn from(error: PgPeeringReconstructionFailure) -> Self {
+        match error {
+            PgPeeringReconstructionFailure::Store(error) => Self::Store(error),
+            PgPeeringReconstructionFailure::Apply(error) => Self::Apply(error),
+            PgPeeringReconstructionFailure::Reconstruction(error) => Self::Reconstruction {
+                message: error.to_string(),
+            },
+        }
+    }
 }
 
 pub(crate) fn reconstruct_pg_peering_from_primary_retained_log(
