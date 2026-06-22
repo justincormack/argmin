@@ -890,6 +890,41 @@ fn test_put_object_ifmatch_quoted_star_returns_not_implemented() {
 }
 
 #[test]
+fn test_put_object_ifmatch_percent_encoded_star_is_literal_etag() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"v1").await;
+
+        let result = put_object_result_retrying_operation_aborted(
+            "put conditional object with percent-encoded-star if-match",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .if_match("%2A")
+                    .body(ByteStream::from_static(b"v2"))
+            },
+        )
+        .await;
+        assert_eq!(err_status(&result), 412);
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get conditional object")
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v1");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
 fn test_put_object_ifmatch_requires_put_object_and_get_object() {
     s3_tests::run(async {
         let bucket = setup_bucket_allowing_policy().await;

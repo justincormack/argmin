@@ -4514,6 +4514,89 @@ fn test_bucket_policy_put_obj_grant_read_condition() {
 }
 
 #[test]
+fn test_bucket_policy_grant_read_condition_uses_raw_header_spacing() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let canonical_grant = format!("id=\"{owner_id}\"");
+        let spaced_grant = format!("id = \"{owner_id}\"");
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-grant-read": canonical_grant
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied("PutObject denied with canonical grant-read header", || {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("canonical-denied")
+                .body(ByteStream::from_static(b"canonical-denied"))
+                .customize()
+                .mutate_request({
+                    let canonical_grant = canonical_grant.clone();
+                    move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", canonical_grant.clone());
+                    }
+                })
+                .send()
+        })
+        .await;
+
+        eventually_ok("PutObject with spaced grant-read header", || {
+            let spaced_grant = spaced_grant.clone();
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("spaced-allowed")
+                .body(ByteStream::from_static(b"spaced-allowed"))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", spaced_grant.clone());
+                })
+                .send()
+        })
+        .await;
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("spaced-allowed")
+            .send()
+            .await
+            .unwrap();
+        assert!(has_grant(acl.grants(), Permission::Read, Some(&owner_id)));
+
+        cleanup(&bucket, &["canonical-denied", "spaced-allowed"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_obj_grant_read_acp_condition() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -7767,6 +7850,86 @@ fn test_bucket_policy_put_obj_request_object_tag() {
         .await;
 
         cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_condition_uses_decoded_tag_value() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringNotEquals": {
+                                "s3:RequestObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let denied_url = object_url(CTX.endpoint(), &bucket, "denied-tag", None);
+        eventually_result_matches(
+            "PutObject denied with nonmatching request-object-tag condition",
+            20,
+            std::time::Duration::from_millis(200),
+            || {
+                let denied_url = denied_url.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(send_signed_request(
+                        "PUT",
+                        &denied_url,
+                        b"denied-tag",
+                        [("x-amz-tagging", "security=private")],
+                    ))
+                }
+            },
+            |result| result.as_ref().is_ok_and(|response| response.status == 403),
+        )
+        .await;
+
+        let url = object_url(CTX.endpoint(), &bucket, "encoded-tag", None);
+        let response = send_signed_request(
+            "PUT",
+            &url,
+            b"encoded-tag",
+            [("x-amz-tagging", "security=pub%6Cic")],
+        );
+        let status = response.status;
+        assert_eq!(status, 200, "expected 200, got {status}");
+
+        let tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key("encoded-tag")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            tags.tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        cleanup(&bucket, &["encoded-tag", "denied-tag"]).await;
     });
 }
 
@@ -11902,6 +12065,98 @@ fn test_bucket_policy_copy_source_condition_uses_leading_slash_encoded_header_va
 }
 
 #[test]
+fn test_bucket_policy_copy_source_condition_percent_encoded_unreserved_bypasses_canonical_deny() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            "private/foo",
+            b"private/foo".to_vec(),
+        )
+        .await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&dst_bucket),
+                        "Condition": {
+                            "StringLike": {
+                                "s3:x-amz-copy-source": format!("{src_bucket}/private/*")
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send_retrying_operation_aborted("put canonical copy-source deny bucket policy")
+            .await
+            .unwrap();
+
+        let canonical_deny_url = object_url(CTX.endpoint(), &dst_bucket, "canonical-denied", None);
+        let canonical_copy_source = format!("{src_bucket}/private/foo");
+        eventually_result_matches(
+            "CopyObject denied with canonical copy-source header",
+            20,
+            std::time::Duration::from_millis(200),
+            || {
+                let canonical_deny_url = canonical_deny_url.clone();
+                let canonical_copy_source = canonical_copy_source.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(send_signed_request(
+                        "PUT",
+                        &canonical_deny_url,
+                        b"",
+                        [("x-amz-copy-source", canonical_copy_source.as_str())],
+                    ))
+                }
+            },
+            |result| result.as_ref().is_ok_and(|response| response.status == 403),
+        )
+        .await;
+
+        let dst_url = object_url(CTX.endpoint(), &dst_bucket, "copied", None);
+        let copy_source = format!("{src_bucket}/%70rivate/foo");
+        let response = send_signed_request(
+            "PUT",
+            &dst_url,
+            b"",
+            [("x-amz-copy-source", copy_source.as_str())],
+        );
+        assert_eq!(
+            response.status, 200,
+            "expected encoded copy-source spelling to bypass canonical deny, got {} body={}",
+            response.status, response.body
+        );
+
+        let copied = s3_tests::get_object_body_retrying_operation_aborted(
+            client,
+            &dst_bucket,
+            "copied",
+            None,
+            "get copied object after encoded copy-source deny bypass",
+        )
+        .await;
+        assert_eq!(copied.as_slice(), b"private/foo");
+
+        cleanup_with_client(client, &dst_bucket, &["copied", "canonical-denied"]).await;
+        cleanup_with_client(client, &src_bucket, &["private/foo"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition() {
     s3_tests::run(async {
         let principal = same_account_exact_principal().await;
@@ -12988,6 +13243,99 @@ fn test_bucket_policy_list_bucket_delimiter_condition() {
         .await;
 
         cleanup(&bucket, &["allowed/one", "allowed/two"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_prefix_and_delimiter_conditions_use_decoded_query_values() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        for key in ["allowed/one", "blocked/one"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Deny",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotEquals": {
+                                    "s3:prefix": "allowed/"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotEquals": {
+                                    "s3:delimiter": "/"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let denied_url = format!(
+            "{}/{bucket}?list-type=2&prefix=blocked%2F&delimiter=%2F",
+            CTX.endpoint()
+        );
+        eventually_result_matches(
+            "ListObjectsV2 denied with nonmatching decoded prefix",
+            20,
+            std::time::Duration::from_millis(200),
+            || {
+                let denied_url = denied_url.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(send_signed_request(
+                        "GET",
+                        &denied_url,
+                        b"",
+                        std::iter::empty::<(&str, &str)>(),
+                    ))
+                }
+            },
+            |result| result.as_ref().is_ok_and(|response| response.status == 403),
+        )
+        .await;
+
+        let allowed_url = format!(
+            "{}/{bucket}?list-type=2&prefix=allowed%2F&delimiter=%2F",
+            CTX.endpoint()
+        );
+        let allowed =
+            send_signed_request("GET", &allowed_url, b"", std::iter::empty::<(&str, &str)>());
+        assert_eq!(
+            allowed.status, 200,
+            "expected decoded prefix/delimiter to avoid deny, got {} body={}",
+            allowed.status, allowed.body
+        );
+
+        cleanup(&bucket, &["allowed/one", "blocked/one"]).await;
     });
 }
 
